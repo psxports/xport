@@ -1,0 +1,61 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+UseTab: Never
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+ColumnLimit: 1000
+
+BreakBeforeBraces: Allman
+IndentCaseLabels: true
+IndentCaseBlocks: false
+NamespaceIndentation: None
+AccessModifierOffset: -4
+
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: None
+AllowShortLoopsOnASingleLine: false
+
+PointerAlignment: Right
+ReferenceAlignment: Pointer
+DerivePointerAlignment: false
+SpaceBeforeParens: ControlStatements
+SpaceBeforeAssignmentOperators: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: None
+AlignConsecutiveBitFields: None
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
+AlignOperands: Align
+AlignEscapedNewlines: DontAlign
+
+BinPackArguments: true
+BinPackParameters: true
+AllowAllParametersOfDeclarationOnNextLine: false
+BreakFunctionDefinitionParameters: false
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeColon
+AlwaysBreakAfterReturnType: None
+AlwaysBreakTemplateDeclarations: Yes
+
+IndentPPDirectives: BeforeHash
+PPIndentWidth: 4
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+SeparateDefinitionBlocks: Always
+# source_index removes trailing spaces before invoking clang-format
+ReflowComments: false
+...
