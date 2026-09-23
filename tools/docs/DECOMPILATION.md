@@ -1,0 +1,53 @@
+# Decompilation, command reference and PSX tips
+
+Normative extension of `../PIPELINE.md`. Read this file only when that contract routes the current task here.
+
+## 8. WIP → DONE and regression gates
+
+DONE requires image-verified static MIPS audit plus compatible dynamic evidence in a declared context/range. Record coverage gaps explicitly; one context is not proof of every character/level/branch. SKIP requires justified replacement scope and its validation, not a missed call. TODO is no accepted implementation; WIP includes incomplete or insufficiently proven implementations.
+
+Compare the entire declared range, expected counts, selected structures, ordered calls and arguments. Inspect `passed`, `partial`, channel scope and first difference; exit zero alone may not mean PASS. State/GPU-command/sound-call matches do not prove pixels/PCM, unhooked intervals or all inputs. No silent masks, input suppression or fake success. Preserve raw GPU differences; exclude only audited unused fields.
+
+On accepted change update implementation/evidence links, coverage and hashes; invalidate stale dependencies without deleting history; rebuild derived SQL/progress. Use once-only markers to prioritize level coverage, never as correctness gates. WIP summary frequencies include every call; expand targets through dependencies, then strict replay to distinguish primary failures from consequences of prior skips.
+
+## 9. Current automation contracts and command reference
+
+Schedule JSON: sorted nonoverlapping inclusive intervals `[{"start":270,"end":275,"buttons":["cross"]}]`; omitted ticks release buttons. PS1 names: select/l3/r3/start/up/right/down/left/l2/r2/l1/r1/triangle/circle/cross/square. `pad_bytes` emits `<III>` start/end/pressed-mask; active-low wire pad values require decoding.
+
+Cache: nonempty hashed groups game/emulator/settings/initial_state/scenario/collector plus `capture:{schema,channels,start_tick,end_tick,options}`; verify before/after capture and publication. Include actual shared implementation/profile/config hashes, not shim bytes only. Reuse original captures only for matching emulator/state/scenario/effective settings/channel contracts. Unmatched new route is unverified.
+
+- `trace_internal --source RAW --output DIR`; `trace_phases --source RAW [--native FILE] --report R`; `trace_actor_diff --original A --native B --report R`; `trace_bundle --manifest M --report R`: offline decoding/comparison.
+- `trace_user_input --transfers JSON --output R`: decode recorded controller transfers. User recording health and growth are reported by `user_trace status`; no separate watcher is needed.
+- `trace_stage_run --name NAME [--anchor CANDIDATE.json] [--wait 0..30]`: current build/preflight/capture/strict comparison/localization/publication runner with persistent SQLite state.
+- `trace_stage_narrow --run RUN_DIRECTORY [--target ABSOLUTE_PHASE --wait 0..30]`: current bounded first-difference/checkpoint replay.
+- `trace_stage_verify --manifest M --report R`: strict declared-channel verifier. Use it for explicit offline verification; ordinary convergence invokes it through `trace_stage_run`.
+- `trace_stage_registry`, `trace_stage_package`, `trace_stage_plan`: current candidate registry, captured-state exporter and immutable preparation/index layer.
+- `trace_evidence --database D [--index-existing]`: evidence index; no automatic DONE.
+- `summarize_wip JOURNAL [--output R]`; `freeze_manifest [--folder DIR ...] [--verify]`: WIP statistics / file integrity snapshot. Narrow folder lists avoid hashing entire build archives; integrity ≠ semantics.
+- `validate_similarity`: independent eligible-pair/index/evidence verification.
+- `code_refresh`; `source_index --rebuild`; `source_context 0xADDRESS --image IMAGE`; `query 0xADDRESS --image IMAGE --audit-context`: batched post-patch acceptance / atomic C index refresh / retained compact packet / direct compact function audit. These optimize evidence retrieval and do not establish DONE
+- `[XPORT_ROOT]/tools/prepare.bat [--offline] [--force] [--clean-workspace]`: materialize the pinned upstream in the user cache, verify/download the dependency archive, apply the complete patch, build and atomically publish the shared runtime. `--verify-only` checks host tools and identities; `--no-build --no-publish` prepares source/dependencies; `--no-publish` builds without replacement. Never publish while an emulator is running.
+- `duckstation_launch.ps1 -ProjectRoot ROOT [-Role ROLE -StateFile STATE]`; `duckstation_stop.ps1 -ProjectRoot ROOT [-Role ROLE]`: diagnostic launch / exact owned instance stop. User playback uses the BAT/visible command. `watch_user_trace_resources.ps1 -SessionPath S -OutputPath R -Seconds N` observes CPU/memory without GDB stops.
+- Import-only helpers: trace_vblank/phase_gpu/phase_checkpoint/cache/capture_latency/recovery/failures/functions/comparison/schedule/layout, plus `trace_runner` as the internal job executor used by current native capture adapters. Do not invoke `trace_runner` as the current convergence CLI. `trace_worker` persists job/process receipts. `mips_audit_machine` is a restricted fail-closed isolated interpreter, not a PS1 emulator (no BIOS/GTE/devices/exceptions).
+
+### Retired automation tools
+
+- The stage pipeline supersedes `capture_internal_original`, `trace_capture_watch`, `trace_generate`, `trace_minimize`, `trace_oracle`, `trace_detail`, `trace_select`, `trace_anchor_registry`, `trace_user_decode` and `user_trace_replay`. They were removed from the shared command surface and preserved under `tools/archive/superseded-pipeline-20260921` with SHA-256 manifest and restoration instructions.
+- A project may retain compatibility wrappers/tests under its own archive while old evidence is required. After an explicit trace reset it may delete those project-local archives and evidence; record the reset and never cite deleted proof. Shared retired implementations remain in the shared archive. Restore a retired tool only to reproduce retained old evidence, never as the default workflow.
+- `trace_actor_diff`, `trace_bundle`, `trace_capture_latency`, `trace_comparison`, `trace_evidence`, `trace_schedule` and `trace_runner` remain because current decode, strict verification or native adapters import them. A file that is no longer a user command is not necessarily unused runtime code.
+
+## 10. Tips: PSX/MIPS/IDA
+
+These are platform facts and audit checks, not game addresses or blanket normalization permissions.
+
+- Little-endian MIPS I: audit branch delay instructions on both paths, including JAL/JALR/JR; link address and nonstandard link register matter. A pending load can leave the next instruction using the old register. Respect HI/LO, sign-vs-zero extension, SRA/SRL and signed/unsigned comparisons. Translate wrapping arithmetic without C signed-overflow UB; implement unaligned LWL/LWR/SWL/SWR merges explicitly. Do not replace division/multiply corner behavior with unchecked host operations. [CPU reference](https://psx-spx.consoledev.net/cpuspecifications/)
+- Main RAM is 2 MiB with cached/uncached aliases. Scratchpad is separate 1 KiB at `0x1F800000..0x1F8003FF` (cached mirror `0x9F800000`); do not treat the KSEG1 scratchpad range as ordinary RAM. Do not apply `addr & 0x1FFFFF` to arbitrary addresses: it aliases scratchpad, MMIO and BIOS incorrectly. VRAM and sound RAM are separate device memories. Overlay/self-modifying code requires cache/context awareness; stored RAM bytes need not equal cached instructions currently executing. [Memory map](https://psx-spx.consoledev.net/memorymap/)
+- Decode fixed hardware addresses through a typed bus, not guessed host pointers: GPU GP0/GP1 `0x1F801810/814`, pad/memory-card serial `0x1F801040`, interrupt and DMA/timer regions per I/O map. Hardware access width/order can matter; do not model all registers as normal memory. [I/O map](https://psx-spx.consoledev.net/iomap/)
+- VRAM is 1024×512 16-bit storage; coordinate/address units depend on pixel/texture format. Preserve CLUT/tpage/texture-window, draw offset/area, mask/semitransparency/dithering and packet order. Check DMA/OT pointers and terminators before dereferencing; packet header length differs from payload length. VRAM transfers must work even with raster disabled. Raw textured packet RGB and padding require opcode/layout-specific proof before comparison exclusions. [GPU reference](https://psx-spx.consoledev.net/graphicsprocessingunitgpu/)
+- GTE is stateful: preserve control/data registers, MAC/IR arithmetic, FIFO effects, saturation/FLAG and fixed-point conventions. Replacing transformations with floating point can change branches as well as pixels. Include GTE state in checkpoints. [GTE reference](https://psx-spx.consoledev.net/geometrytransformationenginegte/)
+- Audit GP initialization per executable/overlay before trusting global accesses. Caller conventions, stack arguments, preserved registers and real structure stride beat inferred prototypes. A pointer in a0 is not evidence of C++ `this`; a table of pointers is not automatically a vtable.
+- IDA can infer wrong function boundaries/chunks, stack deltas, prototypes, signedness, structure sizes, array stride, tail calls and jump-table targets. Inline assembly, reused registers and overlapping data/code can invalidate pseudocode. Never implement guessed `undefined` types literally. Fix metadata only with byte/caller evidence; preserve the initial export and failures. Validate pseudocode-reordered delay-slot side effects against raw instruction order. These are audit risks, not a claim that every MIPS decompilation is wrong. [Hex-Rays MIPS examples](https://docs.hex-rays.com/user-guide/decompiler/introduction-to-decompilation-vs-disassembly/comparisons-of-mips-disassembly-and-decompilation), [failure handling](https://docs.hex-rays.com/user-guide/decompiler/failures)
+- Native pointers/host endian/alignment differ from guest addresses. Use explicit load/store helpers and documented guest struct offsets; never serialize raw host pointers/padding into portable checkpoints. Clear/reuse scratchpad only as original code does, not at every function/frame.
+- VBlank, GPU submission, game logic tick and menu/sequence phase may differ. Preserve callback ordering/RNG/time during accelerated runs; PAL/NTSC rates and phase resets are project facts. Do not align solely by wall time or equal frame numbers.
+
+- Immediate reconstruction: `LUI imm16` produces `imm16 << 16`; audit hex digit positions before transcribing constants. For `SRA`, cast the complete wrapped 32-bit expression to a signed type before the shift, not after an unsigned shift.

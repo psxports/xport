@@ -1,0 +1,1333 @@
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -130,6 +130,20 @@
+ 
+ bool Core::SetDataRoot(Error* error)
+ {
++  // Keep project data separate from the shared executable and resources
++  if (const char* project_root = std::getenv("XPORT_DUCKSTATION_DATA_ROOT"); project_root && project_root[0])
++  {
++    if (!Path::IsAbsolute(project_root))
++    {
++      Error::SetStringView(error, "XPORT_DUCKSTATION_DATA_ROOT must be an absolute path.");
++      return false;
++    }
++    EmuFolders::DataRoot = Path::Canonicalize(project_root);
++    if (!FileSystem::EnsureDirectoryExists(EmuFolders::DataRoot.c_str(), true, error))
++      return false;
++    return true;
++  }
++
+ #ifndef __ANDROID__
+   // This bullshit here because AppImage mounts in /tmp, so we need to check the "real" appimage location.
+   std::string_view real_approot = EmuFolders::AppRoot;
+--- a/src/core/gdb_server.cpp
++++ b/src/core/gdb_server.cpp
+@@ -11,6 +11,13 @@
+ #include "cpu_core_private.h"
+ #include "gte.h"
+ #include "system.h"
++#include "settings.h"
++#include "pad.h"
++#include "controller.h"
++#include "common/error.h"
++#include "common/file_system.h"
++#include "common/path.h"
++#include <future>
+ 
+ #include "common/assert.h"
+ #include "common/log.h"
+@@ -20,12 +27,15 @@
+ #include "common/timer.h"
+ 
+ #include "util/sockets.h"
++#include "util/ini_settings_interface.h"
+ 
+ #include <limits>
+ #include <optional>
+ #include <utility>
+ 
+ LOG_CHANNEL(GDBServer);
++
++#include "ff_trace.inl"
+ 
+ namespace GDBServer {
+ 
+@@ -312,6 +322,15 @@
+ static bool Cmd$z(ClientSocket* client, std::string_view data);
+ static bool Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data);
+ static bool Cmd$qSupported(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTraceStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTraceDetailStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTraceVBlankStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTraceStateStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFUserStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFUserStop(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTestPad(ClientSocket* client, std::string_view data);
++static bool Cmd$qFFTraceStop(ClientSocket* client, std::string_view data);
++template<bool save> static bool Cmd$qFFState(ClientSocket* client, std::string_view data);
+ static bool Cmd$qXferFeaturesRead(ClientSocket* client, std::string_view data);
+ static bool Cmd$qXferMemoryMapRead(ClientSocket* client, std::string_view data);
+ 
+@@ -403,6 +422,16 @@
+   {"qXfer:features:read:", Cmd$qXferFeaturesRead},
+   {"qXfer:memory-map:read:", Cmd$qXferMemoryMapRead},
+   {"qSupported", Cmd$qSupported},
++  {"qFFTraceStart:", Cmd$qFFTraceStart},
++  {"qFFTraceDetailStart:", Cmd$qFFTraceDetailStart},
++  {"qFFTraceVBlankStart:", Cmd$qFFTraceVBlankStart},
++  {"qFFTraceStateStart:", Cmd$qFFTraceStateStart},
++  {"qFFUserStart:", Cmd$qFFUserStart},
++  {"qFFUserStop", Cmd$qFFUserStop},
++  {"qFFTestPad:", Cmd$qFFTestPad},
++  {"qFFTraceStop", Cmd$qFFTraceStop},
++  {"qFFSaveState:", Cmd$qFFState<true>},
++  {"qFFLoadState:", Cmd$qFFState<false>},
+ };
+ 
+ namespace {
+@@ -940,10 +969,167 @@
+   return true;
+ }
+ 
++// Local diagnostic extension: caller supplies a hex-encoded basename, never a path.
++// GDB socket dispatch runs on the emulation thread. Require an already paused VM.
++template<bool save>
++bool GDBServer::Cmd$qFFState(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || System::IsExecuting() || FFTrace::stream || FFTrace::armed)
++  {
++    client->SendReplyWithAck("E10");
++    return true;
++  }
++  const auto decoded = StringUtil::DecodeHex(data);
++  if (!decoded || decoded->empty() || decoded->size() > 64)
++  {
++    client->SendReplyWithAck("E11");
++    return true;
++  }
++  std::string name(decoded->begin(), decoded->end());
++  for (const char c : name)
++  {
++    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++          (c >= '0' && c <= '9') || c == '-' || c == '_'))
++    {
++      client->SendReplyWithAck("E11");
++      return true;
++    }
++  }
++  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-audit-" + name + ".sav");
++  Error error;
++  bool success;
++  if constexpr (save)
++  {
++    if (FileSystem::FileExists(path.c_str()))
++    {
++      client->SendReplyWithAck("E12"); // Never overwrite a prior reference state.
++      return true;
++    }
++    std::promise<bool> completion;
++    auto future = completion.get_future();
++    success = System::SaveState(path, &error, false, false,
++      [&completion](bool result, const Error&) { completion.set_value(result); });
++    if (success)
++      success = future.get(); // Reply only after the file is atomically committed.
++  }
++  else
++  {
++    client->ClearBreakpoints(); // Clients must reinstall breakpoints after restore.
++    const auto result = System::LoadState(path.c_str(), &error, false, false);
++    success = result.has_value() && *result;
++  }
++  client->SendReplyWithAck(success ? "OK" : "E13");
++  return true;
++}
++
++bool GDBServer::Cmd$qFFTraceStart(ClientSocket* client, std::string_view data)
++{
++  client->SendReplyWithAck(FFTrace::Start(data));
++  return true;
++}
++
++bool GDBServer::Cmd$qFFTraceStop(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || System::IsExecuting())
++  {
++    client->SendReplyWithAck("E20");
++    return true;
++  }
++  FFTrace::Close(FFTrace::Read(0x80093dd0), false);
++  FFTrace::Disarm();
++  client->SendReplyWithAck(FFTrace::failed ? "E23" : "OK");
++  return true;
++}
++
++bool GDBServer::Cmd$qFFTraceDetailStart(ClientSocket* client, std::string_view data)
++{
++  client->SendReplyWithAck(FFTrace::Start(data, true));
++  return true;
++}
++
++bool GDBServer::Cmd$qFFTraceVBlankStart(ClientSocket* client, std::string_view data)
++{
++  client->SendReplyWithAck(FFTrace::Start(data, false, true));
++  return true;
++}
++
++void GDBServer::OnTraceVBlank()
++{
++  FFTrace::VBlank();
++}
++
++void GDBServer::OnTraceSettings()
++{
++  FFTrace::SettingsChanged();
++}
++
++void GDBServer::OnTracePad(u32 port, u32 device, u8 outgoing, u8 incoming, bool ack)
++{
++  if (!FFTrace::stream || !FFTrace::vblank_enabled)
++    return;
++  const auto ticks = FFTrace::ReadClock();
++  std::vector<u8> payload;
++  for (u32 value : {System::GetFrameNumber(), static_cast<u32>(ticks), static_cast<u32>(ticks >> 32),
++                    port, device, static_cast<u32>(outgoing), static_cast<u32>(incoming), ack ? 1u : 0u})
++    FFTrace::Number(payload, value);
++  FFTrace::Emit(11, FFTrace::Read(0x80093dd0), payload);
++}
++
++bool GDBServer::Cmd$qFFTraceStateStart(ClientSocket* client, std::string_view data)
++{
++  client->SendReplyWithAck(FFTrace::Start(data, false, true, true));
++  return true;
++}
++
++bool GDBServer::Cmd$qFFUserStart(ClientSocket* client, std::string_view data)
++{
++  client->SendReplyWithAck(FFTrace::Start(data, false, true, true, true));
++  return true;
++}
++
++bool GDBServer::Cmd$qFFUserStop(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || System::IsExecuting() || !FFTrace::user_mode)
++  {
++    client->SendReplyWithAck("E20");
++    return true;
++  }
++  FFTrace::Close(FFTrace::Read(0x80093dd0), true);
++  FFTrace::Disarm();
++  client->SendReplyWithAck(FFTrace::failed ? "E23" : "OK");
++  return true;
++}
++
++bool GDBServer::Cmd$qFFTestPad(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || System::IsExecuting())
++  {
++    client->SendReplyWithAck("E20");
++    return true;
++  }
++  auto bytes = StringUtil::DecodeHex(data);
++  if (!bytes || bytes->size() != 8 || FFTrace::Word(bytes->data()) > 1 || FFTrace::Word(bytes->data() + 4) > 65535)
++  {
++    client->SendReplyWithAck("E21");
++    return true;
++  }
++  Controller* controller = Pad::GetController(FFTrace::Word(bytes->data()));
++  if (!controller || controller->GetType() != ControllerType::DigitalController)
++  {
++    client->SendReplyWithAck("E24");
++    return true;
++  }
++  const u32 mask = FFTrace::Word(bytes->data() + 4);
++  for (u32 bit = 0; bit < 16; bit++)
++    controller->SetBindState(bit, (mask & (1u << bit)) ? 1.0f : 0.0f);
++  client->SendReplyWithAck("OK");
++  return true;
++}
++
+ bool GDBServer::Cmd$qSupported(ClientSocket* client, std::string_view data)
+ {
+   client->SendReplyWithAck(
+-    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+", MAX_PACKET_SIZE));
++    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+;qFFSaveState+;qFFLoadState+;qFFTraceStart+;qFFTraceDetailStart+;qFFTraceVBlankStart+;qFFTraceStateStart+;qFFUserStart+;qFFUserStop+;qFFTraceStop+;qFFTestPad+", MAX_PACKET_SIZE));
+   return true;
+ }
+ 
+--- a/src/core/system.cpp
++++ b/src/core/system.cpp
+@@ -1240,6 +1240,9 @@
+   }
+ 
+   CheckForSettingsChanges(old_settings);
++#ifdef ENABLE_GDB_SERVER
++  GDBServer::OnTraceSettings();
++#endif
+   Host::OnSettingsReloaded();
+ }
+ 
+@@ -2023,6 +2026,9 @@
+ 
+ void System::FrameDone()
+ {
++#ifdef ENABLE_GDB_SERVER
++  GDBServer::OnTraceVBlank();
++#endif
+   // Generate any pending samples from the SPU before sleeping, this way we reduce the chances of underruns.
+   // TODO: when running ahead, we can skip this (and the flush above)
+   if (!IsReplayingGPUDump()) [[likely]]
+@@ -3083,7 +3089,7 @@
+ }
+ 
+ bool System::SaveState(std::string path, Error* error, bool backup_existing_save, bool ignore_memcard_busy,
+-                       std::function<void(bool, const Error& error)> completion_callback)
++                       std::function<void(bool, const Error& error)> completion_callback, u32 screenshot_size)
+ {
+   if (!IsValid() || IsReplayingGPUDump())
+   {
+@@ -3099,7 +3105,7 @@
+   Timer save_timer;
+ 
+   SaveStateBuffer buffer;
+-  if (!SaveStateToBuffer(&buffer, error, 256))
++  if (!SaveStateToBuffer(&buffer, error, screenshot_size))
+     return false;
+ 
+   VERBOSE_LOG("Preparing state save took {:.2f} msec", save_timer.GetTimeMilliseconds());
+--- /dev/null
++++ b/src/core/ff_trace.inl
+@@ -0,0 +1,600 @@
++// Project-configured diagnostics executed on the emulation thread
++#include <cstdio>
++#include <cstring>
++#include <array>
++#include <unordered_map>
++#include <unordered_set>
++#include "common/sha256_digest.h"
++#include "ff_trace_writer.h"
++#include <chrono>
++#include "gpu.h"
++#include "spu.h"
++#include "save_state_version.h"
++#include "util/state_wrapper.h"
++
++namespace FFTrace {
++static FILE* stream = nullptr;
++static FFTraceWriter writer;
++static bool failed = false;
++static bool armed = false;
++static u32 end_tick = 0;
++static u32 detail_from = UINT32_MAX, detail_to = 0;
++static bool vblank_enabled = false;
++static u32 last_vblank = UINT32_MAX, vblank_count = 0;
++static std::chrono::steady_clock::time_point previous_vblank_wall;
++static std::vector<u8> previous_memory;
++struct PageContentRecord { u32 id; std::vector<u8> data; u32 references; };
++static std::unordered_map<std::string, std::vector<PageContentRecord>> page_contents;
++static std::array<u32, 513> previous_page_ids{};
++static u32 next_page_content = 1;
++static bool states_enabled = false;
++static std::string trace_name;
++static u64 next_state_tick = 0;
++static u32 state_index = 0, state_prepare_us = 0;
++static std::future<bool> state_pending;
++static bool user_mode = false;
++static u64 user_end_tick = 0;
++static u64 last_observed_clock = 0;
++static std::string initial_settings;
++static void Close(u32 tick, bool complete);
++static u32 requested = 0;
++static u32 last_boundary = UINT32_MAX;
++static std::vector<u8> schedule;
++#include "xport_trace_profile.inl"
++static std::vector<u32> sites;
++
++static u32 Word(const u8* data)
++{
++  u32 value;
++  std::memcpy(&value, data, 4);
++  return value;
++}
++
++static void Number(std::vector<u8>& data, u32 value)
++{
++  const auto* bytes = reinterpret_cast<const u8*>(&value);
++  data.insert(data.end(), bytes, bytes + 4);
++}
++
++static u32 PageContent(const u8* data, u32 size, bool* fresh)
++{
++  const auto digest = SHA256Digest::GetDigest(data, size);
++  const std::string key(reinterpret_cast<const char*>(digest.data()), digest.size());
++  auto& candidates = page_contents[key];
++  for (PageContentRecord& candidate : candidates)
++  {
++    if (candidate.data.size() == size && std::memcmp(candidate.data.data(), data, size) == 0)
++    {
++      candidate.references++;
++      *fresh = false;
++      return candidate.id;
++    }
++  }
++  if (next_page_content == UINT32_MAX)
++  {
++    failed = true;
++    return 0;
++  }
++  const u32 id = next_page_content++;
++  candidates.push_back({id, std::vector<u8>(data, data + size), 1});
++  *fresh = true;
++  return id;
++}
++
++static void ReleasePageContent(u32 id)
++{
++  if (!id)
++    return;
++  for (auto group = page_contents.begin(); group != page_contents.end(); group++)
++  {
++    auto& candidates = group->second;
++    for (auto candidate = candidates.begin(); candidate != candidates.end(); candidate++)
++    {
++      if (candidate->id != id)
++        continue;
++      if (--candidate->references == 0)
++        candidates.erase(candidate);
++      if (candidates.empty())
++        page_contents.erase(group);
++      return;
++    }
++  }
++  failed = true;
++}
++
++static u64 ReadClock()
++{
++  const u64 ticks = System::GetGlobalTickCounter();
++  last_observed_clock = std::max(last_observed_clock, ticks);
++  return ticks;
++}
++
++static bool RAM(std::vector<u8>& data, u32 address, u32 size)
++{
++  const size_t offset = data.size();
++  data.resize(offset + size);
++  return CPU::SafeReadMemoryBytes(address, data.data() + offset, size);
++}
++
++static u32 Read(u32 address)
++{
++  u32 value = 0;
++  if (!CPU::SafeReadMemoryWord(address, &value))
++    failed = true;
++  return value;
++}
++
++static void Emit(u32 type, u32 tick, const std::vector<u8>& data)
++{
++  std::vector<u8> record;
++  record.reserve(12 + data.size());
++  Number(record, type);
++  Number(record, tick);
++  Number(record, static_cast<u32>(data.size()));
++  record.insert(record.end(), data.begin(), data.end());
++  if (!writer.Write(std::move(record)))
++    failed = true;
++}
++
++#include "ff_stage_package.inl"
++
++static std::string EffectiveSettings()
++{
++  INISettingsInterface settings;
++  g_settings.Save(settings, false, false);
++  return settings.SaveToString() + "\n" + profile_text;
++}
++
++static void SettingsChanged()
++{
++  if (!stream || !user_mode)
++    return;
++  const std::string current = EffectiveSettings();
++  if (current != initial_settings)
++  {
++    Emit(14, Read(profile.game_tick), std::vector<u8>(current.begin(), current.end()));
++    failed = true;
++  }
++}
++
++static void FinishState(bool wait)
++{
++  if (!state_pending.valid() || (!wait && state_pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
++    return;
++  const bool success = state_pending.get();
++  std::vector<u8> payload;
++  Number(payload, state_index - 1);
++  Number(payload, success ? 1 : 0);
++  Number(payload, state_prepare_us);
++  Emit(10, Read(profile.game_tick), payload);
++  failed |= !success;
++}
++
++static void SaveCheckpoint()
++{
++  FinishState(false);
++  const u64 ticks = ReadClock();
++  if (!states_enabled || ticks < next_state_tick)
++    return;
++  if (state_pending.valid())
++  {
++    failed = true;
++    return;
++  }
++  const std::string name = "trace-" + trace_name + "-" + std::to_string(state_index);
++  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-audit-" + name + ".sav");
++  if (FileSystem::FileExists(path.c_str()))
++  {
++    failed = true;
++    return;
++  }
++  std::vector<u8> payload;
++  Number(payload, state_index++);
++  Number(payload, System::GetFrameNumber());
++  Number(payload, static_cast<u32>(ticks));
++  Number(payload, static_cast<u32>(ticks >> 32));
++  Number(payload, CPU::g_state.pc);
++  payload.insert(payload.end(), name.begin(), name.end());
++  Emit(9, Read(profile.game_tick), payload);
++  auto completion = std::make_shared<std::promise<bool>>();
++  state_pending = completion->get_future();
++  Error error;
++  const auto begin = std::chrono::steady_clock::now();
++  const bool scheduled = System::SaveState(path, &error, false, true,
++    [completion](bool result, const Error&) { completion->set_value(result); }, 0);
++  state_prepare_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
++  if (!scheduled)
++    completion->set_value(false);
++  next_state_tick = ticks + static_cast<u64>(System::GetTicksPerSecond()) * 10;
++}
++
++static void VBlank()
++{
++  if (!stream || !vblank_enabled)
++    return;
++  const auto capture_started = std::chrono::steady_clock::now();
++  const u32 wall_interval_us = vblank_count ? static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(capture_started - previous_vblank_wall).count()) : 0;
++  previous_vblank_wall = capture_started;
++  const u32 frame = System::GetFrameNumber();
++  if (last_vblank != UINT32_MAX && frame != last_vblank + 1)
++  {
++    failed = true;
++    return;
++  }
++  std::vector<u8> memory;
++  if (!RAM(memory, 0x80000000, 0x200000) || !RAM(memory, 0x1f800000, 1024))
++  {
++    failed = true;
++    return;
++  }
++  const bool first = previous_memory.empty();
++  const bool keyframe = !first && vblank_count % 600 == 0;
++  const auto ticks = ReadClock();
++  std::vector<u8> payload;
++  Number(payload, frame);
++  Number(payload, static_cast<u32>(ticks));
++  Number(payload, static_cast<u32>(ticks >> 32));
++  Number(payload, keyframe ? 3 : 2);
++  Number(payload, 0);
++  u32 changed = 0;
++  for (u32 page = 0; page <= 512; page++)
++  {
++    const u32 offset = page * 4096, size = page == 512 ? 1024 : 4096;
++    if (keyframe)
++    {
++      Number(payload, page);
++      Number(payload, previous_page_ids[page]);
++      changed++;
++      continue;
++    }
++    if (!first && !keyframe && std::memcmp(memory.data() + offset, previous_memory.data() + offset, size) == 0)
++      continue;
++    Number(payload, page);
++    bool fresh = false;
++    const u32 content = PageContent(memory.data() + offset, size, &fresh);
++    ReleasePageContent(previous_page_ids[page]);
++    previous_page_ids[page] = content;
++    Number(payload, content);
++    if (!keyframe)
++    {
++      Number(payload, fresh ? 1 : 0);
++      if (fresh)
++        payload.insert(payload.end(), memory.data() + offset, memory.data() + offset + size);
++    }
++    changed++;
++  }
++  std::memcpy(payload.data() + 16, &changed, 4);
++  Emit(8, Read(profile.game_tick), payload);
++  previous_memory = std::move(memory);
++  last_vblank = frame;
++  vblank_count++;
++  const u32 previous_state_index = state_index;
++  SaveCheckpoint();
++  if (user_mode)
++  {
++    const u32 capture_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - capture_started).count());
++    std::vector<u8> timing;
++    for (u32 value : {frame, capture_us, wall_interval_us, keyframe ? 1u : 0u, state_index != previous_state_index ? 1u : 0u})
++      Number(timing, value);
++    Emit(18, Read(profile.game_tick), timing);
++  }
++  if (user_mode && ticks >= user_end_tick)
++    Close(Read(profile.game_tick), true);
++}
++
++static bool Boundary(u32 tick)
++{
++  if (!user_mode && last_boundary == tick)
++    return true;
++  if (!user_mode && last_boundary != UINT32_MAX && tick != last_boundary + 1)
++    return false;
++  last_boundary = tick;
++  if (tick >= detail_from && tick <= detail_to)
++  {
++    std::vector<u8> detail;
++    if (!RAM(detail, 0x80000000, 0x200000) || !RAM(detail, 0x1f800000, 1024))
++      return false;
++    Emit(6, tick, detail);
++    std::vector<u8> registers;
++    Number(registers, CPU::g_state.pc);
++    for (u32 i = 0; i < 32; i++)
++      Number(registers, CPU::g_state.regs.r[i]);
++    Emit(7, tick, registers);
++  }
++  std::vector<u8> actors;
++  if (!RAM(actors, profile.actors, profile.actors_size) || !RAM(actors, profile.camera, profile.camera_size))
++    return false;
++  Emit(1, tick, actors);
++  std::vector<u8> world;
++  const u32 count = Read(profile.world_count);
++  if (count > profile.world_max_count)
++    return false;
++  Number(world, count);
++  if (!RAM(world, profile.world_a, profile.world_a_size) || !RAM(world, profile.world_b, profile.world_b_size) ||
++      !RAM(world, profile.world_dynamic, count * profile.world_item_size) || !RAM(world, profile.world_c, profile.world_c_size) ||
++      !RAM(world, profile.world_scalar_a, 4) || !RAM(world, profile.world_scalar_b, 4))
++    return false;
++  const u32 ot = Read(profile.ot_pointer) & 0x1fffff;
++  const u32 cursor = Read(profile.gpu_cursor_pointer) & 0x1fffff;
++  const u32 start = cursor >= profile.gpu_pool_split ? profile.gpu_pool_split : profile.gpu_pool_low;
++  if (cursor < start || cursor > profile.gpu_pool_end)
++    return false;
++  auto valid = [=](u32 address, u32 size) {
++    return (address >= ot && address + size <= ot + profile.ot_size) ||
++           (address >= start && address + size <= cursor);
++  };
++  std::unordered_set<u32> seen;
++  u32 address = ot;
++  while (address != profile.ot_end)
++  {
++    if (seen.size() >= 131072 || !seen.insert(address).second || !valid(address, 4))
++      return false;
++    const u32 tag = Read(0x80000000 | address);
++    const u32 words = tag >> 24;
++    if (words)
++    {
++      if (!valid(address + 4, words * 4))
++        return false;
++      Number(world, words);
++      if (!RAM(world, 0x80000000 | (address + 4), words * 4))
++        return false;
++    }
++    address = tag & 0xffffff;
++  }
++  Number(world, 0);
++  Emit(2, tick, world);
++  return !failed;
++}
++
++static void Close(u32 tick, bool complete)
++{
++  if (!stream)
++    return;
++  SettingsChanged();
++  FinishState(true);
++  if (user_mode)
++    failed |= !FinishStagePackages(complete && !failed);
++  if (user_mode)
++  {
++    ReadClock();
++    // Cover event callbacks even when their pending ticks exceed the paused CPU clock
++    const u64 now = last_observed_clock;
++    std::vector<u8> summary;
++    Number(summary, static_cast<u32>(now));
++    Number(summary, static_cast<u32>(now >> 32));
++    Number(summary, vblank_count);
++    Number(summary, static_cast<u32>(writer.Peak()));
++    Emit(13, tick, summary);
++  }
++  std::vector<u8> footer;
++  Number(footer, complete && !failed ? 1 : 0);
++  Emit(5, tick, footer);
++  if (!writer.Finish())
++    failed = true;
++  stream = nullptr;
++}
++
++static bool PhaseGPU(u32 pc, u32 tick)
++{
++  std::vector<u8> payload;
++  Number(payload, pc);
++  std::unordered_set<u32> seen;
++  u32 address = Read(profile.ot_pointer) & 0x1fffff;
++  while (address != profile.ot_end)
++  {
++    if (address >= 0x200000 || (address & 3) || seen.size() >= 131072 || !seen.insert(address).second)
++      return false;
++    const u32 tag = Read(0x80000000 | address), words = tag >> 24;
++    if (address + 4 + words * 4 > 0x200000 || payload.size() + 8 + words * 4 > 0x200000)
++      return false;
++    if (words)
++    {
++      Number(payload, words);
++      if (!RAM(payload, 0x80000000 | (address + 4), words * 4))
++        return false;
++    }
++    address = tag & 0xffffff;
++  }
++  Number(payload, 0);
++  Emit(17, tick, payload);
++  return !failed;
++}
++
++static CPU::BreakpointCallbackAction OnExecute(CPU::BreakpointType, u32 pc, u32)
++{
++  if (!stream)
++    return CPU::BreakpointCallbackAction::Continue;
++  const u32 tick = Read(profile.game_tick);
++  std::vector<u8> data;
++  if (pc == profile.input_decode)
++  {
++    if (user_mode)
++    {
++      const u32 controller = CPU::g_state.regs.r[4];
++      const u32 pad = controller ? profile.pad_second : profile.pad_first;
++      const u64 clock = ReadClock();
++      for (u32 value : {controller, pad, System::GetFrameNumber(), static_cast<u32>(clock),
++                        static_cast<u32>(clock >> 32), CPU::g_state.regs.r[31]})
++        Number(data, value);
++      failed |= !RAM(data, pad, profile.pad_size);
++      Emit(16, tick, data);
++      input_call_ordinal++;
++    }
++    return CPU::BreakpointCallbackAction::Continue;
++  }
++  if (user_mode && (pc == profile.game_begin || pc == profile.menu_phase || pc == profile.sequence_phase || pc == profile.aux_phase))
++  {
++    const u64 clock = ReadClock();
++    failed |= !CaptureStagePackage(pc, tick, clock);
++    for (u32 value : {pc, System::GetFrameNumber(), static_cast<u32>(clock), static_cast<u32>(clock >> 32),
++                      Read(profile.stage), Read(profile.callback), Read(profile.pad_first), Read(profile.pad_second)})
++      Number(data, value);
++    failed |= !RAM(data, profile.menu_state, profile.menu_state_size) || !RAM(data, profile.actors, profile.actors_size) || !RAM(data, profile.camera, profile.camera_size);
++    Emit(15, tick, data);
++    if (!PhaseGPU(pc, tick))
++    {
++      Close(tick, false);
++      return CPU::BreakpointCallbackAction::Continue;
++    }
++    data.clear();
++  }
++  if (pc == profile.menu_phase || pc == profile.sequence_phase || pc == profile.aux_phase)
++    return CPU::BreakpointCallbackAction::Continue;
++  if (pc == profile.game_begin)
++  {
++    failed |= !Boundary(tick);
++    if ((!user_mode && tick >= end_tick) || failed)
++    {
++      Close(tick, tick == end_tick);
++      return user_mode ? CPU::BreakpointCallbackAction::Continue : CPU::BreakpointCallbackAction::Pause;
++    }
++  }
++  else if (pc == profile.input_inject && CPU::g_state.regs.r[6] == profile.pad_first)
++  {
++    requested = 0;
++    if (user_mode)
++      requested = (Read(profile.pad_first) >> 16) ^ 65535;
++    else
++    {
++      for (size_t offset = 0; offset < schedule.size(); offset += 12)
++        if (tick >= Word(&schedule[offset]) && tick <= Word(&schedule[offset + 4]))
++          requested = Word(&schedule[offset + 8]);
++      failed |= !CPU::SafeWriteMemoryHalfWord(profile.pad_buttons, static_cast<u16>(requested ^ 65535));
++    }
++  }
++  else if (pc == profile.game_input_result)
++  {
++    Number(data, requested);
++    Number(data, Read(profile.decoded_input) & 65535);
++    Emit(3, tick, data);
++  }
++  else if (pc != profile.input_inject)
++  {
++    Number(data, pc);
++    const u32 count = pc == profile.sound_one ? 1 : pc == profile.sound_two ? 2 : 3;
++    for (u32 i = 0; i < count; i++)
++      Number(data, CPU::g_state.regs.r[4 + i]);
++    Emit(4, tick, data);
++  }
++  if (failed)
++  {
++    Close(tick, false);
++    return user_mode ? CPU::BreakpointCallbackAction::Continue : CPU::BreakpointCallbackAction::Pause;
++  }
++  return CPU::BreakpointCallbackAction::Continue;
++}
++
++static void Disarm()
++{
++  if (!armed)
++    return;
++  for (u32 pc : sites)
++    CPU::RemoveBreakpoint(CPU::BreakpointType::Execute, pc);
++  armed = false;
++}
++
++static const char* Start(std::string_view data, bool detailed = false, bool vblank = false, bool states = false, bool user = false)
++{
++  if (!System::IsPaused() || System::IsExecuting() || stream || CPU::HasAnyBreakpoints())
++    return "E20";
++  if (!LoadProfile())
++    return "E25";
++  sites = {profile.game_begin, profile.game_input_result, profile.input_inject, profile.sound_three_a,
++                               profile.sound_three_b, profile.sound_one, profile.sound_two, profile.menu_phase, profile.sequence_phase, profile.input_decode, profile.aux_phase};
++  if (!user && CPU::g_state.pc != profile.game_begin)
++    return "E20";
++  if (user && (g_settings.rewind_enable || g_settings.runahead_frames ||
++               g_settings.cpu_overclock_enable || g_settings.cpu_enable_8mb_ram))
++    return "E24";
++  const size_t comma = data.find(',');
++  if (comma == std::string_view::npos)
++    return "E21";
++  auto name_bytes = StringUtil::DecodeHex(data.substr(0, comma));
++  auto config = StringUtil::DecodeHex(data.substr(comma + 1));
++  const size_t header_size = detailed ? 12 : 4;
++  if (!name_bytes || name_bytes->empty() || name_bytes->size() > 64 || !config ||
++      config->size() < header_size || (config->size() - header_size) % 12 != 0)
++    return "E21";
++  std::string name(name_bytes->begin(), name_bytes->end());
++  if (states && name.size() > 40)
++    return "E21";
++  for (char c : name)
++    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++          (c >= '0' && c <= '9') || c == '-' || c == '_'))
++      return "E21";
++  end_tick = Word(config->data());
++  failed = false;
++  const u32 tick = Read(profile.game_tick);
++  if (failed || (user ? (end_tick == 0 || end_tick > 600 || config->size() != 4) : (end_tick <= tick || end_tick - tick > 18000)))
++    return "E21";
++  detail_from = detailed ? Word(config->data() + 4) : UINT32_MAX;
++  detail_to = detailed ? Word(config->data() + 8) : 0;
++  if (detailed && (detail_from < tick || detail_to < detail_from || detail_to > end_tick || detail_to - detail_from > 120))
++    return "E21";
++  schedule.assign(config->begin() + header_size, config->end());
++  u32 previous = 0;
++  for (size_t offset = 0; offset < schedule.size(); offset += 12)
++  {
++    const u32 begin = Word(&schedule[offset]), end = Word(&schedule[offset + 4]);
++    if (begin > end || (offset && begin <= previous) || Word(&schedule[offset + 8]) > 65535)
++      return "E21";
++    previous = end;
++  }
++  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-trace-" + name + ".bin");
++  stream = std::fopen(path.c_str(), "wbx");
++  if (!stream)
++    return "E22";
++  std::setvbuf(stream, nullptr, _IOFBF, 1024 * 1024);
++  const u32 magic[] = {user ? 0x32544646u : 0x31544646u, tick, end_tick};
++  failed = std::fwrite(magic, sizeof(magic), 1, stream) != 1;
++  if (!writer.Start(stream))
++  {
++    std::fclose(stream);
++    stream = nullptr;
++    return "E23";
++  }
++  last_boundary = UINT32_MAX;
++  vblank_enabled = vblank;
++  last_vblank = UINT32_MAX;
++  vblank_count = 0;
++  previous_memory.clear();
++  page_contents.clear();
++  previous_page_ids.fill(0);
++  next_page_content = 1;
++  states_enabled = states;
++  trace_name = name;
++  next_state_tick = 0;
++  state_index = 0;
++  user_mode = user;
++  if (user_mode)
++    failed |= !BeginStagePackages(name);
++  last_observed_clock = System::GetGlobalTickCounter();
++  user_end_tick = System::GetGlobalTickCounter() + static_cast<u64>(System::GetTicksPerSecond()) * end_tick;
++  armed = true;
++  for (u32 pc : sites)
++    failed |= !CPU::AddBreakpointWithCallback(CPU::BreakpointType::Execute, pc, OnExecute);
++  if (user_mode)
++  {
++    const u64 now = System::GetGlobalTickCounter();
++    std::vector<u8> metadata;
++    Number(metadata, static_cast<u32>(System::GetTicksPerSecond()));
++    Number(metadata, static_cast<u32>(now));
++    Number(metadata, static_cast<u32>(now >> 32));
++    Number(metadata, System::GetFrameNumber());
++    Emit(12, tick, metadata);
++    initial_settings = EffectiveSettings();
++    Emit(14, tick, std::vector<u8>(initial_settings.begin(), initial_settings.end()));
++  }
++  if (!user_mode)
++    failed |= !Boundary(tick);
++  if (states_enabled && !failed)
++    SaveCheckpoint();
++  if (failed)
++  {
++    Close(tick, false);
++    Disarm();
++    return "E23";
++  }
++  return "OK";
++}
++}
+--- /dev/null
++++ b/src/core/xport_trace_profile.inl
+@@ -0,0 +1,201 @@
++// Required project trace profile; no game address defaults
++struct TraceProfile {
++  u32 game_begin = 0;
++  u32 game_input_result = 0;
++  u32 input_inject = 0;
++  u32 sound_three_a = 0;
++  u32 sound_three_b = 0;
++  u32 sound_one = 0;
++  u32 sound_two = 0;
++  u32 menu_phase = 0;
++  u32 sequence_phase = 0;
++  u32 input_decode = 0;
++  u32 aux_phase = 0;
++  u32 game_tick = 0;
++  u32 actors = 0;
++  u32 camera = 0;
++  u32 world_count = 0;
++  u32 world_a = 0;
++  u32 world_b = 0;
++  u32 world_dynamic = 0;
++  u32 world_c = 0;
++  u32 world_scalar_a = 0;
++  u32 world_scalar_b = 0;
++  u32 ot_pointer = 0;
++  u32 gpu_cursor_pointer = 0;
++  u32 pad_second = 0;
++  u32 pad_first = 0;
++  u32 stage = 0;
++  u32 callback = 0;
++  u32 menu_state = 0;
++  u32 pad_buttons = 0;
++  u32 decoded_input = 0;
++  u32 gpu_pool_split = 0;
++  u32 gpu_pool_low = 0;
++  u32 gpu_pool_end = 0;
++  u32 ot_end = 0;
++  u32 actors_size = 0;
++  u32 camera_size = 0;
++  u32 menu_state_size = 0;
++  u32 world_a_size = 0;
++  u32 world_b_size = 0;
++  u32 world_item_size = 0;
++  u32 world_c_size = 0;
++  u32 world_max_count = 0;
++  u32 ot_size = 0;
++  u32 pad_size = 0;
++};
++static TraceProfile profile;
++static std::string profile_text;
++
++static bool LoadProfile()
++{
++  INISettingsInterface ini(Path::Combine(EmuFolders::DataRoot, "xport-trace-profile.ini"));
++  if (!ini.Load() || ini.GetUIntValue("XportTrace", "version", 0) != 1)
++    return false;
++  TraceProfile candidate;
++  if (!ini.ContainsValue("XportTrace", "game_begin")) return false;
++  candidate.game_begin = ini.GetUIntValue("XportTrace", "game_begin", 0);
++  if (!ini.ContainsValue("XportTrace", "game_input_result")) return false;
++  candidate.game_input_result = ini.GetUIntValue("XportTrace", "game_input_result", 0);
++  if (!ini.ContainsValue("XportTrace", "input_inject")) return false;
++  candidate.input_inject = ini.GetUIntValue("XportTrace", "input_inject", 0);
++  if (!ini.ContainsValue("XportTrace", "sound_three_a")) return false;
++  candidate.sound_three_a = ini.GetUIntValue("XportTrace", "sound_three_a", 0);
++  if (!ini.ContainsValue("XportTrace", "sound_three_b")) return false;
++  candidate.sound_three_b = ini.GetUIntValue("XportTrace", "sound_three_b", 0);
++  if (!ini.ContainsValue("XportTrace", "sound_one")) return false;
++  candidate.sound_one = ini.GetUIntValue("XportTrace", "sound_one", 0);
++  if (!ini.ContainsValue("XportTrace", "sound_two")) return false;
++  candidate.sound_two = ini.GetUIntValue("XportTrace", "sound_two", 0);
++  if (!ini.ContainsValue("XportTrace", "menu_phase")) return false;
++  candidate.menu_phase = ini.GetUIntValue("XportTrace", "menu_phase", 0);
++  if (!ini.ContainsValue("XportTrace", "sequence_phase")) return false;
++  candidate.sequence_phase = ini.GetUIntValue("XportTrace", "sequence_phase", 0);
++  if (!ini.ContainsValue("XportTrace", "input_decode")) return false;
++  candidate.input_decode = ini.GetUIntValue("XportTrace", "input_decode", 0);
++  if (!ini.ContainsValue("XportTrace", "aux_phase")) return false;
++  candidate.aux_phase = ini.GetUIntValue("XportTrace", "aux_phase", 0);
++  if (!ini.ContainsValue("XportTrace", "game_tick")) return false;
++  candidate.game_tick = ini.GetUIntValue("XportTrace", "game_tick", 0);
++  if (!ini.ContainsValue("XportTrace", "actors")) return false;
++  candidate.actors = ini.GetUIntValue("XportTrace", "actors", 0);
++  if (!ini.ContainsValue("XportTrace", "camera")) return false;
++  candidate.camera = ini.GetUIntValue("XportTrace", "camera", 0);
++  if (!ini.ContainsValue("XportTrace", "world_count")) return false;
++  candidate.world_count = ini.GetUIntValue("XportTrace", "world_count", 0);
++  if (!ini.ContainsValue("XportTrace", "world_a")) return false;
++  candidate.world_a = ini.GetUIntValue("XportTrace", "world_a", 0);
++  if (!ini.ContainsValue("XportTrace", "world_b")) return false;
++  candidate.world_b = ini.GetUIntValue("XportTrace", "world_b", 0);
++  if (!ini.ContainsValue("XportTrace", "world_dynamic")) return false;
++  candidate.world_dynamic = ini.GetUIntValue("XportTrace", "world_dynamic", 0);
++  if (!ini.ContainsValue("XportTrace", "world_c")) return false;
++  candidate.world_c = ini.GetUIntValue("XportTrace", "world_c", 0);
++  if (!ini.ContainsValue("XportTrace", "world_scalar_a")) return false;
++  candidate.world_scalar_a = ini.GetUIntValue("XportTrace", "world_scalar_a", 0);
++  if (!ini.ContainsValue("XportTrace", "world_scalar_b")) return false;
++  candidate.world_scalar_b = ini.GetUIntValue("XportTrace", "world_scalar_b", 0);
++  if (!ini.ContainsValue("XportTrace", "ot_pointer")) return false;
++  candidate.ot_pointer = ini.GetUIntValue("XportTrace", "ot_pointer", 0);
++  if (!ini.ContainsValue("XportTrace", "gpu_cursor_pointer")) return false;
++  candidate.gpu_cursor_pointer = ini.GetUIntValue("XportTrace", "gpu_cursor_pointer", 0);
++  if (!ini.ContainsValue("XportTrace", "pad_second")) return false;
++  candidate.pad_second = ini.GetUIntValue("XportTrace", "pad_second", 0);
++  if (!ini.ContainsValue("XportTrace", "pad_first")) return false;
++  candidate.pad_first = ini.GetUIntValue("XportTrace", "pad_first", 0);
++  if (!ini.ContainsValue("XportTrace", "stage")) return false;
++  candidate.stage = ini.GetUIntValue("XportTrace", "stage", 0);
++  if (!ini.ContainsValue("XportTrace", "callback")) return false;
++  candidate.callback = ini.GetUIntValue("XportTrace", "callback", 0);
++  if (!ini.ContainsValue("XportTrace", "menu_state")) return false;
++  candidate.menu_state = ini.GetUIntValue("XportTrace", "menu_state", 0);
++  if (!ini.ContainsValue("XportTrace", "pad_buttons")) return false;
++  candidate.pad_buttons = ini.GetUIntValue("XportTrace", "pad_buttons", 0);
++  if (!ini.ContainsValue("XportTrace", "decoded_input")) return false;
++  candidate.decoded_input = ini.GetUIntValue("XportTrace", "decoded_input", 0);
++  if (!ini.ContainsValue("XportTrace", "gpu_pool_split")) return false;
++  candidate.gpu_pool_split = ini.GetUIntValue("XportTrace", "gpu_pool_split", 0);
++  if (!ini.ContainsValue("XportTrace", "gpu_pool_low")) return false;
++  candidate.gpu_pool_low = ini.GetUIntValue("XportTrace", "gpu_pool_low", 0);
++  if (!ini.ContainsValue("XportTrace", "gpu_pool_end")) return false;
++  candidate.gpu_pool_end = ini.GetUIntValue("XportTrace", "gpu_pool_end", 0);
++  if (!ini.ContainsValue("XportTrace", "ot_end")) return false;
++  candidate.ot_end = ini.GetUIntValue("XportTrace", "ot_end", 0);
++  if (!ini.ContainsValue("XportTrace", "actors_size")) return false;
++  candidate.actors_size = ini.GetUIntValue("XportTrace", "actors_size", 0);
++  if (!ini.ContainsValue("XportTrace", "camera_size")) return false;
++  candidate.camera_size = ini.GetUIntValue("XportTrace", "camera_size", 0);
++  if (!ini.ContainsValue("XportTrace", "menu_state_size")) return false;
++  candidate.menu_state_size = ini.GetUIntValue("XportTrace", "menu_state_size", 0);
++  if (!ini.ContainsValue("XportTrace", "world_a_size")) return false;
++  candidate.world_a_size = ini.GetUIntValue("XportTrace", "world_a_size", 0);
++  if (!ini.ContainsValue("XportTrace", "world_b_size")) return false;
++  candidate.world_b_size = ini.GetUIntValue("XportTrace", "world_b_size", 0);
++  if (!ini.ContainsValue("XportTrace", "world_item_size")) return false;
++  candidate.world_item_size = ini.GetUIntValue("XportTrace", "world_item_size", 0);
++  if (!ini.ContainsValue("XportTrace", "world_c_size")) return false;
++  candidate.world_c_size = ini.GetUIntValue("XportTrace", "world_c_size", 0);
++  if (!ini.ContainsValue("XportTrace", "world_max_count")) return false;
++  candidate.world_max_count = ini.GetUIntValue("XportTrace", "world_max_count", 0);
++  if (!ini.ContainsValue("XportTrace", "ot_size")) return false;
++  candidate.ot_size = ini.GetUIntValue("XportTrace", "ot_size", 0);
++  if (!ini.ContainsValue("XportTrace", "pad_size")) return false;
++  candidate.pad_size = ini.GetUIntValue("XportTrace", "pad_size", 0);
++  if (candidate.game_begin < 0x80000000u || candidate.game_begin >= 0x80200000u || candidate.game_begin % 4) return false;
++  if (candidate.game_input_result < 0x80000000u || candidate.game_input_result >= 0x80200000u || candidate.game_input_result % 4) return false;
++  if (candidate.input_inject < 0x80000000u || candidate.input_inject >= 0x80200000u || candidate.input_inject % 4) return false;
++  if (candidate.sound_three_a < 0x80000000u || candidate.sound_three_a >= 0x80200000u || candidate.sound_three_a % 4) return false;
++  if (candidate.sound_three_b < 0x80000000u || candidate.sound_three_b >= 0x80200000u || candidate.sound_three_b % 4) return false;
++  if (candidate.sound_one < 0x80000000u || candidate.sound_one >= 0x80200000u || candidate.sound_one % 4) return false;
++  if (candidate.sound_two < 0x80000000u || candidate.sound_two >= 0x80200000u || candidate.sound_two % 4) return false;
++  if (candidate.menu_phase < 0x80000000u || candidate.menu_phase >= 0x80200000u || candidate.menu_phase % 4) return false;
++  if (candidate.sequence_phase < 0x80000000u || candidate.sequence_phase >= 0x80200000u || candidate.sequence_phase % 4) return false;
++  if (candidate.input_decode < 0x80000000u || candidate.input_decode >= 0x80200000u || candidate.input_decode % 4) return false;
++  if (candidate.aux_phase < 0x80000000u || candidate.aux_phase >= 0x80200000u || candidate.aux_phase % 4) return false;
++  if (candidate.game_tick < 0x80000000u || candidate.game_tick >= 0x80200000u || candidate.game_tick % 4) return false;
++  if (candidate.actors < 0x80000000u || candidate.actors >= 0x80200000u || candidate.actors % 4) return false;
++  if (candidate.camera < 0x80000000u || candidate.camera >= 0x80200000u || candidate.camera % 4) return false;
++  if (candidate.world_count < 0x80000000u || candidate.world_count >= 0x80200000u || candidate.world_count % 4) return false;
++  if (candidate.world_a < 0x80000000u || candidate.world_a >= 0x80200000u || candidate.world_a % 4) return false;
++  if (candidate.world_b < 0x80000000u || candidate.world_b >= 0x80200000u || candidate.world_b % 4) return false;
++  if (candidate.world_dynamic < 0x80000000u || candidate.world_dynamic >= 0x80200000u || candidate.world_dynamic % 4) return false;
++  if (candidate.world_c < 0x80000000u || candidate.world_c >= 0x80200000u || candidate.world_c % 4) return false;
++  if (candidate.world_scalar_a < 0x80000000u || candidate.world_scalar_a >= 0x80200000u || candidate.world_scalar_a % 4) return false;
++  if (candidate.world_scalar_b < 0x80000000u || candidate.world_scalar_b >= 0x80200000u || candidate.world_scalar_b % 4) return false;
++  if (candidate.ot_pointer < 0x80000000u || candidate.ot_pointer >= 0x80200000u || candidate.ot_pointer % 4) return false;
++  if (candidate.gpu_cursor_pointer < 0x80000000u || candidate.gpu_cursor_pointer >= 0x80200000u || candidate.gpu_cursor_pointer % 4) return false;
++  if (candidate.pad_second < 0x80000000u || candidate.pad_second >= 0x80200000u || candidate.pad_second % 4) return false;
++  if (candidate.pad_first < 0x80000000u || candidate.pad_first >= 0x80200000u || candidate.pad_first % 4) return false;
++  if (candidate.stage < 0x80000000u || candidate.stage >= 0x80200000u || candidate.stage % 4) return false;
++  if (candidate.callback < 0x80000000u || candidate.callback >= 0x80200000u || candidate.callback % 4) return false;
++  if (candidate.menu_state < 0x80000000u || candidate.menu_state >= 0x80200000u || candidate.menu_state % 4) return false;
++  if (candidate.pad_buttons < 0x80000000u || candidate.pad_buttons >= 0x80200000u || candidate.pad_buttons % 2) return false;
++  if (candidate.decoded_input < 0x80000000u || candidate.decoded_input >= 0x80200000u || candidate.decoded_input % 4) return false;
++  if (!candidate.actors_size || candidate.actors_size > 0x200000u) return false;
++  if (!candidate.camera_size || candidate.camera_size > 0x200000u) return false;
++  if (!candidate.menu_state_size || candidate.menu_state_size > 0x200000u) return false;
++  if (!candidate.world_a_size || candidate.world_a_size > 0x200000u) return false;
++  if (!candidate.world_b_size || candidate.world_b_size > 0x200000u) return false;
++  if (!candidate.world_item_size || candidate.world_item_size > 0x200000u) return false;
++  if (!candidate.world_c_size || candidate.world_c_size > 0x200000u) return false;
++  if (!candidate.world_max_count || candidate.world_max_count > 0x200000u) return false;
++  if (!candidate.ot_size || candidate.ot_size > 0x200000u) return false;
++  if (!candidate.pad_size || candidate.pad_size > 0x200000u) return false;
++  if (candidate.world_max_count > 0x200000u / candidate.world_item_size ||
++      candidate.gpu_pool_low >= candidate.gpu_pool_split || candidate.gpu_pool_split >= candidate.gpu_pool_end ||
++      candidate.gpu_pool_end > 0x200000u || candidate.ot_end >= 0x200000u) return false;
++  if (candidate.actors_size > 0x80200000u - candidate.actors) return false;
++  if (candidate.camera_size > 0x80200000u - candidate.camera) return false;
++  if (candidate.menu_state_size > 0x80200000u - candidate.menu_state) return false;
++  if (candidate.world_a_size > 0x80200000u - candidate.world_a) return false;
++  if (candidate.world_b_size > 0x80200000u - candidate.world_b) return false;
++  if (candidate.world_c_size > 0x80200000u - candidate.world_c) return false;
++  if (candidate.world_max_count * candidate.world_item_size > 0x80200000u - candidate.world_dynamic ||
++      candidate.pad_size > 0x80200000u - candidate.pad_first || candidate.pad_size > 0x80200000u - candidate.pad_second) return false;
++  const std::unordered_set<u32> hooks = {candidate.game_begin, candidate.game_input_result, candidate.input_inject, candidate.sound_three_a, candidate.sound_three_b, candidate.sound_one, candidate.sound_two, candidate.menu_phase, candidate.sequence_phase, candidate.input_decode, candidate.aux_phase};
++  if (hooks.size() != 11) return false;
++  profile = candidate;
++  profile_text = ini.SaveToString();
++  return true;
++}
+--- /dev/null
++++ b/src/core/ff_trace_writer.h
+@@ -0,0 +1,94 @@
++// Bounded asynchronous writer for local diagnostic records
++#pragma once
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++class FFTraceWriter
++{
++public:
++  ~FFTraceWriter() { Finish(); }
++
++  bool Start(FILE* file, size_t capacity = 64 * 1024 * 1024)
++  {
++    if (m_thread.joinable() || !file)
++      return false;
++    m_file = file;
++    m_capacity = capacity;
++    m_pending = m_peak = 0;
++    m_failed = false;
++    m_closing = false;
++    m_thread = std::thread([this] { Run(); });
++    return true;
++  }
++
++  bool Write(std::vector<unsigned char> data)
++  {
++    std::lock_guard lock(m_mutex);
++    if (m_closing || m_failed || data.size() > m_capacity - m_pending)
++    {
++      m_failed = true;
++      return false;
++    }
++    m_pending += data.size();
++    if (m_peak < m_pending)
++      m_peak = m_pending;
++    m_queue.push_back(std::move(data));
++    m_ready.notify_one();
++    return true;
++  }
++
++  bool Finish()
++  {
++    if (!m_thread.joinable())
++      return !m_failed;
++    {
++      std::lock_guard lock(m_mutex);
++      m_closing = true;
++    }
++    m_ready.notify_one();
++    m_thread.join();
++    if (std::fclose(m_file) != 0)
++      m_failed = true;
++    m_file = nullptr;
++    return !m_failed;
++  }
++
++  size_t Peak() const { return m_peak; }
++
++private:
++  void Run()
++  {
++    for (;;)
++    {
++      std::vector<unsigned char> data;
++      {
++        std::unique_lock lock(m_mutex);
++        m_ready.wait(lock, [this] { return m_closing || !m_queue.empty(); });
++        if (m_queue.empty())
++          return;
++        data = std::move(m_queue.front());
++        m_queue.pop_front();
++      }
++      if (!m_failed && std::fwrite(data.data(), 1, data.size(), m_file) != data.size())
++        m_failed = true;
++      {
++        std::lock_guard lock(m_mutex);
++        m_pending -= data.size();
++      }
++    }
++  }
++
++  FILE* m_file = nullptr;
++  std::thread m_thread;
++  std::mutex m_mutex;
++  std::condition_variable m_ready;
++  std::deque<std::vector<unsigned char>> m_queue;
++  std::atomic<bool> m_failed{false};
++  bool m_closing = false;
++  size_t m_capacity = 0, m_pending = 0, m_peak = 0;
++};
+--- a/src/core/gdb_server.h
++++ b/src/core/gdb_server.h
+@@ -21,6 +21,9 @@
+ 
+ void OnSystemPaused();
+ void OnSystemResumed();
++void OnTraceVBlank();
++void OnTraceSettings();
++void OnTracePad(u32 port, u32 device, u8 outgoing, u8 incoming, bool ack);
+ 
+ } // namespace GDBServer
+ 
+--- a/src/core/pad.cpp
++++ b/src/core/pad.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "pad.h"
++#include "gdb_server.h"
+ #include "controller.h"
+ #include "interrupt_controller.h"
+ #include "memory_card.h"
+@@ -841,6 +842,9 @@
+     break;
+   }
+ 
++#ifdef ENABLE_GDB_SERVER
++  GDBServer::OnTracePad(static_cast<u32>(s_state.JOY_CTRL.SLOT), static_cast<u32>(s_state.active_device), data_out, data_in, ack);
++#endif
+   s_state.receive_buffer = data_in;
+   s_state.receive_buffer_full = true;
+   if (s_state.JOY_CTRL.RXINTEN)
+--- a/src/core/system.h
++++ b/src/core/system.h
+@@ -299,7 +299,7 @@
+ /// Loads state from the specified path.
+ std::optional<bool> LoadState(const char* path, Error* error, bool save_undo_state, bool force_update_display);
+ bool SaveState(std::string path, Error* error, bool backup_existing_save, bool ignore_memcard_busy,
+-               std::function<void(bool, const Error& error)> completion_callback = {});
++               std::function<void(bool, const Error& error)> completion_callback = {}, u32 screenshot_size = 256);
+ bool SaveResumeState(Error* error);
+ 
+ /// Saves/load state to/from slot.
+--- /dev/null
++++ b/src/core/ff_stage_package.inl
+@@ -0,0 +1,86 @@
++// Coherent stage entry snapshots with asynchronous file writes
++static FFTraceWriter stage_writer;
++static bool stage_packages_enabled = false;
++static u32 stage_entry_tick = 0, phase_ordinal = 0, input_call_ordinal = 0;
++static u32 prior_phase_pc = UINT32_MAX, prior_phase_stage = UINT32_MAX, prior_phase_tick = UINT32_MAX;
++
++static bool BeginStagePackages(const std::string& name)
++{
++  phase_ordinal = input_call_ordinal = 0;
++  prior_phase_pc = prior_phase_stage = prior_phase_tick = UINT32_MAX;
++  INISettingsInterface ini(Path::Combine(EmuFolders::DataRoot, "xport-trace-profile.ini"));
++  if (!ini.Load())
++    return false;
++  stage_packages_enabled = ini.GetBoolValue("XportStage", "enabled", false);
++  stage_entry_tick = ini.GetUIntValue("XportStage", "entry_tick", 0);
++  if (!stage_packages_enabled)
++    return true;
++  if (!ini.ContainsValue("XportStage", "entry_tick"))
++    return false;
++  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-stage-" + name + ".bin");
++  FILE* file = std::fopen(path.c_str(), "wbx");
++  if (!file)
++    return false;
++  if (!stage_writer.Start(file))
++  {
++    std::fclose(file);
++    return false;
++  }
++  std::vector<u8> header;
++  for (u32 value : {0x31545358u, 1u, SAVE_STATE_VERSION})
++    Number(header, value);
++  return stage_writer.Write(std::move(header));
++}
++
++static bool StageDevice(std::vector<u8>& payload, u32 kind, bool (*save)(StateWrapper&))
++{
++  std::vector<u8> block(16 * 1024 * 1024);
++  StateWrapper wrapper(std::span<u8>(block), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
++  if (!save(wrapper) || wrapper.HasError())
++    return false;
++  Number(payload, kind);
++  Number(payload, static_cast<u32>(wrapper.GetPosition()));
++  payload.insert(payload.end(), block.begin(), block.begin() + wrapper.GetPosition());
++  return true;
++}
++
++static bool CaptureStagePackage(u32 pc, u32 tick, u64 clock)
++{
++  const u32 stage = Read(profile.stage);
++  const bool capture = stage_packages_enabled && pc == profile.game_begin && tick == stage_entry_tick &&
++    (prior_phase_pc != pc || prior_phase_stage != stage || prior_phase_tick != tick);
++  prior_phase_pc = pc;
++  prior_phase_stage = stage;
++  prior_phase_tick = tick;
++  const u32 ordinal = phase_ordinal++;
++  if (!capture)
++    return true;
++  std::vector<u8> payload;
++  for (u32 value : {ordinal, pc, tick, stage, System::GetFrameNumber(), static_cast<u32>(clock),
++                    static_cast<u32>(clock >> 32), input_call_ordinal, 5u})
++    Number(payload, value);
++  Number(payload, 1); Number(payload, 0x200000);
++  if (!RAM(payload, 0x80000000, 0x200000))
++    return false;
++  Number(payload, 2); Number(payload, 1024);
++  if (!RAM(payload, 0x1f800000, 1024) || !StageDevice(payload, 3, CPU::DoState) ||
++      !StageDevice(payload, 4, GPU::DoState) || !StageDevice(payload, 5, SPU::DoState))
++    return false;
++  std::vector<u8> record;
++  Number(record, 1);
++  Number(record, static_cast<u32>(payload.size()));
++  record.insert(record.end(), payload.begin(), payload.end());
++  return stage_writer.Write(std::move(record));
++}
++
++static bool FinishStagePackages(bool complete)
++{
++  if (!stage_packages_enabled)
++    return true;
++  std::vector<u8> footer;
++  Number(footer, 2); Number(footer, 4); Number(footer, complete ? 1 : 0);
++  const bool queued = stage_writer.Write(std::move(footer));
++  const bool saved = stage_writer.Finish();
++  stage_packages_enabled = false;
++  return queued && saved;
++}

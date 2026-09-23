@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repository": "https://github.com/stenzek/duckstation.git",
+    "commit": "5fd366809053fe287291de7a39752c4d5d5b146b",
+    "version": "0.1-11752"
+  },
+  "patch": {
+    "path": "internal-trace-api.patch",
+    "sha256": "7209b151c7f439e4b1f7f7ecff03e23d8a8cf3f5a499eae32525b4475ef55e5f"
+  },
+  "dependencies": {
+    "windows-x64": {
+      "version": "release-20260805",
+      "url": "https://github.com/duckstation/dependencies/releases/download/release-20260805/deps-windows-x64.7z",
+      "archive": "deps-windows-x64.7z",
+      "sha256": "e1c4dcb10b579f6271d0e39e5055ca17f3de8d93e3f3cd589a4ab14a72fa6e52"
+    }
+  },
+  "build": {
+    "solution": "duckstation.sln",
+    "target": "duckstation-qt",
+    "configuration": "Release",
+    "platform": "x64",
+    "toolset": "v143",
+    "max_cpu_count": 1,
+    "source_executable": "bin/x64/duckstation-qt-x64-Release-MSVC.exe",
+    "distribution_executable": "duckstation-qt-x64-ReleaseLTCG.exe"
+  },
+  "runtime": {
+    "trace_profile_version": 1,
+    "stage_package_schema": 1,
+    "device_serializer_version": 85,
+    "data_root_environment": "XPORT_DUCKSTATION_DATA_ROOT",
+    "required_files": [
+      "duckstation-qt-x64-ReleaseLTCG.exe",
+      "Qt6Core.dll",
+      "Qt6Gui.dll",
+      "Qt6Widgets.dll",
+      "QtPlugins/platforms/qwindows.dll",
+      "resources/duckstation-qt.rcc",
+      "LICENSE.txt"
+    ],
+    "required_executable_markers": [
+      "qFFUserStart",
+      "qFFTraceVBlankStart",
+      "XPORT_DUCKSTATION_DATA_ROOT"
+    ]
+  }
+}

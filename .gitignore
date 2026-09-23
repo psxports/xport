@@ -1,0 +1,8 @@
+tools/duckstation/source/
+tools/duckstation/dependencies/
+tools/duckstation/distribution/
+tools/duckstation/.distribution-new-*/
+tools/duckstation/.distribution-old-*/
+tools/duckstation/builds/
+__pycache__/
+tools/archive/
