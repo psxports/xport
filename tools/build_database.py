@@ -34,6 +34,8 @@ def main():
  CREATE TABLE indirect_transfers(image TEXT,function INTEGER,site INTEGER,instruction TEXT,status TEXT,FOREIGN KEY(image,function) REFERENCES functions(image,address));
  CREATE TABLE decompilation_failures(image TEXT,function INTEGER,error TEXT,FOREIGN KEY(image,function) REFERENCES functions(image,address));
  CREATE TABLE pointer_candidates(image TEXT,site INTEGER,target INTEGER,classification TEXT);
+ CREATE TABLE semantic_aliases(image TEXT,address INTEGER,kind TEXT,original_name TEXT,semantic_name TEXT,binding TEXT,status TEXT,legacy_status TEXT,source TEXT,sha256 TEXT,PRIMARY KEY(image,address,kind,semantic_name));
+ CREATE TABLE semantic_structures(name TEXT,source TEXT,start_line INTEGER,definition_sha256 TEXT,status TEXT,PRIMARY KEY(name,source,start_line));
  CREATE INDEX instructions_address ON instructions(image,address);
  CREATE INDEX data_target ON data_refs(image,target);
  CREATE INDEX edges_target ON edges(target);
@@ -109,13 +111,30 @@ def main():
     db.executemany('INSERT INTO edge_candidates VALUES(?,?,?)',[(eid,c[0],c[1]) for c in chosen])
     graph.append(dict(source='%s:%08X'%(image,f['address']),site=a,target=target,kind=kind,resolution=resolution,candidates=['%s:%08X'%c for c in chosen]))
  assert translated_seen==set(translations),'Translation refers to missing function'
+ semantic_path=project_path('semantic_map','status/semantic-map.json')
+ semantic={'functions':[],'structures':[]}
+ if semantic_path.exists():
+  semantic=read(semantic_path);assert semantic.get('schema')==1,'Unsupported semantic map schema'
+  seen=set()
+  for item in semantic.get('functions',[]):
+   key=(item['image'],item['address'],item['kind'],item['semantic_name']);assert key not in seen,'Duplicate semantic alias';seen.add(key)
+   assert item['binding'] in ['bound','pending_image_inventory']
+   if item['binding']=='bound':
+    match=db.execute('SELECT sha256 FROM functions WHERE image=? AND address=?',(item['image'],item['address'])).fetchone()
+    assert match and item.get('sha256')==match[0],'Stale bound semantic alias: '+str(key)
+   if item.get('source'):assert (R/item['source']).is_file(),'Missing semantic source: '+item['source']
+   db.execute('INSERT INTO semantic_aliases VALUES(?,?,?,?,?,?,?,?,?,?)',(item['image'],item['address'],item['kind'],item['original_name'],item['semantic_name'],item['binding'],item['status'],item.get('legacy_status'),item.get('source'),item.get('sha256')))
+  for item in semantic.get('structures',[]):
+   source=R/item['source'];assert source.is_file(),'Missing semantic structure source: '+item['source']
+   db.execute('INSERT INTO semantic_structures VALUES(?,?,?,?,?)',(item['name'],item['source'],item['start_line'],item['definition_sha256'],item['status']))
  from function_similarity import run as compare_mips_functions
  similarity_summary=compare_mips_functions(db)
  from source_index import populate as index_sources
  source_summary=index_sources(db,R,ledger)
- for k,v in {'schema_version':'3','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'TODO unless evidence-backed PsyQ replacement SKIP; aliases stored separately','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest(),'source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
+ for k,v in {'schema_version':'4','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'TODO unless evidence-backed PsyQ replacement SKIP; aliases stored separately','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
  db.commit();assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok';assert not db.execute('PRAGMA foreign_key_check').fetchall()
  totals={k:sum(x[k] for x in metrics) for k in ['functions','pseudocode','failures','instruction_words','symbols','data_refs']};totals['edges']=len(graph);totals['indirect_transfers']=db.execute('SELECT count(*) FROM indirect_transfers').fetchone()[0];totals['unresolved_targets']=sum(e['resolution']=='unresolved_target' for e in graph);totals['overlay_context_edges']=sum(e['resolution']=='overlay_context_required' for e in graph)
+ totals['semantic_aliases']=len(semantic.get('functions',[]));totals['semantic_structures']=len(semantic.get('structures',[]))
  statuses={s:0 for s in ['TODO','WIP','DONE','SKIP']};statuses.update(dict(db.execute('SELECT status,count(*) FROM functions GROUP BY status')))
  db.close();tmp.replace(path)
  write(project_path('callgraph', 'status/callgraph.json'),dict(identity='image:address',nodes=nodes,edges=graph));write(R/'status/code-gaps.json',gaps);write(R/'status/decompilation-failures.json',failures)

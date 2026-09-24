@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 
 CONFIG_NAME = 'xport-project.json'
 
@@ -20,6 +21,10 @@ def load_project(root=None):
     document = json.loads(config.read_text(encoding='utf-8-sig'))
     if document.get('schema') != 1 or not document.get('name'):
         raise ValueError('Unsupported project configuration')
+    short_name = document.get('short_name')
+    reserved = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
+    if short_name is not None and (not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,15}', short_name) or short_name.upper() in reserved):
+        raise ValueError('Invalid configured short_name')
     return config.parent, document
 
 

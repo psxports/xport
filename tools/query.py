@@ -19,6 +19,7 @@ if not f:raise SystemExit('Function entry not found; specify the image and exact
 def rows(sql,args):return [dict(x) for x in c.execute(sql,args)]
 out=dict(function=dict(f),callees=rows('SELECT * FROM edges WHERE source_image=? AND source_function=?',(a.image,a.address)),callers=rows('SELECT e.* FROM edges e JOIN edge_candidates x ON e.id=x.edge WHERE x.target_image=? AND x.target_function=?',(a.image,a.address)),data_refs=rows('SELECT * FROM data_refs WHERE image=? AND function=?',(a.image,a.address)),indirect=rows('SELECT * FROM indirect_transfers WHERE image=? AND function=?',(a.image,a.address)))
 out['library_classification']=rows('SELECT alias,reason,evidence FROM library_classification WHERE image=? AND address=?',(a.image,a.address))
+out['semantic_aliases']=rows('SELECT * FROM semantic_aliases WHERE image=? AND address=? ORDER BY kind,semantic_name',(a.image,a.address))
 out['reuse_summary']=rows('SELECT * FROM function_similarity WHERE image=? AND address=?',(a.image,a.address))
 out['reuse_peers']=rows('SELECT r.*,f.name AS peer_name,f.bytes AS peer_bytes,f.status AS peer_status FROM function_reuse r JOIN functions f ON f.image=r.peer_image AND f.address=r.peer_address WHERE r.image=? AND r.address=? ORDER BY r.kind,r.peer_image,r.peer_address',(a.image,a.address))
 if not a.full:

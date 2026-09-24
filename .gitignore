@@ -6,3 +6,6 @@ tools/duckstation/.distribution-old-*/
 tools/duckstation/builds/
 __pycache__/
 tools/archive/
+tools/adpcm-xq/*.exe
+tools/adpcm-xq/*.obj
+tools/adpcm-xq/.build.json

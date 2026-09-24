@@ -13,6 +13,7 @@ from repair_contract import cases, expr, identifier, identity, load, native_sour
 from trace_worker import write_receipt
 from xport_project import artifact_path
 from pipeline_metrics import measured
+from xport_process import normalized_environment
 
 TYPES = {'uint32', 'sint32', 'uint16', 'sint16', 'uint8', 'sint8', 'uint32 *', 'sint32 *', 'void *'}
 
@@ -120,6 +121,7 @@ typedef uint32_t uint32; typedef int32_t sint32;
 typedef uint16_t uint16; typedef int16_t sint16;
 typedef uint8_t uint8; typedef int8_t sint8;
 #define GDB_CALL
+#define FUNCTION_MARKER(a,b)
 #define FF_FUNCTION_MARKER(a,b)
 static uint8 ram[RAM_SIZE]; static uint32 cfg[CFG_SIZE];
 static uint32 calls[EVENT_CAP][10], access_log[EVENT_CAP][5], ncalls, naccess;
@@ -185,7 +187,8 @@ def compile_native(directory):
     script.write_text('@echo off\ncall "'+str(vcvars)+'" >nul\nif errorlevel 1 exit /b 1\ncl /nologo /TC /Od /W3 /wd4100 /D_CRT_SECURE_NO_WARNINGS native.c /Fe:native.exe\n', encoding='utf-8')
     with (directory/'build.log').open('w',encoding='utf-8') as log:
         result = subprocess.run(['cmd.exe','/d','/c',str(script)], cwd=directory, stdout=log, stderr=subprocess.STDOUT,
-                                timeout=120, creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                                timeout=120, creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
+                                env=normalized_environment())
     if result.returncode: raise ValueError('Audit native build failed; see build.log')
 
 

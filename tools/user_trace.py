@@ -95,7 +95,12 @@ def finalize_locked(session, folder):
     while output.exists():
         attempt += 1
         output = folder/f'decoded-attempt-{attempt:04d}'
-    result = decode(source, output)
+    try:
+        result = decode(source, output)
+    except Exception as error:
+        session.update(status='capture_failed', decoded_directory=str(output), failure=str(error))
+        write_receipt(folder/'session.json', session)
+        raise
     if session.get('recording_settings'):
         verification = verify_recording_settings(output/'effective-settings.ini', session['recording_settings'])
         result['recording_settings_verification'] = verification

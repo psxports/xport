@@ -13,14 +13,20 @@ def validate(path):
     with Path(path).open(encoding='utf-8-sig') as stream:
         ini.read_file(stream)
     section = ini['XportTrace']
-    if set(section) != {'version', *schema['required_u32']}:
+    optional = schema.get('optional_u32', {})
+    allowed = {'version', *schema['required_u32'], *optional}
+    if not {'version', *schema['required_u32']} <= set(section) or set(section) - allowed:
         raise ValueError('Missing or unknown trace profile fields')
     values = {k:int(v, 10) for k,v in section.items()}
     if values.pop('version') != 1 or any(not 0 < v <= 0xffffffff for v in values.values()):
         raise ValueError('Invalid trace profile version or values')
-    offsets = {'gpu_pool_low','gpu_pool_split','gpu_pool_end','ot_end'}
-    limits = {'world_max_count'}
+    for key, default in optional.items():
+        values.setdefault(key, default)
+    offsets = {'gpu_pool_low','gpu_pool_split','gpu_pool_end'}
+    limits = {'world_max_count','gpu_phase_mask','gpu_full_ram'}
     for key,value in values.items():
+        if key == 'ot_end':
+            continue
         if key in offsets or key in limits or key.endswith('_size'):
             if value > 0x200000:
                 raise ValueError('Trace profile bound exceeds PS1 RAM: '+key)
@@ -28,6 +34,12 @@ def validate(path):
             raise ValueError('Invalid RAM address: '+key)
     if not values['gpu_pool_low'] < values['gpu_pool_split'] < values['gpu_pool_end'] <= 0x200000:
         raise ValueError('Invalid GPU pool bounds')
+    if values['ot_end'] > 0x200000 and values['ot_end'] != 0xffffff:
+        raise ValueError('Invalid ordering-table terminator')
+    if not 1 <= values['gpu_phase_mask'] <= 15:
+        raise ValueError('Invalid GPU phase mask')
+    if values['gpu_full_ram'] not in (0, 1):
+        raise ValueError('Invalid GPU address scope')
     if values['world_max_count']*values['world_item_size'] > 0x200000:
         raise ValueError('Dynamic world range exceeds RAM')
     for key in ('actors','camera','menu_state','world_a','world_b','world_c'):

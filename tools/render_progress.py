@@ -10,6 +10,16 @@ from xport_project import load_project, project_path, artifact_path
 def render():
     root, config = load_project()
     database = project_path('analysis_database', 'status/analysis.sqlite')
+    ledger_path = root / 'status/translation-ledger.json'
+    ledger_entries = json.loads(ledger_path.read_text(encoding='utf-8-sig'))['entries']
+    ledger = {}
+    for entry in ledger_entries:
+        key = (entry['image'], entry['address'])
+        if key in ledger:
+            raise ValueError('Duplicate translation ledger identity: %s:%08X' % key)
+        if entry['status'] not in ('TODO', 'WIP', 'DONE', 'SKIP'):
+            raise ValueError('Unknown ledger status: ' + str(entry['status']))
+        ledger[key] = entry
     with sqlite3.connect(database.as_uri()+'?mode=ro', uri=True) as db:
         db.row_factory = sqlite3.Row
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
@@ -25,9 +35,13 @@ def render():
         counts = dict.fromkeys(('TODO','WIP','DONE','SKIP'), 0)
         for row in db.execute('SELECT * FROM functions ORDER BY bytes,image,address'):
             key = (row['image'], row['address'])
-            if row['status'] not in counts:
-                raise ValueError('Unknown implementation status: '+str(row['status']))
-            counts[row['status']] += 1
+            entry = ledger.get(key)
+            if entry and entry['sha256'] != row['sha256']:
+                raise ValueError('Translation ledger hash mismatch: %s:%08X' % key)
+            status = entry['status'] if entry else row['status']
+            if status not in counts:
+                raise ValueError('Unknown implementation status: '+str(status))
+            counts[status] += 1
             classification = sdk.get(key)
             note = 'Implementation status from SQL; coverage is not correctness'
             if classification:
@@ -36,7 +50,7 @@ def render():
                 note += '; MIPS reuse candidates: audit constants, calls and layouts before reuse'
             functions.append({'id': '%s:%08X'%key, 'module': 'PSYQ/BIOS' if classification else row['image'],
                               'image':row['image'], 'address':'0x%08X'%row['address'],
-                              'name':row['name'], 'status':row['status'], 'comments':note,
+                              'name':row['name'], 'status':status, 'comments':note,
                               'listing':row['listing'], 'pseudocode':row['pseudocode'],
                               'size':row['bytes'], 'reuse':peers.get(key, [])})
         data = [dict(module=r['image'], address='0x%08X'%r['address'], name=r['name'],

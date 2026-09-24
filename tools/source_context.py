@@ -20,7 +20,8 @@ def checked_text(root,db,relative,cache):
     row=db.execute('SELECT sha256 FROM source_files WHERE path=?',(relative,)).fetchone()
     if not row:raise ValueError('Source is not indexed: '+relative)
     path=(root/relative).resolve()
-    if not path.is_relative_to((root/'src').resolve()) or not path.is_file():raise ValueError('Indexed source path is invalid: '+relative)
+    shared=(Path(__file__).resolve().parents[1]/'src').resolve()
+    if not (path.is_relative_to((root/'src').resolve()) or path.is_relative_to(shared)) or not path.is_file():raise ValueError('Indexed source path is invalid: '+relative)
     if digest(path)!=row['sha256']:raise ValueError('Indexed source changed; run build_database: '+relative)
     cache[relative]=path.read_bytes().decode('utf-8-sig');return cache[relative]
 
@@ -89,12 +90,13 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
         identifiers=[r[0] for r in db.execute('SELECT identifier FROM implementation_identifiers WHERE image=? AND address=? ORDER BY identifier',(image,address))]
         ledger=json.loads((root/'status/translation-ledger.json').read_text(encoding='utf-8-sig'))
         evidence=next((x for x in ledger.get('entries',[]) if x['image']==image and x['address']==address),None)
+        semantic=[dict(row) for row in db.execute('SELECT * FROM semantic_aliases WHERE image=? AND address=? ORDER BY kind,semantic_name',(image,address))] if 'semantic_aliases' in tables else []
         result=dict(schema=1,image=image,address=hex(address),function=dict(function),implementation=body_view or dict(path=impl['source_path'],mapping_status=impl['mapping_status'],mapping_basis=impl['mapping_basis']),
             declarations=declarations,identifiers=dict(count=len(identifiers),names=identifiers[:64],truncated=len(identifiers)>64),
             callees=limited(callees),callers=limited(callers),reuse_peers=limited(peers),
             mips=original_excerpt(root,function['listing'],mips_address or address,56),
             pseudocode=original_excerpt(root,function['pseudocode'],None,40,pseudo_line),
-            evidence=evidence,gaps=[])
+            evidence=evidence,semantic_aliases=semantic,gaps=[])
     if impl['mapping_status']!='mapped':result['gaps'].append('No unique explicit address-to-C-function mapping: '+impl['mapping_basis'])
     if function['boundary_status']!='audited':result['gaps'].append('Original boundary status: '+function['boundary_status'])
     if function['status']!='DONE':result['gaps'].append('Implementation status is '+function['status'])

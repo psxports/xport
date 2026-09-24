@@ -46,5 +46,9 @@
     "ot_size",
     "pad_size"
   ],
+  "optional_u32": {
+    "gpu_phase_mask": 15,
+    "gpu_full_ram": 0
+  },
   "wire_contract": "Legacy FFT1/FFT2 slots with configured RAM ranges and hook PCs; project decoder must match lengths and semantics"
 }

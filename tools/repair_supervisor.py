@@ -57,6 +57,9 @@ class Supervisor:
         if self.settings.get('solver',{}).get('mode')=='codex':
             from repair_solver import preflight
             self.state['solver_runtime']=preflight(self.settings['solver'],self.folder);self.save()
+            if self.state['solver_runtime'].get('status')!='available':
+                return dict(status='solver_unavailable',validation=validation,
+                            solver_runtime=self.state['solver_runtime'])
         return dict(status='ready',validation=validation,solver_runtime=self.state.get('solver_runtime'))
 
     def refresh(self, directory):
@@ -170,7 +173,11 @@ class Supervisor:
             return dict(status='needs_solver',reason=failure['reason'],suppressed_duplicate=True,
                         evidence=failure['evidence'],task=str(directory/'solver-task.json'))
         self.state['solver_calls']+=1;self.save()
-        result=solve(self.root,directory/'solver',task,settings)
+        try:result=solve(self.root,directory/'solver',task,settings)
+        except ValueError as error:
+            if str(error)=='Solver task identity changed':
+                self.state['solver_calls']-=1;self.save()
+            raise
         if result.get('infrastructure_failure'):
             self.state['solver_infrastructure_failure']=dict(fingerprint=environment['fingerprint'],reason=result['reason'],
                 evidence=str(directory/'solver/result.json'))
@@ -198,13 +205,22 @@ class Supervisor:
         packet_path,packet=diagnostic(result)
         if packet is None:return dict(status='needs_solver',reason='No usable diagnostic packet')
         fingerprint=signature(packet)
-        if any(a['signature']==fingerprint for a in self.state['attempts']):
-            return dict(status='needs_solver',reason='Unchanged failure already investigated',state=str(self.path))
-        if len(self.state['attempts'])>=int(self.settings.get('max_repairs',8)):
-            return dict(status='needs_solver',reason='Persistent repair budget exhausted',state=str(self.path))
-        directory=self.folder/fingerprint;directory.mkdir(exist_ok=True)
-        attempt=dict(signature=fingerprint,status='analyzing',directory=str(directory),started=time.time())
-        self.state['attempts'].append(attempt);self.state['current_ordinal']=packet.get('ordinal');self.save()
+        attempt=next((a for a in self.state['attempts'] if a['signature']==fingerprint),None)
+        if attempt:
+            from repair_solver import retryable_runtime_failure
+            prior=attempt.get('solver') or {}
+            if not retryable_runtime_failure(prior,self.settings.get('solver',{})):
+                return dict(status='needs_solver',reason='Unchanged failure already investigated',state=str(self.path))
+            if attempt.get('error')=='Solver task identity changed':
+                self.state['solver_calls']=max(0,self.state['solver_calls']-1);attempt.pop('error')
+            attempt['status']='retrying_solver_runtime';self.save()
+        else:
+            if len(self.state['attempts'])>=int(self.settings.get('max_repairs',8)):
+                return dict(status='needs_solver',reason='Persistent repair budget exhausted',state=str(self.path))
+            directory=self.folder/fingerprint;directory.mkdir(exist_ok=True)
+            attempt=dict(signature=fingerprint,status='analyzing',directory=str(directory),started=time.time())
+            self.state['attempts'].append(attempt);self.state['current_ordinal']=packet.get('ordinal');self.save()
+        directory=Path(attempt['directory'])
         contracts=[]
         registry=self.settings.get('contracts_directory')
         if registry:

@@ -6,9 +6,11 @@ from pathlib import Path
 import runpy
 import sys
 from xport_project import load_project
+from xport_process import normalize_current_environment
 
 
 def main():
+    normalize_current_environment()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--project', help='Project root or xport-project.json')
     parser.add_argument('tool', help='Shared script name or doctor')
@@ -18,6 +20,7 @@ def main():
     os.environ['XPORT_PROJECT'] = str(root)
     if args.tool == 'doctor':
         print(json.dumps({'project': str(root), 'name': config['name'],
+                          'short_name': config.get('short_name'),
                           'toolset': str(Path(__file__).resolve().parent),
                           'paths': config.get('paths', {})}, indent=2))
         return

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from ctypes import wintypes as w
 from xport_project import load_project
+from xport_process import normalized_environment
 
 DATA_ROOT_VARIABLE = 'XPORT_DUCKSTATION_DATA_ROOT'
 
@@ -64,9 +65,7 @@ def data_directory(override=None, role=None):
 
 
 def environment(directory):
-    env = os.environ.copy()
-    env[DATA_ROOT_VARIABLE] = str(data_directory(directory))
-    return env
+    return normalized_environment(updates={DATA_ROOT_VARIABLE: str(data_directory(directory))})
 
 
 def validate_settings(directory, port):

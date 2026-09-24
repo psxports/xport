@@ -29,31 +29,41 @@ Normative extension of `../PIPELINE.md`. Read this file only when that contract 
 
 ## 1. Create and configure a project
 
+Before running any initializer, ask the user for both the human-readable project name and an explicit short native name. Never derive, abbreviate or silently normalize the short name. It must start with an ASCII letter, contain only ASCII letters, digits or underscores and be at most 16 characters. The exact value names the solution, project and executable; for example full name `Fighting Force`, short name `FF` produces `FF.sln`, `FF.vcxproj` and `FF.exe`.
+
 Run from the workspace parent; keep projects as siblings so port reservations can be discovered:
 
 ```powershell
-python -B xport/tools/project_init.py --root [PROJECT_ROOT] --name [PROJECT]
+python -B xport/tools/project_init.py --root [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
 python -B xport/tools/xport.py --project [PROJECT_ROOT] doctor
+python -B xport/tools/xport.py --project [PROJECT_ROOT] build_native
 ```
 
-Initialization refuses existing configuration, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
+Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports and creates a compilable VS2022 v143 `Debug|Win32` C console skeleton. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=768` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer also creates a project `AGENTS.md` routing stub, the empty translation ledger and configures `code_refresh` to build the short-name solution. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
 
 Standard layout:
 
-- `src/`: C game implementation and `.h` declarations; preserve guest widths/addresses.
-- `src/platform/win/`: `[PROJECT].sln`, project and `main.c`; VS2022 Debug x86.
-- `bin/`: `[PROJECT].exe`, required game assets; native Working Directory.
+- `src/`: Platform-neutral C game implementation and `.h` declarations; preserve guest widths/addresses. The initializer creates `src/game_main.c` with the required game entry/bindings; game code includes the shared `[XPORT_ROOT]/src/xport.h` for the complete Xport contract, fixed-width types and `FUNCTION_MARKER` and must not create a project copy or auxiliary `xport_*.h` contract header.
+- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`; VS2022 v143 Debug x86, compiled as C. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
+- `bin/`: Native Working Directory. The build output is exactly `bin/[SHORT].exe`, directly under `bin`.
+  - `bin/DATA/`: Runtime game data extracted from the first, data track of the CD image.
+  - `bin/MUSIC/`: Decimal-name IMA ADPCM WAV tracks generated from the CD audio tracks by `X convert_music`; never place them under `bin/DATA`.
 - `_build/`: native compiler intermediates. Never point to another game's build tree.
-- `orig/`: immutable supplied game/analysis inputs; retained legacy exports may stay read-only.
-- `status/`: SQL, progress, ledgers, evidence, logs, trace sessions and reports.
-- `tools/`: project-specific adapters/fixtures, emulator data, temporary emulator builds, recovery archives and thin shared entrypoints. No maintained shared-tool copies.
-- `xport-project.json`: machine-readable context. `AGENTS.md`: game revision, language decision, agreed dummy scope, actual hooks/layouts, adapter paths, build/launch details and links to shared rules; no duplicated generic methodology.
+- `iso/`: user-supplied disc images and tracks; record hashes/provenance and never treat filenames as identity.
+- `orig/`: immutable accepted original inputs. `orig/images/[IMAGE]/` is the accepted canonical IDA snapshot; `orig/ghidra/` may retain reviewed SDK-recognition inputs when the project chooses that path.
+- `status/`: reproducible databases, progress, ledgers, evidence, logs, trace sessions and reports.
+  - `status/ida/runs/[LABEL]/`: fresh labelled IDA databases, logs, configs and exports under review.
+  - `status/ida/accepted/[LABEL].json`: hash receipt for a run copied into the immutable configured `ida_exports` tree.
+  - `status/ghidra/runs/[LABEL]/`: Ghidra PsyQ signature reports/logs; reviewed classification normally lives at `status/ghidra/classification.json`.
+  - `status/translation-ledger.json`: editable TODO/WIP/DONE/SKIP implementation mappings; SQL is a derived view.
+- `tools/`: project-specific adapters/fixtures, emulator data, temporary emulator builds, recovery archives and thin shared entrypoints. `tools/ida/[IMAGE].json` stores image facts and `tools/ida/databases/` stores manual IDBs copied into labelled runs by `--export-existing`. No maintained shared-tool copies.
+- `xport-project.json`: machine-readable context including full `name`, user-chosen `short_name`, paths and ports. `AGENTS.md`: game revision, language decision, agreed dummy scope, actual hooks/layouts, adapter paths, build/launch details and links to shared rules; no duplicated generic methodology.
 
 Command notation below: `X TOOL args` means `python -B [XPORT_ROOT]/tools/xport.py --project [PROJECT_ROOT] TOOL args`. Relative config paths resolve against project root; manifest paths resolve against that manifest's directory. `XPORT_PROJECT` is the explicit environment alternative. Missing context is an error.
 
 Required/configurable fields:
 
-- `schema:1`, `name`, `toolset` (normally `../xport/tools`).
+- `schema:1`, full `name`, user-chosen `short_name`, `toolset` (normally `../xport/tools`). Existing projects without `short_name` remain readable, but new projects must never omit it.
 - `paths`: `native_solution`, `native_executable`, `native_working_directory`, `native_build`, `disc_image`; optional `original_executable`, `native_game_collector`.
 - Analysis: `paths.ida_configs` default `tools/ida`, `paths.ida_exports` default `status/ida/images`, `paths.analysis_database` default `status/analysis.sqlite`, `paths.sdk_classification`, `paths.similarity_directory`; `analysis.images`, optional unambiguous `analysis.default_image`, `analysis.wrapper_references`.
 - Emulator: `duckstation.host`, `gdb_port`, `reserved_gdb_ports`, `default_role`, `data_directory`, `data_directories` by role, `trace_profile`. Default port must equal its role reservation.
@@ -74,9 +84,18 @@ X ida_export --ida [IDA]/idat.exe --image [IMAGE] --label export-v1 --plan
 # Review prepared commands/config; execute under another fresh label:
 X ida_export --ida [IDA]/idat.exe --image [IMAGE] --label export-v2
 X ida_canonicalize --exports status/ida/runs/export-v2 --configs status/ida/runs/export-v2
+X ida_accept --label export-v2
 ```
 
-`--export-existing` copies a database from `paths.ida_databases` (default `tools/ida/databases`) into the new run before exporting; never overwrite manual IDA work. New exports/IDB/logs remain in the run directory. Existing integration targets IDA 7.7 MIPS little endian; validate another version. Current importer/canonicalizer use the final load entry as code image: split-code multi-load images require an explicit mapping extension, not guessed offsets.
+`--export-existing` copies a database from `paths.ida_databases` (default `tools/ida/databases`) into the new run before exporting; never overwrite manual IDA work. New exports/IDB/logs remain in the run directory. `ida_accept` is the only normal publication path into the configured immutable `paths.ida_exports` tree (new projects use `orig/images`). It requires canonical byte verification, complete per-function artifacts, absent destination image directories and writes a complete hash receipt without deleting the labelled run. It never replaces a prior accepted image; a re-analysis needs a new reviewed input root/migration rather than overwriting evidence. Existing integration targets IDA 7.7 MIPS little endian; validate another version. Current importer/canonicalizer use the final load entry as code image: split-code multi-load images require an explicit mapping extension, not guessed offsets.
+
+Canonical output for every accepted `orig/images/[IMAGE]`:
+
+- `functions/[ADDRESS].lst`: IDA instruction listing, preserved as discovery evidence.
+- `functions/[ADDRESS].mips.txt`: independent Capstone words/disassembly with explicit delay-slot flags and source hash.
+- `pseudocode/[ADDRESS].c`: Hex-Rays draft when decompilation succeeded; the sufficient structural reference for the first WIP coverage pass, while original MIPS remains the authority for every semantic detail.
+- `[IMAGE].lst` and `[IMAGE].c`: aggregate listing and pseudocode convenience files.
+- `functions.json`, `export-report.json`, call/data/symbol JSON and decompilation failures: machine-readable boundaries, raw words, provenance and gaps.
 
 4. Inspect export failures, chunks, raw instructions and source-byte verification. Canonicalization adds independently decoded MIPS words/delay-slot flags and checks bytes/hashes; it does not prove boundaries or pseudocode semantics. Preserve undecoded words and data/code ambiguities.
 5. Set accepted `paths.ida_exports` and matching `paths.ida_configs`. Run:
@@ -90,7 +109,11 @@ X query 0xADDRESS --image [IMAGE]
 
 Gate: SQL integrity/foreign-key checks; all functions/errors inventoried; source hashes match; duplicate evidence validated. Progress is generated from SQL, not independent manually edited counts.
 
-Required PsyQ initial analysis: `X ghidra_recognize --ghidra INSTALL --plugin PSX_PLUGIN --image [IMAGE] --label UNIQUE [--plan]` invokes the shared `tools/ghidra/RecognizePsyq.java` post-script against the installed PSX plugin signature data. It exports auditable masked candidates and applied symbols for every configured executable image. Then run `X psyq_classify --reports DIRECTORY --output status/ghidra/classification.json` and select the reviewed result through `paths.sdk_classification`. If Ghidra or the plugin is unavailable, record this gate as blocked/deferred; never silently omit it. Recognition uses masked bytes and containment; short/ambiguous signatures remain candidates. Wrapper symbol presence does not prove ABI/runtime equivalence. Current policy labels planned SDK replacement scope SKIP; validate the actual replacement before accepting its behavior. Do not reuse another game's aliases or wrapper evidence automatically.
+Required PsyQ initial analysis: `X ghidra_recognize --ghidra INSTALL --plugin PSX_PLUGIN --image [IMAGE] --label psyq-v1 [--plan]` invokes the shared `tools/ghidra/RecognizePsyq.java` post-script against the installed PSX plugin signature data. It exports auditable masked candidates and applied symbols for every configured executable image. Then run `X psyq_classify --reports status/ghidra/runs/psyq-v1 --output status/ghidra/classification.json`, review both `accepted` and `pending`, select the result through `paths.sdk_classification`, and run `X build_database`. If Ghidra or the plugin is unavailable, record this gate as blocked/deferred; never silently omit it.
+
+SKIP is applied only by the reviewed classification merge, not by editing generated IDA files or recognizing a familiar instruction sequence by eye. The classifier rechecks masked bytes against the original image, requires the IDA function entry to match a recognized label and every IDA chunk to fit within the matched PsyQ object. Short generic signatures, unresolved callees and conflicting aliases remain `pending`/TODO. Accepted entries record `image`, `address`, alias, exact `.lst` and pseudocode paths, matched objects/versions, hashes, reason and wrapper status. `build_database` imports these entries as SKIP while preserving original IDA names and TODO discovery snapshots.
+
+An `.lst` alone deliberately has no mutable SKIP annotation. To identify a possible PsyQ routine while reading it, take its image and address from `orig/images/[IMAGE]/functions/[ADDRESS].lst` and run `X query 0xADDRESS --image IMAGE`. Treat it as SKIP only when the result contains both `function.status: "SKIP"` and a nonempty `library_classification`; inspect alias/reason/evidence there. A `pending` signature, name similarity, call to a known SDK routine or wrapper symbol is not SKIP. SKIP means an explicit replacement boundary, not DONE or runtime equivalence; validate the replacement ABI, widths, layouts, callbacks, side effects, timing and ownership before accepting behavior. If the matched body mixes game logic with SDK code, return it to TODO. Do not reuse another game's aliases or wrapper evidence automatically.
 
 ## 3. Data and evidence contracts
 
@@ -103,7 +126,7 @@ Required model (do not claim every future table already exists):
 - Control edge: source image/function/site, target image/address, direct/conditional/tail/indirect kind, resolution evidence and ambiguity. Pointer-looking data remains a candidate until usage is proven. Same overlay address does not resolve identity.
 - Duplicate pair: exact bytes vs documented MIPS normalization vs similarity, input hashes/algorithm version, differing instructions/constants/addresses, flow shape and reuse risks. Normalized equality never transfers DONE.
 - Implementation: TODO/WIP/DONE/SKIP separate from static audit, dynamic coverage and comparison. Link original hash, C location and implementation revision.
-- Derived C source index: `source_files`, `implementations`, `implementation_identifiers`, `source_declarations` and `implementation_declarations` map `(image,address)` to an exact C range only through an image-qualified `FF_FUNCTION_MARKER`, an exact address-bearing symbol, or one unique address-bearing symbol in the ledger-declared source. Partial/combined regions remain `ambiguous`/`unmapped`; never select a nearby function by line proximity. Store source/body/declaration hashes and parser version. The translation ledger remains the editable mapping authority; these tables are reproducible views
+- Derived C source index: `source_files`, `implementations`, `implementation_identifiers`, `source_declarations` and `implementation_declarations` map `(image,address)` to an exact C range only through an image-qualified `FUNCTION_MARKER`, an exact address-bearing symbol, or one unique address-bearing symbol in the ledger-declared source. Partial/combined regions remain `ambiguous`/`unmapped`; never select a nearby function by line proximity. Store source/body/declaration hashes and parser version. The translation ledger remains the editable mapping authority; these tables are reproducible views. `FF_FUNCTION_MARKER` remains parser-compatible for existing Fighting Force evidence but is not the generic name for new projects
 - Evidence: type/scope/result, artifact path/hash, input image/source/build identities. Mark dependent evidence stale on changed inputs; retain history.
 - Run: native/emulator hashes, effective configuration, paired checkpoints/provenance, character/level/context, absolute input schedule and actual decoded input, range/counts, raster/audio/shared-RAM settings. Link all channels by run/ordinal/tick.
 - WIP events: unique branch identity, every occurrence, first/last event, continued/fatal status, prior skips and scenarios. Absence in one trace is not proof of unreachability.
@@ -123,15 +146,41 @@ Do not emit standalone `(void)parameter;` statements solely to suppress unused f
 
 `X source_context 0xADDRESS --image IMAGE [the same selection options] [--output status/CONTEXT.json]` is the standalone form. Prefer `query --audit-context` for interactive audit and `--output` for retained evidence. Interactive stdout is compact single-line JSON to avoid spending context on indentation; retained evidence files remain readable formatted JSON. Declaration matches are lexical candidates, not proof of runtime use or type correctness. Conditional duplicate declarations may remain visible because this index does not run the platform preprocessor
 
-## 4. Plan work; TODO → WIP
+## 4. Establish the trace-ready TODO → WIP frontier
 
-1. Select functions from current user scope, actual trace/WIP sites and dependencies. Query callers/callees and implemented duplicate candidates before new analysis.
+1. Select functions from current user scope, startup/trace boundaries, actual trace/WIP sites and dependencies. Query callers/callees and implemented duplicate candidates before new analysis. Unreached functions may remain TODO before the first recording.
 2. Build transitive static dependencies using image-aware edges. Report unresolved targets separately. Implement dependency groups before callers; collapse cycles into SCCs. Static graph is possible control flow, not execution order; only a trace proves sequence.
-3. For each function retain original hash, current IDA pseudocode, image-verified MIPS and candidate reuse differences. Use pseudocode as a starting template; resolve every semantic decision from MIPS/callers.
+3. Preserve existing WIP/DONE implementations. For every selected TODO function retain original hash, current IDA pseudocode, image-verified MIPS and candidate reuse differences. Use pseudocode as the sufficient structural reference for this first pass, then resolve and correct every constant, signed operation, delay slot, ABI decision, branch, call and memory effect from MIPS bytes, callers and applicable evidence. Translate Hex-Rays failures directly from MIPS.
 4. Emit C `.c/.h`; explicit guest widths, layout and address translation. Use the established platform/PsyQ wrapper. Preserve input, RNG, callbacks, timing, side effects, audio and engine cutscenes. Dummy scope must be explicitly agreed in project AGENTS; no automatic game-logic stubs.
 5. Represent unresolved branches honestly as registered WIP with site/context logging. Manual discovery may skip registered WIP if the project supports it; strict evidence mode (`--debug` ABI) must stop. Never suppress input or silently classify an unknown fatal guard as harmless.
 6. Add a once-per-function call marker when coverage discovery is requested. Markers prove calls, not correctness. Hits after skipped logic can be downstream artifacts.
 7. Build Debug x86: `X build_native [--plan]`; solution controls `bin/[PROJECT].exe` and `_build`. Build first checks for a running manual native game. Intermediate artifacts follow the project's build paths.
-8. Record WIP implementation status, exact unresolved pieces and static audit scope. Do not mark DONE for pseudocode transcription, successful compilation or marker coverage. Honor user-requested batch boundaries; do not insert emulator tests before an explicitly deferred test stage.
+8. Record WIP implementation status, exact unresolved pieces and static audit scope. During convergence, if the causal function is TODO, translate its whole derived branch before replaying: root plus SCC plus transitively resolved direct TODO callees until WIP/DONE/SKIP boundaries, with trace-proven callbacks added as roots. Keep unresolved indirect/overlay edges explicit. Do not mark DONE for pseudocode translation, successful compilation or marker coverage. Empty stubs, invented success returns, generic interpreter wrappers and ledger-only promotion do not count. Honor user-requested batch boundaries; do not insert emulator tests before an explicitly deferred test stage.
 
-Gate: implementation/known gaps are reviewable; no invented semantics; build succeeds where required; source/evidence ledger and `status/progress.html` reflect reality. Before every intermediate report run `X render_progress`; after changing importer inputs run `X build_database` first. Preserve legacy log encoding (ASCII additions if required).
+The first function follows this reproducible sequence:
+
+```powershell
+X query 0xADDRESS --image IMAGE --audit-context
+# Include the shared xport.h and add the C body/declaration with its exact image-qualified FUNCTION_MARKER
+# Add the source file to src/platform/win/[SHORT].vcxproj when it is new
+# Add/update the reviewed status/translation-ledger.json entry shown below
+X code_refresh
+```
+
+Minimal WIP ledger entry (JSON addresses are decimal numbers; copy the exact original SHA from `query`, never invent it):
+
+```json
+{
+  "image": "GAME.EXE",
+  "address": 2147549184,
+  "sha256": "ORIGINAL_FUNCTION_SHA256",
+  "status": "WIP",
+  "source": "src/game.c",
+  "evidence": ["status/audits/GAME.EXE-80010000.md"],
+  "note": "MIPS-audited translated scope and explicit remaining gaps"
+}
+```
+
+TODO means no accepted implementation. Move to WIP only after the exact `(image,address,original SHA)` has an owned C location and reviewable evidence; compilation by itself is insufficient. `FUNCTION_MARKER(0xADDRESSu, "IMAGE")`, defined by the shared `[XPORT_ROOT]/src/xport.h`, binds a source body to that identity when naming is not uniquely address-bearing. Keep unresolved branches as explicit WIP guards. A new `.c` file is not built until it is added to `[SHORT].vcxproj`. After every C/H edit, `code_refresh` is the mandatory format/index/Debug-x86-build/check/progress gate.
+
+Gate before recording: the selected startup/trace frontier is implemented as WIP/DONE/SKIP; remaining TODO and unresolved edges are inventoried; implementation/known gaps are reviewable; no invented semantics; build succeeds where required; source/evidence ledger and `status/progress.html` reflect reality. Global TODO zero is a later full-coverage milestone, not a pre-record gate. Before every intermediate report run `X render_progress`; after changing importer inputs run `X build_database` first. Preserve legacy log encoding (ASCII additions if required).

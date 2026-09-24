@@ -8,6 +8,7 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 from pipeline_journal import connect, ensure_run, set_step, step, reserve_attempt
@@ -21,6 +22,7 @@ from xport_project import load_project, project_path, artifact_path
 from trace_layout import PROFILE
 from pipeline_metrics import measured, span
 from trace_hash_session import hash_session
+from trace_converge_progress import update as update_progress
 
 
 def preflight(plan, anchor):
@@ -73,12 +75,19 @@ def capture_worker(path):
         configs = master.get('segments')
         if configs is None:
             configs = [str(folder/'capture.json')]
+        stop_progress=threading.Event()
+        progress_thread=threading.Thread(target=capture_progress,args=(configs,stop_progress),daemon=True)
+        progress_thread.start()
         with (folder/'capture.log').open('w') as log, contextlib.redirect_stdout(log):
-            code = 0
-            for config in configs:
-                code = capture(Path(config))
-                if code:
-                    break
+            try:
+                code = 0
+                for config in configs:
+                    code = capture(Path(config))
+                    if code:
+                        break
+            finally:
+                stop_progress.set()
+                progress_thread.join(timeout=2)
         if code == 0 and len(configs) > 1:
             merge_segment_capture(folder, configs, request['native'])
         if {key:digest(value) for key,value in request['dependencies'].items()} != before:
@@ -109,6 +118,44 @@ def capture_worker(path):
     receipt.update(seconds=time.perf_counter()-started, finished=time.time())
     write_receipt(receipt_path,receipt)
     return receipt['exit_code']
+
+
+def capture_progress(config_paths, stop):
+    configs=[json.loads(Path(path).read_text()) for path in config_paths]
+    boundary_path=configs[0].get('progress_boundaries')
+    boundaries={row['ordinal']:row for row in json.loads(Path(boundary_path).read_text())} if boundary_path else {}
+    while not stop.is_set():
+        latest=None
+        for segment,config in enumerate(configs):
+            initial=config.get('progress',{})
+            if latest is None:
+                latest=dict(initial,segment=segment)
+            folder=config.get('checkpoint_directory')
+            progress_path=config.get('progress_path')
+            if progress_path:
+                try:
+                    raw=Path(progress_path).read_bytes()
+                    if len(raw)==12:
+                        phase,tick,pc=struct.unpack('<3I',raw)
+                        candidate=dict(initial,segment=segment,phase=phase-1,tick=tick,pc=pc)
+                        row=boundaries.get(phase-1)
+                        if row:candidate['stage']=row['stage']
+                        if latest is None or candidate['phase']>latest.get('phase',-1):latest=candidate
+                except OSError:
+                    pass
+            if not folder:
+                continue
+            for path in Path(folder).glob('phase-*.ffcp.ctx'):
+                try:
+                    state=context(path)
+                except (OSError,ValueError):
+                    continue
+                row=boundaries.get(state['ordinal'])
+                candidate=dict(initial,segment=segment,phase=state['ordinal'])
+                if row:candidate.update(stage=row['stage'],tick=row['game_tick'])
+                if latest is None or candidate['phase']>latest.get('phase',-1):latest=candidate
+        if latest:update_progress('capture',detail='native_replay',**latest)
+        stop.wait(1)
 
 
 def merge_phase_streams(paths, output):
@@ -213,9 +260,11 @@ def run(args):
                 current = json.loads(path.read_text())
                 if current['status']=='running' and alive(current.get('worker')):
                     return dict(status='running',folder=previous['folder'])
+        update_progress('prepare',detail='start')
         prepared = prepare(args.name)
         plan = json.loads(Path(prepared['manifest']).read_text())
         build_started = time.perf_counter()
+        update_progress('build',detail='native')
         with span('build'):
             build = subprocess.run([sys.executable,'-B',str(Path(__file__).with_name('build_native.py'))],capture_output=True,text=True)
         (work/'build-driver.log').write_text(build.stdout+build.stderr)
@@ -363,7 +412,11 @@ def run(args):
                     input_calls=artifacts['input_calls'],output=native['phases'],phase_count=segment['end_phase']-segment['start_phase'],
                     input_calls_end=segment['input_calls_end'],
                     end_tick=segment['end_tick']+1,world=True,audit_output=str(folder/'native-state'),
-                    checkpoint_directory=str(folder/'native-checkpoints'),checkpoint_interval=300)
+                    checkpoint_directory=str(folder/'native-checkpoints'),checkpoint_interval=300,
+                    progress_path=str(folder/'native-progress.bin'),
+                    progress_boundaries=artifacts['boundaries'],
+                    progress=dict(segment=0,stage=segment['stage'],tick=segment['start_tick'],tick_end=segment['end_tick'],
+                                  phase=segment['start_phase'],phase_end=segment['end_phase']))
                 (folder/'native-checkpoints').mkdir(exist_ok=True)
                 write_receipt(folder/'capture.json',config)
                 config_paths=[str(folder/'capture.json')]
@@ -375,7 +428,11 @@ def run(args):
                     config=dict(checkpoint=item['checkpoint'],phase_restore=True,phase_aligned=True,jobs=artifacts['jobs'],pad=segment_pad,decode_pad=artifacts['decode_pad_segment_'+str(ordinal)],
                         input_calls=artifacts['input_calls'],output=str(prefix/'native.phases'),phase_count=segment['end_phase']-segment['start_phase'],
                         input_calls_end=segment['input_calls_end'],end_tick=segment['end_tick']+1,world=True,audit_output=str(prefix/'native-state'),
-                        checkpoint_directory=str(checkpoints),checkpoint_interval=300)
+                        checkpoint_directory=str(checkpoints),checkpoint_interval=300,
+                        progress_path=str(prefix/'native-progress.bin'),
+                        progress_boundaries=artifacts['boundaries'],
+                        progress=dict(segment=ordinal,stage=segment['stage'],tick=segment['start_tick'],tick_end=segment['end_tick'],
+                                      phase=segment['start_phase'],phase_end=segment['end_phase']))
                     config_path=prefix/'capture.json';prefix.mkdir(parents=True,exist_ok=True);write_receipt(config_path,config);config_paths.append(str(config_path))
                 write_receipt(folder/'capture.json',{'schema':1,'segments':config_paths})
             source_session=json.loads(Path(plan['session']).read_text())
@@ -411,6 +468,10 @@ def run(args):
             set_step(db,run_id,'fix_probe',probed['status'],probed)
             if probed['status']=='running':return dict(status='running',folder=str(folder),phase='fix_probe')
         set_step(db,run_id,'capture','running',{'folder':str(folder)})
+        first_segment=plan['segments'][0]
+        update_progress('capture',detail='launch_or_observe',folder=str(folder),segment=0,
+                        stage=first_segment['stage'],tick=first_segment['start_tick'],tick_end=plan['segments'][-1]['end_tick'],
+                        phase=first_segment['start_phase'],phase_end=plan['segments'][-1]['end_phase'])
         receipt = launch_or_observe(folder,args.wait)
         if receipt['status']=='running':
             return dict(status='running',folder=str(folder))
@@ -424,6 +485,7 @@ def run(args):
             return dict(status='capture_failed',folder=str(folder),diagnostic=detail)
         set_step(db,run_id,'capture','captured',{'folder':str(folder)},receipt['seconds'])
         started = time.perf_counter()
+        update_progress('compare',detail='verify')
         report = verify(json.loads((folder/'manifest.json').read_text()))
         write_receipt(folder/'comparison.json',report)
         status = 'match' if report['passed'] else 'mismatch'

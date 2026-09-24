@@ -1,6 +1,7 @@
 """Replay recordings from a menu anchor through menu, cutscene and gameplay phases"""
 from xport_project import load_project, project_path
 from trace_layout import PROFILE, INPUT_CALL_BYTES
+from trace_pad_schedule import decode_pad_schedule
 import re
 import json
 import os
@@ -15,6 +16,7 @@ from trace_runner import database, execute_job, refresh_reports
 from trace_evidence import export_coverage
 from trace_worker import write_receipt
 from trace_phase_checkpoint import context as checkpoint_context, select as select_phase_checkpoint, verified_end
+from xport_process import normalized_environment
 
 ROOT, PROJECT = load_project()
 
@@ -71,25 +73,6 @@ def input_call_cursor(source, rows, clock_limit):
     return count
 
 
-def decode_pad_schedule(records, start_tick, end_tick):
-    """Encode one recorded decode-time pad value for every gameplay tick"""
-    if type(start_tick) is not int or type(end_tick) is not int or start_tick > end_tick:
-        raise ValueError('Invalid decode pad interval')
-    if len(records) != end_tick-start_tick+1:
-        raise ValueError('Decode pad interval is incomplete')
-    ranges=[]
-    for index,row in enumerate(records):
-        tick=start_tick+index
-        if (not isinstance(row,list) or len(row)!=3 or row[0]!=tick or
-                any(type(value) is not int for value in row) or not 0<=row[1]<=0xffff):
-            raise ValueError('Invalid decode-time pad record')
-        value=row[1]
-        if ranges and ranges[-1][2]==value:
-            ranges[-1][1]=tick
-        else:ranges.append([tick,tick,value])
-    return b''.join(struct.pack('<3I',*row) for row in ranges)
-
-
 def menu_jobs(rows, anchor, cross_phase=False):
     if not rows or rows[0]['pc'] != anchor['pc'] or rows[0]['game_tick'] != anchor['tick']:
         raise ValueError('Menu recording does not start at the registered anchor')
@@ -121,7 +104,7 @@ def capture(config_path):
     prefix = PROJECT['native_trace']['environment_prefix']
     if not re.fullmatch('[A-Z][A-Z0-9_]*_', prefix):
         raise ValueError('Invalid native environment prefix')
-    env = {k.upper():v for k,v in os.environ.items() if not k.upper().startswith(prefix)}
+    env = normalized_environment({k:v for k,v in os.environ.items() if not k.upper().startswith(prefix)})
     options = dict(AUDIT_PAD_SCHEDULE=config['pad'], MENU_CHECKPOINT_LOAD=config['checkpoint'],
                    TRACE_PHASE_PATH=config['output'], AUDIO_OUTPUT='0', RASTERIZE='0', VERIFY_VRAM='0', CAPTURE_WIP='1')
     if config.get('decode_pad'):
@@ -132,6 +115,8 @@ def capture(config_path):
     if config.get('checkpoint_directory'):
         options.update(PHASE_CHECKPOINT_DIRECTORY=config['checkpoint_directory'],
                        PHASE_CHECKPOINT_INTERVAL=str(config.get('checkpoint_interval',300)))
+    if config.get('progress_path'):
+        options['PROGRESS_PATH'] = config['progress_path']
     if 'input_calls' in config:
         options.update(TRACE_INPUT_CALLS=config['input_calls'], MENU_PHASE_COUNT=str(config['phase_count']),
                        AUDIT_END_TICK=str(config.get('end_tick',900)))

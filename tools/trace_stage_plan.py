@@ -11,8 +11,11 @@ from trace_cache import digest
 from trace_layout import PROFILE, PROFILE_PATH
 from trace_phases import read_phases
 from trace_phase_index import build as build_index
-from user_menu_replay import decode_pad_schedule, input_calls, input_call_cursor, menu_jobs
+from user_menu_replay import input_calls, input_call_cursor, menu_jobs
+from trace_pad_schedule import decode_pad_schedule
 from trace_worker import write_receipt
+from trace_converge_progress import update as update_progress
+from trace_stage_segments import stage_segments
 from trace_finalize_lock import exclusive_finalize
 from xport_project import load_project, artifact_path
 
@@ -68,6 +71,7 @@ def prepare(name):
     with exclusive_finalize(directory):
         manifest_path = directory/'manifest.json'
         hash_started = time.perf_counter()
+        update_progress('prepare',detail='hash_source')
         if digest(session['raw']) != identity['raw_sha256']:
             raise ValueError('Original trace changed')
         hash_seconds = time.perf_counter()-hash_started
@@ -78,21 +82,19 @@ def prepare(name):
             validate_cache(manifest)
             return dict(manifest=str(manifest_path), cached=True, seconds=time.perf_counter()-started,
                         hash_seconds=hash_seconds)
+        update_progress('prepare',detail='read_phases')
         rows = read_phases(session['raw'])
         begin = select_boundary(rows, settings['entry_tick'])
         game = [r for r in rows[begin:] if r['pc'] == PROFILE['game_begin']]
-        segments = []
-        for row in game:
-            if not segments or row['stage'] != segments[-1]['stage'] or row['game_tick'] != segments[-1]['end_tick']+1:
-                segments.append(dict(stage=row['stage'], start_phase=row['ordinal'],
-                                     start_tick=row['game_tick'], end_tick=row['game_tick']))
-            else:
-                segments[-1]['end_tick'] = row['game_tick']
-            segments[-1]['end_phase'] = row['ordinal']+1
+        segments = stage_segments(game)
         scope_end=segments[-1]['end_phase']
+        update_progress('prepare',detail='input_calls',stage=segments[0]['stage'],tick=segments[0]['start_tick'],
+                        phase=segments[0]['start_phase'],phase_end=scope_end,tick_end=segments[-1]['end_tick'])
         scoped_rows=rows[:scope_end]
         calls, count = input_calls(session['raw'], scoped_rows)
         for segment in segments:
+            update_progress('prepare',detail='input_cursor',stage=segment['stage'],tick=segment['end_tick'],
+                            phase=segment['end_phase'],phase_end=scope_end,tick_end=segments[-1]['end_tick'])
             terminal = rows[segment['end_phase']-1]
             segment['input_calls_end'] = input_call_cursor(session['raw'], rows, terminal['emulated_ticks'])
         outputs = {'input_calls': directory/'input-calls.bin', 'jobs': directory/'menu.jobs.bin',
@@ -105,19 +107,28 @@ def prepare(name):
             outputs[key]=directory/('segment-'+str(ordinal)+'.pad.bin')
             outputs[key].write_bytes(stage_pad_schedule(rows,segment))
         write_receipt(outputs['boundaries'], [{k:r[k] for k in ('ordinal','pc','stage','game_tick','emulated_ticks')} for r in rows])
+        update_progress('prepare',detail='extract_channels',stage=segments[0]['stage'],tick=segments[0]['start_tick'],
+                        phase=begin,phase_end=scope_end,tick_end=segments[-1]['end_tick'])
         from trace_stage_channels import extract
         channel_metadata={}
         channels=extract(session['raw'],begin,scope_end,directory,channel_metadata)
         outputs.update({'original_'+k:v for k,v in channels.items()})
         input_rows=json.loads(channels['inputs'].read_text())
+        terminal_records=channel_metadata['terminal_input_records']
+        if terminal_records not in (0,1):raise ValueError('Ambiguous terminal decoded input records')
+        expected=sum(segment['gameplay_count'] for segment in segments)-(terminal_records==0)
+        if len(input_rows)!=expected:raise ValueError('Decoded input count differs from gameplay boundaries')
         input_cursor=0
         for ordinal,segment in enumerate(segments):
-            phase_count=segment['end_phase']-segment['start_phase']
+            update_progress('prepare',detail='decode_pad',segment=ordinal,stage=segment['stage'],
+                            tick=segment['start_tick'],tick_end=segment['end_tick'],
+                            phase=segment['start_phase'],phase_end=segment['end_phase'])
+            record_count=segment['gameplay_count']-(ordinal==len(segments)-1 and terminal_records==0)
             key='decode_pad_segment_'+str(ordinal)
             outputs[key]=directory/('segment-'+str(ordinal)+'.decode-pad.bin')
-            outputs[key].write_bytes(decode_pad_schedule(input_rows[input_cursor:input_cursor+phase_count],
+            outputs[key].write_bytes(decode_pad_schedule(input_rows[input_cursor:input_cursor+record_count],
                 segment['start_tick'],segment['end_tick']))
-            input_cursor+=phase_count
+            input_cursor+=record_count
         if input_cursor!=len(input_rows):raise ValueError('Decoded input records exceed gameplay segments')
         index_dir = directory/'phase-index'
         # An incomplete index is never a cache hit
@@ -127,6 +138,8 @@ def prepare(name):
             while (directory/('interrupted-phase-index-'+str(attempt))).exists():attempt+=1
             if attempt>2:raise ValueError('Preparation recovery attempt limit exhausted')
             index_dir.replace(directory/('interrupted-phase-index-'+str(attempt)))
+        update_progress('prepare',detail='phase_index',stage=segments[-1]['stage'],tick=segments[-1]['end_tick'],
+                        phase=scope_end,phase_end=scope_end,tick_end=segments[-1]['end_tick'])
         build_index(session['raw'], index_dir, session['raw_sha256'])
         outputs['phase_index'] = index_dir/'index.json'
         manifest = dict(schema=1, identity=identity, trace=name, original=session['raw'],

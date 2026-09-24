@@ -5,14 +5,19 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import tempfile
 
 from repair_contract import identity, sha
 from trace_worker import write_receipt, process_identity
 from pipeline_metrics import measured
+from xport_process import normalized_environment
+
+INFRASTRUCTURE_REASONS=('home_unavailable','home_readonly','authentication_unavailable','cli_incompatible')
+
 
 def runtime(settings):
     """Resolve the caller's existing home without copying credentials"""
-    env=os.environ.copy()
+    env=normalized_environment()
     requested=settings.get('home') or env.get('CODEX_HOME')
     if not requested:
         profile=env.get('USERPROFILE') or env.get('HOME')
@@ -36,25 +41,62 @@ def runtime(settings):
 def failure_reason(text, code, timed_out):
     value=text.lower()
     if 'could not find home directory' in value:return 'home_unavailable'
+    if 'readonly database' in value or 'read-only database' in value:return 'home_readonly'
     if any(s in value for s in ('unauthorized','authentication','not logged in','401')):return 'authentication_unavailable'
     if any(s in value for s in ('unexpected argument','unrecognized option','unknown option')):return 'cli_incompatible'
     if timed_out:return 'timeout'
     return 'process_failed' if code else 'invalid_or_missing_answer'
 
 
+def home_write_probe(home):
+    """Verify the existing Codex home is writable in this process context"""
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.xport-solver-write-',dir=home):
+            pass
+    except OSError as error:
+        return str(error)[:1000]
+    return None
+
+
+def retryable_runtime_failure(result, settings):
+    """Allow one preserved retry only after the configured runtime identity changes"""
+    reason=failure_reason(result.get('stderr_excerpt',''),result.get('exit_code',1),result.get('timed_out',False))
+    prior=(result.get('runtime') or {}).get('fingerprint')
+    current=runtime(settings)[2]['fingerprint']
+    return reason in INFRASTRUCTURE_REASONS and bool(prior) and prior!=current
+
+
+def preserve_failed_launch(directory):
+    index=1
+    while (directory/f'failed-runtime-{index:04d}').exists():index+=1
+    archive=directory/f'failed-runtime-{index:04d}';archive.mkdir()
+    for name in ('result.json','launch.json','answer.json','events.jsonl','stderr.log'):
+        path=directory/name
+        if path.exists():path.replace(archive/name)
+    return archive
+
+
 def preflight(settings, directory):
     """Check CLI startup without a model request"""
     executable,env,info=runtime(settings);path=Path(directory)/'solver-runtime.json'
     prior=json.loads(path.read_text()) if path.exists() else None
-    if prior and prior.get('fingerprint')==info['fingerprint']:return prior
     if not info['problem']:
-        try:
-            check=subprocess.run([executable,'--version'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                                 timeout=15,text=True,encoding='utf-8',errors='replace',
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-            info.update(exit_code=check.returncode,version=check.stdout[:200],stderr_excerpt=check.stderr[:1000])
-            if check.returncode:info['problem']=failure_reason(check.stderr,check.returncode,False)
-        except (OSError,subprocess.TimeoutExpired) as error:info['problem']='launch_failed';info['stderr_excerpt']=str(error)[:1000]
+        problem=home_write_probe(env['CODEX_HOME'])
+        info['home_write_probe']='failed' if problem else 'passed'
+        if problem:
+            info['problem']='home_readonly';info['stderr_excerpt']=problem
+    if not info['problem']:
+        if prior and prior.get('fingerprint')==info['fingerprint'] and prior.get('status')=='available':
+            info.update(exit_code=prior.get('exit_code'),version=prior.get('version'),
+                        stderr_excerpt=prior.get('stderr_excerpt'))
+        else:
+            try:
+                check=subprocess.run([executable,'--version'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                     timeout=15,text=True,encoding='utf-8',errors='replace',
+                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                info.update(exit_code=check.returncode,version=check.stdout[:200],stderr_excerpt=check.stderr[:1000])
+                if check.returncode:info['problem']=failure_reason(check.stderr,check.returncode,False)
+            except (OSError,subprocess.TimeoutExpired) as error:info['problem']='launch_failed';info['stderr_excerpt']=str(error)[:1000]
     info['status']='available' if not info['problem'] else 'unavailable'
     info['scope']='CLI launch only; structured solver reasoning requires a real defect'
     write_receipt(path,info);return info
@@ -74,8 +116,10 @@ def solve(root, directory, task, settings):
     identity_hash=identity(task); done=directory/'result.json'; launch=directory/'launch.json'
     if done.exists():
         result=json.loads(done.read_text())
-        if result.get('task_sha256')!=identity_hash:raise ValueError('Solver task identity changed')
-        return result
+        if retryable_runtime_failure(result,settings):preserve_failed_launch(directory)
+        else:
+            if result.get('task_sha256')!=identity_hash:raise ValueError('Solver task identity changed')
+            return result
     if launch.exists():
         raise RuntimeError('Interrupted solver launch requires explicit ownership recovery; no duplicate invocation')
     write_receipt(directory/'task.json',task);write_receipt(directory/'result-schema.json',RESULT_SCHEMA)
@@ -125,7 +169,7 @@ def solve(root, directory, task, settings):
     reason=None if answer is not None else failure_reason(excerpt,child.returncode,timed_out)
     result=dict(status='answered' if answer is not None else 'needs_solver',task_sha256=identity_hash,
                 answer=answer,exit_code=child.returncode,timed_out=timed_out,seconds=time.time()-started,
-                reason=reason,infrastructure_failure=reason in ('home_unavailable','authentication_unavailable','cli_incompatible'),
+                reason=reason,infrastructure_failure=reason in INFRASTRUCTURE_REASONS,
                 stderr_excerpt=excerpt,runtime=runtime_info,
                 usage=usage,events=str(directory/'events.jsonl'),events_sha256=sha((directory/'events.jsonl').read_bytes()),
                 scope='Solver reasoning is a proposal; only deterministic transformations can modify game code')

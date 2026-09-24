@@ -36,14 +36,16 @@ def transcript_root():
 
 def select_transcript(project):
     candidates=[]; requested=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID')
+    project=project.resolve()
     for path in transcript_root().glob('*/*/*/rollout-*.jsonl'):
         meta=metadata(path)
         if not meta or meta.get('thread_source')!='user' or meta.get('originator')!='Codex Desktop':continue
         try:cwd=Path(meta['cwd']).resolve()
         except (KeyError,OSError):continue
-        if cwd!=project.resolve():continue
         session_id=meta.get('session_id') or meta.get('id')
-        if requested and session_id==requested:return path,meta
+        if requested and session_id==requested and (cwd==project or project.is_relative_to(cwd)):
+            return path,meta
+        if cwd!=project:continue
         candidates.append((path.stat().st_mtime,path,meta))
     if requested:raise ValueError('Current Codex Desktop transcript not found for this project: '+requested)
     if not candidates:raise ValueError('No Codex Desktop user transcript for this project')

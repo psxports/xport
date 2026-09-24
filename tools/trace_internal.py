@@ -146,7 +146,7 @@ def decode(source, output):
                                     'caller': caller, 'packet_hex': payload[24:].hex()})
             else:
                 if (not user and tick != end) or payload != struct.pack('<I', 1):
-                    raise ValueError('Capture did not complete cleanly')
+                    raise ValueError('Recorder completion footer reported failure')
                 complete = True
                 footer_tick = tick
         if not complete:

@@ -12,6 +12,7 @@ def main():
  parser.add_argument('--output',type=Path,default=R/'status/ghidra/classification.json')
  args=parser.parse_args()
  args.output=artifact_path(args.output)
+ exports=project_path('ida_exports','status/ida/images')
  wrappers=[(R/p).resolve() for p in PROJECT.get('analysis',{}).get('wrapper_references',[])]
  texts={str(p):p.read_text(encoding='utf-8-sig') for p in wrappers}
  assert all((args.reports/(image+'.json')).is_file() for image in PROJECT['analysis']['images']), 'Run recognition for both images first'
@@ -19,7 +20,7 @@ def main():
  for file in sorted((args.reports).glob('*.json')):
   if file.stem not in PROJECT['analysis']['images']:continue
   report=read(file);image=report['image'];cfg=read(project_path('ida_configs','tools/ida')/(image+'.json'));load=cfg['loads'][-1];raw=(R/load['path']).read_bytes();payload=raw[load.get('offset',0):];base=load['base'];assert base==report['base'];assert cfg['gp']==report['gp']
-  funcs=read(project_path('ida_exports','status/ida/images')/image/'functions.json');byaddr=collections.defaultdict(list)
+  funcs=read(exports/image/'functions.json');byaddr=collections.defaultdict(list)
   for m in report['matches']:
    pattern=bytes.fromhex(m['pattern']);mask=bytes.fromhex(m['mask']);off=m['address']-base;actual=payload[off:off+len(pattern)]
    assert len(pattern)==len(mask) and off>=0 and len(actual)==len(pattern) and all((a&k)==(b&k) for a,b,k in zip(actual,pattern,mask))
@@ -30,7 +31,9 @@ def main():
    hits=[m for m in byaddr[f['address']] if all(m['object_start']<=a<b<=m['object_end'] for a,b in f['chunks'])]
    if not hits:continue
    names=sorted({m['name'] for m in hits if not m['name'].startswith('text_')})
-   entry=dict(image=image,address=f['address'],original_name=f['name'],sha256=f['sha256'],matches=hits,names=names)
+   listing=(exports/image/'functions'/('%08X.lst'%f['address'])).relative_to(R).as_posix()
+   pseudocode=(exports/image/f['pseudocode']).relative_to(R).as_posix() if f.get('pseudocode') else None
+   entry=dict(image=image,address=f['address'],original_name=f['name'],sha256=f['sha256'],listing=listing,pseudocode=pseudocode,matches=hits,names=names)
    longest=max(m['object_end']-m['object_start'] for m in hits)
    is_bios=any(m['bios'] for m in hits)
    calls=[]

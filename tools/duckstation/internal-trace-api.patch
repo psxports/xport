@@ -297,7 +297,7 @@
    VERBOSE_LOG("Preparing state save took {:.2f} msec", save_timer.GetTimeMilliseconds());
 --- /dev/null
 +++ b/src/core/ff_trace.inl
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,610 @@
 +// Project-configured diagnostics executed on the emulation thread
 +#include <cstdio>
 +#include <cstring>
@@ -620,6 +620,8 @@
 +  if (cursor < start || cursor > profile.gpu_pool_end)
 +    return false;
 +  auto valid = [=](u32 address, u32 size) {
++    if (profile.gpu_full_ram)
++      return address < 0x200000u && size <= 0x200000u - address;
 +    return (address >= ot && address + size <= ot + profile.ot_size) ||
 +           (address >= start && address + size <= cursor);
 +  };
@@ -678,6 +680,14 @@
 +{
 +  std::vector<u8> payload;
 +  Number(payload, pc);
++  const u32 phase_bit = pc == profile.game_begin ? 1u : pc == profile.menu_phase ? 2u :
++                        pc == profile.sequence_phase ? 4u : 8u;
++  if (!(profile.gpu_phase_mask & phase_bit))
++  {
++    Number(payload, 0);
++    Emit(17, tick, payload);
++    return !failed;
++  }
 +  std::unordered_set<u32> seen;
 +  u32 address = Read(profile.ot_pointer) & 0x1fffff;
 +  while (address != profile.ot_end)
@@ -900,7 +910,7 @@
 +}
 --- /dev/null
 +++ b/src/core/xport_trace_profile.inl
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,208 @@
 +// Required project trace profile; no game address defaults
 +struct TraceProfile {
 +  u32 game_begin = 0;
@@ -947,6 +957,8 @@
 +  u32 world_max_count = 0;
 +  u32 ot_size = 0;
 +  u32 pad_size = 0;
++  u32 gpu_phase_mask = 15;
++  u32 gpu_full_ram = 0;
 +};
 +static TraceProfile profile;
 +static std::string profile_text;
@@ -1045,6 +1057,8 @@
 +  candidate.ot_size = ini.GetUIntValue("XportTrace", "ot_size", 0);
 +  if (!ini.ContainsValue("XportTrace", "pad_size")) return false;
 +  candidate.pad_size = ini.GetUIntValue("XportTrace", "pad_size", 0);
++  candidate.gpu_phase_mask = ini.GetUIntValue("XportTrace", "gpu_phase_mask", 15);
++  candidate.gpu_full_ram = ini.GetUIntValue("XportTrace", "gpu_full_ram", 0);
 +  if (candidate.game_begin < 0x80000000u || candidate.game_begin >= 0x80200000u || candidate.game_begin % 4) return false;
 +  if (candidate.game_input_result < 0x80000000u || candidate.game_input_result >= 0x80200000u || candidate.game_input_result % 4) return false;
 +  if (candidate.input_inject < 0x80000000u || candidate.input_inject >= 0x80200000u || candidate.input_inject % 4) return false;
@@ -1085,9 +1099,12 @@
 +  if (!candidate.world_max_count || candidate.world_max_count > 0x200000u) return false;
 +  if (!candidate.ot_size || candidate.ot_size > 0x200000u) return false;
 +  if (!candidate.pad_size || candidate.pad_size > 0x200000u) return false;
++  if (!candidate.gpu_phase_mask || candidate.gpu_phase_mask > 15u) return false;
++  if (candidate.gpu_full_ram > 1u) return false;
 +  if (candidate.world_max_count > 0x200000u / candidate.world_item_size ||
 +      candidate.gpu_pool_low >= candidate.gpu_pool_split || candidate.gpu_pool_split >= candidate.gpu_pool_end ||
-+      candidate.gpu_pool_end > 0x200000u || candidate.ot_end >= 0x200000u) return false;
++      candidate.gpu_pool_end > 0x200000u ||
++      (candidate.ot_end > 0x200000u && candidate.ot_end != 0x00ffffffu)) return false;
 +  if (candidate.actors_size > 0x80200000u - candidate.actors) return false;
 +  if (candidate.camera_size > 0x80200000u - candidate.camera) return false;
 +  if (candidate.menu_state_size > 0x80200000u - candidate.menu_state) return false;

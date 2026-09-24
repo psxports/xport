@@ -7,7 +7,7 @@
   },
   "patch": {
     "path": "internal-trace-api.patch",
-    "sha256": "7209b151c7f439e4b1f7f7ecff03e23d8a8cf3f5a499eae32525b4475ef55e5f"
+    "sha256": "d2d2f9b9eadf4da401077307457f2c4465cd2a33b480c8c08d4b1e0489343111"
   },
   "dependencies": {
     "windows-x64": {

@@ -19,6 +19,7 @@ from trace_schedule import pad_bytes
 import trace_evidence
 from trace_worker import process_identity, alive
 from trace_comparison import validate as validate_capture, compare_capture
+from xport_process import normalized_environment
 
 
 class CaptureFailure(RuntimeError):
@@ -234,8 +235,7 @@ def execute_job(db, name, spec, root, output, compare_only=False, native_only=Fa
                 command = commands[phase]
                 if not isinstance(command, list) or not command or any(not isinstance(s, str) for s in command):
                     raise ValueError('Commands must be explicit argv lists')
-                env = {k.upper(): v for k, v in os.environ.items()}
-                env.update({k.upper(): str(v) for k, v in spec.get('environment', {}).items()})
+                env = normalized_environment(updates={k: str(v) for k, v in spec.get('environment', {}).items()})
                 env.update(FF_AUDIO_OUTPUT='0', FF_RASTERIZE='0', FF_VERIFY_VRAM='0')
                 log = directory/(phase+'.log')
                 db.execute('UPDATE jobs SET phase=? WHERE id=?', (phase, key))

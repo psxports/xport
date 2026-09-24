@@ -9,12 +9,13 @@ import time
 import uuid
 import heapq
 from collections import Counter, defaultdict
+from xport_process import normalized_environment
 
 _parent = ContextVar('operation_parent', default=None)
 
 
 def child_environment(base=None):
-    env=dict(os.environ if base is None else base)
+    env=normalized_environment(base)
     parent=_parent.get() or os.environ.get('XPORT_PARENT_OPERATION')
     if parent:env['XPORT_PARENT_OPERATION']=parent
     return env

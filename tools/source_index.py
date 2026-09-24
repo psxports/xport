@@ -10,13 +10,25 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-source-index-v1'
+PARSER_VERSION='c-source-index-v5'
 IDENT=re.compile(r'\b[A-Za-z_]\w*\b')
 CONTROL={'if','for','while','switch','sizeof','return'}
 KEYWORDS={'auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','restrict','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','_Bool','_Atomic','_Complex'}
 
 
 def sha(data):return hashlib.sha256(data).hexdigest()
+
+
+def source_relative(root,path):
+    return Path(os.path.relpath(path.resolve(),root.resolve())).as_posix()
+
+
+def source_inventory(root):
+    shared=Path(__file__).resolve().parents[1]/'src'
+    roots=[root/'src']
+    if shared.resolve()!=(root/'src').resolve():roots.append(shared)
+    paths={path.resolve() for source_root in roots for path in source_root.rglob('*') if path.is_file() and path.suffix.lower() in ('.c','.h')}
+    return sorted(paths,key=lambda path:source_relative(root,path))
 
 
 def mask_c(text):
@@ -90,10 +102,13 @@ def functions(text,path):
                 start=statement
                 while start<i and masked[start].isspace():start+=1
                 name=name_match.group(1);body=text[start:end+1]
-                markers=[(int(a,16),image) for a,image in re.findall(r'FF_FUNCTION_MARKER\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
+                markers=[(int(a,16),image) for a,image in re.findall(r'\b(?:FF_)?FUNCTION_MARKER\b\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
+                prefix=text[max(0,start-512):start]
+                original_match=re.search(r'/\*\s*Original:\s*([A-Za-z_]\w*?_([0-9A-Fa-f]{8}))\.\s*\*/\s*$',prefix,re.S)
+                originals=[(original_match.group(1),int(original_match.group(2),16))] if original_match else []
                 result.append(dict(path=path,name=name,start=start,end=end+1,
                     start_line=line_number(text,start),end_line=line_number(text,end),
-                    sha256=sha(body.encode()),identifiers=sorted(set(IDENT.findall(mask_c(body)))),markers=markers))
+                    sha256=sha(body.encode()),identifiers=sorted(set(IDENT.findall(mask_c(body)))),markers=markers,originals=originals))
                 i=end+1;statement=i;continue
             depth=1;i+=1;continue
         if c=='{' :depth+=1
@@ -171,10 +186,10 @@ def include_closure(root,relative,texts):
         if current in seen:continue
         seen.add(current);base=(root/current).parent
         for name in re.findall(r'^\s*#\s*include\s*"([^"]+)"',texts[current],re.M):
-            options=[(base/name).resolve(),(root/'src'/name).resolve()]
-            target=next((p for p in options if p.is_file() and p.is_relative_to(root)),None)
+            options=[(base/name).resolve(),(root/'src'/name).resolve(),(Path(__file__).resolve().parents[1]/'src'/name).resolve()]
+            target=next((p for p in options if p.is_file() and source_relative(root,p) in texts),None)
             if target:
-                rel=target.relative_to(root).as_posix()
+                rel=source_relative(root,target)
                 if rel in texts:todo.append(rel)
     return seen
 
@@ -182,6 +197,10 @@ def include_closure(root,relative,texts):
 def select_implementation(entry,candidates):
     address=entry['address'];image=entry['image']
     exact=[f for f in candidates if (address,image) in f['markers']];basis='marker';multiple=False
+    if not exact and entry.get('original_name'):
+        exact=[f for f in candidates if (entry['original_name'],address) in f.get('originals',[])];basis='original_comment'
+    if not exact and entry.get('semantic_name'):
+        exact=[f for f in candidates if f['name']==entry['semantic_name']];basis='ledger_semantic_name'
     if not exact:
         exact=[f for f in candidates if re.fullmatch(r'FUN_(?:SLUS_)?'+f'{address:08X}',f['name'],re.I)];basis='exact_address_symbol'
     if not exact:
@@ -211,9 +230,9 @@ def populate(db,root,ledger):
     CREATE INDEX declaration_name ON source_declarations(name,path);
     ''')
     texts={};parsed={};decls=[]
-    paths=sorted([p for p in (root/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')])
+    paths=source_inventory(root)
     for source in paths:
-        rel=source.relative_to(root).as_posix();raw=source.read_bytes();text=raw.decode('utf-8-sig')
+        rel=source_relative(root,source);raw=source.read_bytes();text=raw.decode('utf-8-sig')
         texts[rel]=text;db.execute('INSERT INTO source_files VALUES(?,?,?,?)',(rel,sha(raw),len(raw),PARSER_VERSION))
         parsed[rel]=functions(text,rel) if source.suffix.lower()=='.c' else []
         decls.extend(declarations(text,rel,source.suffix.lower()=='.h'))
@@ -242,42 +261,55 @@ def populate(db,root,ledger):
     return dict(parser_version=PARSER_VERSION,source_files=len(paths),declarations=len(decls),mapped=mapped,ambiguous=ambiguous,unmapped=unmapped)
 
 
-def incremental_c_refresh(db,root,ledger,changed):
-    """Refresh changed C files and their declaration links in an existing index"""
-    texts={p.relative_to(root).as_posix():p.read_text(encoding='utf-8-sig') for p in (root/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')}
-    affected=[]
+def incremental_source_refresh(db,root,ledger,changed):
+    """Refresh changed sources and their declaration links in an existing index"""
+    texts={source_relative(root,p):p.read_text(encoding='utf-8-sig') for p in source_inventory(root)}
+    affected=set();changed_headers=set()
     for relative in changed:
-        path=root/relative;raw=path.read_bytes();text=raw.decode('utf-8-sig');parsed=functions(text,relative)
+        path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower()=='.h'
+        parsed=[] if is_header else functions(text,relative)
+        if is_header:changed_headers.add(relative)
         declaration_ids=[r[0] for r in db.execute('SELECT id FROM source_declarations WHERE path=?',(relative,))]
         if declaration_ids:
             marks=','.join('?'*len(declaration_ids));db.execute('DELETE FROM implementation_declarations WHERE declaration IN ('+marks+')',declaration_ids)
         db.execute('DELETE FROM source_declarations WHERE path=?',(relative,))
         db.execute('UPDATE source_files SET sha256=?,bytes=?,parser_version=? WHERE path=?',(sha(raw),len(raw),PARSER_VERSION,relative))
-        for item in declarations(text,relative,False):
+        for item in declarations(text,relative,is_header):
             db.execute('INSERT INTO source_declarations(path,name,kind,start_offset,end_offset,start_line,end_line,sha256) VALUES(?,?,?,?,?,?,?,?)',
                 (item['path'],item['name'],item['kind'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256']))
         for entry in ledger:
             rel,_=relative_source(root,entry['source'])
             if rel!=relative:continue
-            image,address=entry['image'],entry['address'];affected.append((image,address,relative))
+            image,address=entry['image'],entry['address'];affected.add((image,address,relative))
             db.execute('DELETE FROM implementation_declarations WHERE image=? AND address=?',(image,address))
             db.execute('DELETE FROM implementation_identifiers WHERE image=? AND address=?',(image,address))
             item,status,basis=select_implementation(entry,parsed)
             if item:
-                values=(item['name'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256'],status,basis,PARSER_VERSION,image,address)
-                db.execute('''UPDATE implementations SET symbol=?,start_offset=?,end_offset=?,start_line=?,end_line=?,body_sha256=?,mapping_status=?,mapping_basis=?,parser_version=?
-                              WHERE image=? AND address=?''',values)
-                db.executemany('INSERT INTO implementation_identifiers VALUES(?,?,?)',[(image,address,name) for name in item['identifiers']])
+                values=(image,address,relative,item['name'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256'],status,basis,PARSER_VERSION)
             else:
-                db.execute('''UPDATE implementations SET symbol=NULL,start_offset=NULL,end_offset=NULL,start_line=NULL,end_line=NULL,body_sha256=NULL,mapping_status=?,mapping_basis=?,parser_version=?
-                              WHERE image=? AND address=?''',(status,basis,PARSER_VERSION,image,address))
+                values=(image,address,relative,None,None,None,None,None,None,status,basis,PARSER_VERSION)
+            db.execute('''INSERT INTO implementations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                          ON CONFLICT(image,address) DO UPDATE SET source_path=excluded.source_path,symbol=excluded.symbol,
+                          start_offset=excluded.start_offset,end_offset=excluded.end_offset,start_line=excluded.start_line,
+                          end_line=excluded.end_line,body_sha256=excluded.body_sha256,mapping_status=excluded.mapping_status,
+                          mapping_basis=excluded.mapping_basis,parser_version=excluded.parser_version''',values)
+            if item:db.executemany('INSERT INTO implementation_identifiers VALUES(?,?,?)',[(image,address,name) for name in item['identifiers']])
+    if changed_headers:
+        closure_cache={}
+        for image,address,relative in db.execute("SELECT image,address,source_path FROM implementations WHERE mapping_status='mapped'"):
+            if relative not in closure_cache:closure_cache[relative]=include_closure(root,relative,texts)
+            if closure_cache[relative]&changed_headers:
+                db.execute('DELETE FROM implementation_declarations WHERE image=? AND address=?',(image,address))
+                affected.add((image,address,relative))
     declaration_ids=defaultdict(list)
     for identifier,path,declaration in db.execute('SELECT name,path,id FROM source_declarations'):
         declaration_ids[identifier].append((declaration,path))
-    for image,address,relative in affected:
+    closure_cache={}
+    for image,address,relative in sorted(affected):
         row=db.execute('SELECT mapping_status FROM implementations WHERE image=? AND address=?',(image,address)).fetchone()
         if not row or row[0]!='mapped':continue
-        allowed=include_closure(root,relative,texts)
+        if relative not in closure_cache:closure_cache[relative]=include_closure(root,relative,texts)
+        allowed=closure_cache[relative]
         identifiers=[r[0] for r in db.execute('SELECT identifier FROM implementation_identifiers WHERE image=? AND address=?',(image,address))]
         links=[]
         for identifier in identifiers:
@@ -293,7 +325,7 @@ def validate_ledger(db,ledger):
 
 
 def indexed_source_changes(db,root):
-    current={p.relative_to(root).as_posix():sha(p.read_bytes()) for p in (root/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')}
+    current={source_relative(root,p):sha(p.read_bytes()) for p in source_inventory(root)}
     indexed=dict(db.execute('SELECT path,sha256 FROM source_files'))
     return current,indexed,sorted(path for path in current if indexed.get(path)!=current[path])
 
@@ -326,7 +358,7 @@ def format_sources(root,relative_paths):
     return dict(files=paths,trimmed_files=trimmed,formatter=version,style_sha256=sha(style.read_bytes()))
 
 
-def rebuild():
+def rebuild(format_changed=True):
     """Atomically add the derived source index to an otherwise valid analysis database"""
     from xport_project import load_project, project_path
     root,_=load_project();source=project_path('analysis_database','status/analysis.sqlite');temporary=source.with_suffix('.source-index.tmp')
@@ -343,21 +375,34 @@ def rebuild():
         if required<=tables:
             current,indexed,changed=indexed_source_changes(db,root)
             style=Path(__file__).resolve().parents[1]/'src/.clang-format';style_changed=metadata.get('source_format_style_sha256')!=sha(style.read_bytes())
-            formatting=format_sources(root,sorted(current) if style_changed else changed)
-            current,indexed,changed=indexed_source_changes(db,root)
+            if format_changed:
+                formatting=format_sources(root,sorted(current) if style_changed else changed)
+                current,indexed,changed=indexed_source_changes(db,root)
+            else:
+                formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha(style.read_bytes()))
         else:formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha((Path(__file__).resolve().parents[1]/'src/.clang-format').read_bytes()))
-        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and metadata.get('source_index_ledger_sha256')==ledger_sha and set(current)==set(indexed) and all(path.lower().endswith('.c') for path in changed)
+        indexed_mappings={(image,address):source for image,address,source in db.execute('SELECT image,address,source_path FROM implementations')} if required<=tables else {}
+        ledger_mappings={(entry['image'],entry['address']):relative_source(root,entry['source'])[0] for entry in ledger}
+        mapping_changes=set(indexed_mappings)^set(ledger_mappings)
+        mapping_changes.update(key for key in set(indexed_mappings)&set(ledger_mappings) if indexed_mappings[key]!=ledger_mappings[key])
+        changed=sorted(set(changed)|{ledger_mappings[key] for key in mapping_changes if key in ledger_mappings}) if isinstance(changed,list) else changed
+        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and all(path.lower().endswith(('.c','.h')) for path in changed)
         if can_increment:
-            affected=incremental_c_refresh(db,root,ledger,changed) if changed else 0
+            removed=set(indexed_mappings)-set(ledger_mappings)
+            for image,address in removed:
+                db.execute('DELETE FROM implementation_declarations WHERE image=? AND address=?',(image,address))
+                db.execute('DELETE FROM implementation_identifiers WHERE image=? AND address=?',(image,address))
+                db.execute('DELETE FROM implementations WHERE image=? AND address=?',(image,address))
+            affected=incremental_source_refresh(db,root,ledger,changed) if changed else 0
             summary=mapping_summary(db);summary.update(mode='incremental' if changed else 'unchanged',changed_files=changed,affected_functions=affected)
         else:
             db.executescript('''DROP TABLE IF EXISTS implementation_declarations; DROP TABLE IF EXISTS implementation_identifiers;
                                 DROP TABLE IF EXISTS implementations; DROP TABLE IF EXISTS source_declarations; DROP TABLE IF EXISTS source_files;''')
             summary=populate(db,root,ledger);summary.update(mode='full',changed_files=sorted(changed) if isinstance(changed,list) else [])
-        db.execute("INSERT OR REPLACE INTO metadata VALUES('schema_version','3')")
+        db.execute("INSERT OR REPLACE INTO metadata VALUES('schema_version','4')")
         db.execute("INSERT OR REPLACE INTO metadata VALUES('source_index_parser',?)",(PARSER_VERSION,))
         db.execute("INSERT OR REPLACE INTO metadata VALUES('source_index_ledger_sha256',?)",(ledger_sha,))
-        db.execute("INSERT OR REPLACE INTO metadata VALUES('source_format_style_sha256',?)",(formatting['style_sha256'],))
+        if format_changed:db.execute("INSERT OR REPLACE INTO metadata VALUES('source_format_style_sha256',?)",(formatting['style_sha256'],))
         if formatting['formatter']:db.execute("INSERT OR REPLACE INTO metadata VALUES('source_formatter_version',?)",(formatting['formatter'],))
         summary.update(formatted_files=formatting['files'],trimmed_files=formatting['trimmed_files'],formatter=formatting['formatter'],format_style_sha256=formatting['style_sha256'])
         db.commit()

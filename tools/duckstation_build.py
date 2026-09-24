@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.request
 import uuid
+from xport_process import normalized_environment
 
 
 DEV_SUFFIXES = {'.exp', '.ilk', '.iobj', '.ipdb', '.lib', '.pdb'}
@@ -32,7 +33,7 @@ def atomic_json(path, value):
 
 
 def command(argv, cwd=None, capture=True, log=None):
-    kwargs = dict(cwd=cwd, env=os.environ.copy(), text=log is None)
+    kwargs = dict(cwd=cwd, env=normalized_environment(), text=log is None)
     if log is not None:
         kwargs.update(stdout=log, stderr=subprocess.STDOUT)
     elif capture:
