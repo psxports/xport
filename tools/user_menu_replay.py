@@ -117,6 +117,8 @@ def capture(config_path):
                        PHASE_CHECKPOINT_INTERVAL=str(config.get('checkpoint_interval',300)))
     if config.get('progress_path'):
         options['PROGRESS_PATH'] = config['progress_path']
+    if config.get('bios'):
+        options['BIOS_IMAGE'] = config['bios']
     if 'input_calls' in config:
         options.update(TRACE_INPUT_CALLS=config['input_calls'], MENU_PHASE_COUNT=str(config['phase_count']),
                        AUDIT_END_TICK=str(config.get('end_tick',900)))

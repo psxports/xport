@@ -9,6 +9,7 @@ Do not read `docs/*.md` at task start. Open only the one file this contract rout
 ## Invariants
 
 - Original images, exports, traces and evidence are immutable inputs. C is a tested translation, never authority
+- Native replay must identity-bind every external memory image it maps, including a project-configured BIOS when translated code can read BIOS data; pass the exact bound path through the owned capture environment rather than embedding proprietary ROM bytes or relying on an untracked host default
 - IDA pseudocode is the sufficient structural reference for the first full C coverage pass. Preserve its useful control/data-flow shape, but derive and correct immediates, signedness, delay slots, ABI, branches, calls and memory effects from original MIPS bytes/SQL; MIPS remains the evidence and later replay establishes behavior
 - Status authority: project ledger plus `status/analysis.sqlite`. Do not infer DONE from source presence, compilation, similarity, a fixture or a narrow replay
 - Preserve unrelated user changes. Shared tooling belongs in `[XPORT_ROOT]/tools`, the mandatory PSX/PsyQ host runtime belongs in `[XPORT_ROOT]/src`, and game facts belong in project `AGENTS.md`

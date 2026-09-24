@@ -300,6 +300,9 @@ def run(args):
                          packet_sha256=digest(Path(__file__).with_name('trace_diagnostic_packet.py')),
                          converter_inputs=conversion,converter_sha256=digest(Path(__file__).with_name('trace_stage_convert.py')),
                          anchor_sha256=key(selected_anchor) if selected_anchor and (args.anchor or conversion is None) else None)
+        bios = project_path('bios_image') if project.get('paths', {}).get('bios_image') else None
+        if bios:
+            request_id['bios_sha256'] = digest(bios)
         verification_names=('trace_stage_verify','trace_stage_difference','trace_phase_index','trace_actor_diff','trace_bundle','trace_phases','gpu_packet_semantics')
         verification_identity={name:digest(Path(__file__).with_name(name+'.py')) for name in verification_names}
         publication_identity={name:digest(Path(__file__).with_name(name+'.py')) for name in ('trace_stage_registry','render_progress','trace_stage_cleanup')}
@@ -417,6 +420,8 @@ def run(args):
                     progress_boundaries=artifacts['boundaries'],
                     progress=dict(segment=0,stage=segment['stage'],tick=segment['start_tick'],tick_end=segment['end_tick'],
                                   phase=segment['start_phase'],phase_end=segment['end_phase']))
+                if bios:
+                    config['bios'] = str(bios)
                 (folder/'native-checkpoints').mkdir(exist_ok=True)
                 write_receipt(folder/'capture.json',config)
                 config_paths=[str(folder/'capture.json')]
@@ -433,6 +438,8 @@ def run(args):
                         progress_boundaries=artifacts['boundaries'],
                         progress=dict(segment=ordinal,stage=segment['stage'],tick=segment['start_tick'],tick_end=segment['end_tick'],
                                       phase=segment['start_phase'],phase_end=segment['end_phase']))
+                    if bios:
+                        config['bios'] = str(bios)
                     config_path=prefix/'capture.json';prefix.mkdir(parents=True,exist_ok=True);write_receipt(config_path,config);config_paths.append(str(config_path))
                 write_receipt(folder/'capture.json',{'schema':1,'segments':config_paths})
             source_session=json.loads(Path(plan['session']).read_text())
@@ -442,6 +449,8 @@ def run(args):
                         project=str(root/'xport-project.json'),collector=str(Path(__file__).with_name('user_menu_replay.py')),
                         runner=str(Path(__file__).resolve()),phase_metadata=str(decoded/'phase-boundaries.json'),
                         input_metadata=str(decoded/'game-input-calls.json'))
+            if bios:
+                deps['bios'] = str(bios)
             for ordinal,(item,config_path) in enumerate(zip(anchors,config_paths)):
                 deps['checkpoint_'+str(ordinal)]=item['checkpoint'];deps['context_'+str(ordinal)]=item['context'];deps['config_'+str(ordinal)]=config_path
                 deps['pad_'+str(ordinal)]=artifacts.get('pad_segment_'+str(ordinal),artifacts['pad'])
