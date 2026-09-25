@@ -57,6 +57,10 @@ def validation(name):
 def diagnosis(name):
     folder=artifact_path('status/stage-pipeline/workers')/name
     handoff=read(folder/'handoff.json') or {}
+    attention=read(folder/'attention.json')
+    if attention is not None:
+        attention['path']=str(folder/'attention.json')
+        return bounded(attention,10000)
     result={k:handoff.get(k) for k in ('status','first_difference','terminal_failure','verified_prefix_end',
         'channel_context','audit','candidate_audits','data_references','diagnostic','repair','error')}
     result['handoff']=str(folder/'handoff.json')

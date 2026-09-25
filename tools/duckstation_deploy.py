@@ -5,9 +5,8 @@ import json
 from pathlib import Path
 import shutil
 import socket
-from project_init import reservations, allocation_lock
 from trace_cache import digest
-from xport_project import load_project
+from xport_project import allocation_lock, load_project, reservations
 from duckstation_runtime import data_directory
 
 

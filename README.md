@@ -7,6 +7,6 @@
 - Upgrade workflow: `tools/docs/UPGRADING.md`
 - One-time shared dependency preparation: `tools/prepare.bat`
 
-New-project trigger: `Prepare project FULL_NAME (SHORT) according to STARTUP.md`. Require the user-supplied full name and exact short native name; never infer the short name.
+New-project command: `startup FULL_NAME SHORT_NAME`. It launches the single `tools/startup.py` supervisor in the current Codex project directory; `STARTUP.md` defines its revisioned attention protocol. Require both user-supplied names and never infer the short name. The former `Prepare project FULL_NAME (SHORT_NAME) according to STARTUP.md` phrase remains an equivalent trigger.
 
 Upgrade trigger: `upgrade`. Resolve and execute the bounded changelog delta through `X upgrade` as specified by `tools/docs/UPGRADING.md`.

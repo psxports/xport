@@ -16,6 +16,11 @@ def main():
     parser.add_argument('tool', help='Shared script name or doctor')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.tool.removesuffix('.py') == 'startup':
+        parser.error('Run startup.py directly because a new project has no xport-project.json')
+    removed = {'project_init', 'ida_accept', 'ghidra_recognize'}
+    if args.tool.removesuffix('.py') in removed:
+        parser.error('This startup-only stage is owned by startup.py')
     root, config = load_project(args.project)
     os.environ['XPORT_PROJECT'] = str(root)
     if args.tool == 'doctor':

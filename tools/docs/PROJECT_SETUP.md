@@ -31,12 +31,10 @@ Normative extension of `../PIPELINE.md`. Read this file only when that contract 
 
 Before running any initializer, ask the user for both the human-readable project name and an explicit short native name. Never derive, abbreviate or silently normalize the short name. It must start with an ASCII letter, contain only ASCII letters, digits or underscores and be at most 16 characters. The exact value names the solution, project and executable; for example full name `Fighting Force`, short name `FF` produces `FF.sln`, `FF.vcxproj` and `FF.exe`.
 
-Run from the workspace parent; keep projects as siblings so port reservations can be discovered:
+Run the single startup supervisor from the shared toolset. It allocates sibling-aware ports, creates the scaffold, runs diagnosis/build, and continues through all startup gates:
 
 ```powershell
-python -B xport/tools/project_init.py --root [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
-python -B xport/tools/xport.py --project [PROJECT_ROOT] doctor
-python -B xport/tools/xport.py --project [PROJECT_ROOT] build_native
+python -B [XPORT_ROOT]/tools/startup.py start --project [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
 ```
 
 Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports and creates a compilable VS2022 v143 `Debug|Win32` C console skeleton. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=768` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer also creates a project `AGENTS.md` routing stub, the empty translation ledger and configures `code_refresh` to build the short-name solution. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
@@ -44,7 +42,7 @@ Initialization refuses every file it would overwrite, locks allocation, checks s
 Standard layout:
 
 - `src/`: Platform-neutral C game implementation and `.h` declarations; preserve guest widths/addresses. The initializer creates `src/game_main.c` with the required game entry/bindings; game code includes the shared `[XPORT_ROOT]/src/xport.h` for the complete Xport contract, fixed-width types and `FUNCTION_MARKER` and must not create a project copy or auxiliary `xport_*.h` contract header.
-- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`; VS2022 v143 Debug x86, compiled as C. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
+- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`; VS2022 v143 Debug x86, compiled as C. The solution platform is `x86` and maps to the vcxproj `Win32` platform; configured solution builds must pass `x86`. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
 - `bin/`: Native Working Directory. The build output is exactly `bin/[SHORT].exe`, directly under `bin`.
   - `bin/DATA/`: Runtime game data extracted from the first, data track of the CD image.
   - `bin/MUSIC/`: Decimal-name IMA ADPCM WAV tracks generated from the CD audio tracks by `X convert_music`; never place them under `bin/DATA`.
@@ -73,21 +71,19 @@ Prerequisites: Python >=3.10; Capstone for independent MIPS export; VS2022 v143 
 
 Gate: pin source image/disc hashes and provenance, identify executable/overlays, configure paths/ports, confirm build configuration and language decision. Do not infer C++ from an object pointer or C from absent vtables; record evidence or the user's explicit language decision.
 
+### Red Book conversion
+
+Run only `X convert_music`. It reads the single configured CUE, starts each `AUDIO` track at `INDEX 01`, and writes decimal track names under the configured music output using the pinned shared ADPCM-XQ encoder. Missing or ambiguous CUE data, non-sector-aligned audio and unexpected output format fail closed. Use input/output overrides only for a recorded project exception.
+
+Projects with no reviewed Red Book tracks set `capabilities.redbook_audio.enabled=false` with a stable reason. The command still validates the CUE and returns `not_applicable` only when it contains no `AUDIO` tracks. XA-ADPCM inside a data track is game data, not converter input.
+
 ## 2. Export original code; establish SQL
 
 1. Identify each executable/overlay revision. Record SHA-256, file segments/offsets, load addresses, entry, GP and overlay residency. Identity is `(image revision, virtual address)`, never name/address alone.
 2. Create `tools/ida/[IMAGE].json`: `image`, `entry`, `gp`, `segments` (`start/end/name/class`), `loads` (`path/base/offset`), `seeds`, `code_ranges`, optional `external_symbols`. Use actual image facts. IDA auto names are not debug symbols.
-3. Prepare then run export into a fresh label:
+3. Supply the licensed IDA path and reviewed image profiles through the current startup attention packet. The supervisor plans under `startup-ida-plan`, executes under `startup-ida-v1`, canonicalizes, and accepts the result as one guarded gate.
 
-```powershell
-X ida_export --ida [IDA]/idat.exe --image [IMAGE] --label export-v1 --plan
-# Review prepared commands/config; execute under another fresh label:
-X ida_export --ida [IDA]/idat.exe --image [IMAGE] --label export-v2
-X ida_canonicalize --exports status/ida/runs/export-v2 --configs status/ida/runs/export-v2
-X ida_accept --label export-v2
-```
-
-`--export-existing` copies a database from `paths.ida_databases` (default `tools/ida/databases`) into the new run before exporting; never overwrite manual IDA work. New exports/IDB/logs remain in the run directory. `ida_accept` is the only normal publication path into the configured immutable `paths.ida_exports` tree (new projects use `orig/images`). It requires canonical byte verification, complete per-function artifacts, absent destination image directories and writes a complete hash receipt without deleting the labelled run. It never replaces a prior accepted image; a re-analysis needs a new reviewed input root/migration rather than overwriting evidence. Existing integration targets IDA 7.7 MIPS little endian; validate another version. Current importer/canonicalizer use the final load entry as code image: split-code multi-load images require an explicit mapping extension, not guessed offsets.
+Startup's acceptance gate is the only normal publication path into the configured immutable `paths.ida_exports` tree (new projects use `orig/images`). It requires canonical byte verification, complete per-function artifacts, absent destination image directories and writes a complete hash receipt without deleting the labelled run. It never replaces a prior accepted image; re-analysis needs a new reviewed input root/migration rather than overwriting evidence. Existing integration targets IDA 7.7 MIPS little endian, pins every declared PSX code range to MIPS32 and normalizes any locally inferred MIPS16 instruction heads back to aligned 32-bit words before export; validate another version. The importer/canonicalizer use the final load entry as code image: split-code multi-load images require an explicit mapping extension, not guessed offsets.
 
 Canonical output for every accepted `orig/images/[IMAGE]`:
 
@@ -98,18 +94,17 @@ Canonical output for every accepted `orig/images/[IMAGE]`:
 - `functions.json`, `export-report.json`, call/data/symbol JSON and decompilation failures: machine-readable boundaries, raw words, provenance and gaps.
 
 4. Inspect export failures, chunks, raw instructions and source-byte verification. Canonicalization adds independently decoded MIPS words/delay-slot flags and checks bytes/hashes; it does not prove boundaries or pseudocode semantics. Preserve undecoded words and data/code ambiguities.
-5. Set accepted `paths.ida_exports` and matching `paths.ida_configs`. Run:
+5. Set accepted `paths.ida_exports` and matching `paths.ida_configs`. Startup owns database construction, independent similarity validation and initial progress rendering. After startup, rebuild derived views with:
 
 ```powershell
 X build_database
-X validate_similarity
 X render_progress
 X query 0xADDRESS --image [IMAGE]
 ```
 
 Gate: SQL integrity/foreign-key checks; all functions/errors inventoried; source hashes match; duplicate evidence validated. Progress is generated from SQL, not independent manually edited counts.
 
-Required PsyQ initial analysis: `X ghidra_recognize --ghidra INSTALL --plugin PSX_PLUGIN --image [IMAGE] --label psyq-v1 [--plan]` invokes the shared `tools/ghidra/RecognizePsyq.java` post-script against the installed PSX plugin signature data. It exports auditable masked candidates and applied symbols for every configured executable image. Then run `X psyq_classify --reports status/ghidra/runs/psyq-v1 --output status/ghidra/classification.json`, review both `accepted` and `pending`, select the result through `paths.sdk_classification`, and run `X build_database`. If Ghidra or the plugin is unavailable, record this gate as blocked/deferred; never silently omit it.
+Required PsyQ initial analysis is a startup-owned gate. The supervisor invokes the shared `tools/ghidra/RecognizePsyq.java` post-script against the installed PSX plugin signature data, classifies auditable masked candidates, then pauses for review of both `accepted` and `pending`. It selects the reviewed result through `paths.sdk_classification` before database construction. If Ghidra or the plugin is unavailable, the gate remains blocked; never silently omit it.
 
 SKIP is applied only by the reviewed classification merge, not by editing generated IDA files or recognizing a familiar instruction sequence by eye. The classifier rechecks masked bytes against the original image, requires the IDA function entry to match a recognized label and every IDA chunk to fit within the matched PsyQ object. Short generic signatures, unresolved callees and conflicting aliases remain `pending`/TODO. Accepted entries record `image`, `address`, alias, exact `.lst` and pseudocode paths, matched objects/versions, hashes, reason and wrapper status. `build_database` imports these entries as SKIP while preserving original IDA names and TODO discovery snapshots.
 
@@ -142,7 +137,7 @@ After every edit to project `.c`/`.h`, `X code_refresh` is a mandatory completio
 
 Do not emit standalone `(void)parameter;` statements solely to suppress unused formal-parameter warnings; they consume source and audit-context budget without preserving game behavior. Configure the project compiler to ignore only that warning (MSVC `/wd4100`; equivalent targeted option on other compilers). Keep unused-local and other warnings enabled. `X code_refresh` rejects newly present standalone casts whose identifier belongs to the containing function signature. Preserve `(void)function_call()` and other expressions with possible side effects
 
-`X query 0xADDRESS --image IMAGE --audit-context [--budget 12000] [--source-line N] [--mips-address 0xSITE] [--pseudo-line N] [--full-source]` returns one content-bound context instead of making the agent search whole `.c/.h` files. It includes the exact C body when it fits, only lexically referenced declarations in the source include closure, bounded MIPS/IDA, callers/callees, reuse candidates, evidence and explicit gaps. Default output is 4–64 KiB bounded; oversized bodies return an exact path/range/hash plus a selected window. `--full-source` returns the entire body only if the requested budget can contain it and otherwise fails. A changed indexed file fails with an instruction to refresh the index; no mtime trust
+`X query 0xADDRESS --image IMAGE --audit-context [--budget 12000] [--source-line N] [--mips-address 0xSITE] [--pseudo-line N] [--full-source]` returns one content-bound context instead of making the agent search whole `.c/.h` files. It includes the exact C body when it fits, only lexically referenced declarations in the source include closure, bounded MIPS/IDA, callers/callees, reuse candidates, evidence and explicit gaps. A TODO function with no implementation-index row returns an explicit unmapped implementation and the original audit context so its first translation can follow the same gate. Default output is 4–64 KiB bounded; oversized bodies return an exact path/range/hash plus a selected window. `--full-source` returns the entire body only if the requested budget can contain it and otherwise fails. A changed indexed file fails with an instruction to refresh the index; no mtime trust
 
 `X source_context 0xADDRESS --image IMAGE [the same selection options] [--output status/CONTEXT.json]` is the standalone form. Prefer `query --audit-context` for interactive audit and `--output` for retained evidence. Interactive stdout is compact single-line JSON to avoid spending context on indentation; retained evidence files remain readable formatted JSON. Declaration matches are lexical candidates, not proof of runtime use or type correctness. Conditional duplicate declarations may remain visible because this index does not run the platform preprocessor
 

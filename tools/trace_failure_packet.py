@@ -14,8 +14,9 @@ def failure_packet(folder):
             for line in path.open(encoding='utf-8'):
                 try: row=json.loads(line)
                 except ValueError:continue
-                if row.get('event')=='wip':events=[row]
+                if row.get('event')=='wip':events.append(row)
     event=events[-1] if events else {}
+    causal_event=next((row for row in reversed(events) if row.get('pc') not in (None,'00000000','0')),event)
     log=folder/'capture.log'
     tail=''
     if log.exists():
@@ -26,7 +27,7 @@ def failure_packet(folder):
     if callbacks:
         target,obj,kind,tick=callbacks[-1]
         event['callback']=dict(target=target,object=obj,kind=kind,tick=int(tick))
-    site=int(event['pc'],16) if event.get('pc') else int(sites[-1],16) if sites else None
+    site=int(causal_event['pc'],16) if causal_event.get('pc') else int(sites[-1],16) if sites else None
     receipt=json.loads((folder/'capture-receipt.json').read_text())
     spec=json.loads((folder/'manifest.json').read_text())
     ordinal=None
@@ -36,7 +37,7 @@ def failure_packet(folder):
         if len(candidates)==1:ordinal=candidates[0]
     checkpoints=[c for c in receipt.get('checkpoints',[]) if ordinal is not None and c['ordinal']<=ordinal]
     selected=max(checkpoints,key=lambda c:c['ordinal']) if checkpoints else None
-    result=dict(status='NEEDS_CODE',kind='capture_failure',event=event,pc=hex(site) if site else None,
+    result=dict(status='NEEDS_CODE',kind='capture_failure',event=event,causal_event=causal_event,pc=hex(site) if site else None,
         ordinal=ordinal,build=receipt.get('exe_sha256'),checkpoint=selected,
         signature=dict(pc=site,stage=event.get('stage'),actors=[(a.get('slot'),a.get('state')) for a in event.get('actors',[])]),
         log=str(log),tail=tail[-1600:],audit=None)

@@ -139,7 +139,28 @@ def capture(config_path):
         with subprocess.Popen([str(executable), *arguments],
                 cwd=project_path('native_working_directory','bin'),env=child_environment(env),
                 creationflags=subprocess.CREATE_NO_WINDOW,stdout=subprocess.PIPE,stderr=subprocess.STDOUT) as child:
-            output,_=child.communicate()
+            wip_path = Path(config_path).parent/'wip.jsonl'
+            fatal_wip = None
+            while True:
+                try:
+                    output,_=child.communicate(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    try:
+                        rows = [json.loads(line) for line in wip_path.read_text().splitlines() if line.strip()]
+                    except (OSError,ValueError):
+                        rows = []
+                    fatal_wip = next((row for row in reversed(rows)
+                                      if row.get('event') == 'wip' and row.get('continued') is False), None)
+                    if not fatal_wip:
+                        continue
+                    child.kill()
+                    output,_=child.communicate()
+                    marker = 'Fatal guard or unclassified WIP: {pc} {function} {fallback}\n'.format(
+                        pc=fatal_wip.get('pc','unknown'), function=fatal_wip.get('function','unknown'),
+                        fallback=fatal_wip.get('fallback','unknown')).encode()
+                    output = (output or b'') + marker
+                    break
             metrics.update(process_counters(child._handle),pid=child.pid,output_bytes=len(output),exit_code=child.returncode)
             result=subprocess.CompletedProcess(child.args,child.returncode,output)
     log = result.stdout.decode(errors='replace')

@@ -55,9 +55,8 @@ def card(name):
     name_check(name)
     return dict(trace=name,commands={
         'begin':f'X trace_workflow converge {name} --wait 30',
-        'run_or_repair':f'X trace_workflow converge {name} --wait 30',
-        'fast_iteration':f'X trace_workflow iterate {name} --wait 30',
-        'observe':f'X trace_workflow status {name} --operation converge --wait 30',
+        'submit_repair':f'X trace_workflow submit-repair {name} --manifest status/repair-manifest.json --wait 30',
+        'observe_transition':f'X trace_workflow status {name} --operation converge --after-revision REVISION --wait 30',
         'summary':f'X trace_report --name {name} --view completion',
         'diagnosis':f'X trace_report --name {name} --view diagnosis',
         'record_metrics':f'X trace_report --name {name} --view recording',
@@ -76,7 +75,7 @@ def card(name):
         rules=['Read project AGENTS.md and shared PIPELINE.md; no old chat history by default',
                'Inspect first_difference before terminal_failure',
                'If the causal function is TODO, translate its complete image-qualified TODO dependency branch before replay',
-               'Use run_or_repair after a code fix; it performs the cross-build probe and full verification',
+               'Use submit_repair exactly once after a complete issued branch; it owns fast and full verification',
                'Never weaken acceptance or use a partial diagnostic as MATCH',
                'Only inspect bounded evidence needed for the current defect'])
 

@@ -176,7 +176,7 @@ def worker(path):
     return 0 if request['status'] in ('recording','complete') else 1
 
 
-def converge(name, wait, telemetry, fast_iteration=False):
+def converge(name, wait, telemetry):
     name_check(name)
     root,_=load_project()
     session=artifact_path('status/user-traces')/name/'session.json'
@@ -192,31 +192,24 @@ def converge(name, wait, telemetry, fast_iteration=False):
             raise ValueError('Converge telemetry belongs to another active thread; observe the existing operation')
         if prior is None or prior.get('trace')!=name or boundary(prior,time.time())[1]:start(name)
     from trace_converge_worker import control
-    if fast_iteration:
-        current=control(name,'status',0)
-        if current.get('status')=='running':return current
-        command=[sys.executable,'-B',str(Path(__file__).with_name('xport.py')),'--project',str(root),'code_refresh_fast']
-        refresh=subprocess.run(command,cwd=root,capture_output=True,text=True,errors='replace')
-        if refresh.returncode:
-            return dict(status='attention_required',error='Fast refresh failed',output=(refresh.stdout+refresh.stderr)[-4000:])
-    result=control(name,'start',wait,final_gate_on_match=fast_iteration)
-    if fast_iteration:result['refresh']='provisional_build_only'
+    result=control(name,'start',wait)
     result['telemetry']='Codex session plus pipeline' if telemetry=='codex' else 'Pipeline only; no agent transcript attribution requested'
     return result
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',nargs='?',choices=('record','stop','converge','iterate','status'))
+    p.add_argument('action',nargs='?',choices=('record','stop','converge','iterate','submit-repair','status'))
     p.add_argument('values',nargs='*');p.add_argument('--worker',type=Path)
     p.add_argument('--wait',type=float,default=30);p.add_argument('--telemetry',choices=('codex','none'),default='codex')
     p.add_argument('--operation',choices=('record','stop','converge'),default='record')
+    p.add_argument('--manifest',type=Path);p.add_argument('--after-revision',type=int)
     a=p.parse_args();root,config=load_project()
     if a.worker:return worker(a.worker)
     if not 0<=a.wait<=60:p.error('Wait must be 0..60 seconds')
     try:
         capability=config.get('capabilities',{}).get('trace_workflow',{'enabled':True})
-        if a.action in ('record','converge','iterate') and not capability.get('enabled',True):
+        if a.action in ('record','converge','iterate','submit-repair') and not capability.get('enabled',True):
             raise ValueError('TRACE_WORKFLOW_DISABLED: '+capability.get('reason','project trace workflow is disabled'))
         if a.action=='record' and len(a.values)==2:
             result=launch(root,config,'record',a.values[1],int(a.values[0]),a.wait)
@@ -224,19 +217,23 @@ def main():
             name=choose_stop(root,a.values[0] if a.values else None)
             result=launch(root,config,'stop',name,None,a.wait) if name else dict(status='idle',reason='No active recording')
         elif a.action=='converge' and len(a.values)==1:result=converge(a.values[0],a.wait,a.telemetry)
-        elif a.action=='iterate' and len(a.values)==1:result=converge(a.values[0],a.wait,a.telemetry,True)
+        elif a.action=='submit-repair' and len(a.values)==1 and a.manifest:
+            from trace_supervisor_protocol import submit
+            result=submit(name_check(a.values[0]),a.manifest,a.wait)
+        elif a.action=='iterate' and len(a.values)==1:
+            result=dict(status='attention_required',error='iterate is absorbed by submit-repair; use the issued attention.json and a repair manifest')
         elif a.action=='status' and len(a.values)==1:
             name=name_check(a.values[0])
             if a.operation=='converge':
                 from trace_converge_worker import control
-                result=control(name,'status',a.wait)
+                result=control(name,'status',a.wait,after_revision=a.after_revision)
             else:result=observe(artifact_path('status/workflow')/(a.operation+'-'+name+'.json'),a.wait)
-        else:p.error('Use record SLOT NAME, stop [NAME], converge NAME, iterate NAME, or status NAME --operation OP')
+        else:p.error('Use record SLOT NAME, stop [NAME], converge NAME, submit-repair NAME --manifest PATH, or status NAME --operation OP')
     except (ValueError,OSError,RuntimeError,subprocess.SubprocessError) as error:
         result=dict(status='attention_required',error=str(error))
     from trace_context import bounded
     print(json.dumps(bounded(result,10000),separators=(',',':')))
-    return 0 if result['status'] in ('recording','complete','MATCH','running','launching','idle') else 1
+    return 0 if result['status'] in ('recording','complete','MATCH','running','launching','idle','unchanged') else 1
 
 
 if __name__=='__main__':raise SystemExit(main())

@@ -12,7 +12,7 @@ def validate(db):
     by_id={f['id']:f for f in functions}
     expected={}
     eligible=0
-    # Deliberately use all combinations, not the optimized sorted window.
+    # Deliberately use all combinations, not the optimized sorted window
     for a,b in itertools.combinations(functions,2):
         if abs(a['size']-b['size'])>=16:
             continue

@@ -1,10 +1,62 @@
 """Resolve explicit project configuration independently of the shared tool location"""
+from contextlib import contextmanager
+import ctypes
+from ctypes import wintypes
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 
 CONFIG_NAME = 'xport-project.json'
+
+
+@contextmanager
+def allocation_lock(workspace):
+    if os.name != 'nt':
+        yield
+        return
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    name = 'Local\\xport-ports-'+hashlib.sha256(str(Path(workspace).resolve()).casefold().encode()).hexdigest()
+    handle = kernel.CreateMutexW(None, False, name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    acquired = False
+    try:
+        result = kernel.WaitForSingleObject(handle, 30000)
+        if result not in (0, 0x80):
+            raise RuntimeError('Xport port allocation is busy; retry without changing reservations')
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
+
+
+def reservations(workspace):
+    used = {}
+    for path in sorted(Path(workspace).glob('*/'+CONFIG_NAME)):
+        config = json.loads(path.read_text(encoding='utf-8-sig'))
+        settings = config.get('duckstation', {})
+        ports = settings.get('reserved_gdb_ports', {})
+        values = list(ports.values())
+        if len(set(values)) != len(values):
+            raise ValueError('Duplicate runtime role ports: '+str(path))
+        if 'gdb_port' in settings:
+            values.append(settings['gdb_port'])
+        for port in set(values):
+            if type(port) is not int or not 1024 <= port <= 65535:
+                raise ValueError('Invalid reserved GDB port: '+str(path))
+            if port in used:
+                raise ValueError('Conflicting GDB port '+str(port)+': '+str(used[port])+' and '+str(path))
+            used[port] = path
+    return used
 
 
 def load_project(root=None):

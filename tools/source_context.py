@@ -74,8 +74,8 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
         function=db.execute('SELECT * FROM functions WHERE image=? AND address=?',(image,address)).fetchone()
         if not function:raise ValueError('Function entry not found for image/address')
         implementation=db.execute('SELECT * FROM implementations WHERE image=? AND address=?',(image,address)).fetchone()
-        if not implementation:raise ValueError('Implementation index entry is absent')
-        impl=dict(implementation);body=None;body_view=None
+        impl=dict(implementation) if implementation else dict(source_path=None,mapping_status='unmapped',mapping_basis='No implementation index entry')
+        body=None;body_view=None
         if impl['mapping_status']=='mapped':
             body=slice_record(root,db,implementation,cache);lines=body.splitlines()
             body_view=dict(path=impl['source_path'],symbol=impl['symbol'],start_line=impl['start_line'],end_line=impl['end_line'],sha256=impl['body_sha256'],complete=True,text=body)
