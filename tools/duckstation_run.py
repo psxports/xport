@@ -3,10 +3,10 @@ import argparse
 import configparser
 import json
 from pathlib import Path
-import subprocess
 import time
 from xport_project import load_project, project_path
-from duckstation_runtime import executable, data_directory, environment, validate_settings, record_owner, verify_owner
+from duckstation_runtime import (executable, data_directory, environment, launch_process,
+                                 validate_settings, record_owner, verify_owner)
 from gdb_endpoint import listener_process
 
 
@@ -83,10 +83,7 @@ def main():
     ini['Main']['EmulationSpeed']='1' if args.visible else '0'
     ini['BIOS']['PatchFastBoot']='true'
     with (data/'settings.ini').open('w',encoding='utf-8') as stream:ini.write(stream)
-    startup=subprocess.STARTUPINFO()
-    if not args.visible:
-        startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
-    process=subprocess.Popen(command,cwd=data,env=environment(data),startupinfo=startup)
+    process=launch_process(command,data,environment(data),args.visible)
     receipt=record_owner(data,port,process.pid)
     deadline=time.monotonic()+30
     while True:

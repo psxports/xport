@@ -62,6 +62,17 @@ def prepare(function):
     return f
 
 
+def function_instruction_rows(db, image, address):
+    chunks = db.execute('SELECT start,end FROM chunks WHERE image=? AND function=? ORDER BY rowid',
+                        (image, address)).fetchall()
+    rows = db.execute('SELECT address,word,disassembly FROM instructions WHERE image=? AND function=?',
+                      (image, address)).fetchall()
+    by_address = {row[0]: row for row in rows}
+    ordered = [by_address[ea] for start, end in chunks for ea in range(start, end, 4) if ea in by_address]
+    assert len(ordered) == len(rows), (image, address, 'instruction outside function chunks')
+    return ordered
+
+
 def load_functions(db):
     result = []
     images = {r[0]: r for r in db.execute('SELECT id,source,sha256,base,file_offset FROM images')}
@@ -71,7 +82,7 @@ def load_functions(db):
         assert hashlib.sha256(raw).hexdigest() == expected, ('image changed', name)
         blobs[name] = raw[offset:]
     for image, address, name, size, sha, status in db.execute('SELECT image,address,name,bytes,sha256,status FROM functions ORDER BY bytes,image,address'):
-        rows = db.execute('SELECT address,word,disassembly FROM instructions WHERE image=? AND function=? ORDER BY address', (image, address)).fetchall()
+        rows = function_instruction_rows(db, image, address)
         words = []
         base = images[image][3]
         for ea, word, text in rows:

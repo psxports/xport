@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from xport_project import artifact_path, load_project
+from xport_project import artifact_path, load_project, native_executable_path
 from xport_process import normalized_environment
 
 
@@ -87,22 +87,23 @@ def source_hygiene(root):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--no-build',action='store_true');parser.add_argument('--no-tests',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--no-build',action='store_true');parser.add_argument('--no-tests',action='store_true');parser.add_argument('--no-format',action='store_true');args=parser.parse_args()
     root,project=load_project();settings=project.get('code_refresh',{});started=time.perf_counter();steps={};logs=[];failure=None
     report_path=artifact_path(settings.get('report','status/code-refresh-latest.json'));log_path=artifact_path(settings.get('log','status/code-refresh-latest.log'))
     try:
         from source_index import rebuild
-        at=time.perf_counter();steps['source_index']=rebuild();steps['source_index']['seconds']=round(time.perf_counter()-at,3)
+        at=time.perf_counter();steps['source_index']=rebuild(format_changed=not args.no_format);steps['source_index']['seconds']=round(time.perf_counter()-at,3)
         steps['source_hygiene']=source_hygiene(root)
         if steps['source_hygiene']['void_parameter_suppressions']:raise RuntimeError('Standalone (void)param suppressions are forbidden; configure the compiler unused-parameter warning')
         build=settings.get('build')
         if build and not args.no_build:
-            process=build.get('process_name')
+            configuration=build.get('configuration','Debug')
+            executable=native_executable_path(configuration)
+            process=build.get('process_name',executable.name)
             if process_running(process):raise RuntimeError(process+' is running; close the manual game before rebuilding')
             solution=(root/build.get('solution',project['paths']['native_solution'])).resolve()
-            command=[str(msbuild_path()),str(solution),'/m','/t:Build','/p:Configuration='+build.get('configuration','Debug'),'/p:Platform='+build.get('platform','Win32'),'/nologo','/verbosity:minimal']
+            command=[str(msbuild_path()),str(solution),'/m','/t:Build','/p:Configuration='+configuration,'/p:Platform='+build.get('platform','Win32'),'/nologo','/verbosity:minimal']
             steps['build']=run_command(command,root,logs)
-            executable=(root/project['paths']['native_executable']).resolve()
             steps['build'].update(executable=executable.relative_to(root).as_posix(),sha256=digest(executable))
         if not args.no_tests:
             tests=[]

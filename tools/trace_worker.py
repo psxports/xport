@@ -58,7 +58,15 @@ def write_receipt(path, value):
             json.dump(value, stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(100):
+            try:
+                os.replace(temporary, path)
+                temporary = None
+                break
+            except PermissionError:
+                if attempt == 99:
+                    raise
+                time.sleep(0.01)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

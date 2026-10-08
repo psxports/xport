@@ -1,9 +1,11 @@
 import json
 import hashlib
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import source_index
 import startup
@@ -17,8 +19,10 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertEqual(config['short_name'], 'FF')
             self.assertEqual(config['paths']['native_solution'], 'src/platform/win/FF.sln')
             self.assertEqual(config['paths']['native_executable'], 'bin/FF.exe')
-            self.assertIn('// XPORT REVISION:', (root/'src/game_main.c').read_text())
+            self.assertEqual(config['paths']['native_debug_executable'], 'bin/FF_debug.exe')
+            self.assertEqual(config['code_refresh']['build']['process_name'], 'FF_debug.exe')
             self.assertTrue((root/'src/platform/win/FF.sln').is_file())
+            self.assertFalse((root/'DuckStation.bat').exists())
             self.assertIn('Native short name: `FF`', (root/'AGENTS.md').read_text(encoding='utf-8'))
             project = (root/'src/platform/win/FF.vcxproj').read_text(encoding='utf-8')
             solution = (root/'src/platform/win/FF.sln').read_text(encoding='utf-8')
@@ -30,6 +34,7 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertNotIn('<EntryPointSymbol>', project)
             self.assertNotIn('<SubSystem>Console</SubSystem>', project)
             self.assertIn('<CompileAs>CompileAsC</CompileAs>', project)
+            self.assertIn('<TargetName>FF_debug</TargetName>', project)
             self.assertIn('<TargetName>FF</TargetName>', project)
             self.assertIn(r'<OutDir>$(ProjectDir)..\..\..\bin\</OutDir>', project)
             self.assertIn('psx_spu.c', project)
@@ -38,13 +43,17 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertIn('\\xport.h', project)
             self.assertNotIn('xport_game.h', project)
             self.assertNotIn('xport_platform.h', project)
+            self.assertEqual(project.count('FULL_NAME=&quot;Fighting Force&quot;'), 2)
             self.assertIn('WND_TITLE=&quot;Fighting Force (xport)&quot;', project)
             self.assertIn('WND_WIDTH=960', project)
             self.assertIn('WND_HEIGHT=768', project)
             self.assertIn('FIELD_RATE=50', project)
+            self.assertEqual(project.count('_CRT_SECURE_NO_WARNINGS'), 2)
+            self.assertEqual(project.count('<TreatWarningAsError>true</TreatWarningAsError>'), 2)
+            self.assertEqual(project.count('<DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings>'), 2)
             self.assertIn('winmm.lib', project)
             main = (root/'src/game_main.c').read_text(encoding='utf-8')
-            self.assertIn('int xport_main(int argc, char **argv)', main)
+            self.assertIn('void xport_main(void)', main)
             self.assertNotIn('audio_runtime_render', main)
             self.assertNotIn('spu_render', main)
             self.assertNotIn('xport_address', main)
@@ -54,21 +63,68 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertEqual(main.count('#include "xport.h"'), 1)
             self.assertFalse((root/'src/xport.h').exists())
             agents = (root/'AGENTS.md').read_text(encoding='utf-8')
-            self.assertIn('executable: `bin/FF.exe`', agents)
+            self.assertIn('Debug executable: `bin/FF_debug.exe`', agents)
+            self.assertIn('Release executable: `bin/FF.exe`', agents)
             self.assertIn('Runtime data: `bin/DATA`', agents)
             self.assertIn('Red Book output when applicable: `bin/MUSIC`', agents)
             self.assertEqual(json.loads((root/'status/translation-ledger.json').read_text())['entries'], [])
-            protocol = config['stage_pipeline']['supervisor_protocol']
-            self.assertTrue(protocol['enabled'])
-            self.assertTrue(protocol['one_launch'])
-            self.assertTrue(protocol['notify_on_revision_only'])
-            self.assertEqual(protocol['acceptance']['unchanged_model_calls'], 0)
+            lockstep = config['lockstep']
+            self.assertEqual(lockstep['schema'], 1)
+            self.assertFalse(lockstep['enabled'])
+            self.assertEqual(lockstep['native_platform'], 'x86')
+            self.assertEqual(lockstep['runtime']['duckstation_role'], 'lockstep')
+            self.assertEqual(lockstep['runtime']['record_role'], 'user')
+            self.assertEqual(set(config['duckstation']['reserved_gdb_ports']), {'user', 'lockstep', 'audit', 'trace'})
+            self.assertEqual(len(set(config['duckstation']['reserved_gdb_ports'].values())), 4)
+
+    def test_initializer_defines_unresolved_gpu_graph_type_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Binding-xport'
+            startup.initialize_project(root, 'Binding Fixture', 'BF', 43110)
+            main = (root/'src/game_main.c').read_text(encoding='utf-8')
+            self.assertIn('const uint32 xport_gpu_graph_type_address = 0u;', main)
+            self.assertIn('Unresolved until the original PsyQ graph type storage is audited', main)
+
+    def test_initializer_renders_shared_native_templates_without_placeholders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Template-xport'
+            startup.initialize_project(root, 'Rock & Roll', 'RNR', 43010)
+            solution = (root/'src/platform/win/RNR.sln').read_text(encoding='utf-8')
+            project = (root/'src/platform/win/RNR.vcxproj').read_text(encoding='utf-8')
+            self.assertIn('"RNR", "RNR.vcxproj"', solution)
+            self.assertIn('<RootNamespace>RNR</RootNamespace>', project)
+            self.assertIn('FULL_NAME=&quot;Rock &amp; Roll&quot;', project)
+            self.assertNotIn('@@', solution+project)
+
+    def test_native_template_renderer_rejects_unresolved_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            template_dir = Path(directory)
+            (template_dir/'broken.sln').write_text('@@UNKNOWN@@\n', encoding='utf-8')
+            with mock.patch.object(startup, 'NATIVE_TEMPLATE_DIR', template_dir):
+                with self.assertRaisesRegex(ValueError, 'Unresolved native project template tokens'):
+                    startup.render_native_template('broken.sln', {})
 
     def test_source_index_accepts_generic_and_legacy_function_markers(self):
-        text = '''int first(void)\n{\n    FUNCTION_MARKER(0x80010000u, "GAME.EXE");\n    return 1;\n}\n\nint second(void)\n{\n    FF_FUNCTION_MARKER(0x80010004u, "GAME.EXE");\n    return 2;\n}\n'''
+        text = '''int first(void)\n{\n    FUNCTION_MARKER(0x80010000u, "GAME.EXE");\n    return 1;\n}\n\nint second(void)\n{\n    FF_FUNCTION_MARKER(0x80010004u, "GAME.EXE");\n    return 2;\n}\n\nint renamed(void)\n{\n    FUNCTION_MARKER_ARGS(0x80010008u, "GAME.EXE", XPORT_CALL_VALUE_SCALAR, 0u);\n    return 3;\n}\n'''
         parsed = source_index.functions(text, 'src/game.c')
         self.assertEqual(parsed[0]['markers'], [(0x80010000, 'GAME.EXE')])
         self.assertEqual(parsed[1]['markers'], [(0x80010004, 'GAME.EXE')])
+        self.assertEqual(parsed[2]['markers'], [(0x80010008, 'GAME.EXE')])
+        selected, status, basis = source_index.select_implementation(
+            {'address': 0x80010008, 'image': 'GAME.EXE'}, parsed)
+        self.assertEqual((selected['name'], status, basis), ('renamed', 'mapped', 'marker'))
+
+    def test_source_index_synchronizes_ledger_statuses(self):
+        with sqlite3.connect(':memory:') as db:
+            db.execute('CREATE TABLE functions(image TEXT,address INTEGER,status TEXT)')
+            db.executemany('INSERT INTO functions VALUES(?,?,?)', [('GAME.EXE', 1, 'TODO'), ('GAME.EXE', 2, 'DONE'),
+                                                                  ('GAME.EXE', 3, 'SKIP')])
+            result = source_index.sync_function_statuses(db,
+                [{'image': 'GAME.EXE', 'address': 1, 'status': 'DONE'}], {('GAME.EXE', 1), ('GAME.EXE', 2), ('GAME.EXE', 3)})
+            self.assertEqual(result['updated'], 1)
+            self.assertEqual(result['reset_removed'], 1)
+            self.assertEqual(dict((address, status) for address, status in db.execute('SELECT address,status FROM functions')),
+                             {1: 'DONE', 2: 'TODO', 3: 'SKIP'})
 
     def test_initializer_rejects_derived_or_unsafe_short_names(self):
         for value in ('', 'Fighting Force', '1FF', 'name-with-dash', 'A'*17, 'CON'):

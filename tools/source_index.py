@@ -1,5 +1,6 @@
 """Index C implementations and declarations without requiring one function per file"""
 from collections import defaultdict
+from contextlib import closing
 from pathlib import Path
 import argparse
 import hashlib
@@ -10,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-source-index-v5'
+PARSER_VERSION='c-source-index-v6'
 IDENT=re.compile(r'\b[A-Za-z_]\w*\b')
 CONTROL={'if','for','while','switch','sizeof','return'}
 KEYWORDS={'auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','restrict','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','_Bool','_Atomic','_Complex'}
@@ -102,7 +103,7 @@ def functions(text,path):
                 start=statement
                 while start<i and masked[start].isspace():start+=1
                 name=name_match.group(1);body=text[start:end+1]
-                markers=[(int(a,16),image) for a,image in re.findall(r'\b(?:FF_)?FUNCTION_MARKER\b\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
+                markers=[(int(a,16),image) for a,image in re.findall(r'\b(?:FF_)?FUNCTION_MARKER(?:_ARGS)?\b\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
                 prefix=text[max(0,start-512):start]
                 original_match=re.search(r'/\*\s*Original:\s*([A-Za-z_]\w*?_([0-9A-Fa-f]{8}))\.\s*\*/\s*$',prefix,re.S)
                 originals=[(original_match.group(1),int(original_match.group(2),16))] if original_match else []
@@ -324,10 +325,48 @@ def validate_ledger(db,ledger):
         if not row or row[0]!=entry['sha256']:raise ValueError('Ledger/function identity mismatch: '+entry['image']+':'+hex(entry['address']))
 
 
+def sync_function_statuses(db,ledger,previous):
+    """Synchronize mutable function status from the authoritative ledger"""
+    current={(entry['image'],entry['address']):entry['status'] for entry in ledger}
+    invalid=sorted(set(current.values())-{'TODO','WIP','DONE','SKIP'})
+    if invalid:raise ValueError('Unsupported ledger status: '+', '.join(invalid))
+    updated=reset=0
+    for (image,address),status in current.items():
+        row=db.execute('SELECT status FROM functions WHERE image=? AND address=?',(image,address)).fetchone()
+        if row and row[0]!=status:
+            db.execute('UPDATE functions SET status=? WHERE image=? AND address=?',(status,image,address));updated+=1
+    for image,address in set(previous)-set(current):
+        row=db.execute('SELECT status FROM functions WHERE image=? AND address=?',(image,address)).fetchone()
+        if row and row[0] in ('WIP','DONE'):
+            db.execute("UPDATE functions SET status='TODO' WHERE image=? AND address=?",(image,address));reset+=1
+    return dict(updated=updated,reset_removed=reset,ledger_entries=len(current))
+
+
 def indexed_source_changes(db,root):
     current={source_relative(root,p):sha(p.read_bytes()) for p in source_inventory(root)}
     indexed=dict(db.execute('SELECT path,sha256 FROM source_files'))
     return current,indexed,sorted(path for path in current if indexed.get(path)!=current[path])
+
+
+def index_needs_refresh(root, database, ledger_path):
+    if not database.is_file() or not ledger_path.is_file():
+        return True
+    try:
+        with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as db:
+            tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            required={'metadata','source_files','implementations',
+                      'implementation_identifiers','source_declarations',
+                      'implementation_declarations'}
+            if not required<=tables:
+                return True
+            metadata=dict(db.execute('SELECT key,value FROM metadata'))
+            if (metadata.get('source_index_parser')!=PARSER_VERSION or
+                    metadata.get('source_index_ledger_sha256')!=sha(ledger_path.read_bytes())):
+                return True
+            current,indexed,_=indexed_source_changes(db,root)
+            return current!=indexed
+    except sqlite3.DatabaseError:
+        return True
 
 
 def find_formatter():
@@ -382,6 +421,7 @@ def rebuild(format_changed=True):
                 formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha(style.read_bytes()))
         else:formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha((Path(__file__).resolve().parents[1]/'src/.clang-format').read_bytes()))
         indexed_mappings={(image,address):source for image,address,source in db.execute('SELECT image,address,source_path FROM implementations')} if required<=tables else {}
+        previous_status_identities=set(indexed_mappings)
         ledger_mappings={(entry['image'],entry['address']):relative_source(root,entry['source'])[0] for entry in ledger}
         mapping_changes=set(indexed_mappings)^set(ledger_mappings)
         mapping_changes.update(key for key in set(indexed_mappings)&set(ledger_mappings) if indexed_mappings[key]!=ledger_mappings[key])
@@ -399,6 +439,7 @@ def rebuild(format_changed=True):
             db.executescript('''DROP TABLE IF EXISTS implementation_declarations; DROP TABLE IF EXISTS implementation_identifiers;
                                 DROP TABLE IF EXISTS implementations; DROP TABLE IF EXISTS source_declarations; DROP TABLE IF EXISTS source_files;''')
             summary=populate(db,root,ledger);summary.update(mode='full',changed_files=sorted(changed) if isinstance(changed,list) else [])
+        summary['status_sync']=sync_function_statuses(db,ledger,previous_status_identities)
         db.execute("INSERT OR REPLACE INTO metadata VALUES('schema_version','4')")
         db.execute("INSERT OR REPLACE INTO metadata VALUES('source_index_parser',?)",(PARSER_VERSION,))
         db.execute("INSERT OR REPLACE INTO metadata VALUES('source_index_ledger_sha256',?)",(ledger_sha,))
@@ -412,9 +453,9 @@ def rebuild(format_changed=True):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--rebuild',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--rebuild',action='store_true');p.add_argument('--no-format',action='store_true');a=p.parse_args()
     if not a.rebuild:p.error('Use --rebuild to atomically refresh the project source index')
-    print(json.dumps(rebuild()))
+    print(json.dumps(rebuild(format_changed=not a.no_format)))
 
 
 if __name__=='__main__':main()

@@ -21,7 +21,7 @@ public class RecognizePsyq extends GhidraScript {
   String detected=DetectPsyQ.getPsyqVersion(currentProgram.getMemory(),start);
   File root=new File(args[1]);
   File patches=new File(root,"patches.json");
-  JsonObject report=new JsonObject();report.addProperty("image",currentProgram.getName());report.addProperty("detected_version",detected);report.addProperty("base",start.getOffset());report.addProperty("gp",Long.parseLong(args[2],16));
+  JsonObject report=new JsonObject();report.addProperty("image",args.length>3?args[3]:currentProgram.getName());report.addProperty("imported_program",currentProgram.getName());report.addProperty("detected_version",detected);report.addProperty("base",start.getOffset());report.addProperty("gp",Long.parseLong(args[2],16));
   JsonArray matches=new JsonArray();
   File[] versions=root.listFiles(f->f.isDirectory()&&f.getName().matches("[0-9]+"));Arrays.sort(versions);
   for(File version:versions){

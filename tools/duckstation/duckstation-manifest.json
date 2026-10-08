@@ -7,7 +7,7 @@
   },
   "patch": {
     "path": "internal-trace-api.patch",
-    "sha256": "d2d2f9b9eadf4da401077307457f2c4465cd2a33b480c8c08d4b1e0489343111"
+    "sha256": "25a99c8a66cd7af93bd052414b1e96f8d5ef9b75be0d3176a347b3f0d234ba2b"
   },
   "dependencies": {
     "windows-x64": {
@@ -28,8 +28,6 @@
     "distribution_executable": "duckstation-qt-x64-ReleaseLTCG.exe"
   },
   "runtime": {
-    "trace_profile_version": 1,
-    "stage_package_schema": 1,
     "device_serializer_version": 85,
     "data_root_environment": "XPORT_DUCKSTATION_DATA_ROOT",
     "required_files": [
@@ -42,9 +40,22 @@
       "LICENSE.txt"
     ],
     "required_executable_markers": [
-      "qFFUserStart",
-      "qFFTraceVBlankStart",
+      "qXportLockstepAttach",
+      "qXportLockstepPreludeStart",
+      "qXportLockstepStartAt",
+      "qXportLockstepHandoffState",
+      "qXportLockstepMode",
+      "qXportLockstepRecordRead",
+      "qXportFunctionCoverageStart",
+      "qXportFunctionCoverageRead",
+      "qXportLockstepCheckpointCapture",
+      "qXportLockstepCheckpointExport",
+      "qXportLockstepCheckpointImport",
+      "qXportLockstepCheckpointRestore",
+      "qXportLockstepLastInstruction",
       "XPORT_DUCKSTATION_DATA_ROOT"
-    ]
+    ],
+    "lockstep_protocol_version": 23,
+    "lockstep_record_version": 1
   }
 }

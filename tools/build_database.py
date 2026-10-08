@@ -1,14 +1,17 @@
 """Build image-aware SQLite, callgraph and progress from verified IDA exports."""
 from pathlib import Path
 import sqlite3,json,hashlib,datetime,html
-from xport_project import project_root, project_path
+from xport_project import load_project, project_root, project_path
+from ida_ctree_schema import validate as validate_ctree
 R=project_root()
 def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
 def write(p,d):p.write_text(json.dumps(d,indent=2)+'\n',encoding='utf8')
-def main():
+def main(no_format=False):
+ _,project_config=load_project(R)
  from source_index import format_sources
  source_paths=[p.relative_to(R).as_posix() for p in (R/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')]
- source_format=format_sources(R,source_paths)
+ source_format=(dict(files=[],trimmed_files=[],formatter=None,style_sha256=hashlib.sha256((Path(__file__).resolve().parents[1]/"src/.clang-format").read_bytes()).hexdigest())
+                if no_format else format_sources(R,source_paths))
  classification_path=project_path('sdk_classification','status/ghidra/classification.json')
  classifications=read(classification_path)['accepted'] if classification_path.exists() else []
  sdk={(x['image'],x['address']):x for x in classifications}
@@ -33,6 +36,9 @@ def main():
  CREATE TABLE edge_candidates(edge INTEGER,target_image TEXT,target_function INTEGER,PRIMARY KEY(edge,target_image,target_function),FOREIGN KEY(edge) REFERENCES edges(id),FOREIGN KEY(target_image,target_function) REFERENCES functions(image,address));
  CREATE TABLE indirect_transfers(image TEXT,function INTEGER,site INTEGER,instruction TEXT,status TEXT,FOREIGN KEY(image,function) REFERENCES functions(image,address));
  CREATE TABLE decompilation_failures(image TEXT,function INTEGER,error TEXT,FOREIGN KEY(image,function) REFERENCES functions(image,address));
+ CREATE TABLE ctree_functions(image TEXT,function INTEGER,path TEXT,sha256 TEXT,ida TEXT,hexrays TEXT,gp INTEGER,image_sha256 TEXT,prototype TEXT,PRIMARY KEY(image,function),FOREIGN KEY(image,function) REFERENCES functions(image,address));
+ CREATE TABLE ctree_lvars(image TEXT,function INTEGER,id INTEGER,name TEXT,type TEXT,location TEXT,is_argument INTEGER,PRIMARY KEY(image,function,id),FOREIGN KEY(image,function) REFERENCES ctree_functions(image,function));
+ CREATE TABLE ctree_nodes(image TEXT,function INTEGER,id INTEGER,kind TEXT,op INTEGER,op_name TEXT,ea INTEGER,parent INTEGER,children TEXT,type TEXT,variable TEXT,number INTEGER,PRIMARY KEY(image,function,id),FOREIGN KEY(image,function) REFERENCES ctree_functions(image,function));
  CREATE TABLE pointer_candidates(image TEXT,site INTEGER,target INTEGER,classification TEXT);
  CREATE TABLE semantic_aliases(image TEXT,address INTEGER,kind TEXT,original_name TEXT,semantic_name TEXT,binding TEXT,status TEXT,legacy_status TEXT,source TEXT,sha256 TEXT,PRIMARY KEY(image,address,kind,semantic_name));
  CREATE TABLE semantic_structures(name TEXT,source TEXT,start_line INTEGER,definition_sha256 TEXT,status TEXT,PRIMARY KEY(name,source,start_line));
@@ -89,6 +95,22 @@ def main():
   db.executemany('INSERT INTO pointer_candidates VALUES(?,?,?,?)',ptrs)
   report=read(out/'export-report.json')
   metrics.append(dict(image=image,functions=len(funcs),pseudocode=report['pseudocode'],failures=report['failures'],instruction_words=len(covered),covered_code_bytes=len(inside&covered)*4,provisional_code_bytes=len(inside)*4,unclassified_gap_bytes=len(missing)*4,symbols=len(symbols),data_refs=len(refs),pointer_candidates=len(ptrs)))
+ ctree_count=0
+ for binding in project_config.get('analysis',{}).get('ctree_exports',[]):
+  folder=(R/binding['path']).resolve();image=binding['image']
+  if not folder.is_relative_to(R) or not folder.is_dir():raise ValueError('Invalid CTree export path')
+  for sidecar in sorted((folder/'ctree').glob('*.json')):
+   document=validate_ctree(read(sidecar));function=document['entry']
+   if document['image']!=image:raise ValueError('CTree image binding mismatch')
+   current=db.execute('SELECT sha256 FROM functions WHERE image=? AND address=?',(image,function)).fetchone()
+   if not current or current[0]!=document['function_sha256']:raise ValueError('Stale CTree function identity')
+   image_path=Path(document['image_identity']['path'])
+   if hashlib.sha256(image_path.read_bytes()).hexdigest()!=document['image_identity']['sha256']:raise ValueError('Stale CTree image identity')
+   relative=sidecar.relative_to(R).as_posix();sidecar_sha=hashlib.sha256(sidecar.read_bytes()).hexdigest()
+   db.execute('INSERT INTO ctree_functions VALUES(?,?,?,?,?,?,?,?,?)',(image,function,relative,sidecar_sha,document['ida'],document['hexrays'],document['gp'],document['image_identity']['sha256'],json.dumps(document['prototype'],sort_keys=True)))
+   db.executemany('INSERT INTO ctree_lvars VALUES(?,?,?,?,?,?,?)',[(image,function,row['id'],row['name'],json.dumps(row['type'],sort_keys=True),row['location'],int(row['is_argument'])) for row in document['lvars']])
+   db.executemany('INSERT INTO ctree_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[(image,function,row['id'],row['kind'],row['op'],row['op_name'],row['ea'],row['parent'],json.dumps(row['children']),json.dumps(row.get('type'),sort_keys=True),json.dumps(row.get('variable'),sort_keys=True),row.get('number')) for row in document['nodes']])
+   ctree_count+=1
  for image,funcs in exported.items():
   for f in funcs:
    seen=set()
@@ -131,10 +153,11 @@ def main():
  similarity_summary=compare_mips_functions(db)
  from source_index import populate as index_sources
  source_summary=index_sources(db,R,ledger)
- for k,v in {'schema_version':'4','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'TODO unless evidence-backed PsyQ replacement SKIP; aliases stored separately','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
+ for k,v in {'schema_version':'5','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'TODO unless evidence-backed PsyQ replacement SKIP; aliases stored separately','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','ctree_functions':str(ctree_count),'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
  db.commit();assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok';assert not db.execute('PRAGMA foreign_key_check').fetchall()
  totals={k:sum(x[k] for x in metrics) for k in ['functions','pseudocode','failures','instruction_words','symbols','data_refs']};totals['edges']=len(graph);totals['indirect_transfers']=db.execute('SELECT count(*) FROM indirect_transfers').fetchone()[0];totals['unresolved_targets']=sum(e['resolution']=='unresolved_target' for e in graph);totals['overlay_context_edges']=sum(e['resolution']=='overlay_context_required' for e in graph)
  totals['semantic_aliases']=len(semantic.get('functions',[]));totals['semantic_structures']=len(semantic.get('structures',[]))
+ totals['ctree_functions']=ctree_count
  statuses={s:0 for s in ['TODO','WIP','DONE','SKIP']};statuses.update(dict(db.execute('SELECT status,count(*) FROM functions GROUP BY status')))
  db.close();tmp.replace(path)
  write(project_path('callgraph', 'status/callgraph.json'),dict(identity='image:address',nodes=nodes,edges=graph));write(R/'status/code-gaps.json',gaps);write(R/'status/decompilation-failures.json',failures)
@@ -147,4 +170,8 @@ def main():
  progress['source_format']=source_format
  write(R/'status/progress-data.json',progress)
  print(json.dumps(totals))
-if __name__=='__main__':main()
+if __name__=='__main__':
+ import argparse
+ parser=argparse.ArgumentParser(description=__doc__)
+ parser.add_argument('--no-format',action='store_true',help='Rebuild evidence views without changing C/H source bytes')
+ main(no_format=parser.parse_args().no_format)

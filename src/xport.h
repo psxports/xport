@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef uint8_t uint8;
 typedef int8_t sint8;
@@ -57,8 +58,6 @@ typedef intptr_t intptr;
     #error FIELD_RATE must be defined by the consuming project
 #endif
 
-#define FUNCTION_MARKER(address, image) ((void)0)
-
 #if defined(_DEBUG) && defined(_MSC_VER)
     #define GDB_CALL __declspec(dllexport) __declspec(noinline)
     #define GDB_DATA __declspec(dllexport)
@@ -68,6 +67,13 @@ typedef intptr_t intptr;
 #endif
 
 typedef struct PSX_RECT PSX_RECT;
+
+typedef enum RUN_MODE
+{
+    RUN_MODE_GAME = 0,
+    RUN_MODE_LOCKSTEP_REPLAY = 1,
+    RUN_MODE_LOCKSTEP_SELFTEST = 2
+} RUN_MODE;
 
 #if defined(__cplusplus)
 extern "C"
@@ -96,9 +102,17 @@ extern "C"
     void xport_audio_shutdown(void);
     void xport_audio_vblank(uint32 before, uint32 rate);
     sint32 xport_audio_is_running(void);
+    sint32 xport_file_size(const char *path, size_t *size);
+    FILE *xport_fopen(const char *path, const char *mode);
     sint32 xport_file_read(const char *path, void *data, size_t capacity, size_t *size);
     sint32 xport_memory_readable(const void *address, size_t size);
+    uint32 xport_memory_read(uint32 address, uint32 width);
+    sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byte_mask);
     void xport_message_error(const char *title, const char *message);
+    RUN_MODE xport_run_mode(void);
+    sint32 xport_arg_count(void);
+    char **xport_arg_values(void);
+    void xport_set_exit_code(sint32 code);
 
     extern GDB_DATA volatile uint32 g_xport_audio_submitted_buffers;
     extern GDB_DATA volatile uint32 g_xport_audio_nonzero_buffers;
@@ -108,15 +122,45 @@ extern "C"
     extern GDB_DATA volatile uint32 g_xport_audio_callback_overruns;
 
     /* Required link-time services implemented by every game */
-    int xport_main(int argc, char **argv);
+    void xport_main(void);
+    extern const uint32 xport_gpu_graph_type_address;
+    void xport_function_marker(const char *image, uint32 address, const char *function, const char *file, uint32 line, uintptr_t host_return_address, uint32 channels);
 
 #if defined(__cplusplus)
 }
 #endif
+/* Access guest memory with a fixed width */
+#define r_u8(address) ((uint8)xport_memory_read((uint32)(address), 1u))
+#define r_u16(address) ((uint16)xport_memory_read((uint32)(address), 2u))
+#define r_u32(address) xport_memory_read((uint32)(address), 4u)
+#define w_u8(address, value) xport_memory_write((uint32)(address), 1u, (uint32)(value), 1u)
+#define w_u16(address, value) xport_memory_write((uint32)(address), 2u, (uint32)(value), 3u)
+#define w_u32(address, value) xport_memory_write((uint32)(address), 4u, (uint32)(value), 15u)
+#define w_masked_u32(address, value, mask) xport_memory_write((uint32)(address), 4u, (uint32)(value), (uint32)(mask))
 
 /* Raw guest-memory lvalues for direct IDA pseudocode translation */
 #define byte_(address) (*(uint8 *)psx_addr((uint32)(address), sizeof(uint8)))
 #define word_(address) (*(uint16 *)psx_addr((uint32)(address), sizeof(uint16)))
 #define dword_(address) (*(uint32 *)psx_addr((uint32)(address), sizeof(uint32)))
+
+#if defined(_MSC_VER)
+    #include <intrin.h>
+    #define XPORT_FUNCTION_RETURN_ADDRESS() ((uintptr_t)_ReturnAddress())
+#elif defined(__GNUC__) || defined(__clang__)
+    #define XPORT_FUNCTION_RETURN_ADDRESS() ((uintptr_t)__builtin_return_address(0))
+#else
+    #define XPORT_FUNCTION_RETURN_ADDRESS() ((uintptr_t)0)
+#endif
+#if defined(XPORT_ENABLE_AUDIT)
+    #define XPORT_FUNCTION_AUDIT_CHANNEL 1u
+#else
+    #define XPORT_FUNCTION_AUDIT_CHANNEL 0u
+#endif
+#if defined(LOCKSTEP_DEBUG)
+    #define XPORT_FUNCTION_LOCKSTEP_CHANNEL 2u
+#else
+    #define XPORT_FUNCTION_LOCKSTEP_CHANNEL 0u
+#endif
+#define FUNCTION_MARKER(address, image) xport_function_marker((image), (uint32)(address), __func__, __FILE__, __LINE__, XPORT_FUNCTION_RETURN_ADDRESS(), XPORT_FUNCTION_AUDIT_CHANNEL | XPORT_FUNCTION_LOCKSTEP_CHANNEL)
 
 #endif

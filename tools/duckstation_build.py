@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import urllib.request
@@ -15,6 +16,14 @@ from xport_process import normalized_environment
 
 
 DEV_SUFFIXES = {'.exp', '.ilk', '.iobj', '.ipdb', '.lib', '.pdb'}
+
+
+def remove_tree(path):
+    def make_writable(function, item, error):
+        os.chmod(item, stat.S_IWRITE)
+        function(item)
+
+    shutil.rmtree(path, onerror=make_writable)
 
 
 def sha256(path):
@@ -152,7 +161,8 @@ def ensure_archive(cache, dependency, offline):
 def prepare_source(workspace, cache_repository, archive, manifest, patch, git, seven_zip):
     source = workspace / 'source'
     def source_git(*arguments):
-        return [git, '-c', f'safe.directory={source.as_posix()}', '-C', source, *arguments]
+        return [git, '-c', f'safe.directory={source.as_posix()}', '-c', 'core.whitespace=cr-at-eol',
+                '-C', source, *arguments]
 
     if not source.is_dir():
         command([git, 'clone', '--no-checkout', cache_repository, source])
@@ -160,11 +170,12 @@ def prepare_source(workspace, cache_repository, archive, manifest, patch, git, s
     head = command(source_git('rev-parse', 'HEAD')).strip()
     if head != manifest['upstream']['commit']:
         raise RuntimeError(f'Workspace HEAD is {head}, expected {manifest["upstream"]["commit"]}')
-    reverse = subprocess.run([str(item) for item in source_git('apply', '--reverse', '--check', patch)],
+    apply_options = ('--ignore-space-change', '--ignore-whitespace')
+    reverse = subprocess.run([str(item) for item in source_git('apply', *apply_options, '--reverse', '--check', patch)],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if reverse.returncode:
-        command(source_git('apply', '--check', patch))
-        command(source_git('apply', patch))
+        command(source_git('apply', *apply_options, '--check', patch))
+        command(source_git('apply', *apply_options, patch))
     command(source_git('diff', '--check'))
     prebuilt = source / 'dep' / 'prebuilt'
     dependency_root = prebuilt / 'windows-x64'
@@ -186,7 +197,7 @@ def prepare_source(workspace, cache_repository, archive, manifest, patch, git, s
         'const char* g_scm_tag_str = "xport-local";\n'
         f'const char* g_scm_version_str = "{values["version"]}-xport";\n'
         'const char* g_scm_date_str = "reproducible-local-build";\n', encoding='utf-8')
-    (scm / 'gen_scmversion.bat').write_text('@echo off\r\nexit /b 0\r\n', encoding='ascii')
+    (scm / 'gen_scmversion.bat').write_text('@echo off\nexit /b 0\n', encoding='ascii')
     return source
 
 
@@ -209,7 +220,7 @@ def build_source(workspace, source, manifest, msbuild):
 def package_runtime(workspace, source, manifest, manifest_identity, build_command):
     package = workspace / 'package'
     if package.exists():
-        shutil.rmtree(package)
+        remove_tree(package)
     package.mkdir(parents=True)
     source_bin = source / 'bin' / 'x64'
     source_exe = Path(manifest['build']['source_executable']).name
@@ -243,9 +254,8 @@ def package_runtime(workspace, source, manifest, manifest_identity, build_comman
         'configuration': 'Release x64 v143',
         'compatibility_executable_name': target_exe,
         'exe_sha256': executable_hash,
-        'trace_profile_version': manifest['runtime']['trace_profile_version'],
-        'stage_package_schema': manifest['runtime']['stage_package_schema'],
-        'device_serializer_version': manifest['runtime']['device_serializer_version'],
+        'lockstep_protocol_version': manifest['runtime']['lockstep_protocol_version'],
+        'lockstep_record_version': manifest['runtime']['lockstep_record_version'],
         'data_root_environment': manifest['runtime']['data_root_environment'],
         'runtime_files': hashes,
         'validation': {
@@ -314,9 +324,14 @@ def publish(package, destination, manifest):
         raise
     finally:
         if incoming.exists():
-            shutil.rmtree(incoming)
+            remove_tree(incoming)
     if previous.exists():
-        shutil.rmtree(previous)
+        remove_tree(previous)
+
+
+def should_remove_workspace(args):
+    return args.clean_workspace or (
+        args.workspace is None and not args.keep_workspace)
 
 
 def main():
@@ -331,8 +346,11 @@ def main():
     parser.add_argument('--no-build', action='store_true')
     parser.add_argument('--no-publish', action='store_true')
     parser.add_argument('--clean-workspace', action='store_true')
+    parser.add_argument('--keep-workspace', action='store_true')
     parser.add_argument('--verify-only', action='store_true')
     args = parser.parse_args()
+    if args.clean_workspace and args.keep_workspace:
+        raise ValueError('--clean-workspace and --keep-workspace are mutually exclusive')
 
     shared = Path(__file__).resolve().parent
     manifest_path, manifest, patch = load_manifest(shared)
@@ -356,7 +374,7 @@ def main():
     workspace = (args.workspace.expanduser().resolve() if args.workspace else
                  cache.parent / 'duckstation-build' / manifest_identity[:16])
     if args.force and workspace.exists():
-        shutil.rmtree(workspace)
+        remove_tree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     repository = ensure_git_cache(cache, manifest, git, args.offline)
     dependency = manifest['dependencies']['windows-x64']
@@ -375,8 +393,8 @@ def main():
     result = {'status': 'prepared', 'published': not args.no_publish,
               'workspace': str(workspace), 'build_log': str(log),
               'manifest_identity': manifest_identity, 'exe_sha256': receipt['exe_sha256']}
-    if args.clean_workspace:
-        shutil.rmtree(workspace)
+    if should_remove_workspace(args):
+        remove_tree(workspace)
         result['workspace_removed'] = True
     print(json.dumps(result))
 

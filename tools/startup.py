@@ -1,6 +1,8 @@
 """Run the complete new-project startup protocol through one durable supervisor"""
 import argparse
 import collections
+import configparser
+import contextlib
 import datetime
 import hashlib
 import importlib
@@ -16,7 +18,7 @@ import sys
 import time
 import uuid
 
-from upgrade import shared_changelog
+from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
 from xport_process import normalized_environment
 from xport_project import CONFIG_NAME, allocation_lock, reservations
 
@@ -28,8 +30,13 @@ LABEL_PATTERN = re.compile(r'[A-Za-z0-9_-]{1,64}')
 IMAGE_PATTERN = re.compile(r'[A-Za-z0-9_.-]+')
 WINDOWS_RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)),
                           *(f'LPT{i}' for i in range(1, 10))}
-CPP_PROJECT_TYPE = 'BC8A1FFA-BEE3-4634-8014-F334798102B3'
 TERMINAL = {'attention', 'complete', 'failed', 'cancelled'}
+NATIVE_TEMPLATE_DIR = XPORT_ROOT/'src/platform/win'
+NATIVE_TEMPLATE_TOKENS = ('@@PROJECT_GUID@@', '@@SHORT_NAME@@', '@@FULL_NAME@@', '@@SHARED_SOURCE@@')
+NATIVE_TEMPLATE_REQUIREMENTS = {
+    'xport.sln': {'@@PROJECT_GUID@@', '@@SHORT_NAME@@'},
+    'xport.vcxproj': set(NATIVE_TEMPLATE_TOKENS),
+}
 
 
 def digest_bytes(value):
@@ -105,17 +112,19 @@ def compact(state, changed=True):
         result['failure'] = state['failure']
     if state.get('completion'):
         result['completion'] = state['completion']
+    if state.get('progress'):
+        result['progress'] = state['progress']
     result['log'] = str(log_path(state['project_root']))
     result['response'] = str(response_path(state['project_root']))
     return result
 
 
-def set_attention(root, state, kind, summary, required, context=None):
+def set_attention(root, state, kind, summary, required, context=None, proposed_decision=None):
     body = {'kind': kind, 'summary': summary, 'required': required, 'context': context or {}}
     body['sha256'] = digest_bytes(canonical(body))
     state = publish(root, state, status='attention', step=kind, attention=body, failure=None)
     atomic_json(response_path(root), {'revision': state['revision'], 'attention_sha256': body['sha256'],
-                                     'decision': {}})
+                                     'decision': proposed_decision or {}})
     return state
 
 
@@ -126,69 +135,93 @@ def validate_names(name, short_name):
         raise ValueError('Short name must be a non-reserved Windows name starting with a letter and containing 1..16 ASCII letters, digits or underscores')
 
 
-def solution_text(short_name, project_guid):
-    return f'''Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.0.31903.59
-MinimumVisualStudioVersion = 10.0.40219.1
-Project("{{{CPP_PROJECT_TYPE}}}") = "{short_name}", "{short_name}.vcxproj", "{{{project_guid}}}"
-EndProject
-Global
- GlobalSection(SolutionConfigurationPlatforms) = preSolution
-  Debug|x86 = Debug|x86
-  Release|x86 = Release|x86
- EndGlobalSection
- GlobalSection(ProjectConfigurationPlatforms) = postSolution
-  {{{project_guid}}}.Debug|x86.ActiveCfg = Debug|Win32
-  {{{project_guid}}}.Debug|x86.Build.0 = Debug|Win32
-  {{{project_guid}}}.Release|x86.ActiveCfg = Release|Win32
-  {{{project_guid}}}.Release|x86.Build.0 = Release|Win32
- EndGlobalSection
-EndGlobal
-'''
-
-
-def project_text(name, short_name, project_guid, shared_source):
-    window_title = (name+' (xport)').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    return fr'''<?xml version="1.0" encoding="utf-8"?>
-<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ItemGroup Label="ProjectConfigurations">
-    <ProjectConfiguration Include="Debug|Win32"><Configuration>Debug</Configuration><Platform>Win32</Platform></ProjectConfiguration>
-    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
-  </ItemGroup>
-  <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><ProjectGuid>{{{project_guid}}}</ProjectGuid><RootNamespace>{short_name}</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries><PlatformToolset>v143</PlatformToolset><CharacterSet>MultiByte</CharacterSet></PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v143</PlatformToolset><CharacterSet>MultiByte</CharacterSet><WholeProgramOptimization>true</WholeProgramOptimization></PropertyGroup>
-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <PropertyGroup><OutDir>$(ProjectDir)..\..\..\bin\</OutDir><IntDir>$(ProjectDir)..\..\..\_build\x86\$(Configuration)\</IntDir><TargetName>{short_name}</TargetName><LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory><LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand><DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor><LinkIncremental>false</LinkIncremental></PropertyGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <ClCompile><WarningLevel>Level3</WarningLevel><DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings><SDLCheck>true</SDLCheck><PreprocessorDefinitions>_DEBUG;_CRT_SECURE_NO_WARNINGS;WND_TITLE=&quot;{window_title}&quot;;WND_WIDTH=960;WND_HEIGHT=768;FIELD_RATE=50;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(ProjectDir)..\..;$(ProjectDir){shared_source};%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><CompileAs>CompileAsC</CompileAs><Optimization>Disabled</Optimization><RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary><DebugInformationFormat>ProgramDatabase</DebugInformationFormat><ProgramDataBaseFileName>$(IntDir){short_name}-compile.pdb</ProgramDataBaseFileName><MultiProcessorCompilation>true</MultiProcessorCompilation></ClCompile>
-    <Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><ProgramDatabaseFile>$(OutDir){short_name}.pdb</ProgramDatabaseFile><ImportLibrary>$(IntDir){short_name}.lib</ImportLibrary><AdditionalDependencies>user32.lib;gdi32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <ClCompile><WarningLevel>Level3</WarningLevel><DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings><SDLCheck>true</SDLCheck><PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;WND_TITLE=&quot;{window_title}&quot;;WND_WIDTH=960;WND_HEIGHT=768;FIELD_RATE=50;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(ProjectDir)..\..;$(ProjectDir){shared_source};%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><CompileAs>CompileAsC</CompileAs><Optimization>MaxSpeed</Optimization><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><MultiProcessorCompilation>true</MultiProcessorCompilation></ClCompile>
-    <Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>false</GenerateDebugInformation><ImportLibrary>$(IntDir){short_name}.lib</ImportLibrary><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences><AdditionalDependencies>user32.lib;gdi32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
-  </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="..\..\game_main.c" /><ClCompile Include="{shared_source}\psx.c" /><ClCompile Include="{shared_source}\psx_gpu.c" /><ClCompile Include="{shared_source}\psx_pad.c" /><ClCompile Include="{shared_source}\psx_spu.c" /><ClCompile Include="{shared_source}\platform\win\main.c"><ObjectFileName>$(IntDir)xport_main.obj</ObjectFileName></ClCompile></ItemGroup>
-  <ItemGroup><ClInclude Include="{shared_source}\xport.h" /><ClInclude Include="{shared_source}\psx.h" /><ClInclude Include="{shared_source}\psx_gpu.h" /><ClInclude Include="{shared_source}\psx_pad.h" /><ClInclude Include="{shared_source}\psx_spu.h" /></ItemGroup>
-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-</Project>
-'''
+def render_native_template(template_name, replacements):
+    path = NATIVE_TEMPLATE_DIR/template_name
+    if not path.is_file():
+        raise ValueError('Missing native project template: '+str(path))
+    text = path.read_text(encoding='utf-8-sig')
+    tokens = set(re.findall(r'@@[A-Z_]+@@', text))
+    unknown = sorted(tokens-set(NATIVE_TEMPLATE_TOKENS))
+    if unknown:
+        raise ValueError('Unresolved native project template tokens: '+', '.join(unknown))
+    missing = sorted(NATIVE_TEMPLATE_REQUIREMENTS.get(template_name, set())-tokens)
+    if missing:
+        raise ValueError('Missing native project template tokens: '+', '.join(missing))
+    absent = sorted(tokens-set(replacements))
+    if absent:
+        raise ValueError('No replacement for native project template tokens: '+', '.join(absent))
+    for token, value in replacements.items():
+        text = text.replace(token, value)
+    return text
 
 
 def agents_text(name, short_name):
     return f'''# {name}
 
-Resolve `[XPORT_ROOT]` from `xport-project.json` and read `[XPORT_ROOT]/tools/PIPELINE.md`. Keep only stable game-specific facts and task-routing links here; put detailed evidence under `status`.
+Resolve `[XPORT_ROOT]` from `xport-project.json` and read `[XPORT_ROOT]/AGENTS.md`. Keep only stable game-specific facts and task-routing links here; put detailed evidence under `status`. Never create, edit, move, delete or regenerate `README.md`.
 
 ## Project facts
 
 - Native short name: `{short_name}`; language: C
-- Solution: `src/platform/win/{short_name}.sln`; executable: `bin/{short_name}.exe`; working directory: `bin`; intermediates: `_build`
+- Solution: `src/platform/win/{short_name}.sln`; Debug executable: `bin/{short_name}_debug.exe`; Release executable: `bin/{short_name}.exe`; working directory: `bin`; intermediates: `_build`
 - Runtime data: `bin/DATA`; Red Book output when applicable: `bin/MUSIC`
 - Before relying on them, record reviewed image identities, language decision, dummy scope, hooks/layouts, adapter contract and evidence links here
 '''
+
+
+def duckstation_launcher_text(root):
+    command = os.path.relpath(TOOLS/'xport.py', Path(root).resolve()).replace('/', '\\')
+    return f'''@echo off
+setlocal
+cd /d "%~dp0"
+python -B "%~dp0{command}" --project "%~dp0." duckstation_run --role user --visible %*
+if errorlevel 1 (
+  echo DuckStation launch failed. See the error above.
+  pause
+  exit /b 1
+)
+endlocal
+'''
+
+
+def ensure_duckstation_launcher(root):
+    root = Path(root).resolve()
+    path = root/'DuckStation.bat'
+    expected = duckstation_launcher_text(root)
+    if path.exists():
+        if not path.is_file() or path.read_text(encoding='utf-8-sig') != expected:
+            raise ValueError('Existing DuckStation.bat differs from the startup launcher')
+        reused = True
+    else:
+        with path.open('x', encoding='utf-8', newline='\r\n') as stream:
+            stream.write(expected)
+        reused = False
+    return {'path': 'DuckStation.bat', 'sha256': digest_file(path), 'reused': reused}
+
+
+def record_launcher_text(root):
+    command = os.path.relpath(TOOLS/'xport.py', Path(root).resolve()).replace('/', '\\')
+    return f'''@echo off
+setlocal
+cd /d "%~dp0"
+python -B "%~dp0{command}" --project "%~dp0." record %*
+exit /b %errorlevel%
+'''
+
+
+def ensure_record_launcher(root):
+    root = Path(root).resolve()
+    path = root/'record.bat'
+    expected = record_launcher_text(root)
+    if path.exists():
+        if not path.is_file() or path.read_text(encoding='utf-8-sig') != expected:
+            raise ValueError('Existing record.bat differs from the startup launcher')
+        reused = True
+    else:
+        with path.open('x', encoding='utf-8', newline='\r\n') as stream:
+            stream.write(expected)
+        reused = False
+    return {'path': 'record.bat', 'sha256': digest_file(path), 'reused': reused}
 
 
 def initialize_project(root, name, short_name, first_port=2400):
@@ -197,17 +230,24 @@ def initialize_project(root, name, short_name, first_port=2400):
         raise ValueError('STARTUP_ALREADY_INITIALIZED: '+str(root/CONFIG_NAME))
     validate_names(name, short_name)
     platform = root/'src/platform/win'
-    targets = [root/CONFIG_NAME, root/'AGENTS.md', root/'src/game_main.c', platform/(short_name+'.sln'),
+    targets = [root/CONFIG_NAME, root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
                platform/(short_name+'.vcxproj'), root/'status/translation-ledger.json']
     existing = [str(path) for path in targets if path.exists()]
     if existing:
         raise ValueError('STARTUP_ROOT_NOT_EMPTY: project initialization would overwrite '+', '.join(existing))
+    project_guid = str(uuid.uuid4()).upper()
+    shared_source = os.path.relpath(XPORT_ROOT/'src', platform).replace('/', '\\')
+    full_name = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    native_replacements = {'@@PROJECT_GUID@@': project_guid, '@@SHORT_NAME@@': short_name,
+                           '@@FULL_NAME@@': full_name, '@@SHARED_SOURCE@@': shared_source}
+    solution = render_native_template('xport.sln', native_replacements)
+    native_project = render_native_template('xport.vcxproj', native_replacements)
     with allocation_lock(root.parent):
         used = reservations(root.parent)
         sockets, ports = [], {}
         try:
             candidate = first_port
-            for role in ('audit', 'trace', 'user'):
+            for role in ('user', 'lockstep', 'audit', 'trace'):
                 while candidate <= 65535:
                     port = candidate
                     candidate += 1
@@ -228,40 +268,41 @@ def initialize_project(root, name, short_name, first_port=2400):
             for relative_path in ('src/platform/win', 'bin', '_build', 'iso', 'orig/images', 'orig/ghidra',
                                   'status/ida/runs', 'status/ida/accepted', 'status/ghidra/runs', 'tools/ida/databases'):
                 (root/relative_path).mkdir(parents=True, exist_ok=True)
-            project_guid = str(uuid.uuid4()).upper()
-            shared_source = os.path.relpath(XPORT_ROOT/'src', platform).replace('/', '\\')
             config = {'schema': 1, 'name': name, 'short_name': short_name, 'toolset': str(TOOLS),
                       'paths': {'status': 'status', 'project_tools': 'tools', 'analysis_database': 'status/analysis.sqlite',
-                                'native_executable': 'bin/'+short_name+'.exe', 'native_working_directory': 'bin',
+                                'native_executable': 'bin/'+short_name+'.exe',
+                                'native_debug_executable': 'bin/'+short_name+'_debug.exe',
+                                'native_working_directory': 'bin',
                                 'native_solution': 'src/platform/win/'+short_name+'.sln', 'native_build': '_build',
                                 'ida_exports': 'orig/images', 'ida_configs': 'tools/ida',
                                 'sdk_classification': 'status/ghidra/classification.json'},
                       'duckstation': {'host': '127.0.0.1', 'gdb_port': ports['user'], 'reserved_gdb_ports': ports,
                                       'default_role': 'user', 'data_directory': 'tools/duckstation/data/user',
                                       'data_directories': {role: 'tools/duckstation/data/'+role for role in ports}},
-                      'stage_pipeline': {'supervisor_protocol': {'schema': 1, 'enabled': True, 'mode': 'enforced',
-                          'one_launch': True, 'notify_on_revision_only': True,
-                          'batch_limits': {'functions': 5, 'instructions': 2048, 'modules': 2},
-                          'acceptance': {'unchanged_model_calls': 0, 'interventions_per_failure': 1,
-                              'submissions_per_batch': 1, 'fast_refreshes_per_batch': 1,
-                              'provisional_replays_per_batch': 1, 'full_gate_after_provisional_match': True,
-                              'max_control_responses': 5, 'max_compactions': 2,
-                              'deterministic_call_reduction_percent': 90}}},
+                       'lockstep': {'schema': 1, 'enabled': False, 'original_image': '',
+                           'native_configuration': 'Debug', 'native_platform': 'x86',
+                           'msbuild_property': 'LockstepDebug=true', 'source_roots': ['src'],
+                           'max_events': 1000000,
+                           'memory': {'dram_size': 2097152, 'scratchpad_size': 1024},
+                           'devices': {'vram': 'trusted_wrapper', 'spu_ram': 'trusted_wrapper'},
+                           'runtime': {'duckstation_role': 'lockstep', 'record_role': 'user',
+                                       'native_arguments': ['--lockstep-replay']}},
                       'code_refresh': {'build': {'solution': 'src/platform/win/'+short_name+'.sln',
                                                  'configuration': 'Debug', 'platform': 'x86',
-                                                 'process_name': short_name+'.exe'}, 'tests': [], 'artifacts': []}}
-            (platform/(short_name+'.sln')).write_text(solution_text(short_name, project_guid), encoding='utf-8', newline='')
-            (platform/(short_name+'.vcxproj')).write_text(project_text(name, short_name, project_guid, shared_source), encoding='utf-8', newline='')
-            revision = shared_changelog()[2][0]['revision']
-            main_text = f'''#include "xport.h"
+                                                 'process_name': short_name+'_debug.exe'}, 'tests': [], 'artifacts': []}}
+            (platform/(short_name+'.sln')).write_text(
+                solution, encoding='utf-8', newline='')
+            (platform/(short_name+'.vcxproj')).write_text(
+                native_project, encoding='utf-8', newline='')
+            main_text = '''#include "xport.h"
 
-// XPORT REVISION: {revision}
-int xport_main(int argc, char **argv)
-{{
-    if (argc < 0 || (argc > 0 && argv == NULL))
-        return -1;
-    return 0;
-}}
+/* Unresolved until the original PsyQ graph type storage is audited */
+const uint32 xport_gpu_graph_type_address = 0u;
+
+void xport_main(void)
+{
+    return;
+}
 '''
             (root/'src/game_main.c').write_text(main_text, encoding='utf-8', newline='')
             (root/'AGENTS.md').write_text(agents_text(name, short_name), encoding='utf-8', newline='')
@@ -322,6 +363,8 @@ def inventory(root):
         if not base.exists():
             continue
         for path in sorted(item for item in base.rglob('*') if item.is_file()):
+            if base.name == 'orig' and path.relative_to(base).parts[0] in ('images', 'ghidra'):
+                continue
             item = {'path': relative(root, path), 'bytes': path.stat().st_size, 'sha256': digest_file(path)}
             with path.open('rb') as stream:
                 header = stream.read(0x800)
@@ -332,36 +375,212 @@ def inventory(root):
                                    'payload_size': int.from_bytes(header[0x1c:0x20], 'little'),
                                    'file_offset': 0x800}
             candidates.append(item)
-    return {'file_count': len(candidates), 'files': candidates[:64], 'files_truncated': len(candidates) > 64,
+    return {'file_count': len(candidates), 'total_bytes': sum(item['bytes'] for item in candidates),
+            'files': candidates[:64], 'files_truncated': len(candidates) > 64,
             'cue_files': [item['path'] for item in candidates if item['path'].lower().endswith('.cue')],
             'psx_executables': [item for item in candidates if item.get('psx_exe')]}
 
 
-def discover_tools(root, supplied=None):
+def runtime_gp_initializers(payload, load_address):
+    """Find adjacent MIPS32 lui/addiu assignments to gp"""
+    candidates = []
+    for offset in range(0, len(payload)-7, 4):
+        first = int.from_bytes(payload[offset:offset+4], 'little')
+        second = int.from_bytes(payload[offset+4:offset+8], 'little')
+        if (first >> 26) != 0x0f or ((first >> 16) & 31) != 28:
+            continue
+        if (second >> 26) != 0x09 or ((second >> 21) & 31) != 28 or ((second >> 16) & 31) != 28:
+            continue
+        low = second & 0xffff
+        low = low-0x10000 if low & 0x8000 else low
+        candidates.append({'site': load_address+offset,
+                           'value': (((first & 0xffff) << 16)+low) & 0xffffffff})
+    return candidates
+
+
+def reviewed_gp_profile(root, item):
+    facts = item['psx_exe']
+    raw = (Path(root)/item['path']).read_bytes()
+    begin = facts['file_offset']
+    payload = raw[begin:begin+facts['payload_size']]
+    candidates = runtime_gp_initializers(payload, facts['load_address'])
+    values = sorted({candidate['value'] for candidate in candidates})
+    header = facts['gp']
+    if header and (not values or values == [header]):
+        value = header
+        source = 'psx_exe_header'
+    elif not header and len(values) == 1:
+        value = values[0]
+        source = 'runtime_initializer'
+    else:
+        value = header
+        source = 'review_required'
+    return value, {'source': source, 'header_value': header, 'runtime_initializers': candidates}
+
+
+def validate_gp_config(root, profile):
+    loads = profile.get('loads', [])
+    if len(loads) != 1:
+        raise ValueError('IDA GP validation requires exactly one reviewed image load')
+    load = loads[0]
+    path = Path(load['path'])
+    path = path if path.is_absolute() else Path(root)/path
+    raw = path.read_bytes()
+    begin = load.get('offset', 0)
+    candidates = runtime_gp_initializers(raw[begin:], load['base'])
+    values = sorted({candidate['value'] for candidate in candidates})
+    gp = profile.get('gp')
+    if type(gp) is not int or not 0 < gp <= 0xffffffff:
+        raise ValueError('IDA config requires a reviewed nonzero runtime GP')
+    evidence = profile.get('gp_evidence')
+    if isinstance(evidence, dict) and evidence.get('source') in ('inherited_runtime_initializer', 'accepted_overlay_profile', 'inherited_static_loader'):
+        from overlay_gp import validate as validate_overlay_gp
+        return validate_overlay_gp(root, profile, evidence)
+    if isinstance(evidence, dict) and evidence.get('source') == 'bios_exec_pslz':
+        from psx_loader_gp import validate as validate_loader_gp
+        return validate_loader_gp(root, profile, evidence)
+    if len(values) != 1 or values[0] != gp:
+        raise ValueError('IDA config GP differs from the unique runtime initializer')
+    evidence = profile.get('gp_evidence')
+    if not isinstance(evidence, dict) or evidence.get('source') not in ('runtime_initializer', 'psx_exe_header'):
+        raise ValueError('IDA config requires machine-readable GP evidence')
+    if evidence.get('runtime_initializers') != candidates:
+        raise ValueError('IDA config GP evidence differs from the executable')
+    return {'gp': gp, 'initializer': candidates[0]}
+
+
+def image_review_proposal(root, found):
+    root = Path(root)
+    executables = found.get('psx_executables', [])
+    names = [Path(item['path']).name for item in executables]
+    if (not executables or len(names) != len(set(names)) or any(not IMAGE_PATTERN.fullmatch(name) for name in names)
+            or any(item['psx_exe']['file_offset']+item['psx_exe']['payload_size'] > item.get('bytes', 0) for item in executables)):
+        return None
+    boot = None
+    system_item = next((item for item in found.get('files', []) if Path(item['path']).name.upper() == 'SYSTEM.CNF'), None)
+    system = root/system_item['path'] if system_item else root/'orig/SYSTEM.CNF'
+    if system.is_file():
+        match = re.search(r'(?im)^\s*BOOT\s*=\s*cdrom:\\+([^;\r\n]+)', system.read_text(errors='replace'))
+        if match:
+            requested = Path(match.group(1).replace('\\', '/')).name
+            boot = next((item for item in executables if Path(item['path']).name.lower() == requested.lower()), None)
+    default = max((item for item in executables if item is not boot), key=lambda item: item['psx_exe']['payload_size'], default=None)
+    default = default or boot or max(executables, key=lambda item: item['psx_exe']['payload_size'])
+    ordered = ([boot] if boot else [])+[item for item in executables if item is not boot]
+    paths = {}
+    if len(found.get('cue_files', [])) == 1:
+        paths['disc_image'] = found['cue_files'][0]
+        paths['music_source'] = str(Path(found['cue_files'][0]).parent).replace('\\', '/') or '.'
+        paths['music_output'] = 'bin/MUSIC'
+    if boot:
+        paths['original_executable'] = boot['path']
+    capabilities = {}
+    if len(found.get('cue_files', [])) == 1:
+        cue = root/found['cue_files'][0]
+        audio = bool(re.search(r'(?im)^\s*TRACK\s+\d+\s+AUDIO\s*$', cue.read_text(errors='replace')))
+        capabilities['redbook_audio'] = {'enabled': audio}
+        if not audio:
+            capabilities['redbook_audio']['reason'] = 'Reviewed CUE contains no AUDIO tracks'
+    profiles = {}
+    for item in ordered:
+        facts = item['psx_exe'];name = Path(item['path']).name
+        start = facts['load_address'];end = start+facts['payload_size']
+        gp, gp_evidence = reviewed_gp_profile(root, item)
+        profiles[name] = {'image': name, 'entry': facts['entry'], 'gp': gp, 'gp_evidence': gp_evidence,
+            'segments': [{'start': start, 'end': end, 'name': name, 'class': 'CODE'}],
+            'loads': [{'path': item['path'], 'base': start, 'offset': facts['file_offset']}],
+            'seeds': [facts['entry']], 'code_ranges': [[start, end]]}
+    patch = {'paths': paths, 'analysis': {'images': [Path(item['path']).name for item in ordered],
+             'default_image': Path(default['path']).name},
+             'lockstep': {'original_image': Path(default['path']).name}}
+    if capabilities:
+        patch['capabilities'] = capabilities
+    return {'config_patch': patch, 'ida_configs': profiles}
+
+
+def project_preflight(root):
+    """Validate project-specific settings without launching host analysis tools"""
+    root = Path(root).resolve()
     config = project(root)
-    configured = config.get('analysis', {}).get('tool_paths', {})
-    supplied = supplied or {}
-    candidates = {
-        'ida': (supplied.get('ida'), configured.get('ida'), os.environ.get('XPORT_IDA'), os.environ.get('IDAT_PATH')),
-        'ghidra': (supplied.get('ghidra'), configured.get('ghidra'), os.environ.get('XPORT_GHIDRA'), os.environ.get('GHIDRA_HOME')),
-        'plugin': (supplied.get('plugin'), configured.get('plugin'), os.environ.get('XPORT_PSX_PLUGIN')),
-    }
-    checks = {
-        'ida': lambda path: path.is_file(),
-        'ghidra': lambda path: (path/'support/analyzeHeadless.bat').is_file(),
-        'plugin': lambda path: (path/'data/psyq').is_dir(),
-    }
-    found, rejected = {}, {}
-    for name, values in candidates.items():
-        for value in values:
-            if not value:
-                continue
-            path = Path(value).expanduser().resolve()
-            if checks[name](path):
-                found[name] = str(path)
-                break
-            rejected[name] = str(path)
-    return found, rejected
+    solution = (root/config['paths']['native_solution']).read_text(encoding='utf-8-sig')
+    platform = config.get('code_refresh', {}).get('build', {}).get('platform', 'x86')
+    if '|'+platform not in solution:
+        raise ValueError('code_refresh platform is absent from the native solution: '+platform)
+    return {'platform': platform}
+
+
+def validate_capture_contract(root):
+    root = Path(root).resolve()
+    config = project(root)
+    lockstep = config.get('lockstep') or {}
+    if lockstep.get('schema') != 1 or lockstep.get('enabled') is not True:
+        raise ValueError('Enable the lockstep record and converge contract')
+    image = lockstep.get('original_image')
+    if not isinstance(image, str) or not IMAGE_PATTERN.fullmatch(image):
+        raise ValueError('Configure lockstep.original_image')
+    runtime = lockstep.get('runtime', {})
+    role = runtime.get('duckstation_role')
+    record_role = runtime.get('record_role', 'user')
+    directories = config.get('duckstation', {}).get('data_directories', {})
+    ports = config.get('duckstation', {}).get('reserved_gdb_ports', {})
+    if any(value not in directories or value not in ports for value in (role, record_role)):
+        raise ValueError('Reserve the user and lockstep DuckStation runtimes')
+    disc = root/config.get('paths', {}).get('disc_image', '')
+    original = root/'orig'/image
+    if not disc.is_file() or not original.is_file():
+        raise ValueError('Lockstep recording requires the disc image and original executable')
+    return {'schema': 1, 'original_image': image, 'duckstation_role': role,
+            'record_role': record_role,
+            'disc_image': relative(root, disc), 'original_executable': relative(root, original)}
+
+
+def capture_contract_packet(root):
+    try:
+        current = validate_capture_contract(root)
+        problem = None
+    except (KeyError, OSError, ValueError, sqlite3.Error) as error:
+        current = None
+        problem = str(error)
+    return {'current': current, 'problem': problem,
+            'required_config': ['lockstep.schema=1', 'lockstep.enabled=true',
+                                'lockstep.original_image', 'lockstep.runtime.duckstation_role'],
+            'scope': 'Configure input-only recording from one exact save state'}
+
+
+def validate_convergence_contract(root):
+    """Require a reviewed project-native continuation before startup can complete"""
+    root = Path(root).resolve()
+    config = project(root)
+    capture = validate_capture_contract(root)
+    progress_path = root/'status/progress-data.json'
+    if not progress_path.is_file():
+        raise ValueError('Generate current translation progress before convergence review')
+    decompilation = read_json(progress_path).get('decompilation_status', {})
+    lockstep = config['lockstep']
+    if lockstep.get('native_configuration') != 'Debug' or lockstep.get('native_platform') != 'x86':
+        raise ValueError('Lockstep convergence requires Debug x86')
+    if lockstep.get('msbuild_property') != 'LockstepDebug=true':
+        raise ValueError('Configure the LOCKSTEP_DEBUG build property')
+    memory = lockstep.get('memory', {})
+    if memory.get('dram_size') != 2097152 or memory.get('scratchpad_size') != 1024:
+        raise ValueError('Configure exact PS1 DRAM and scratchpad sizes')
+    native_scope = frontier_packet(root)
+    return {'contract': 'xport-lockstep-v2', 'capture': capture,
+            'decompilation_status': decompilation, 'native_scope': native_scope}
+
+
+def convergence_contract_packet(root):
+    try:
+        current = validate_convergence_contract(root)
+        problem = None
+    except (KeyError, OSError, ValueError, sqlite3.Error) as error:
+        current = None
+        problem = str(error)
+    return {'current': current, 'problem': problem,
+            'required_config': ['lockstep.native_configuration=Debug', 'lockstep.native_platform=x86',
+                                'lockstep.msbuild_property=LockstepDebug=true', 'lockstep.memory'],
+            'required_files': ['src/game_except.c', 'LOCKSTEP_DEBUG native build'],
+            'scope': 'Configure shared-memory lockstep comparison and semantic call boundaries'}
 
 
 def prepare_ida_export(root, ida, label, images=None, export_existing=False, plan=False):
@@ -380,6 +599,7 @@ def prepare_ida_export(root, ida, label, images=None, export_existing=False, pla
         if Path(image).name != image or not IMAGE_PATTERN.fullmatch(image):
             raise ValueError('Invalid image name')
         task = read_json(configs/(image+'.json'))
+        validate_gp_config(root, task)
         task['output'] = str(run/image)
         task['rebuild'] = not export_existing
         for load in task['loads']:
@@ -403,7 +623,16 @@ def prepare_ida_export(root, ida, label, images=None, export_existing=False, pla
     (run/'commands.json').write_text(json.dumps(commands, indent=2)+'\n', encoding='utf-8')
     if not plan:
         for command in commands:
-            subprocess.run(command, check=True, cwd=root)
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            output = (result.stdout or '')+(result.stderr or '')
+            if output:
+                append_log(root, 'IDA export process', output)
+            if result.returncode:
+                if 'Fatal registry error' in output or 'Отказано в доступе' in output:
+                    raise RuntimeError('XPORT_IDA_HOST_ACCESS_REQUIRED: IDA lost registry access; '
+                                       'retry the startup revision with host access outside the workspace sandbox')
+                raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout,
+                                                    stderr=result.stderr)
     return {'run': str(run), 'planned': plan, 'images': images}
 
 
@@ -439,8 +668,10 @@ def canonicalize_ida(root, exports, configs):
                 lines.append('%08X  %-23s %s' % (item['address'], raw_item.hex(' '), item['text']))
                 for address in range(item['address'], item['address']+len(raw_item), 4):
                     raw = blob[address-base:address-base+4]
-                    if raw != raw_item[address-item['address']:address-item['address']+4]:
-                        raise ValueError('IDA bytes differ from original image')
+                    expected_raw = raw_item[address-item['address']:address-item['address']+4]
+                    if raw != expected_raw:
+                        raise ValueError('IDA bytes differ from original image: '+out.name+':'+format(address, '08X')+
+                                         ' image='+raw.hex()+' export='+expected_raw.hex())
                     word = int.from_bytes(raw, 'little')
                     decoded = list(decoder.disasm(raw, address))
                     text = (decoded[0].mnemonic+' '+decoded[0].op_str).strip() if decoded else '.word 0x%08X'%word
@@ -586,7 +817,7 @@ def run_ghidra(root, ghidra, plugin, label, images=None, plan=False):
                    '-loader-baseAddr', hex(load['base']), '-loader-fileOffset', hex(load.get('offset', 0)),
                    '-processor', 'PSX:LE:32:default', '-cspec', 'default', '-noanalysis',
                    '-scriptPath', str(TOOLS/'ghidra'), '-postScript', 'RecognizePsyq.java',
-                   str(run/(image+'.json')), str(Path(plugin)/'data/psyq'), format(cfg['gp'], 'X')]
+                   str(run/(image+'.json')), str(Path(plugin)/'data/psyq'), format(cfg['gp'], 'X'), image]
         commands.append(command)
         if not plan:
             with (run/(image+'.log')).open('wb') as stream:
@@ -614,9 +845,11 @@ def classify_psyq(root, reports, output=None):
         if file.stem not in images:
             continue
         report = read_json(file)
-        image = report['image']
+        image = file.stem
         cfg = read_json(project_path(root, config, 'ida_configs', 'tools/ida')/(image+'.json'))
         load = cfg['loads'][-1]
+        if report['image'] not in (image, Path(load['path']).name):
+            raise ValueError('Ghidra report image identity mismatch: '+image)
         raw = (root/load['path']).read_bytes()
         payload, base = raw[load.get('offset', 0):], load['base']
         if base != report['base'] or cfg['gp'] != report['gp']:
@@ -707,7 +940,7 @@ def apply_response(root, state, response):
         config_path = Path(root)/CONFIG_NAME
         config = read_json(config_path)
         patch = decision.get('config_patch', {})
-        if any(key not in ('paths', 'analysis', 'capabilities') for key in patch):
+        if any(key not in ('paths', 'analysis', 'capabilities', 'lockstep') for key in patch):
             raise ValueError('STARTUP_RESPONSE_CONFIG_SCOPE')
         for key, value in patch.items():
             if not isinstance(value, dict):
@@ -718,9 +951,9 @@ def apply_response(root, state, response):
                 raise ValueError('STARTUP_RESPONSE_INVALID_IDA_CONFIG')
             path = Path(root)/'tools/ida'/(name+'.json')
             path.parent.mkdir(parents=True, exist_ok=True)
+            validate_gp_config(root, value)
             atomic_json(path, value)
         atomic_json(config_path, config)
-        state.setdefault('decisions', {}).update({'tools': decision.get('tools', state.get('decisions', {}).get('tools', {}))})
         next_step = 'inventory'
     elif kind == 'psyq_review':
         if decision.get('approved') is not True:
@@ -729,7 +962,40 @@ def apply_response(root, state, response):
     elif kind == 'frontier_translation':
         if decision.get('approved') is not True or not decision.get('changed_files'):
             raise ValueError('STARTUP_FRONTIER_REQUIRES_REVIEWED_CHANGES')
+        expected = attention.get('context', {}).get('functions', [])
+        audits = decision.get('function_audits')
+        if not isinstance(audits, list) or len(audits) != len(expected):
+            raise ValueError('STARTUP_FRONTIER_REQUIRES_COMPLETE_FUNCTION_AUDITS')
+        keyed = {(row.get('image'), row.get('address')): row for row in audits
+                 if isinstance(row, dict)}
+        for function in expected:
+            context = function.get('audit_context') or {}
+            mips = context.get('mips') or {}
+            pseudocode = context.get('pseudocode') or {}
+            if mips.get('complete') is not True:
+                raise ValueError('STARTUP_FRONTIER_PACKET_CONTAINS_TRUNCATED_ORIGINAL')
+            audit = keyed.get((function['image'], function['address']))
+            if not audit:
+                raise ValueError('STARTUP_FRONTIER_FUNCTION_AUDIT_MISSING')
+            if (audit.get('mips_sha256') != mips.get('sha256') or
+                    audit.get('pseudocode_sha256') != pseudocode.get('sha256')):
+                raise ValueError('STARTUP_FRONTIER_FUNCTION_AUDIT_IDENTITY_MISMATCH')
+            expected_pseudocode = pseudocode.get('complete') is True
+            if (audit.get('pseudocode_used_as_baseline') is not expected_pseudocode or
+                    audit.get('complete_mips_audit') is not True or
+                    audit.get('unresolved_semantics') != []):
+                raise ValueError('STARTUP_FRONTIER_FUNCTION_AUDIT_INCOMPLETE')
         next_step = 'verify_frontier'
+    elif kind == 'trace_capture_review':
+        if decision.get('approved') is not True or not decision.get('changed_files'):
+            raise ValueError('STARTUP_TRACE_CAPTURE_REQUIRES_REVIEWED_CHANGES')
+        validate_capture_contract(root)
+        next_step = 'convergence_contract'
+    elif kind == 'convergence_review':
+        if decision.get('approved') is not True or not decision.get('changed_files'):
+            raise ValueError('STARTUP_CONVERGENCE_REQUIRES_REVIEWED_CHANGES')
+        validate_convergence_contract(root)
+        next_step = 'emulator'
     else:
         raise ValueError('STARTUP_UNSUPPORTED_ATTENTION_KIND: '+kind)
     history = state.setdefault('history', [])
@@ -739,36 +1005,81 @@ def apply_response(root, state, response):
     return publish(root, state, status='running', step=next_step, attention=None, failure=None)
 
 
-def record_step(state, name, result):
+def record_step(state, name, result, started=None):
     state.setdefault('steps', {})[name] = {'status': 'passed', 'result': result,
         'completed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    if started is not None:
+        state['steps'][name]['seconds'] = round(time.perf_counter()-started, 3)
+
+
+def publish_progress(root, state, detail, **metrics):
+    progress = {'detail': detail, 'updated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), **metrics}
+    return publish(root, state, progress=progress)
+
+
+def psyq_review_summary(root, classification):
+    report = read_json(Path(root)/classification['output'])
+    accepted = report.get('accepted', []);pending = report.get('pending', [])
+    return {'classification': classification,
+            'accepted_by_image': dict(collections.Counter(item['image'] for item in accepted)),
+            'wrapper_statuses': dict(collections.Counter(item.get('wrapper_status', 'unknown') for item in accepted)),
+            'accepted': [{'image': item['image'], 'address': '0x%08X'%item['address'],
+                          'alias': item.get('alias'), 'objects': sorted({match['object'] for match in item.get('matches', [])}),
+                          'wrapper_status': item.get('wrapper_status'), 'wrapper_references': item.get('wrapper_references', [])}
+                         for item in accepted[:64]],
+            'accepted_truncated': len(accepted) > 64,
+            'pending': [{'image': item['image'], 'address': '0x%08X'%item['address'],
+                         'names': item.get('names', []), 'reason': item.get('reason')} for item in pending[:64]],
+            'pending_truncated': len(pending) > 64}
 
 
 def frontier_packet(root):
     config = project(root)
     database = project_path(root, config, 'analysis_database', 'status/analysis.sqlite')
-    with sqlite3.connect(database) as db:
-        root_row = db.execute("SELECT image,address FROM functions WHERE status='TODO' ORDER BY image,address LIMIT 1").fetchone()
-        rows, queue, seen = [], collections.deque([root_row] if root_row else []), set()
-        while queue and len(rows) < 5:
-            identity = queue.popleft()
-            if identity in seen:
-                continue
-            seen.add(identity)
-            row = db.execute("SELECT image,address,name,sha256,listing,pseudocode FROM functions WHERE image=? AND address=? AND status='TODO'", identity).fetchone()
-            if not row:
-                continue
-            rows.append(row)
-            queue.extend(db.execute('''SELECT c.target_image,c.target_function
-                FROM edges e JOIN edge_candidates c ON c.edge=e.id
-                JOIN functions f ON f.image=c.target_image AND f.address=c.target_function
-                WHERE e.source_image=? AND e.source_function=? AND e.kind='call' AND f.status='TODO'
-                ORDER BY c.target_image,c.target_function''', identity).fetchall())
-        dependency_closed = not any(identity not in seen for identity in queue)
+    with contextlib.closing(sqlite3.connect(database)) as db:
+        functions = {(image, address): (name, sha, listing, pseudocode, status)
+                     for image, address, name, sha, listing, pseudocode, status in db.execute(
+                         'SELECT image,address,name,sha256,listing,pseudocode,status FROM functions')}
+        configured = config.get('analysis', {}).get('native_entrypoints')
+        if configured:
+            roots = [(item['image'], int(str(item['address']), 0)) for item in configured]
+        else:
+            image = config.get('analysis', {}).get('default_image')
+            ida = read_json(project_path(root, config, 'ida_configs', 'tools/ida')/(image+'.json'))
+            roots = [(image, ida['entry'])]
+        if any(identity not in functions for identity in roots):
+            raise ValueError('Configured native entrypoint is not an analyzed function')
+        selected = [identity for identity in roots if functions[identity][4] == 'TODO']
+        remaining = sum(row[4] == 'TODO' for row in functions.values())
+        rows = [(image, address, *functions[(image, address)][:4])
+                for image, address in selected]
+    os.environ['XPORT_PROJECT'] = str(Path(root).resolve())
+    import source_context
+    source_context = importlib.reload(source_context)
     functions = [{'image': image, 'address': address, 'name': name, 'sha256': sha,
-                  'listing': listing, 'pseudocode': pseudocode} for image, address, name, sha, listing, pseudocode in rows]
-    return {'functions': functions, 'dependency_closed': dependency_closed,
-            'scope': 'Initial dependency-closed TODO call frontier, bounded to five functions',
+                  'listing': listing, 'pseudocode': pseudocode,
+                  'audit_context': source_context.compact(
+                      image, address, budget=2097152, full_source=True, full_original=True),
+                  'proposed_change': {'status': 'WIP', 'source': None, 'semantic_name': None,
+                                      'evidence_required': ['reviewed MIPS/IDA context', 'source mapping', 'verification result']}}
+                 for image, address, name, sha, listing, pseudocode in rows]
+    for function in functions:
+        context = function['audit_context']
+        if (context.get('mips') or {}).get('complete') is not True:
+            raise ValueError('STARTUP_FRONTIER_REQUIRES_COMPLETE_MIPS_CONTEXT')
+    scope = 'Configured executable entrypoints only; callees are deferred to function coverage'
+    return {'functions': functions, 'dependency_closed': False, 'cyclic': False, 'remaining_todo': remaining,
+            'native_entrypoints': [{'image': image, 'address': address} for image, address in roots],
+            'reachable_functions': None,
+            'scope': scope,
+            'translation_contract': {
+                'pseudocode_baseline_required': False,
+                'complete_mips_audit_required': True,
+                'semantic_simplification_allowed': False,
+                'unresolved_semantics_allowed': False,
+                'code_refresh_is_semantic_evidence': False,
+                'required_response_field': 'decision.function_audits',
+            },
             'ledger': 'status/translation-ledger.json'}
 
 
@@ -776,16 +1087,17 @@ def advance(root, state):
     root = Path(root).resolve()
     while state.get('status') == 'running':
         step = state['step']
+        started = time.perf_counter()
         try:
             if step == 'initialize':
                 result = initialize_project(root, state['name'], state['short_name'], state.get('first_port', 2400))
                 os.environ['XPORT_PROJECT'] = str(root)
-                record_step(state, step, {'name': result['name'], 'short_name': result['short_name']})
+                record_step(state, step, {'name': result['name'], 'short_name': result['short_name']}, started)
                 state = publish(root, state, step='build')
             elif step == 'build':
                 doctor = run_shared(root, 'doctor')
                 build = run_shared(root, 'build_native')
-                record_step(state, step, {'doctor': doctor, 'build': build})
+                record_step(state, step, {'doctor': doctor, 'build': build}, started)
                 state = publish(root, state, step='inventory')
             elif step == 'inventory':
                 found = inventory(root)
@@ -795,20 +1107,19 @@ def advance(root, state):
                 configs = Path(root)/config.get('paths', {}).get('ida_configs', 'tools/ida')
                 missing = [image for image in images if not (configs/(image+'.json')).is_file()]
                 if not images or missing:
+                    proposal = image_review_proposal(root, found)
                     state = set_attention(root, state, 'image_review',
                         'Confirm original inputs and image-qualified IDA profiles',
-                        ['config_patch.paths', 'config_patch.analysis.images', 'ida_configs'], found)
+                        ['config_patch.paths', 'config_patch.analysis.images', 'ida_configs'],
+                        {'inventory': found, 'proposal_available': proposal is not None}, proposal)
                     continue
-                tools, rejected = discover_tools(root, state.get('decisions', {}).get('tools', {}))
-                state.setdefault('decisions', {})['tools'] = tools
-                absent = [name for name in ('ida', 'ghidra', 'plugin') if not tools.get(name)]
-                if absent:
-                    state = set_attention(root, state, 'tool_paths', 'Provide licensed analysis tool paths',
-                                          ['tools.'+name for name in absent],
-                                          {'inventory': found, 'rejected_paths': rejected,
-                                           'environment': ['XPORT_IDA', 'XPORT_GHIDRA', 'XPORT_PSX_PLUGIN']})
-                    continue
-                record_step(state, step, found)
+                record_step(state, step, found, started)
+                state = publish(root, state, step='preflight')
+            elif step == 'preflight':
+                toolchain = validate_toolchain_receipt()
+                state.setdefault('decisions', {})['tools'] = toolchain['tools']
+                result = {'toolchain': toolchain, 'project': project_preflight(root)}
+                record_step(state, step, result, started)
                 state = publish(root, state, step='music')
             elif step == 'music':
                 config = project(root)
@@ -819,38 +1130,78 @@ def advance(root, state):
                     raise ValueError('Multiple CUE files require an explicit music_source')
                 else:
                     result = 'not_requested'
-                record_step(state, step, result)
+                record_step(state, step, result, started)
                 state = publish(root, state, step='ida_export')
             elif step == 'ida_export':
+                state = publish_progress(root, state, 'Running IDA export and independent byte verification')
                 tools = state['decisions']['tools']
                 plan = prepare_ida_export(root, tools['ida'], 'startup-ida-plan', plan=True)
                 actual = prepare_ida_export(root, tools['ida'], 'startup-ida-v1')
                 canonical = canonicalize_ida(root, 'status/ida/runs/startup-ida-v1', 'tools/ida')
                 accepted = accept_ida(root, 'startup-ida-v1')
-                record_step(state, step, {'plan': plan, 'actual': actual, 'canonical': canonical, 'accepted': accepted})
+                record_step(state, step, {'plan': plan, 'actual': actual, 'canonical': canonical, 'accepted': accepted}, started)
                 state = publish(root, state, step='psyq')
             elif step == 'psyq':
+                state = publish_progress(root, state, 'Running Ghidra PsyQ recognition')
                 tools = state['decisions']['tools']
                 recognition = run_ghidra(root, tools['ghidra'], tools['plugin'], 'startup-psyq-v1')
                 classification = classify_psyq(root, 'status/ghidra/runs/startup-psyq-v1')
-                record_step(state, step, {'recognition': recognition, 'classification': classification})
+                record_step(state, step, {'recognition': recognition, 'classification': classification}, started)
                 state = set_attention(root, state, 'psyq_review', 'Review accepted and pending PsyQ classifications',
-                                      ['decision.approved'], classification)
+                                      ['decision.approved'], psyq_review_summary(root, classification))
             elif step == 'database':
                 build = run_shared(root, 'build_database')
                 similarity = validate_similarity(root)
                 progress = run_shared(root, 'render_progress')
-                record_step(state, step, {'build_database': build, 'similarity': similarity, 'progress': progress})
+                record_step(state, step, {'build_database': build, 'similarity': similarity, 'progress': progress}, started)
                 packet = frontier_packet(root)
                 if packet['functions']:
                     state = set_attention(root, state, 'frontier_translation',
-                                          'Translate the first reviewed dependency-closed WIP frontier',
+                                          'Translate only the reviewed executable entrypoint',
                                           ['decision.approved', 'decision.changed_files'], packet)
                 else:
                     state = publish(root, state, step='verify_frontier')
             elif step == 'verify_frontier':
-                refresh = run_shared(root, 'code_refresh')
+                refresh = run_shared(root, 'source_index', ('--rebuild', '--no-format'))
+                progress = run_shared(root, 'render_progress')
+                record_step(state, step, {'source_index': refresh,
+                                          'progress': progress,
+                                          'native_link_deferred_to_coverage': True}, started)
+                state = publish(root, state, step='trace_contract')
+            elif step == 'trace_contract':
+                packet = capture_contract_packet(root)
+                if packet['problem']:
+                    state = set_attention(root, state, 'trace_capture_review',
+                                          'Audit and configure the original recording contract',
+                                          ['decision.approved', 'decision.changed_files'], packet)
+                else:
+                    record_step(state, step, packet['current'], started)
+                    state = publish(root, state, step='convergence_contract')
+            elif step == 'convergence_contract':
+                packet = convergence_contract_packet(root)
+                if packet['problem']:
+                    state = set_attention(root, state, 'convergence_review',
+                                          'Implement and review the native convergence contract',
+                                          ['decision.approved', 'decision.changed_files'], packet)
+                else:
+                    record_step(state, step, packet['current'], started)
+                    state = publish(root, state, step='emulator')
+            elif step == 'emulator':
+                if 'verify_frontier' not in state.get('steps', {}):
+                    refresh = run_shared(root, 'source_index', '--rebuild', '--no-format')
+                    record_step(state, 'verify_frontier', {'source_index': refresh,
+                                'native_link_deferred_to_coverage': True})
                 config = project(root)
+                capture = validate_capture_contract(root)
+                launcher = ensure_duckstation_launcher(root)
+                record_launcher = ensure_record_launcher(root)
+                deployments = {}
+                for role in config['duckstation']['reserved_gdb_ports']:
+                    deployments[role] = run_shared(root, 'duckstation_deploy', ('--role', role, '--ensure'))
+                emulator = {'launcher': launcher, 'record_launcher': record_launcher,
+                            'deployments': deployments, 'capture': capture,
+                            'shared_distribution': str((TOOLS/'duckstation/distribution').resolve())}
+                record_step(state, step, emulator, started)
                 progress = read_json(root/'status/progress-data.json')
                 completion = {'project': config['name'], 'short_name': config.get('short_name'),
                               'project_root': str(root), 'inputs': state.get('inventory', {}),
@@ -859,9 +1210,22 @@ def advance(root, state):
                               'decompilation_status': progress.get('decompilation_status'),
                               'native_solution': config['paths']['native_solution'],
                               'native_executable': config['paths']['native_executable'],
-                              'code_refresh': refresh,
-                              'next': 'Validate trace contracts, then use record SLOT NAME when ready'}
-                record_step(state, step, {'code_refresh': refresh})
+                              'native_debug_executable': config['paths']['native_debug_executable'],
+                              'duckstation': emulator,
+                              'convergence': validate_convergence_contract(root),
+                              'source_index': state['steps']['verify_frontier']['result']['source_index'],
+                              'next': 'Run function_converge NAME, stop, then coverage NAME'}
+                created = datetime.datetime.fromisoformat(state['created_utc'])
+                canonical_result = state['steps'].get('ida_export', {}).get('result', {}).get('canonical', [])
+                classification = state['steps'].get('psyq', {}).get('result', {}).get('classification', {})
+                completion['metrics'] = {
+                    'total_seconds': round((datetime.datetime.now(datetime.timezone.utc)-created).total_seconds(), 3),
+                    'step_seconds': {name: value.get('seconds') for name, value in state['steps'].items()},
+                    'input_bytes': state.get('inventory', {}).get('total_bytes',
+                                       sum(item.get('bytes', 0) for item in state.get('inventory', {}).get('files', []))),
+                    'ida_functions': sum(item.get('functions', 0) for item in canonical_result),
+                    'psyq_accepted': classification.get('accepted', 0), 'psyq_pending': classification.get('pending', 0),
+                    'recovery_count': len(state.get('recoveries', []))}
                 state = publish(root, state, status='complete', step='complete', completion=completion, attention=None)
             else:
                 raise ValueError('Unknown startup step: '+str(step))
@@ -869,6 +1233,53 @@ def advance(root, state):
             append_log(root, 'failure '+step, type(error).__name__+': '+str(error))
             state = publish(root, state, status='failed', failure={'step': step, 'type': type(error).__name__, 'message': str(error)})
     return state
+
+
+def archive_failed_artifacts(root, state):
+    """Retain compact diagnostics and deduplicate their content before a retry"""
+    root = Path(root).resolve();step = state['failure']['step']
+    targets = []
+    if step == 'emulator':
+        config = project(root)
+        targets.extend(root/path for path in config['duckstation']['data_directories'].values())
+    if step == 'ida_export':
+        targets.extend(root/'status/ida/runs'/name for name in ('startup-ida-plan', 'startup-ida-v1'))
+    if step in ('psyq', 'database', 'verify_frontier'):
+        targets.append(root/'status/ghidra/runs/startup-psyq-v1')
+    recovery = root/'status/startup-recovery';blobs = recovery/'blobs';blobs.mkdir(parents=True, exist_ok=True)
+    manifest = {'revision': state['revision'], 'step': step, 'files': []}
+    for target in targets:
+        if not target.exists():continue
+        paths = [target] if target.is_file() else sorted(path for path in target.rglob('*') if path.is_file())
+        for path in paths:
+            size = path.stat().st_size;digest = digest_file(path);retained = size <= 1024*1024 and path.suffix.lower() in ('.json','.log','.txt','.md')
+            if retained:
+                blob = blobs/digest
+                if not blob.exists():shutil.copy2(path, blob)
+            manifest['files'].append({'path': relative(root, path), 'bytes': size, 'sha256': digest, 'retained': retained})
+        if target.is_dir():shutil.rmtree(target)
+        else:target.unlink()
+    path = recovery/('revision-'+str(state['revision'])+'.json');atomic_json(path, manifest)
+    return relative(root, path)
+
+
+def retry(root, expected_revision, advance_now=True):
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        if state.get('status') != 'failed':raise ValueError('STARTUP_RETRY_REQUIRES_FAILED_STATE')
+        if state['revision'] != expected_revision:raise ValueError('STARTUP_STALE_RETRY')
+        stored_inventory = dict(state.get('inventory', {}))
+        if stored_inventory and 'total_bytes' not in stored_inventory:
+            stored_inventory['total_bytes'] = sum(item.get('bytes', 0) for item in stored_inventory.get('files', []))
+        if stored_inventory and digest_bytes(canonical(inventory(root))) != digest_bytes(canonical(stored_inventory)):
+            raise ValueError('STARTUP_INPUTS_CHANGED: review images before retry')
+        receipt = archive_failed_artifacts(root, state)
+        state.setdefault('recoveries', []).append({'revision': state['revision'], 'step': state['failure']['step'], 'receipt': receipt,
+                                                   'utc': datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        state = publish(root, state, status='running', step=state['failure']['step'], failure=None,
+                        progress={'detail': 'Retrying '+state['failure']['step']})
+        return advance(root, state) if advance_now else state
 
 
 class StartupLock:
@@ -884,8 +1295,10 @@ class StartupLock:
         except FileExistsError:
             try:
                 owner = int(self.path.read_text().strip())
-                os.kill(owner, 0)
-            except (OSError, ValueError):
+                running = process_is_running(owner)
+            except ValueError:
+                running = False
+            if not running:
                 self.path.unlink(missing_ok=True)
                 with self.path.open('x', encoding='ascii') as stream:
                     stream.write(str(self.pid)+'\n')
@@ -901,7 +1314,22 @@ class StartupLock:
             pass
 
 
-def start(root, name, short_name, first_port=2400):
+def refresh_frontier(root, expected_revision):
+    """Regenerate paused translation evidence after a hash-bound pseudocode review"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        if state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'frontier_translation':
+            raise ValueError('STARTUP_REFRESH_REQUIRES_FRONTIER_ATTENTION')
+        if state['revision'] != expected_revision:
+            raise ValueError('STARTUP_STALE_REFRESH')
+        packet = frontier_packet(root)
+        return set_attention(root, state, 'frontier_translation',
+                             'Translate only the reviewed executable entrypoint',
+                             ['decision.approved', 'decision.changed_files'], packet)
+
+
+def start(root, name, short_name, first_port=2400, advance_now=True):
     root = Path(root).resolve()
     with StartupLock(root):
         if (root/CONFIG_NAME).exists():
@@ -916,15 +1344,105 @@ def start(root, name, short_name, first_port=2400):
                  'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                  'updated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
         atomic_json(state_path(root), state)
-        return advance(root, state)
+        return advance(root, state) if advance_now else state
 
 
-def submit(root, response):
+def refresh_completion(root, expected_revision, advance_now=True):
+    """Regenerate a completed startup handoff from current derived source state"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        if state['revision'] != expected_revision:
+            raise ValueError('STARTUP_REVISION_MISMATCH')
+        if state.get('status') != 'complete':
+            raise ValueError('STARTUP_NOT_COMPLETE')
+        validate_capture_contract(root)
+        state = publish(root, state, status='running', step='verify_frontier',
+                        completion=None, attention=None, failure=None)
+        return advance(root, state) if advance_now else state
+
+
+def reopen_convergence(root, advance_now=True):
+    """Resume a completed legacy startup at the convergence readiness gate"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        refresh = (state.get('status') == 'attention' and
+                   state.get('attention', {}).get('kind') in ('convergence_review', 'frontier_translation'))
+        if state.get('status') != 'complete' and not refresh:
+            raise ValueError('STARTUP_NOT_COMPLETE: use status, submit or retry')
+        progress_path = root/'status/progress-data.json'
+        progress = read_json(progress_path).get('decompilation_status', {}) if progress_path.is_file() else {}
+        next_step = 'database' if progress.get('TODO', 1) else 'convergence_contract'
+        state = publish(root, state, status='running', step=next_step,
+                        completion=None, attention=None, failure=None)
+        return advance(root, state) if advance_now else state
+
+
+def submit(root, response, advance_now=True):
     root = Path(root).resolve()
     with StartupLock(root):
         state = load_state(root)
         state = apply_response(root, state, read_json(response))
-        return advance(root, state)
+        return advance(root, state) if advance_now else state
+
+
+def process_is_running(pid):
+    pid = int(pid)
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        import ctypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, SystemError):
+        return False
+
+
+def dispatch_worker(root):
+    root = Path(root).resolve();receipt_path = root/'status/startup-worker.json'
+    if receipt_path.is_file():
+        try:
+            prior = read_json(receipt_path)
+            if prior.get('status') == 'running' and process_is_running(prior['pid']):
+                return prior
+        except (ValueError, KeyError, json.JSONDecodeError):
+            pass
+    try:
+        step = load_state(root).get('step')
+    except (OSError, ValueError, json.JSONDecodeError):
+        step = None
+    if step in ('inventory', 'preflight', 'music', 'ida_export'):
+        validate_runtime_access()
+    log = (root/'status/startup-worker.log').open('ab')
+    flags = 0
+    if os.name == 'nt':
+        flags = subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP|subprocess.DETACHED_PROCESS
+    process = subprocess.Popen([sys.executable, '-B', str(Path(__file__).resolve()), 'work', '--project', str(root)],
+                               cwd=root, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                               creationflags=flags, start_new_session=os.name != 'nt')
+    receipt = {'pid': process.pid, 'status': 'running', 'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    atomic_json(receipt_path, receipt);log.close();return receipt
+
+
+def work(root):
+    root = Path(root).resolve();receipt_path = root/'status/startup-worker.json'
+    try:
+        with StartupLock(root):return advance(root, load_state(root))
+    finally:
+        receipt = read_json(receipt_path) if receipt_path.is_file() else {'pid': os.getpid()}
+        receipt.update(status='stopped', stopped_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+        atomic_json(receipt_path, receipt)
 
 
 def status(root, after_revision=None, resume=True):
@@ -955,18 +1473,55 @@ def main():
     submit_parser = subparsers.add_parser('submit')
     submit_parser.add_argument('--project', type=Path, default=Path.cwd())
     submit_parser.add_argument('--response', type=Path)
+    retry_parser = subparsers.add_parser('retry')
+    retry_parser.add_argument('--project', type=Path, default=Path.cwd())
+    retry_parser.add_argument('--expected-revision', required=True, type=int)
+    work_parser = subparsers.add_parser('work')
+    work_parser.add_argument('--project', type=Path, default=Path.cwd())
+    refresh_parser = subparsers.add_parser('refresh-frontier')
+    refresh_parser.add_argument('--project', type=Path, default=Path.cwd())
+    refresh_parser.add_argument('--expected-revision', required=True, type=int)
+    completion_parser = subparsers.add_parser('refresh-completion')
+    completion_parser.add_argument('--project', type=Path, default=Path.cwd())
+    completion_parser.add_argument('--expected-revision', required=True, type=int)
+    reopen_parser = subparsers.add_parser('reopen-convergence')
+    reopen_parser.add_argument('--project', type=Path, default=Path.cwd())
     args = parser.parse_args()
     try:
         if args.action == 'start':
             if not 1024 <= args.first_port <= 65533:
                 parser.error('First port must be 1024..65533')
-            result = compact(start(args.project, args.name, args.short_name, args.first_port))
+            validate_toolchain_receipt()
+            result = compact(start(args.project, args.name, args.short_name, args.first_port, advance_now=False))
+            dispatch_worker(args.project)
         elif args.action == 'submit':
+            pending = load_state(args.project)
+            if pending.get('attention', {}).get('kind') == 'image_review':
+                validate_runtime_access()
             path = args.response or response_path(args.project)
-            result = compact(submit(args.project, path))
+            result = compact(submit(args.project, path, advance_now=False))
+            dispatch_worker(args.project)
+        elif args.action == 'retry':
+            pending = load_state(args.project)
+            if pending.get('failure', {}).get('step') == 'ida_export':
+                validate_runtime_access()
+            result = compact(retry(args.project, args.expected_revision, advance_now=False))
+            dispatch_worker(args.project)
+        elif args.action == 'work':
+            result = compact(work(args.project))
+        elif args.action == 'refresh-frontier':
+            result = compact(refresh_frontier(args.project, args.expected_revision))
+        elif args.action == 'refresh-completion':
+            result = compact(refresh_completion(args.project, args.expected_revision, advance_now=False))
+            dispatch_worker(args.project)
+        elif args.action == 'reopen-convergence':
+            result = compact(reopen_convergence(args.project, advance_now=False))
+            dispatch_worker(args.project)
         else:
-            result = status(args.project, args.after_revision)
-    except (OSError, ValueError) as error:
+            state = load_state(args.project)
+            if state.get('status') == 'running':dispatch_worker(args.project)
+            result = compact(load_state(args.project), changed=args.after_revision is None or state['revision'] > args.after_revision)
+    except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps({'status': 'error', 'error': str(error)}, indent=2, ensure_ascii=False))
         raise SystemExit(2) from None
     print(json.dumps(result, indent=2, ensure_ascii=False))

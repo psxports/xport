@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from lockstep_audit import words_from_listing
 from xport_project import load_project, artifact_path
 
 
@@ -50,11 +51,13 @@ def excerpt(lines,center,count):
     return dict(first_line=start+1,lines=lines[start:end],complete=start==0 and end==len(lines),total_lines=len(lines))
 
 
-def original_excerpt(root,path,address=None,count=48,line=None):
+def original_excerpt(root,path,address=None,count=48,line=None,full=False):
     if not path:return dict(path=None,sha256=None,first_line=1,lines=[],complete=False,total_lines=0)
     source=(root/path).resolve()
     if not source.is_file():return dict(path=path,sha256=None,first_line=1,lines=[],complete=False,total_lines=0,problem='missing')
-    lines=source.read_text(errors='replace').splitlines();center=max(0,(line or 1)-1)
+    lines=source.read_text(errors='replace').splitlines()
+    if full:return dict(path=path,sha256=digest(source),first_line=1,lines=lines,complete=True,total_lines=len(lines))
+    center=max(0,(line or 1)-1)
     if address is not None and line is None:
         center=next((i for i,line in enumerate(lines) if re.match(r'^\s*'+f'{address:08X}',line,re.I)),0)
     return dict(path=path,sha256=digest(source),**excerpt(lines,center,count))
@@ -63,8 +66,62 @@ def original_excerpt(root,path,address=None,count=48,line=None):
 def limited(rows,limit=8):return dict(count=len(rows),rows=[dict(x) for x in rows[:limit]],truncated=len(rows)>limit)
 
 
-def compact(image,address,budget=12000,full_source=False,mips_address=None,source_line=None,pseudo_line=None):
-    if not 4096<=budget<=65536:raise ValueError('Budget must be 4096..65536 bytes')
+def function_info_at_pc(image, pc):
+    root,project=load_project();database=root/project['paths']['analysis_database']
+    with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
+        db.row_factory=sqlite3.Row
+        rows=db.execute('SELECT address,listing,status FROM functions WHERE image=? AND address<=? AND end>? ORDER BY address DESC',
+                        (image,pc,pc)).fetchall()
+    if len(rows)!=1:return None
+    listing=(root/rows[0]['listing']).resolve()
+    if not listing.is_relative_to(root) or not listing.is_file():return None
+    try:return dict(rows[0]) if pc in words_from_listing(listing.read_text(errors='replace').splitlines()) else None
+    except ValueError:return None
+
+
+def function_at_pc(image, pc):
+    row=function_info_at_pc(image,pc)
+    return row['address'] if row else None
+
+
+def writer_audit_owner(image, pc, return_address=None):
+    writer=function_info_at_pc(image,pc)
+    if writer is None:return None
+    if writer['status']!='SKIP':
+        return dict(address=writer['address'],kind='original_writer_function',writer_address=writer['address'])
+    if isinstance(return_address,str) and return_address.startswith('0x'):
+        caller=function_info_at_pc(image,int(return_address,16)-8)
+        if caller and caller['status']!='SKIP':
+            return dict(address=caller['address'],kind='writer_library_caller',writer_address=writer['address'])
+    return None
+
+
+def reviewed_library_identity(image, address):
+    root, project = load_project()
+    database = root / project['paths']['analysis_database']
+    from contextlib import closing
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        function = db.execute(
+            'SELECT status,sha256 FROM functions WHERE image=? AND address=?',
+            (image, address)).fetchone()
+        row = db.execute(
+            'SELECT alias,reason,evidence FROM library_classification '
+            'WHERE image=? AND address=?', (image, address)).fetchone()
+    if function is None or row is None:
+        return None
+    evidence = json.loads(row['evidence'])
+    if (function['status'] != 'SKIP' or evidence.get('sha256') != function['sha256'] or
+            evidence.get('alias') != row['alias'] or evidence.get('status') != 'SKIP'):
+        raise ValueError('Reviewed library classification does not match original function')
+    return {'alias': row['alias'], 'reason': row['reason'],
+            'wrapper_status': evidence.get('wrapper_status'),
+            'original_sha256': function['sha256']}
+
+
+def compact(image,address,budget=12000,full_source=False,mips_address=None,source_line=None,pseudo_line=None,
+            full_original=False):
+    if not 4096<=budget<=2097152:raise ValueError('Budget must be 4096..2097152 bytes')
     root,project=load_project();database=root/project['paths']['analysis_database'];cache={}
     with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as db:
         db.row_factory=sqlite3.Row
@@ -94,13 +151,18 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
         result=dict(schema=1,image=image,address=hex(address),function=dict(function),implementation=body_view or dict(path=impl['source_path'],mapping_status=impl['mapping_status'],mapping_basis=impl['mapping_basis']),
             declarations=declarations,identifiers=dict(count=len(identifiers),names=identifiers[:64],truncated=len(identifiers)>64),
             callees=limited(callees),callers=limited(callers),reuse_peers=limited(peers),
-            mips=original_excerpt(root,function['listing'],mips_address or address,56),
-            pseudocode=original_excerpt(root,function['pseudocode'],None,40,pseudo_line),
+            mips=original_excerpt(root,function['listing'],mips_address or address,56,full=full_original),
+            pseudocode=original_excerpt(root,function['pseudocode'],None,40,pseudo_line,full=full_original),
             evidence=evidence,semantic_aliases=semantic,gaps=[])
+    from pseudocode_review import apply_review
+    result['pseudocode']=apply_review(root,project,dict(function),result['pseudocode'])
+    if result['pseudocode'].get('review'):result['gaps'].append('Reviewed incomplete pseudocode: '+result['pseudocode']['review']['reason'])
     if impl['mapping_status']!='mapped':result['gaps'].append('No unique explicit address-to-C-function mapping: '+impl['mapping_basis'])
     if function['boundary_status']!='audited':result['gaps'].append('Original boundary status: '+function['boundary_status'])
     if function['status']!='DONE':result['gaps'].append('Implementation status is '+function['status'])
     if body_view and not body_view['complete']:result['gaps'].append('C body exceeds bounded view; use --full-source or --source-line')
+    if full_original and len(json.dumps(result,ensure_ascii=True).encode())>budget:
+        raise ValueError('Complete MIPS, pseudocode and C context does not fit requested budget')
     # Preserve exact C/declaration context before secondary original-code excerpts
     for key,minimum in (('pseudocode',8),('mips',16)):
         while len(result[key]['lines'])>minimum and len(json.dumps(result,ensure_ascii=True).encode())>budget:

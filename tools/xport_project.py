@@ -7,8 +7,18 @@ import json
 import os
 from pathlib import Path
 import re
+import uuid
+from coverage_permissions import coverage_permissions
 
 CONFIG_NAME = 'xport-project.json'
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+    temporary.write_text(json.dumps(value, indent=2)+'\n', encoding='utf-8')
+    os.replace(temporary, path)
 
 
 @contextmanager
@@ -77,6 +87,7 @@ def load_project(root=None):
     reserved = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
     if short_name is not None and (not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,15}', short_name) or short_name.upper() in reserved):
         raise ValueError('Invalid configured short_name')
+    coverage_permissions(document)
     return config.parent, document
 
 
@@ -89,6 +100,20 @@ def project_path(key, default=None):
     value = config.get('paths', {}).get(key, default)
     if value is None:
         raise ValueError('Missing project path: '+key)
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root/path).resolve()
+
+
+def native_executable_path(configuration='Release'):
+    root, config = load_project()
+    paths = config.get('paths', {})
+    if configuration.casefold() == 'debug':
+        value = paths.get('native_debug_executable')
+        if value is None:
+            release = Path(paths['native_executable'])
+            value = str(release.with_name(release.stem+'_debug'+release.suffix))
+    else:
+        value = paths['native_executable']
     path = Path(value)
     return path.resolve() if path.is_absolute() else (root/path).resolve()
 

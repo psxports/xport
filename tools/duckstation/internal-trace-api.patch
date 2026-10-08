@@ -1,6 +1,46 @@
+diff --git a/src/core/analog_controller.cpp b/src/core/analog_controller.cpp
+index 080cfae..2709c97 100644
+--- a/src/core/analog_controller.cpp
++++ b/src/core/analog_controller.cpp
+@@ -287,6 +287,21 @@ std::optional<u32> AnalogController::GetAnalogInputBytes() const
+          m_axis_state[static_cast<size_t>(Axis::RightY)] << 8 | m_axis_state[static_cast<size_t>(Axis::RightX)];
+ }
+ 
++bool AnalogController::SetTraceInput(u16 pressed_buttons, u32 axes)
++{
++  // Preserve serial mode and reject changes during an active response
++  if (!m_analog_mode || m_configuration_mode || m_analog_toggle_queued ||
++      (m_command != Command::Idle && m_command != Command::Ready))
++    return false;
++  m_button_state = pressed_buttons ^ UINT16_C(0xFFFF);
++  m_axis_state[static_cast<size_t>(Axis::RightX)] = static_cast<u8>(axes);
++  m_axis_state[static_cast<size_t>(Axis::RightY)] = static_cast<u8>(axes >> 8);
++  m_axis_state[static_cast<size_t>(Axis::LeftX)] = static_cast<u8>(axes >> 16);
++  m_axis_state[static_cast<size_t>(Axis::LeftY)] = static_cast<u8>(axes >> 24);
++  System::SetRunaheadReplayFlag(false);
++  return true;
++}
++
+ void AnalogController::ResetTransferState()
+ {
+   if (m_analog_toggle_queued)
+diff --git a/src/core/analog_controller.h b/src/core/analog_controller.h
+index 832539a..7f57f0d 100644
+--- a/src/core/analog_controller.h
++++ b/src/core/analog_controller.h
+@@ -74,6 +74,7 @@ public:
+   void SetBindState(u32 index, float value) override;
+   u32 GetButtonStateBits() const override;
+   std::optional<u32> GetAnalogInputBytes() const override;
++  bool SetTraceInput(u16 pressed_buttons, u32 axes);
+ 
+   void ResetTransferState() override;
+   bool Transfer(const u8 data_in, u8* data_out) override;
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index c4ca720..2e80169 100644
 --- a/src/core/core.cpp
 +++ b/src/core/core.cpp
-@@ -130,6 +130,20 @@
+@@ -130,6 +130,20 @@ bool Core::SetAppRootAndResources(const char* resources_subdir, Error* error)
  
  bool Core::SetDataRoot(Error* error)
  {
@@ -21,229 +61,1165 @@
  #ifndef __ANDROID__
    // This bullshit here because AppImage mounts in /tmp, so we need to check the "real" appimage location.
    std::string_view real_approot = EmuFolders::AppRoot;
+diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
+index d729042..78a4756 100644
+--- a/src/core/cpu_core.cpp
++++ b/src/core/cpu_core.cpp
+@@ -8,6 +8,7 @@
+ #include "cpu_disasm.h"
+ #include "cpu_pgxp.h"
+ #include "gte.h"
++#include "gdb_server.h"
+ #include "host.h"
+ #include "pcdrv.h"
+ #include "pio.h"
+@@ -379,6 +380,10 @@ ALWAYS_INLINE_RELEASE void CPU::RaiseException(u32 CAUSE_bits, u32 EPC, u32 vect
+     g_state.cop0_regs.TAR = g_state.pc;
+   }
+ 
++#ifdef ENABLE_GDB_SERVER
++  GDBServer::OnLockstepException(vector, g_state.cop0_regs.EPC);
++#endif
++
+   // current -> previous, switch to kernel mode and disable interrupts
+   g_state.cop0_regs.sr.mode_bits <<= 2;
+ 
+@@ -2147,6 +2152,9 @@ bool CPU::UpdateDebugDispatcherFlag()
+ 
+   const bool use_debug_dispatcher =
+     has_any_breakpoints || has_cop0_breakpoints || s_locals.trace_to_log ||
++#ifdef ENABLE_GDB_SERVER
++    GDBServer::IsLockstepBoundaryActive() ||
++#endif
+     (g_settings.cpu_execution_mode == CPUExecutionMode::Interpreter && g_settings.bios_tty_logging);
+   if (use_debug_dispatcher == g_state.using_debug_dispatcher)
+     return false;
+@@ -2559,6 +2567,20 @@ template<PGXPMode pgxp_mode, bool debug>
+   {
+     do
+     {
++      if constexpr (debug)
++      {
++#ifdef ENABLE_GDB_SERVER
++        if (GDBServer::OnLockstepBeforeInstruction(g_state.pc, g_state.next_instruction.bits,
++                                                   g_state.regs.r, g_state.regs.hi, g_state.regs.lo,
++                                                   g_state.gte_regs.r32,
++                                                   g_state.branch_was_taken)) [[unlikely]]
++        {
++          System::PauseSystem(true);
++          ExitExecution();
++          return;
++        }
++#endif
++      }
+       if constexpr (debug)
+         ExecutionBreakpointCheck(g_state.pc);
+ 
+diff --git a/src/core/gdb_server.cpp b/src/core/gdb_server.cpp
+index ca45889..173eebd 100644
 --- a/src/core/gdb_server.cpp
 +++ b/src/core/gdb_server.cpp
-@@ -11,6 +11,13 @@
+@@ -10,9 +10,20 @@
+ #include "cpu_core.h"
  #include "cpu_core_private.h"
  #include "gte.h"
++#include "dma.h"
++#include "gpu.h"
++#include "timers.h"
  #include "system.h"
 +#include "settings.h"
++#include "spu.h"
 +#include "pad.h"
 +#include "controller.h"
-+#include "common/error.h"
-+#include "common/file_system.h"
-+#include "common/path.h"
-+#include <future>
++#include "xport_lockstep_peer.h"
++#include "xport_lockstep_mips.h"
++#include "analog_controller.h"
  
  #include "common/assert.h"
++#include "common/file_system.h"
  #include "common/log.h"
-@@ -20,12 +27,15 @@
+ #include "common/small_string.h"
+ #include "common/string_util.h"
+@@ -20,8 +31,9 @@
  #include "common/timer.h"
  
  #include "util/sockets.h"
-+#include "util/ini_settings_interface.h"
- 
+-
  #include <limits>
++#include <cstdlib>
++#include <cstdio>
  #include <optional>
  #include <utility>
  
- LOG_CHANNEL(GDBServer);
-+
-+#include "ff_trace.inl"
- 
- namespace GDBServer {
- 
-@@ -312,6 +322,15 @@
+@@ -312,6 +324,35 @@ template<bool add_breakpoint>
  static bool Cmd$z(ClientSocket* client, std::string_view data);
  static bool Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data);
  static bool Cmd$qSupported(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTraceStart(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTraceDetailStart(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTraceVBlankStart(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTraceStateStart(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFUserStart(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFUserStop(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTestPad(ClientSocket* client, std::string_view data);
-+static bool Cmd$qFFTraceStop(ClientSocket* client, std::string_view data);
-+template<bool save> static bool Cmd$qFFState(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepAttach(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepExceptions(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepMode(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepCompare(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepDiff(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepDetach(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepPreludeStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepStartAt(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepHandoffState(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepRecordStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepRecordRead(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportFunctionCoverageStart(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportFunctionCoverageTarget(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportFunctionCoverageStop(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportFunctionCoverageRead(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepReplay(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepSeed(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepInput(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepPadRestore(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepBoundary(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepTail(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepNextEvent(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepDMA(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepCheckpointCapture(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepCheckpointExport(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepCheckpointImport(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepCheckpointRestore(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepLastInstruction(ClientSocket* client, std::string_view data);
  static bool Cmd$qXferFeaturesRead(ClientSocket* client, std::string_view data);
  static bool Cmd$qXferMemoryMapRead(ClientSocket* client, std::string_view data);
  
-@@ -403,6 +422,16 @@
+@@ -403,6 +444,49 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
    {"qXfer:features:read:", Cmd$qXferFeaturesRead},
    {"qXfer:memory-map:read:", Cmd$qXferMemoryMapRead},
    {"qSupported", Cmd$qSupported},
-+  {"qFFTraceStart:", Cmd$qFFTraceStart},
-+  {"qFFTraceDetailStart:", Cmd$qFFTraceDetailStart},
-+  {"qFFTraceVBlankStart:", Cmd$qFFTraceVBlankStart},
-+  {"qFFTraceStateStart:", Cmd$qFFTraceStateStart},
-+  {"qFFUserStart:", Cmd$qFFUserStart},
-+  {"qFFUserStop", Cmd$qFFUserStop},
-+  {"qFFTestPad:", Cmd$qFFTestPad},
-+  {"qFFTraceStop", Cmd$qFFTraceStop},
-+  {"qFFSaveState:", Cmd$qFFState<true>},
-+  {"qFFLoadState:", Cmd$qFFState<false>},
++  {"qXportLockstepAttach:", Cmd$qXportLockstepAttach},
++  {"qXportLockstepExceptions:", Cmd$qXportLockstepExceptions},
++  {"qXportLockstepMode:", Cmd$qXportLockstepMode},
++  {"qXportLockstepCompare:", Cmd$qXportLockstepCompare},
++  {"qXportLockstepDiff:", Cmd$qXportLockstepDiff},
++  {"qXportLockstepDetach:", Cmd$qXportLockstepDetach},
++  {"qXportLockstepPreludeStart", Cmd$qXportLockstepPreludeStart},
++  {"qXportLockstepStartAt:", Cmd$qXportLockstepStartAt},
++  {"qXportLockstepHandoffState", Cmd$qXportLockstepHandoffState},
++  {"qXportLockstepStart", Cmd$qXportLockstepStart},
++  {"qXportLockstepRecordStart:", Cmd$qXportLockstepRecordStart},
++  {"qXportLockstepRecordStart", Cmd$qXportLockstepRecordStart},
++  {"qXportLockstepRecordRead:", Cmd$qXportLockstepRecordRead},
++  {"qXportFunctionCoverageStart", Cmd$qXportFunctionCoverageStart},
++  {"qXportFunctionCoverageTarget:", Cmd$qXportFunctionCoverageTarget},
++  {"qXportFunctionCoverageStop", Cmd$qXportFunctionCoverageStop},
++  {"qXportFunctionCoverageRead:", Cmd$qXportFunctionCoverageRead},
++  {"qXportLockstepReplay:", Cmd$qXportLockstepReplay},
++  {"qXportLockstepSeed:", Cmd$qXportLockstepSeed},
++  {"qXportLockstepInput:", Cmd$qXportLockstepInput},
++  {"qXportLockstepPadRestore:", Cmd$qXportLockstepPadRestore},
++  {"qXportLockstepBoundary:", Cmd$qXportLockstepBoundary},
++  {"qXportLockstepTail:", Cmd$qXportLockstepTail},
++  {"qXportLockstepNextEvent", Cmd$qXportLockstepNextEvent},
++  {"qXportLockstepDMA", Cmd$qXportLockstepDMA},
++  {"qXportLockstepCheckpointCapture:", Cmd$qXportLockstepCheckpointCapture},
++  {"qXportLockstepCheckpointExport:", Cmd$qXportLockstepCheckpointExport},
++  {"qXportLockstepCheckpointImport:", Cmd$qXportLockstepCheckpointImport},
++  {"qXportLockstepCheckpointRestore:", Cmd$qXportLockstepCheckpointRestore},
++  {"qXportLockstepLastInstruction", Cmd$qXportLockstepLastInstruction},
++};
++
++struct LockstepPadState
++{
++  u32 type = 0;
++  u32 buttons = 0;
++  u32 analog = 0x80808080u;
++};
++
++struct LockstepRecordFrame
++{
++  u32 frame = 0;
++  std::array<LockstepPadState, 2> pads{};
  };
  
  namespace {
-@@ -940,10 +969,167 @@
+@@ -412,6 +496,36 @@ struct Locals
+   std::shared_ptr<ListenSocket> listen_socket;
+   std::vector<std::shared_ptr<ClientSocket>> clients;
+   std::vector<ManagedBreakpoint> breakpoints;
++  XportLockstep::Peer lockstep_peer;
++  XportLockstep::Difference lockstep_difference;
++  std::string lockstep_request;
++  XportLockstep::MipsCallTracker lockstep_tracker;
++  XportLockstep::MipsFunctionCoverage function_coverage;
++  XportLockstep::MipsEvent lockstep_event;
++  std::array<LockstepPadState, 2> lockstep_pad_state{};
++  std::array<LockstepPadState, 2> lockstep_queued_pad_state{};
++  std::vector<LockstepRecordFrame> lockstep_record_frames;
++  std::string lockstep_record_identity;
++  std::string lockstep_frame_error;
++  std::vector<u8> lockstep_checkpoint_state;
++  std::vector<u8> lockstep_checkpoint_candidate;
++  size_t lockstep_checkpoint_size = 0;
++  u32 lockstep_checkpoint_frame = 0;
++  u32 lockstep_frame = 0;
++  u32 lockstep_queued_frame = 0;
++  u32 lockstep_target_frame = 0;
++  u32 lockstep_record_limit = 0;
++  u32 lockstep_epoch = 0;
++  bool lockstep_boundary_active = false;
++  bool lockstep_frame_active = false;
++  bool lockstep_replay_active = false;
++  bool lockstep_record_active = false;
++  bool lockstep_input_queued = false;
++  bool lockstep_event_pending = false;
++  bool lockstep_prefix_guard = false;
++  bool lockstep_mode_configured = false;
++  bool lockstep_transition_pending = false;
++  bool function_coverage_active = false;
+   u8 pending_stop_signal = GDB_SIGNAL_TRAP;
+   bool resume_on_last_disconnect = false;
+ };
+@@ -940,10 +1054,955 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
    return true;
  }
  
-+// Local diagnostic extension: caller supplies a hex-encoded basename, never a path.
-+// GDB socket dispatch runs on the emulation thread. Require an already paused VM.
-+template<bool save>
-+bool GDBServer::Cmd$qFFState(ClientSocket* client, std::string_view data)
++bool GDBServer::IsLockstepBoundaryActive()
 +{
-+  if (!System::IsPaused() || System::IsExecuting() || FFTrace::stream || FFTrace::armed)
++  return s_locals.lockstep_boundary_active;
++}
++
++bool GDBServer::OnLockstepBeforeInstruction(u32 pc, u32 word, const u32* registers, u32 hi, u32 lo,
++                                            const u32* gte_registers,
++                                            bool prior_branch_taken)
++{
++  if (!s_locals.lockstep_boundary_active || s_locals.lockstep_event_pending)
++    return s_locals.lockstep_event_pending;
++  if (s_locals.function_coverage_active)
 +  {
-+    client->SendReplyWithAck("E10");
-+    return true;
++    s_locals.function_coverage.BeforeInstruction(pc);
++    return false;
 +  }
-+  const auto decoded = StringUtil::DecodeHex(data);
-+  if (!decoded || decoded->empty() || decoded->size() > 64)
++  if (s_locals.lockstep_transition_pending)
 +  {
-+    client->SendReplyWithAck("E11");
-+    return true;
++    s_locals.lockstep_transition_pending = false;
++    s_locals.lockstep_prefix_guard = false;
++    System::SetFastForwardEnabled(true);
++    s_locals.lockstep_epoch++;
++    s_locals.lockstep_tracker.ResetEpoch();
++    s_locals.lockstep_event_pending = s_locals.lockstep_tracker.ModeTransition(
++      s_locals.lockstep_target_frame, &s_locals.lockstep_event);
++    if (s_locals.lockstep_event_pending)
++      System::PauseSystem(true);
++    return s_locals.lockstep_event_pending;
 +  }
-+  std::string name(decoded->begin(), decoded->end());
-+  for (const char c : name)
++  if (s_locals.lockstep_prefix_guard)
++    return false;
++  s_locals.lockstep_event_pending = s_locals.lockstep_tracker.BeforeInstruction(
++    pc, word, registers, hi, lo, gte_registers, prior_branch_taken, &s_locals.lockstep_event);
++  if (s_locals.lockstep_event_pending)
++    s_locals.lockstep_event.frame = s_locals.lockstep_frame;
++  return s_locals.lockstep_event_pending;
++}
++
++void GDBServer::OnLockstepException(u32 vector, u32 return_pc)
++{
++  if (s_locals.lockstep_boundary_active && !s_locals.function_coverage_active)
++    s_locals.lockstep_tracker.EnterException(vector, return_pc);
++}
++
++static bool CaptureLockstepPads(std::array<GDBServer::LockstepPadState, 2>* states, std::string* error)
++{
++  for (u32 port = 0; port < states->size(); port++)
 +  {
-+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-+          (c >= '0' && c <= '9') || c == '-' || c == '_'))
++    Controller* controller = Pad::GetController(port);
++    GDBServer::LockstepPadState& state = (*states)[port];
++    if (!controller)
 +    {
-+      client->SendReplyWithAck("E11");
-+      return true;
++      state = {};
++      continue;
++    }
++    state.buttons = controller->GetButtonStateBits() & 0xffffu;
++    state.analog = 0x80808080u;
++    if (controller->GetType() == ControllerType::DigitalController)
++      state.type = 1;
++    else if (controller->GetType() == ControllerType::AnalogController)
++    {
++      state.type = 2;
++      state.analog = controller->GetAnalogInputBytes().value_or(0x80808080u);
++    }
++    else
++    {
++      *error = "unsupported_controller";
++      return false;
 +    }
 +  }
-+  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-audit-" + name + ".sav");
-+  Error error;
-+  bool success;
-+  if constexpr (save)
++  return true;
++}
++
++static bool ApplyLockstepPads(const std::array<GDBServer::LockstepPadState, 2>& states, std::string* error)
++{
++  for (u32 port = 0; port < states.size(); port++)
 +  {
-+    if (FileSystem::FileExists(path.c_str()))
++    Controller* controller = Pad::GetController(port);
++    const GDBServer::LockstepPadState& state = states[port];
++    if (!state.type)
 +    {
-+      client->SendReplyWithAck("E12"); // Never overwrite a prior reference state.
-+      return true;
++      if (controller)
++      {
++        *error = "controller_presence_mismatch";
++        return false;
++      }
++      continue;
 +    }
-+    std::promise<bool> completion;
-+    auto future = completion.get_future();
-+    success = System::SaveState(path, &error, false, false,
-+      [&completion](bool result, const Error&) { completion.set_value(result); });
-+    if (success)
-+      success = future.get(); // Reply only after the file is atomically committed.
++    if (!controller || (state.type == 1 && controller->GetType() != ControllerType::DigitalController) ||
++        (state.type == 2 && controller->GetType() != ControllerType::AnalogController))
++    {
++      *error = "controller_type_mismatch";
++      return false;
++    }
++    if (state.type == 2)
++    {
++      if (!static_cast<AnalogController*>(controller)->SetTraceInput(static_cast<u16>(state.buttons), state.analog))
++      {
++        *error = "controller_busy";
++        return false;
++      }
++      continue;
++    }
++    for (u32 bit = 0; bit < 16; bit++)
++      controller->SetBindState(bit, (state.buttons & (1u << bit)) ? 1.0f : 0.0f);
 +  }
-+  else
-+  {
-+    client->ClearBreakpoints(); // Clients must reinstall breakpoints after restore.
-+    const auto result = System::LoadState(path.c_str(), &error, false, false);
-+    success = result.has_value() && *result;
-+  }
-+  client->SendReplyWithAck(success ? "OK" : "E13");
 +  return true;
 +}
 +
-+bool GDBServer::Cmd$qFFTraceStart(ClientSocket* client, std::string_view data)
++void GDBServer::OnLockstepFrameDone()
 +{
-+  client->SendReplyWithAck(FFTrace::Start(data));
-+  return true;
-+}
-+
-+bool GDBServer::Cmd$qFFTraceStop(ClientSocket* client, std::string_view data)
-+{
-+  if (!System::IsPaused() || System::IsExecuting())
-+  {
-+    client->SendReplyWithAck("E20");
-+    return true;
-+  }
-+  FFTrace::Close(FFTrace::Read(0x80093dd0), false);
-+  FFTrace::Disarm();
-+  client->SendReplyWithAck(FFTrace::failed ? "E23" : "OK");
-+  return true;
-+}
-+
-+bool GDBServer::Cmd$qFFTraceDetailStart(ClientSocket* client, std::string_view data)
-+{
-+  client->SendReplyWithAck(FFTrace::Start(data, true));
-+  return true;
-+}
-+
-+bool GDBServer::Cmd$qFFTraceVBlankStart(ClientSocket* client, std::string_view data)
-+{
-+  client->SendReplyWithAck(FFTrace::Start(data, false, true));
-+  return true;
-+}
-+
-+void GDBServer::OnTraceVBlank()
-+{
-+  FFTrace::VBlank();
-+}
-+
-+void GDBServer::OnTraceSettings()
-+{
-+  FFTrace::SettingsChanged();
-+}
-+
-+void GDBServer::OnTracePad(u32 port, u32 device, u8 outgoing, u8 incoming, bool ack)
-+{
-+  if (!FFTrace::stream || !FFTrace::vblank_enabled)
++  if (!s_locals.lockstep_frame_active || s_locals.lockstep_event_pending)
 +    return;
-+  const auto ticks = FFTrace::ReadClock();
-+  std::vector<u8> payload;
-+  for (u32 value : {System::GetFrameNumber(), static_cast<u32>(ticks), static_cast<u32>(ticks >> 32),
-+                    port, device, static_cast<u32>(outgoing), static_cast<u32>(incoming), ack ? 1u : 0u})
-+    FFTrace::Number(payload, value);
-+  FFTrace::Emit(11, FFTrace::Read(0x80093dd0), payload);
-+}
-+
-+bool GDBServer::Cmd$qFFTraceStateStart(ClientSocket* client, std::string_view data)
-+{
-+  client->SendReplyWithAck(FFTrace::Start(data, false, true, true));
-+  return true;
-+}
-+
-+bool GDBServer::Cmd$qFFUserStart(ClientSocket* client, std::string_view data)
-+{
-+  client->SendReplyWithAck(FFTrace::Start(data, false, true, true, true));
-+  return true;
-+}
-+
-+bool GDBServer::Cmd$qFFUserStop(ClientSocket* client, std::string_view data)
-+{
-+  if (!System::IsPaused() || System::IsExecuting() || !FFTrace::user_mode)
++  const u32 frame = s_locals.lockstep_frame;
++  bool valid = true;
++  s_locals.lockstep_frame_error.clear();
++  if (s_locals.lockstep_record_active)
 +  {
-+    client->SendReplyWithAck("E20");
-+    return true;
++    LockstepRecordFrame recorded;
++    recorded.frame = frame;
++    valid = CaptureLockstepPads(&recorded.pads, &s_locals.lockstep_frame_error);
++    if (!valid)
++    {
++      s_locals.lockstep_frame_active = false;
++      s_locals.lockstep_record_active = false;
++      System::PauseSystem(true);
++      return;
++    }
++    s_locals.lockstep_record_frames.push_back(recorded);
++    s_locals.lockstep_frame++;
++    if (s_locals.lockstep_record_limit && s_locals.lockstep_frame >= s_locals.lockstep_record_limit)
++    {
++      s_locals.lockstep_frame_active = false;
++      s_locals.lockstep_record_active = false;
++      System::PauseSystem(true);
++    }
++    return;
 +  }
-+  FFTrace::Close(FFTrace::Read(0x80093dd0), true);
-+  FFTrace::Disarm();
-+  client->SendReplyWithAck(FFTrace::failed ? "E23" : "OK");
++  if (s_locals.lockstep_replay_active)
++  {
++    if (!s_locals.lockstep_input_queued)
++    {
++      s_locals.lockstep_frame_error = "missing_frame_input";
++      valid = false;
++    }
++    else if (s_locals.lockstep_queued_frame != frame)
++    {
++      s_locals.lockstep_frame_error = "frame_input_mismatch";
++      valid = false;
++    }
++    else
++    {
++      valid = ApplyLockstepPads(s_locals.lockstep_queued_pad_state, &s_locals.lockstep_frame_error);
++      s_locals.lockstep_input_queued = false;
++    }
++  }
++  if (valid)
++    valid = CaptureLockstepPads(&s_locals.lockstep_pad_state, &s_locals.lockstep_frame_error);
++  s_locals.lockstep_event_pending = s_locals.lockstep_tracker.FrameDone(
++    frame, !valid, &s_locals.lockstep_event);
++  if (valid)
++    s_locals.lockstep_frame++;
++  if (s_locals.lockstep_event_pending)
++  {
++    if (valid && s_locals.lockstep_prefix_guard && frame >= s_locals.lockstep_target_frame)
++      s_locals.lockstep_transition_pending = true;
++    System::PauseSystem(true);
++  }
++}
++
++void GDBServer::OnLockstepSpuEvent(u32 kind, u32 address, u32 value, u64 ticks)
++{
++  if (!s_locals.lockstep_replay_active || !s_locals.lockstep_frame_active ||
++      !s_locals.lockstep_peer.IsAttached())
++    return;
++  s_locals.lockstep_peer.PublishSpuEvent(
++    static_cast<XportLockstep::SpuEventKind>(kind), address, value, ticks);
++}
++
++static std::string_view TakeLockstepField(std::string_view* data)
++{
++  const size_t separator = data->find(':');
++  if (separator == std::string_view::npos)
++  {
++    const std::string_view field = *data;
++    *data = {};
++    return field;
++  }
++  const std::string_view field = data->substr(0, separator);
++  data->remove_prefix(separator + 1);
++  return field;
++}
++
++static bool IsLockstepIdentity(std::string_view value, size_t length)
++{
++  if (value.size() != length)
++    return false;
++  for (const char character : value)
++  {
++    if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')))
++      return false;
++  }
 +  return true;
 +}
 +
-+bool GDBServer::Cmd$qFFTestPad(ClientSocket* client, std::string_view data)
++static std::string_view LockstepErrorName(XportLockstep::Error error)
 +{
++  switch (error)
++  {
++    case XportLockstep::Error::None: return "ok";
++    case XportLockstep::Error::PlatformUnsupported: return "platform_unsupported";
++    case XportLockstep::Error::InvalidIdentity: return "invalid_identity";
++    case XportLockstep::Error::AlreadyAttached: return "already_attached";
++    case XportLockstep::Error::OpenFailed: return "open_failed";
++    case XportLockstep::Error::SizeMismatch: return "size_mismatch";
++    case XportLockstep::Error::MapFailed: return "map_failed";
++    case XportLockstep::Error::NotAttached: return "not_attached";
++    case XportLockstep::Error::InvalidStackRanges: return "invalid_stack_ranges";
++    case XportLockstep::Error::UnknownStackRanges: return "unknown_stack_ranges";
++    case XportLockstep::Error::AlreadySeeded: return "already_seeded";
++    case XportLockstep::Error::Unseeded: return "unseeded";
++    case XportLockstep::Error::InvalidDeferredState: return "invalid_deferred_state";
++    default: return "unknown";
++  }
++}
++
++static bool SendLockstepError(GDBServer::ClientSocket* client, std::string_view request, std::string_view code)
++{
++  client->SendReplyWithAck(TinyString::from_format("ERROR:{}:{}", request, code));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepAttach(ClientSocket* client, std::string_view data)
++{
++  const std::string_view run_id = TakeLockstepField(&data);
++  const std::string_view dram_name = TakeLockstepField(&data);
++  const std::string_view scratchpad_name = TakeLockstepField(&data);
++  const std::string_view deferred_name = TakeLockstepField(&data);
++  if (!data.empty() || run_id.empty() || dram_name.empty() || scratchpad_name.empty() ||
++      deferred_name.empty())
++    return SendLockstepError(client, run_id, "malformed_attach");
++  const XportLockstep::Error error =
++    s_locals.lockstep_peer.Attach(run_id, dram_name, scratchpad_name, deferred_name);
++  if (error != XportLockstep::Error::None)
++    return SendLockstepError(client, run_id, LockstepErrorName(error));
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", run_id));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepExceptions(ClientSocket* client, std::string_view data)
++{
++  const std::string_view identity = TakeLockstepField(&data);
++  if (!IsLockstepIdentity(identity, 64) || data.empty())
++    return SendLockstepError(client, identity, "invalid_stack_ranges");
++  std::vector<XportLockstep::Range> ranges;
++  while (!data.empty())
++  {
++    const size_t end = data.find(';');
++    const std::string_view encoded = data.substr(0, end);
++    const size_t first_comma = encoded.find(',');
++    const size_t second_comma = first_comma == std::string_view::npos ? std::string_view::npos :
++      encoded.find(',', first_comma + 1);
++    const std::string_view region_name = encoded.substr(0, first_comma);
++    const auto offset = second_comma == std::string_view::npos ? std::nullopt :
++      StringUtil::FromChars<u32>(encoded.substr(first_comma + 1, second_comma - first_comma - 1), 16);
++    const auto size = second_comma == std::string_view::npos ? std::nullopt :
++      StringUtil::FromChars<u32>(encoded.substr(second_comma + 1), 16);
++    XportLockstep::Range::Region region;
++    if (region_name == "dram")
++      region = XportLockstep::Range::Region::Dram;
++    else if (region_name == "scratchpad")
++      region = XportLockstep::Range::Region::Scratchpad;
++    else
++      return SendLockstepError(client, identity, "invalid_stack_ranges");
++    if (!offset.has_value() || !size.has_value())
++      return SendLockstepError(client, identity, "invalid_stack_ranges");
++    ranges.push_back({region, *offset, *size});
++    if (end == std::string_view::npos)
++      data = {};
++    else
++      data.remove_prefix(end + 1);
++  }
++  const XportLockstep::Error error = s_locals.lockstep_peer.SetStackRanges(identity, ranges);
++  if (error != XportLockstep::Error::None)
++    return SendLockstepError(client, identity, LockstepErrorName(error));
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", identity));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepMode(ClientSocket* client, std::string_view data)
++{
++  const std::string_view mode = TakeLockstepField(&data);
++  const auto target = StringUtil::FromChars<u32>(data, 16);
++  if (!s_locals.lockstep_peer.IsAttached() || !s_locals.lockstep_replay_active ||
++      s_locals.lockstep_boundary_active || !target.has_value() ||
++      (mode != "DETAILED" && mode != "PREFIX_GUARD") ||
++      (mode == "DETAILED" && *target != 0) || (mode == "PREFIX_GUARD" && *target == 0))
++    return SendLockstepError(client, "mode", "invalid_mode");
++  s_locals.lockstep_prefix_guard = mode == "PREFIX_GUARD";
++  System::SetFastForwardEnabled(true);
++  s_locals.lockstep_target_frame = *target;
++  s_locals.lockstep_epoch = 0;
++  s_locals.lockstep_mode_configured = true;
++  s_locals.lockstep_transition_pending = false;
++  client->SendReplyWithAck(TinyString::from_format("OK:{}:{:x}", mode, *target));
++  return true;
++}
++
++static bool IsLockstepRequest(std::string_view value)
++{
++  if (value.empty() || value.size() > 64)
++    return false;
++  for (const char character : value)
++  {
++    if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'z') ||
++          (character >= 'A' && character <= 'Z') || character == '_' || character == '-'))
++      return false;
++  }
++  return true;
++}
++
++static bool SendLockstepDifference(GDBServer::ClientSocket* client, std::string_view request,
++                                   const XportLockstep::Difference& difference, u32 offset, u32 length)
++{
++  const std::string_view region = difference.region == XportLockstep::Difference::Region::Dram ?
++                                    "dram" : "scratchpad";
++  const u32 relative = offset - difference.offset;
++  const std::string original = StringUtil::EncodeHex(difference.original.data() + relative, length);
++  const std::string candidate = StringUtil::EncodeHex(difference.candidate.data() + relative, length);
++  client->SendReplyWithAck(TinyString::from_format("DIFF:{}:{}:{:x}:{:x}:{}:{}", request, region, offset,
++                                                   length, original, candidate));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepCompare(ClientSocket* client, std::string_view data)
++{
++  const std::string_view request = TakeLockstepField(&data);
++  const std::string_view stack_identity = TakeLockstepField(&data);
++  if (!IsLockstepRequest(request) || !IsLockstepIdentity(stack_identity, 64) || !data.empty())
++    return SendLockstepError(client, request, "malformed_compare");
 +  if (!System::IsPaused() || System::IsExecuting())
++    return SendLockstepError(client, request, "not_stopped");
++  XportLockstep::Difference difference;
++  u32 deferred_generation = 0;
++  const XportLockstep::Error error = s_locals.lockstep_peer.Compare(
++    stack_identity, g_bus.ram, CPU::g_state.scratchpad.data(), &difference, &deferred_generation);
++  if (error != XportLockstep::Error::None)
++    return SendLockstepError(client, request, LockstepErrorName(error));
++  s_locals.lockstep_request = request;
++  s_locals.lockstep_difference = difference;
++  if (difference.region == XportLockstep::Difference::Region::None)
 +  {
-+    client->SendReplyWithAck("E20");
++    if (deferred_generation)
++      client->SendReplyWithAck(TinyString::from_format("DEFERRED:{}:{:x}", request, deferred_generation));
++    else
++      client->SendReplyWithAck(TinyString::from_format("OK:{}", request));
 +    return true;
 +  }
-+  auto bytes = StringUtil::DecodeHex(data);
-+  if (!bytes || bytes->size() != 8 || FFTrace::Word(bytes->data()) > 1 || FFTrace::Word(bytes->data() + 4) > 65535)
++  return SendLockstepDifference(client, request, difference, difference.offset, difference.length);
++}
++
++bool GDBServer::Cmd$qXportLockstepDiff(ClientSocket* client, std::string_view data)
++{
++  const std::string_view request = TakeLockstepField(&data);
++  const std::string_view region = TakeLockstepField(&data);
++  const std::string_view offset_text = TakeLockstepField(&data);
++  const std::string_view length_text = TakeLockstepField(&data);
++  const auto offset = StringUtil::FromChars<u32>(offset_text, 16);
++  const auto length = StringUtil::FromChars<u32>(length_text, 16);
++  const std::string_view expected_region =
++    s_locals.lockstep_difference.region == XportLockstep::Difference::Region::Dram ? "dram" : "scratchpad";
++  if (!data.empty() || request != s_locals.lockstep_request || region != expected_region ||
++      !offset.has_value() || !length.has_value() || !*length || *length > XportLockstep::MAX_DIFF_SIZE ||
++      *length > s_locals.lockstep_difference.length ||
++      *offset < s_locals.lockstep_difference.offset ||
++      *offset > s_locals.lockstep_difference.offset + s_locals.lockstep_difference.length - *length)
++    return SendLockstepError(client, request, "invalid_diff_range");
++  return SendLockstepDifference(client, request, s_locals.lockstep_difference, *offset, *length);
++}
++
++bool GDBServer::Cmd$qXportLockstepDetach(ClientSocket* client, std::string_view data)
++{
++  const XportLockstep::Error error = s_locals.lockstep_peer.Detach(data);
++  if (error != XportLockstep::Error::None)
++    return SendLockstepError(client, data, LockstepErrorName(error));
++  s_locals.lockstep_request.clear();
++  s_locals.lockstep_difference = {};
++  s_locals.lockstep_boundary_active = false;
++  s_locals.lockstep_frame_active = false;
++  s_locals.lockstep_replay_active = false;
++  s_locals.lockstep_record_active = false;
++  s_locals.lockstep_input_queued = false;
++  s_locals.lockstep_record_frames.clear();
++  s_locals.function_coverage.Reset();
++  s_locals.function_coverage_active = false;
++  s_locals.lockstep_record_identity.clear();
++  s_locals.lockstep_frame_error.clear();
++  s_locals.lockstep_checkpoint_state.clear();
++  s_locals.lockstep_checkpoint_candidate.clear();
++  s_locals.lockstep_checkpoint_size = 0;
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_prefix_guard = false;
++  System::SetFastForwardEnabled(false);
++  s_locals.lockstep_mode_configured = false;
++  s_locals.lockstep_transition_pending = false;
++  s_locals.lockstep_target_frame = 0;
++  s_locals.lockstep_record_limit = 0;
++  s_locals.lockstep_epoch = 0;
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", data));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepStart(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || !s_locals.lockstep_peer.IsAttached() || !s_locals.lockstep_peer.IsSeeded() ||
++      !s_locals.lockstep_replay_active || !s_locals.lockstep_mode_configured)
++    return SendLockstepError(client, "start", "replay_not_ready");
++  s_locals.lockstep_tracker.Reset();
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_checkpoint_state.clear();
++  s_locals.lockstep_checkpoint_candidate.clear();
++  s_locals.lockstep_peer.ResetSpuTimeline();
++  s_locals.lockstep_checkpoint_size = 0;
++  s_locals.lockstep_boundary_active = true;
++  s_locals.lockstep_frame_active = true;
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck("OK:start");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepPreludeStart(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || s_locals.lockstep_peer.IsAttached() ||
++      !s_locals.lockstep_replay_active || s_locals.lockstep_frame_active ||
++      s_locals.lockstep_boundary_active || s_locals.lockstep_record_active)
++    return SendLockstepError(client, "prelude", "replay_not_ready");
++  s_locals.lockstep_tracker.Reset();
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_checkpoint_state.clear();
++  s_locals.lockstep_checkpoint_candidate.clear();
++  s_locals.lockstep_checkpoint_size = 0;
++  s_locals.lockstep_boundary_active = false;
++  s_locals.lockstep_frame_active = true;
++  System::SetFastForwardEnabled(true);
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck("OK:prelude");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepStartAt(ClientSocket* client, std::string_view data)
++{
++  const auto frame = StringUtil::FromChars<u32>(data, 16);
++  if (!frame.has_value() || !*frame || !s_locals.lockstep_peer.IsAttached() ||
++      !s_locals.lockstep_peer.IsSeeded() || !s_locals.lockstep_replay_active ||
++      !s_locals.lockstep_mode_configured || !s_locals.lockstep_frame_active ||
++      s_locals.lockstep_boundary_active || s_locals.lockstep_event_pending ||
++      !s_locals.lockstep_input_queued || s_locals.lockstep_queued_frame != *frame)
++    return SendLockstepError(client, "start_at", "replay_not_ready");
++  s_locals.lockstep_tracker.Reset();
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_frame = *frame;
++  s_locals.lockstep_checkpoint_state.clear();
++  s_locals.lockstep_checkpoint_candidate.clear();
++  s_locals.lockstep_checkpoint_size = 0;
++  s_locals.lockstep_boundary_active = true;
++  s_locals.lockstep_frame_active = true;
++  System::SetFastForwardEnabled(true);
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck(TinyString::from_format("OK:start_at:{:x}", *frame));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepHandoffState(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || System::IsExecuting() || !System::IsPaused() ||
++      !s_locals.lockstep_replay_active || s_locals.lockstep_boundary_active)
++    return SendLockstepError(client, "handoff_state", "handoff_state_not_ready");
++  const u32 timer1 = Timers::ReadRegister(0x10);
++  const u32 gpu_status = GPU::ReadRegister(0x04);
++  const u32 field_lines = GPU::IsInPALMode() ? 314u : 263u;
++  client->SendReplyWithAck(TinyString::from_format(
++    "HANDOFF:{:08x}:{:08x}:{:x}", timer1, gpu_status, field_lines));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepRecordStart(ClientSocket* client, std::string_view data)
++{
++  const auto limit = data.empty() ? std::optional<u32>(0) : StringUtil::FromChars<u32>(data, 16);
++  if (!limit.has_value() || s_locals.lockstep_peer.IsAttached())
++    return SendLockstepError(client, "record", "record_not_isolated");
++  s_locals.lockstep_tracker.Reset();
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_boundary_active = false;
++  s_locals.lockstep_frame_active = true;
++  s_locals.lockstep_replay_active = false;
++  s_locals.lockstep_record_active = true;
++  s_locals.lockstep_input_queued = false;
++  s_locals.lockstep_record_frames.clear();
++  s_locals.lockstep_frame_error.clear();
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_record_limit = *limit;
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck("OK:record");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepRecordRead(ClientSocket* client, std::string_view data)
++{
++  const std::string_view offset_text = TakeLockstepField(&data);
++  const std::string_view count_text = TakeLockstepField(&data);
++  const auto offset = StringUtil::FromChars<u32>(offset_text, 16);
++  const auto count = StringUtil::FromChars<u32>(count_text, 16);
++  if (System::IsExecuting() || !data.empty() || !offset.has_value() ||
++      !count.has_value() || !*count || *count > 64 || *offset > s_locals.lockstep_record_frames.size())
++    return SendLockstepError(client, "record", "invalid_record_read");
++  s_locals.lockstep_frame_active = false;
++  s_locals.lockstep_record_active = false;
++  const u32 total = static_cast<u32>(s_locals.lockstep_record_frames.size());
++  const u32 end = std::min(total, *offset + *count);
++  SmallString reply;
++  reply.append_format("RECORD:{:x}:{:x}:", total, *offset);
++  for (u32 index = *offset; index < end; index++)
 +  {
-+    client->SendReplyWithAck("E21");
++    const LockstepRecordFrame& frame = s_locals.lockstep_record_frames[index];
++    if (index != *offset)
++      reply.append(';');
++    reply.append_format("{:x},{:x},{:x},{:x},{:x},{:x},{:x}", frame.frame,
++                        frame.pads[0].type, frame.pads[0].buttons, frame.pads[0].analog,
++                        frame.pads[1].type, frame.pads[1].buttons, frame.pads[1].analog);
++  }
++  client->SendReplyWithAck(reply);
++  return true;
++}
++
++bool GDBServer::Cmd$qXportFunctionCoverageStart(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || System::IsExecuting() || !System::IsPaused() ||
++      s_locals.lockstep_peer.IsAttached() || s_locals.lockstep_boundary_active ||
++      s_locals.lockstep_frame_active || s_locals.lockstep_replay_active ||
++      s_locals.lockstep_record_active || s_locals.function_coverage_active)
++  {
++    return SendLockstepError(client, "coverage", "coverage_not_isolated");
++  }
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.function_coverage.Reset();
++  s_locals.function_coverage_active = true;
++  s_locals.lockstep_boundary_active = true;
++  s_locals.resume_on_last_disconnect = true;
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck("OK:coverage");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportFunctionCoverageTarget(ClientSocket* client, std::string_view data)
++{
++  const auto target = StringUtil::FromChars<u32>(data, 16);
++  if (!s_locals.function_coverage_active || !target.has_value() ||
++      !s_locals.function_coverage.AddTarget(*target))
++  {
++    return SendLockstepError(client, "coverage", "invalid_coverage_target");
++  }
++  client->SendReplyWithAck("OK:coverage_target");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportFunctionCoverageStop(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || System::IsExecuting() || !System::IsPaused() ||
++      !s_locals.function_coverage_active)
++  {
++    return SendLockstepError(client, "coverage", "coverage_not_active");
++  }
++  s_locals.function_coverage_active = false;
++  s_locals.lockstep_boundary_active = false;
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck(TinyString::from_format(
++    "OK:coverage:{:x}", s_locals.function_coverage.GetCount()));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportFunctionCoverageRead(ClientSocket* client, std::string_view data)
++{
++  const std::string_view offset_text = TakeLockstepField(&data);
++  const std::string_view count_text = TakeLockstepField(&data);
++  const auto offset = StringUtil::FromChars<u32>(offset_text, 16);
++  const auto count = StringUtil::FromChars<u32>(count_text, 16);
++  if (System::IsExecuting() || !System::IsPaused() || s_locals.function_coverage_active ||
++      !data.empty() || !offset.has_value() || !count.has_value() || !*count ||
++      *count > 64 || *offset > s_locals.function_coverage.GetCount())
++  {
++    return SendLockstepError(client, "coverage", "invalid_coverage_read");
++  }
++  const u32 total = s_locals.function_coverage.GetCount();
++  const u32 end = std::min(total, *offset + *count);
++  SmallString reply;
++  reply.append_format("COVERAGE:{:x}:{:x}:", total, *offset);
++  for (u32 index = *offset; index < end; index++)
++  {
++    if (index != *offset)
++      reply.append(';');
++    reply.append_format("{:x}", s_locals.function_coverage.GetFunction(index));
++  }
++  client->SendReplyWithAck(reply);
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepReplay(ClientSocket* client, std::string_view data)
++{
++  if (!IsLockstepIdentity(data, 64) || s_locals.lockstep_frame_active ||
++      s_locals.lockstep_boundary_active || s_locals.lockstep_record_active)
++    return SendLockstepError(client, "replay", "invalid_record_identity");
++  s_locals.lockstep_record_identity = data;
++  s_locals.lockstep_replay_active = true;
++  s_locals.lockstep_input_queued = false;
++  s_locals.lockstep_frame_error.clear();
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_checkpoint_state.clear();
++  s_locals.lockstep_checkpoint_candidate.clear();
++  s_locals.lockstep_checkpoint_size = 0;
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", data));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepSeed(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || System::IsExecuting() || !s_locals.lockstep_replay_active ||
++      data != s_locals.lockstep_record_identity || s_locals.lockstep_boundary_active)
++    return SendLockstepError(client, data, "seed_not_ready");
++  GPU::SynchronizeVRAMForLockstep();
++  const XportLockstep::Error error = s_locals.lockstep_peer.Seed(
++    g_bus.ram, CPU::g_state.scratchpad.data(), reinterpret_cast<const u8*>(g_vram));
++  if (error != XportLockstep::Error::None)
++    return SendLockstepError(client, data, LockstepErrorName(error));
++  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter());
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", data));
++  return true;
++}
++
++static bool ParseLockstepPad(std::string_view value, GDBServer::LockstepPadState* state)
++{
++  const size_t first = value.find(',');
++  const size_t second = first == std::string_view::npos ? first : value.find(',', first + 1);
++  const auto type = first == std::string_view::npos ? std::nullopt :
++    StringUtil::FromChars<u32>(value.substr(0, first), 16);
++  const auto buttons = second == std::string_view::npos ? std::nullopt :
++    StringUtil::FromChars<u32>(value.substr(first + 1, second - first - 1), 16);
++  const auto analog = second == std::string_view::npos ? std::nullopt :
++    StringUtil::FromChars<u32>(value.substr(second + 1), 16);
++  if (!type.has_value() || !buttons.has_value() || !analog.has_value() || *type > 2 || *buttons > 0xffffu)
++    return false;
++  *state = {*type, *buttons, *analog};
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepInput(ClientSocket* client, std::string_view data)
++{
++  const std::string_view frame_text = TakeLockstepField(&data);
++  const std::string_view port0 = TakeLockstepField(&data);
++  const std::string_view port1 = TakeLockstepField(&data);
++  const auto frame = StringUtil::FromChars<u32>(frame_text, 16);
++  std::array<GDBServer::LockstepPadState, 2> states;
++  if (!s_locals.lockstep_replay_active || s_locals.lockstep_input_queued || !data.empty() ||
++      !frame.has_value() || !ParseLockstepPad(port0, &states[0]) || !ParseLockstepPad(port1, &states[1]))
++    return SendLockstepError(client, frame_text, "invalid_frame_input");
++  s_locals.lockstep_queued_frame = *frame;
++  s_locals.lockstep_queued_pad_state = states;
++  s_locals.lockstep_input_queued = true;
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", frame_text));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepBoundary(ClientSocket* client, std::string_view data)
++{
++  const auto target = StringUtil::FromChars<u32>(data, 16);
++  if (!s_locals.lockstep_boundary_active || s_locals.function_coverage_active ||
++      !target.has_value() ||
++      !s_locals.lockstep_tracker.AddBoundaryTarget(*target))
++    return SendLockstepError(client, "boundary", "invalid_boundary_target");
++  client->SendReplyWithAck("OK:boundary");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepTail(ClientSocket* client, std::string_view data)
++{
++  const std::string_view source_text = TakeLockstepField(&data);
++  const std::string_view target_text = TakeLockstepField(&data);
++  const auto source = StringUtil::FromChars<u32>(source_text, 16);
++  const auto target = StringUtil::FromChars<u32>(target_text, 16);
++  if (!data.empty() || !source.has_value() || !target.has_value() ||
++      !s_locals.lockstep_tracker.AddReviewedTailCall(*source, *target))
++    return SendLockstepError(client, "tail", "invalid_tail_call");
++  client->SendReplyWithAck("OK:tail");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepNextEvent(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty())
++    return SendLockstepError(client, "event", "malformed_event_query");
++  if (!s_locals.lockstep_event_pending)
++  {
++    client->SendReplyWithAck("NONE");
 +    return true;
 +  }
-+  Controller* controller = Pad::GetController(FFTrace::Word(bytes->data()));
-+  if (!controller || controller->GetType() != ControllerType::DigitalController)
++  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter());
++  const XportLockstep::MipsEvent& event = s_locals.lockstep_event;
++  const std::string_view mode = s_locals.lockstep_prefix_guard ? "PREFIX_GUARD" : "DETAILED";
++  if (event.kind == XportLockstep::MipsEventKind::ModeTransition)
 +  {
-+    client->SendReplyWithAck("E24");
++    const TinyString json = TinyString::from_format(
++      "{{\"schema\":1,\"contract\":\"xport-lockstep-event-v2\",\"side\":\"original\","
++      "\"kind\":\"MODE_TRANSITION\",\"mode\":\"DETAILED\",\"epoch\":{},\"event_sequence\":{},"
++      "\"frame\":{},\"image\":\"MAIN.EXE\",\"function\":null,\"parent_invocation\":0,"
++      "\"invocation\":0,\"depth\":0,\"call_ordinal\":0,\"callsite\":null,\"target\":null,"
++      "\"return_pc\":null,\"source\":{{\"previous_mode\":\"PREFIX_GUARD\","
++      "\"next_mode\":\"DETAILED\",\"target_frame\":{}}}}}",
++      s_locals.lockstep_epoch, event.sequence, event.frame, s_locals.lockstep_target_frame);
++    client->SendReplyWithAck("EVENT:" + StringUtil::EncodeHex(json.c_str(), json.length()));
++    s_locals.lockstep_event_pending = false;
 +    return true;
 +  }
-+  const u32 mask = FFTrace::Word(bytes->data() + 4);
-+  for (u32 bit = 0; bit < 16; bit++)
-+    controller->SetBindState(bit, (mask & (1u << bit)) ? 1.0f : 0.0f);
-+  client->SendReplyWithAck("OK");
++  if (event.kind == XportLockstep::MipsEventKind::VBlank || event.kind == XportLockstep::MipsEventKind::Fault)
++  {
++    const auto pad_name = [](u32 type) -> std::string_view {
++      return type == 1 ? "digital" : type == 2 ? "analog" : "disconnected";
++    };
++    const bool fault = event.kind == XportLockstep::MipsEventKind::Fault;
++    const TinyString json = fault ? TinyString::from_format(
++      "{{\"schema\":1,\"contract\":\"xport-lockstep-event-v2\",\"side\":\"original\","
++      "\"kind\":\"FAULT\",\"mode\":\"{}\",\"epoch\":{},\"event_sequence\":{},\"frame\":{},\"image\":\"MAIN.EXE\","
++      "\"function\":null,\"parent_invocation\":0,\"invocation\":0,\"depth\":0,"
++      "\"call_ordinal\":0,\"callsite\":null,\"target\":null,\"return_pc\":null,"
++      "\"source\":{{\"error\":\"{}\"}}}}", mode, s_locals.lockstep_epoch, event.sequence, event.frame, s_locals.lockstep_frame_error) :
++      TinyString::from_format(
++      "{{\"schema\":1,\"contract\":\"xport-lockstep-event-v2\",\"side\":\"original\","
++      "\"kind\":\"VBLANK\",\"mode\":\"{}\",\"epoch\":{},\"event_sequence\":{},\"frame\":{},\"image\":\"MAIN.EXE\","
++      "\"function\":null,\"parent_invocation\":0,\"invocation\":0,\"depth\":0,"
++      "\"call_ordinal\":0,\"callsite\":null,\"target\":null,\"return_pc\":null,"
++      "\"controller_state\":[{{\"type\":\"{}\",\"buttons\":{},\"analog\":{}}},"
++      "{{\"type\":\"{}\",\"buttons\":{},\"analog\":{}}}]}}",
++      mode, s_locals.lockstep_epoch, event.sequence, event.frame,
++      pad_name(s_locals.lockstep_pad_state[0].type), s_locals.lockstep_pad_state[0].buttons,
++      s_locals.lockstep_pad_state[0].analog, pad_name(s_locals.lockstep_pad_state[1].type),
++      s_locals.lockstep_pad_state[1].buttons, s_locals.lockstep_pad_state[1].analog);
++    client->SendReplyWithAck("EVENT:" + StringUtil::EncodeHex(json.c_str(), json.length()));
++    s_locals.lockstep_event_pending = false;
++    return true;
++  }
++  const std::string_view kind = event.kind == XportLockstep::MipsEventKind::PreCall ? "PRE_CALL" :
++                                event.kind == XportLockstep::MipsEventKind::PostCall ? "POST_CALL" : "TAIL_CALL";
++  const TinyString json = TinyString::from_format(
++    "{{\"schema\":1,\"contract\":\"xport-lockstep-event-v2\",\"side\":\"original\","
++    "\"kind\":\"{}\",\"mode\":\"{}\",\"epoch\":{},\"event_sequence\":{},\"frame\":{},\"image\":\"MAIN.EXE\","
++    "\"function\":\"0x{:08x}\",\"parent_invocation\":{},\"invocation\":{},\"depth\":{},"
++    "\"call_ordinal\":{},\"callsite\":\"0x{:08x}\",\"target\":\"0x{:08x}\","
++    "\"return_pc\":\"0x{:08x}\",\"instruction_word\":\"0x{:08x}\","
++    "\"instruction\":\"0x{:08x}\",\"delay_slot_pc\":\"0x{:08x}\","
++    "\"delay_slot_word\":\"0x{:08x}\",\"delay_slot\":\"0x{:08x}\","
++    "\"arguments\":[{},{},{},{}],\"return_value\":{},\"registers\":{{\"sp\":{},\"gp\":{},\"ra\":{},\"hi\":{},\"lo\":{}}},"
++    "\"link_register\":{},\"link_value\":{},\"gte_identity\":\"{:016x}\"}}",
++    kind, mode, s_locals.lockstep_epoch, event.sequence, event.frame, event.function, event.parent_invocation, event.invocation,
++    event.depth, event.call_ordinal, event.callsite, event.target, event.return_pc, event.instruction_word,
++    event.instruction_word, event.delay_slot_pc, event.delay_slot_word, event.delay_slot_word,
++    event.arguments[0], event.arguments[1], event.arguments[2], event.arguments[3], event.return_value, event.sp, event.gp,
++    event.ra, event.hi, event.lo, event.link_register, event.link_value, event.gte_identity);
++  client->SendReplyWithAck("EVENT:" + StringUtil::EncodeHex(json.c_str(), json.length()));
++  s_locals.lockstep_event_pending = false;
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepDMA(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || !System::IsPaused() || System::IsExecuting())
++    return SendLockstepError(client, "dma", "not_stopped");
++  SmallString reply("DMA");
++  for (u32 channel = 0; channel < DMA::NUM_CHANNELS; channel++)
++  {
++    const u32 offset = channel * 0x10;
++    reply.append_format(":{:08x}:{:08x}:{:08x}", DMA::ReadRegister(offset), DMA::ReadRegister(offset + 4),
++                        DMA::ReadRegister(offset + 8));
++  }
++  reply.append_format(":{:08x}:{:08x}", DMA::ReadRegister(0x70), DMA::ReadRegister(0x74));
++  client->SendReplyWithAck(reply);
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepPadRestore(ClientSocket* client, std::string_view data)
++{
++  const std::string_view frame_text = TakeLockstepField(&data);
++  const std::string_view port0 = TakeLockstepField(&data);
++  const std::string_view port1 = TakeLockstepField(&data);
++  const auto frame = StringUtil::FromChars<u32>(frame_text, 16);
++  std::array<GDBServer::LockstepPadState, 2> states;
++  if (!System::IsPaused() || System::IsExecuting() || !s_locals.lockstep_replay_active ||
++      !s_locals.lockstep_peer.IsAttached() || !frame.has_value() ||
++      *frame + 1u != s_locals.lockstep_frame || !data.empty() ||
++      !ParseLockstepPad(port0, &states[0]) || !ParseLockstepPad(port1, &states[1]))
++    return SendLockstepError(client, frame_text, "invalid_pad_restore");
++  std::string error;
++  if (!ApplyLockstepPads(states, &error))
++    return SendLockstepError(client, frame_text, error);
++  s_locals.lockstep_pad_state = states;
++  client->SendReplyWithAck(TinyString::from_format("OK:{}", frame_text));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepLastInstruction(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || !System::IsPaused() || System::IsExecuting())
++    return SendLockstepError(client, "instruction", "not_stopped");
++  client->SendReplyWithAck(TinyString::from_format("INSTRUCTION:{:08x}:{:08x}",
++                                                    CPU::g_state.current_instruction_pc,
++                                                    CPU::g_state.current_instruction.bits));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepCheckpointCapture(ClientSocket* client, std::string_view data)
++{
++  const auto frame = StringUtil::FromChars<u32>(data, 16);
++  if (!frame.has_value() || *frame == UINT32_MAX || !System::IsPaused() || System::IsExecuting() ||
++      !s_locals.lockstep_peer.IsAttached() || !s_locals.lockstep_replay_active ||
++      !s_locals.lockstep_frame_active || !s_locals.lockstep_prefix_guard ||
++      s_locals.lockstep_event_pending || s_locals.lockstep_transition_pending ||
++      s_locals.lockstep_frame != *frame + 1u)
++    return SendLockstepError(client, "checkpoint", "capture_not_ready");
++
++  std::vector<u8>& candidate = s_locals.lockstep_checkpoint_candidate;
++  candidate.resize(System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE));
++  size_t size = 0;
++  Error error;
++  if (!System::SaveStateDataToBuffer(std::span<u8>(candidate.data(), candidate.size()), &size, &error) ||
++      !size || size > candidate.size())
++    return SendLockstepError(client, "checkpoint", "capture_failed");
++  candidate.swap(s_locals.lockstep_checkpoint_state);
++  s_locals.lockstep_checkpoint_size = size;
++  s_locals.lockstep_checkpoint_frame = *frame;
++  client->SendReplyWithAck(TinyString::from_format("OK:{:x}:{:x}", *frame, size));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepCheckpointExport(ClientSocket* client, std::string_view data)
++{
++  const auto frame = StringUtil::FromChars<u32>(data, 16);
++  const char* path = std::getenv("XPORT_LOCKSTEP_CHECKPOINT_FILE");
++  if (!frame.has_value() || !System::IsPaused() || System::IsExecuting() ||
++      !s_locals.lockstep_replay_active || !s_locals.lockstep_peer.IsAttached() ||
++      !s_locals.lockstep_checkpoint_size || s_locals.lockstep_checkpoint_frame != *frame ||
++      !path || !*path)
++    return SendLockstepError(client, "checkpoint", "export_not_ready");
++  Error error;
++  if (!FileSystem::WriteAtomicRenamedFile(
++        path, s_locals.lockstep_checkpoint_state.data(), s_locals.lockstep_checkpoint_size, &error))
++    return SendLockstepError(client, "checkpoint", "export_failed");
++  client->SendReplyWithAck(TinyString::from_format("OK:{:x}:{:x}", *frame,
++                                                    s_locals.lockstep_checkpoint_size));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepCheckpointImport(ClientSocket* client, std::string_view data)
++{
++  const std::string_view frame_text = TakeLockstepField(&data);
++  const auto frame = StringUtil::FromChars<u32>(frame_text, 16);
++  const char* path = std::getenv("XPORT_LOCKSTEP_CHECKPOINT_FILE");
++  const bool prepare = data == "prepare";
++  if (!frame.has_value() || *frame == UINT32_MAX || !System::IsPaused() || System::IsExecuting() ||
++      !path || !*path || (!prepare && (!s_locals.lockstep_peer.IsAttached() ||
++      !s_locals.lockstep_replay_active || !s_locals.lockstep_frame_active ||
++      s_locals.lockstep_event_pending)))
++    return SendLockstepError(client, "checkpoint", "import_not_ready");
++  Error error;
++  auto source = FileSystem::OpenManagedCFile(path, "rb", &error);
++  if (!source || std::fseek(source.get(), 0, SEEK_END) != 0)
++    return SendLockstepError(client, "checkpoint", "import_open_failed");
++  const long length = std::ftell(source.get());
++  if (length <= 0 || static_cast<size_t>(length) >
++        System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE) ||
++      std::fseek(source.get(), 0, SEEK_SET) != 0)
++    return SendLockstepError(client, "checkpoint", "import_size_invalid");
++  std::vector<u8> candidate(static_cast<size_t>(length));
++  if (std::fread(candidate.data(), 1, candidate.size(), source.get()) != candidate.size())
++    return SendLockstepError(client, "checkpoint", "import_read_failed");
++  if (prepare)
++  {
++    if (!System::LoadStateDataFromBuffer(candidate, &error))
++      return SendLockstepError(client, "checkpoint", "import_state_invalid");
++    client->SendReplyWithAck(TinyString::from_format("OK:{:x}:prepared", *frame));
++    return true;
++  }
++  s_locals.lockstep_checkpoint_state.swap(candidate);
++  s_locals.lockstep_checkpoint_size = static_cast<size_t>(length);
++  s_locals.lockstep_checkpoint_frame = *frame;
++  std::string restore_data(frame_text);
++  if (!data.empty())
++  {
++    restore_data.push_back(':');
++    restore_data.append(data);
++  }
++  return Cmd$qXportLockstepCheckpointRestore(client, restore_data);
++}
++
++bool GDBServer::Cmd$qXportLockstepCheckpointRestore(ClientSocket* client, std::string_view data)
++{
++  const std::string_view frame_text = TakeLockstepField(&data);
++  const auto frame = StringUtil::FromChars<u32>(frame_text, 16);
++  const auto target = data.empty() ? std::optional<u32>() : StringUtil::FromChars<u32>(data, 16);
++  if (!frame.has_value() || *frame == UINT32_MAX || !System::IsPaused() || System::IsExecuting() ||
++      !s_locals.lockstep_peer.IsAttached() || !s_locals.lockstep_replay_active ||
++      !s_locals.lockstep_frame_active || s_locals.lockstep_event_pending ||
++      !s_locals.lockstep_checkpoint_size || s_locals.lockstep_checkpoint_frame != *frame ||
++      (!data.empty() && (!target.has_value() || *target <= *frame + 1u)))
++    return SendLockstepError(client, "checkpoint", "restore_not_ready");
++
++  Error error;
++  const std::vector<u8>& checkpoint = s_locals.lockstep_checkpoint_state;
++  if (!System::LoadStateDataFromBuffer(std::span<const u8>(checkpoint.data(), s_locals.lockstep_checkpoint_size), &error))
++    return SendLockstepError(client, "checkpoint", "restore_failed");
++
++  s_locals.lockstep_tracker.ResetCheckpointEpoch();
++  s_locals.lockstep_event = {};
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_frame_error.clear();
++  s_locals.lockstep_request.clear();
++  s_locals.lockstep_difference = {};
++  s_locals.lockstep_input_queued = false;
++  s_locals.lockstep_queued_frame = 0;
++  s_locals.lockstep_frame = *frame + 1u;
++  s_locals.lockstep_target_frame = target.value_or(*frame + 1u);
++  s_locals.lockstep_epoch = 0;
++  s_locals.lockstep_prefix_guard = true;
++  s_locals.lockstep_transition_pending = !target.has_value();
++  System::SetFastForwardEnabled(true);
++  CPU::UpdateDebugDispatcherFlag();
++  client->SendReplyWithAck(TinyString::from_format("OK:{:x}", *frame));
 +  return true;
 +}
 +
@@ -251,1100 +1227,1532 @@
  {
    client->SendReplyWithAck(
 -    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+", MAX_PACKET_SIZE));
-+    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+;qFFSaveState+;qFFLoadState+;qFFTraceStart+;qFFTraceDetailStart+;qFFTraceVBlankStart+;qFFTraceStateStart+;qFFUserStart+;qFFUserStop+;qFFTraceStop+;qFFTestPad+", MAX_PACKET_SIZE));
++    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+;qXportLockstepAttach+;qXportLockstepExceptions+;qXportLockstepMode+;qXportLockstepCompare+;qXportLockstepDiff+;qXportLockstepDetach+;qXportLockstepStart+;qXportLockstepPreludeStart+;qXportLockstepStartAt+;qXportLockstepHandoffState+;qXportLockstepRecordStart+;qXportLockstepRecordRead+;qXportFunctionCoverageStart+;qXportFunctionCoverageTarget+;qXportFunctionCoverageStop+;qXportFunctionCoverageRead+;qXportLockstepReplay+;qXportLockstepSeed+;qXportLockstepInput+;qXportLockstepPadRestore+;qXportLockstepBoundary+;qXportLockstepTail+;qXportLockstepNextEvent+;qXportLockstepDMA+;qXportLockstepCheckpointCapture+;qXportLockstepCheckpointExport+;qXportLockstepCheckpointImport+;qXportLockstepCheckpointRestore+;qXportLockstepLastInstruction+", MAX_PACKET_SIZE));
    return true;
  }
  
---- a/src/core/system.cpp
-+++ b/src/core/system.cpp
-@@ -1240,6 +1240,9 @@
-   }
+@@ -1516,6 +2575,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
  
-   CheckForSettingsChanges(old_settings);
-+#ifdef ENABLE_GDB_SERVER
-+  GDBServer::OnTraceSettings();
-+#endif
-   Host::OnSettingsReloaded();
- }
- 
-@@ -2023,6 +2026,9 @@
- 
- void System::FrameDone()
+ void GDBServer::Shutdown()
  {
-+#ifdef ENABLE_GDB_SERVER
-+  GDBServer::OnTraceVBlank();
-+#endif
-   // Generate any pending samples from the SPU before sleeping, this way we reduce the chances of underruns.
-   // TODO: when running ahead, we can skip this (and the flush above)
-   if (!IsReplayingGPUDump()) [[likely]]
-@@ -3083,7 +3089,7 @@
- }
++  s_locals.lockstep_peer.Detach();
++  s_locals.lockstep_boundary_active = false;
++  s_locals.lockstep_frame_active = false;
++  s_locals.lockstep_replay_active = false;
++  s_locals.lockstep_record_active = false;
++  s_locals.lockstep_input_queued = false;
++  s_locals.lockstep_record_frames.clear();
++  s_locals.function_coverage.Reset();
++  s_locals.function_coverage_active = false;
++  s_locals.lockstep_record_limit = 0;
++  s_locals.lockstep_event_pending = false;
++  s_locals.lockstep_frame = 0;
++  s_locals.lockstep_request.clear();
++  s_locals.lockstep_difference = {};
+   if (!s_locals.listen_socket)
+     return;
  
- bool System::SaveState(std::string path, Error* error, bool backup_existing_save, bool ignore_memcard_busy,
--                       std::function<void(bool, const Error& error)> completion_callback)
-+                       std::function<void(bool, const Error& error)> completion_callback, u32 screenshot_size)
- {
-   if (!IsValid() || IsReplayingGPUDump())
-   {
-@@ -3099,7 +3105,7 @@
-   Timer save_timer;
- 
-   SaveStateBuffer buffer;
--  if (!SaveStateToBuffer(&buffer, error, 256))
-+  if (!SaveStateToBuffer(&buffer, error, screenshot_size))
-     return false;
- 
-   VERBOSE_LOG("Preparing state save took {:.2f} msec", save_timer.GetTimeMilliseconds());
---- /dev/null
-+++ b/src/core/ff_trace.inl
-@@ -0,0 +1,610 @@
-+// Project-configured diagnostics executed on the emulation thread
-+#include <cstdio>
-+#include <cstring>
-+#include <array>
-+#include <unordered_map>
-+#include <unordered_set>
-+#include "common/sha256_digest.h"
-+#include "ff_trace_writer.h"
-+#include <chrono>
-+#include "gpu.h"
-+#include "spu.h"
-+#include "save_state_version.h"
-+#include "util/state_wrapper.h"
-+
-+namespace FFTrace {
-+static FILE* stream = nullptr;
-+static FFTraceWriter writer;
-+static bool failed = false;
-+static bool armed = false;
-+static u32 end_tick = 0;
-+static u32 detail_from = UINT32_MAX, detail_to = 0;
-+static bool vblank_enabled = false;
-+static u32 last_vblank = UINT32_MAX, vblank_count = 0;
-+static std::chrono::steady_clock::time_point previous_vblank_wall;
-+static std::vector<u8> previous_memory;
-+struct PageContentRecord { u32 id; std::vector<u8> data; u32 references; };
-+static std::unordered_map<std::string, std::vector<PageContentRecord>> page_contents;
-+static std::array<u32, 513> previous_page_ids{};
-+static u32 next_page_content = 1;
-+static bool states_enabled = false;
-+static std::string trace_name;
-+static u64 next_state_tick = 0;
-+static u32 state_index = 0, state_prepare_us = 0;
-+static std::future<bool> state_pending;
-+static bool user_mode = false;
-+static u64 user_end_tick = 0;
-+static u64 last_observed_clock = 0;
-+static std::string initial_settings;
-+static void Close(u32 tick, bool complete);
-+static u32 requested = 0;
-+static u32 last_boundary = UINT32_MAX;
-+static std::vector<u8> schedule;
-+#include "xport_trace_profile.inl"
-+static std::vector<u32> sites;
-+
-+static u32 Word(const u8* data)
-+{
-+  u32 value;
-+  std::memcpy(&value, data, 4);
-+  return value;
-+}
-+
-+static void Number(std::vector<u8>& data, u32 value)
-+{
-+  const auto* bytes = reinterpret_cast<const u8*>(&value);
-+  data.insert(data.end(), bytes, bytes + 4);
-+}
-+
-+static u32 PageContent(const u8* data, u32 size, bool* fresh)
-+{
-+  const auto digest = SHA256Digest::GetDigest(data, size);
-+  const std::string key(reinterpret_cast<const char*>(digest.data()), digest.size());
-+  auto& candidates = page_contents[key];
-+  for (PageContentRecord& candidate : candidates)
-+  {
-+    if (candidate.data.size() == size && std::memcmp(candidate.data.data(), data, size) == 0)
-+    {
-+      candidate.references++;
-+      *fresh = false;
-+      return candidate.id;
-+    }
-+  }
-+  if (next_page_content == UINT32_MAX)
-+  {
-+    failed = true;
-+    return 0;
-+  }
-+  const u32 id = next_page_content++;
-+  candidates.push_back({id, std::vector<u8>(data, data + size), 1});
-+  *fresh = true;
-+  return id;
-+}
-+
-+static void ReleasePageContent(u32 id)
-+{
-+  if (!id)
-+    return;
-+  for (auto group = page_contents.begin(); group != page_contents.end(); group++)
-+  {
-+    auto& candidates = group->second;
-+    for (auto candidate = candidates.begin(); candidate != candidates.end(); candidate++)
-+    {
-+      if (candidate->id != id)
-+        continue;
-+      if (--candidate->references == 0)
-+        candidates.erase(candidate);
-+      if (candidates.empty())
-+        page_contents.erase(group);
-+      return;
-+    }
-+  }
-+  failed = true;
-+}
-+
-+static u64 ReadClock()
-+{
-+  const u64 ticks = System::GetGlobalTickCounter();
-+  last_observed_clock = std::max(last_observed_clock, ticks);
-+  return ticks;
-+}
-+
-+static bool RAM(std::vector<u8>& data, u32 address, u32 size)
-+{
-+  const size_t offset = data.size();
-+  data.resize(offset + size);
-+  return CPU::SafeReadMemoryBytes(address, data.data() + offset, size);
-+}
-+
-+static u32 Read(u32 address)
-+{
-+  u32 value = 0;
-+  if (!CPU::SafeReadMemoryWord(address, &value))
-+    failed = true;
-+  return value;
-+}
-+
-+static void Emit(u32 type, u32 tick, const std::vector<u8>& data)
-+{
-+  std::vector<u8> record;
-+  record.reserve(12 + data.size());
-+  Number(record, type);
-+  Number(record, tick);
-+  Number(record, static_cast<u32>(data.size()));
-+  record.insert(record.end(), data.begin(), data.end());
-+  if (!writer.Write(std::move(record)))
-+    failed = true;
-+}
-+
-+#include "ff_stage_package.inl"
-+
-+static std::string EffectiveSettings()
-+{
-+  INISettingsInterface settings;
-+  g_settings.Save(settings, false, false);
-+  return settings.SaveToString() + "\n" + profile_text;
-+}
-+
-+static void SettingsChanged()
-+{
-+  if (!stream || !user_mode)
-+    return;
-+  const std::string current = EffectiveSettings();
-+  if (current != initial_settings)
-+  {
-+    Emit(14, Read(profile.game_tick), std::vector<u8>(current.begin(), current.end()));
-+    failed = true;
-+  }
-+}
-+
-+static void FinishState(bool wait)
-+{
-+  if (!state_pending.valid() || (!wait && state_pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
-+    return;
-+  const bool success = state_pending.get();
-+  std::vector<u8> payload;
-+  Number(payload, state_index - 1);
-+  Number(payload, success ? 1 : 0);
-+  Number(payload, state_prepare_us);
-+  Emit(10, Read(profile.game_tick), payload);
-+  failed |= !success;
-+}
-+
-+static void SaveCheckpoint()
-+{
-+  FinishState(false);
-+  const u64 ticks = ReadClock();
-+  if (!states_enabled || ticks < next_state_tick)
-+    return;
-+  if (state_pending.valid())
-+  {
-+    failed = true;
-+    return;
-+  }
-+  const std::string name = "trace-" + trace_name + "-" + std::to_string(state_index);
-+  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-audit-" + name + ".sav");
-+  if (FileSystem::FileExists(path.c_str()))
-+  {
-+    failed = true;
-+    return;
-+  }
-+  std::vector<u8> payload;
-+  Number(payload, state_index++);
-+  Number(payload, System::GetFrameNumber());
-+  Number(payload, static_cast<u32>(ticks));
-+  Number(payload, static_cast<u32>(ticks >> 32));
-+  Number(payload, CPU::g_state.pc);
-+  payload.insert(payload.end(), name.begin(), name.end());
-+  Emit(9, Read(profile.game_tick), payload);
-+  auto completion = std::make_shared<std::promise<bool>>();
-+  state_pending = completion->get_future();
-+  Error error;
-+  const auto begin = std::chrono::steady_clock::now();
-+  const bool scheduled = System::SaveState(path, &error, false, true,
-+    [completion](bool result, const Error&) { completion->set_value(result); }, 0);
-+  state_prepare_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
-+  if (!scheduled)
-+    completion->set_value(false);
-+  next_state_tick = ticks + static_cast<u64>(System::GetTicksPerSecond()) * 10;
-+}
-+
-+static void VBlank()
-+{
-+  if (!stream || !vblank_enabled)
-+    return;
-+  const auto capture_started = std::chrono::steady_clock::now();
-+  const u32 wall_interval_us = vblank_count ? static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(capture_started - previous_vblank_wall).count()) : 0;
-+  previous_vblank_wall = capture_started;
-+  const u32 frame = System::GetFrameNumber();
-+  if (last_vblank != UINT32_MAX && frame != last_vblank + 1)
-+  {
-+    failed = true;
-+    return;
-+  }
-+  std::vector<u8> memory;
-+  if (!RAM(memory, 0x80000000, 0x200000) || !RAM(memory, 0x1f800000, 1024))
-+  {
-+    failed = true;
-+    return;
-+  }
-+  const bool first = previous_memory.empty();
-+  const bool keyframe = !first && vblank_count % 600 == 0;
-+  const auto ticks = ReadClock();
-+  std::vector<u8> payload;
-+  Number(payload, frame);
-+  Number(payload, static_cast<u32>(ticks));
-+  Number(payload, static_cast<u32>(ticks >> 32));
-+  Number(payload, keyframe ? 3 : 2);
-+  Number(payload, 0);
-+  u32 changed = 0;
-+  for (u32 page = 0; page <= 512; page++)
-+  {
-+    const u32 offset = page * 4096, size = page == 512 ? 1024 : 4096;
-+    if (keyframe)
-+    {
-+      Number(payload, page);
-+      Number(payload, previous_page_ids[page]);
-+      changed++;
-+      continue;
-+    }
-+    if (!first && !keyframe && std::memcmp(memory.data() + offset, previous_memory.data() + offset, size) == 0)
-+      continue;
-+    Number(payload, page);
-+    bool fresh = false;
-+    const u32 content = PageContent(memory.data() + offset, size, &fresh);
-+    ReleasePageContent(previous_page_ids[page]);
-+    previous_page_ids[page] = content;
-+    Number(payload, content);
-+    if (!keyframe)
-+    {
-+      Number(payload, fresh ? 1 : 0);
-+      if (fresh)
-+        payload.insert(payload.end(), memory.data() + offset, memory.data() + offset + size);
-+    }
-+    changed++;
-+  }
-+  std::memcpy(payload.data() + 16, &changed, 4);
-+  Emit(8, Read(profile.game_tick), payload);
-+  previous_memory = std::move(memory);
-+  last_vblank = frame;
-+  vblank_count++;
-+  const u32 previous_state_index = state_index;
-+  SaveCheckpoint();
-+  if (user_mode)
-+  {
-+    const u32 capture_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - capture_started).count());
-+    std::vector<u8> timing;
-+    for (u32 value : {frame, capture_us, wall_interval_us, keyframe ? 1u : 0u, state_index != previous_state_index ? 1u : 0u})
-+      Number(timing, value);
-+    Emit(18, Read(profile.game_tick), timing);
-+  }
-+  if (user_mode && ticks >= user_end_tick)
-+    Close(Read(profile.game_tick), true);
-+}
-+
-+static bool Boundary(u32 tick)
-+{
-+  if (!user_mode && last_boundary == tick)
-+    return true;
-+  if (!user_mode && last_boundary != UINT32_MAX && tick != last_boundary + 1)
-+    return false;
-+  last_boundary = tick;
-+  if (tick >= detail_from && tick <= detail_to)
-+  {
-+    std::vector<u8> detail;
-+    if (!RAM(detail, 0x80000000, 0x200000) || !RAM(detail, 0x1f800000, 1024))
-+      return false;
-+    Emit(6, tick, detail);
-+    std::vector<u8> registers;
-+    Number(registers, CPU::g_state.pc);
-+    for (u32 i = 0; i < 32; i++)
-+      Number(registers, CPU::g_state.regs.r[i]);
-+    Emit(7, tick, registers);
-+  }
-+  std::vector<u8> actors;
-+  if (!RAM(actors, profile.actors, profile.actors_size) || !RAM(actors, profile.camera, profile.camera_size))
-+    return false;
-+  Emit(1, tick, actors);
-+  std::vector<u8> world;
-+  const u32 count = Read(profile.world_count);
-+  if (count > profile.world_max_count)
-+    return false;
-+  Number(world, count);
-+  if (!RAM(world, profile.world_a, profile.world_a_size) || !RAM(world, profile.world_b, profile.world_b_size) ||
-+      !RAM(world, profile.world_dynamic, count * profile.world_item_size) || !RAM(world, profile.world_c, profile.world_c_size) ||
-+      !RAM(world, profile.world_scalar_a, 4) || !RAM(world, profile.world_scalar_b, 4))
-+    return false;
-+  const u32 ot = Read(profile.ot_pointer) & 0x1fffff;
-+  const u32 cursor = Read(profile.gpu_cursor_pointer) & 0x1fffff;
-+  const u32 start = cursor >= profile.gpu_pool_split ? profile.gpu_pool_split : profile.gpu_pool_low;
-+  if (cursor < start || cursor > profile.gpu_pool_end)
-+    return false;
-+  auto valid = [=](u32 address, u32 size) {
-+    if (profile.gpu_full_ram)
-+      return address < 0x200000u && size <= 0x200000u - address;
-+    return (address >= ot && address + size <= ot + profile.ot_size) ||
-+           (address >= start && address + size <= cursor);
-+  };
-+  std::unordered_set<u32> seen;
-+  u32 address = ot;
-+  while (address != profile.ot_end)
-+  {
-+    if (seen.size() >= 131072 || !seen.insert(address).second || !valid(address, 4))
-+      return false;
-+    const u32 tag = Read(0x80000000 | address);
-+    const u32 words = tag >> 24;
-+    if (words)
-+    {
-+      if (!valid(address + 4, words * 4))
-+        return false;
-+      Number(world, words);
-+      if (!RAM(world, 0x80000000 | (address + 4), words * 4))
-+        return false;
-+    }
-+    address = tag & 0xffffff;
-+  }
-+  Number(world, 0);
-+  Emit(2, tick, world);
-+  return !failed;
-+}
-+
-+static void Close(u32 tick, bool complete)
-+{
-+  if (!stream)
-+    return;
-+  SettingsChanged();
-+  FinishState(true);
-+  if (user_mode)
-+    failed |= !FinishStagePackages(complete && !failed);
-+  if (user_mode)
-+  {
-+    ReadClock();
-+    // Cover event callbacks even when their pending ticks exceed the paused CPU clock
-+    const u64 now = last_observed_clock;
-+    std::vector<u8> summary;
-+    Number(summary, static_cast<u32>(now));
-+    Number(summary, static_cast<u32>(now >> 32));
-+    Number(summary, vblank_count);
-+    Number(summary, static_cast<u32>(writer.Peak()));
-+    Emit(13, tick, summary);
-+  }
-+  std::vector<u8> footer;
-+  Number(footer, complete && !failed ? 1 : 0);
-+  Emit(5, tick, footer);
-+  if (!writer.Finish())
-+    failed = true;
-+  stream = nullptr;
-+}
-+
-+static bool PhaseGPU(u32 pc, u32 tick)
-+{
-+  std::vector<u8> payload;
-+  Number(payload, pc);
-+  const u32 phase_bit = pc == profile.game_begin ? 1u : pc == profile.menu_phase ? 2u :
-+                        pc == profile.sequence_phase ? 4u : 8u;
-+  if (!(profile.gpu_phase_mask & phase_bit))
-+  {
-+    Number(payload, 0);
-+    Emit(17, tick, payload);
-+    return !failed;
-+  }
-+  std::unordered_set<u32> seen;
-+  u32 address = Read(profile.ot_pointer) & 0x1fffff;
-+  while (address != profile.ot_end)
-+  {
-+    if (address >= 0x200000 || (address & 3) || seen.size() >= 131072 || !seen.insert(address).second)
-+      return false;
-+    const u32 tag = Read(0x80000000 | address), words = tag >> 24;
-+    if (address + 4 + words * 4 > 0x200000 || payload.size() + 8 + words * 4 > 0x200000)
-+      return false;
-+    if (words)
-+    {
-+      Number(payload, words);
-+      if (!RAM(payload, 0x80000000 | (address + 4), words * 4))
-+        return false;
-+    }
-+    address = tag & 0xffffff;
-+  }
-+  Number(payload, 0);
-+  Emit(17, tick, payload);
-+  return !failed;
-+}
-+
-+static CPU::BreakpointCallbackAction OnExecute(CPU::BreakpointType, u32 pc, u32)
-+{
-+  if (!stream)
-+    return CPU::BreakpointCallbackAction::Continue;
-+  const u32 tick = Read(profile.game_tick);
-+  std::vector<u8> data;
-+  if (pc == profile.input_decode)
-+  {
-+    if (user_mode)
-+    {
-+      const u32 controller = CPU::g_state.regs.r[4];
-+      const u32 pad = controller ? profile.pad_second : profile.pad_first;
-+      const u64 clock = ReadClock();
-+      for (u32 value : {controller, pad, System::GetFrameNumber(), static_cast<u32>(clock),
-+                        static_cast<u32>(clock >> 32), CPU::g_state.regs.r[31]})
-+        Number(data, value);
-+      failed |= !RAM(data, pad, profile.pad_size);
-+      Emit(16, tick, data);
-+      input_call_ordinal++;
-+    }
-+    return CPU::BreakpointCallbackAction::Continue;
-+  }
-+  if (user_mode && (pc == profile.game_begin || pc == profile.menu_phase || pc == profile.sequence_phase || pc == profile.aux_phase))
-+  {
-+    const u64 clock = ReadClock();
-+    failed |= !CaptureStagePackage(pc, tick, clock);
-+    for (u32 value : {pc, System::GetFrameNumber(), static_cast<u32>(clock), static_cast<u32>(clock >> 32),
-+                      Read(profile.stage), Read(profile.callback), Read(profile.pad_first), Read(profile.pad_second)})
-+      Number(data, value);
-+    failed |= !RAM(data, profile.menu_state, profile.menu_state_size) || !RAM(data, profile.actors, profile.actors_size) || !RAM(data, profile.camera, profile.camera_size);
-+    Emit(15, tick, data);
-+    if (!PhaseGPU(pc, tick))
-+    {
-+      Close(tick, false);
-+      return CPU::BreakpointCallbackAction::Continue;
-+    }
-+    data.clear();
-+  }
-+  if (pc == profile.menu_phase || pc == profile.sequence_phase || pc == profile.aux_phase)
-+    return CPU::BreakpointCallbackAction::Continue;
-+  if (pc == profile.game_begin)
-+  {
-+    failed |= !Boundary(tick);
-+    if ((!user_mode && tick >= end_tick) || failed)
-+    {
-+      Close(tick, tick == end_tick);
-+      return user_mode ? CPU::BreakpointCallbackAction::Continue : CPU::BreakpointCallbackAction::Pause;
-+    }
-+  }
-+  else if (pc == profile.input_inject && CPU::g_state.regs.r[6] == profile.pad_first)
-+  {
-+    requested = 0;
-+    if (user_mode)
-+      requested = (Read(profile.pad_first) >> 16) ^ 65535;
-+    else
-+    {
-+      for (size_t offset = 0; offset < schedule.size(); offset += 12)
-+        if (tick >= Word(&schedule[offset]) && tick <= Word(&schedule[offset + 4]))
-+          requested = Word(&schedule[offset + 8]);
-+      failed |= !CPU::SafeWriteMemoryHalfWord(profile.pad_buttons, static_cast<u16>(requested ^ 65535));
-+    }
-+  }
-+  else if (pc == profile.game_input_result)
-+  {
-+    Number(data, requested);
-+    Number(data, Read(profile.decoded_input) & 65535);
-+    Emit(3, tick, data);
-+  }
-+  else if (pc != profile.input_inject)
-+  {
-+    Number(data, pc);
-+    const u32 count = pc == profile.sound_one ? 1 : pc == profile.sound_two ? 2 : 3;
-+    for (u32 i = 0; i < count; i++)
-+      Number(data, CPU::g_state.regs.r[4 + i]);
-+    Emit(4, tick, data);
-+  }
-+  if (failed)
-+  {
-+    Close(tick, false);
-+    return user_mode ? CPU::BreakpointCallbackAction::Continue : CPU::BreakpointCallbackAction::Pause;
-+  }
-+  return CPU::BreakpointCallbackAction::Continue;
-+}
-+
-+static void Disarm()
-+{
-+  if (!armed)
-+    return;
-+  for (u32 pc : sites)
-+    CPU::RemoveBreakpoint(CPU::BreakpointType::Execute, pc);
-+  armed = false;
-+}
-+
-+static const char* Start(std::string_view data, bool detailed = false, bool vblank = false, bool states = false, bool user = false)
-+{
-+  if (!System::IsPaused() || System::IsExecuting() || stream || CPU::HasAnyBreakpoints())
-+    return "E20";
-+  if (!LoadProfile())
-+    return "E25";
-+  sites = {profile.game_begin, profile.game_input_result, profile.input_inject, profile.sound_three_a,
-+                               profile.sound_three_b, profile.sound_one, profile.sound_two, profile.menu_phase, profile.sequence_phase, profile.input_decode, profile.aux_phase};
-+  if (!user && CPU::g_state.pc != profile.game_begin)
-+    return "E20";
-+  if (user && (g_settings.rewind_enable || g_settings.runahead_frames ||
-+               g_settings.cpu_overclock_enable || g_settings.cpu_enable_8mb_ram))
-+    return "E24";
-+  const size_t comma = data.find(',');
-+  if (comma == std::string_view::npos)
-+    return "E21";
-+  auto name_bytes = StringUtil::DecodeHex(data.substr(0, comma));
-+  auto config = StringUtil::DecodeHex(data.substr(comma + 1));
-+  const size_t header_size = detailed ? 12 : 4;
-+  if (!name_bytes || name_bytes->empty() || name_bytes->size() > 64 || !config ||
-+      config->size() < header_size || (config->size() - header_size) % 12 != 0)
-+    return "E21";
-+  std::string name(name_bytes->begin(), name_bytes->end());
-+  if (states && name.size() > 40)
-+    return "E21";
-+  for (char c : name)
-+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-+          (c >= '0' && c <= '9') || c == '-' || c == '_'))
-+      return "E21";
-+  end_tick = Word(config->data());
-+  failed = false;
-+  const u32 tick = Read(profile.game_tick);
-+  if (failed || (user ? (end_tick == 0 || end_tick > 600 || config->size() != 4) : (end_tick <= tick || end_tick - tick > 18000)))
-+    return "E21";
-+  detail_from = detailed ? Word(config->data() + 4) : UINT32_MAX;
-+  detail_to = detailed ? Word(config->data() + 8) : 0;
-+  if (detailed && (detail_from < tick || detail_to < detail_from || detail_to > end_tick || detail_to - detail_from > 120))
-+    return "E21";
-+  schedule.assign(config->begin() + header_size, config->end());
-+  u32 previous = 0;
-+  for (size_t offset = 0; offset < schedule.size(); offset += 12)
-+  {
-+    const u32 begin = Word(&schedule[offset]), end = Word(&schedule[offset + 4]);
-+    if (begin > end || (offset && begin <= previous) || Word(&schedule[offset + 8]) > 65535)
-+      return "E21";
-+    previous = end;
-+  }
-+  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-trace-" + name + ".bin");
-+  stream = std::fopen(path.c_str(), "wbx");
-+  if (!stream)
-+    return "E22";
-+  std::setvbuf(stream, nullptr, _IOFBF, 1024 * 1024);
-+  const u32 magic[] = {user ? 0x32544646u : 0x31544646u, tick, end_tick};
-+  failed = std::fwrite(magic, sizeof(magic), 1, stream) != 1;
-+  if (!writer.Start(stream))
-+  {
-+    std::fclose(stream);
-+    stream = nullptr;
-+    return "E23";
-+  }
-+  last_boundary = UINT32_MAX;
-+  vblank_enabled = vblank;
-+  last_vblank = UINT32_MAX;
-+  vblank_count = 0;
-+  previous_memory.clear();
-+  page_contents.clear();
-+  previous_page_ids.fill(0);
-+  next_page_content = 1;
-+  states_enabled = states;
-+  trace_name = name;
-+  next_state_tick = 0;
-+  state_index = 0;
-+  user_mode = user;
-+  if (user_mode)
-+    failed |= !BeginStagePackages(name);
-+  last_observed_clock = System::GetGlobalTickCounter();
-+  user_end_tick = System::GetGlobalTickCounter() + static_cast<u64>(System::GetTicksPerSecond()) * end_tick;
-+  armed = true;
-+  for (u32 pc : sites)
-+    failed |= !CPU::AddBreakpointWithCallback(CPU::BreakpointType::Execute, pc, OnExecute);
-+  if (user_mode)
-+  {
-+    const u64 now = System::GetGlobalTickCounter();
-+    std::vector<u8> metadata;
-+    Number(metadata, static_cast<u32>(System::GetTicksPerSecond()));
-+    Number(metadata, static_cast<u32>(now));
-+    Number(metadata, static_cast<u32>(now >> 32));
-+    Number(metadata, System::GetFrameNumber());
-+    Emit(12, tick, metadata);
-+    initial_settings = EffectiveSettings();
-+    Emit(14, tick, std::vector<u8>(initial_settings.begin(), initial_settings.end()));
-+  }
-+  if (!user_mode)
-+    failed |= !Boundary(tick);
-+  if (states_enabled && !failed)
-+    SaveCheckpoint();
-+  if (failed)
-+  {
-+    Close(tick, false);
-+    Disarm();
-+    return "E23";
-+  }
-+  return "OK";
-+}
-+}
---- /dev/null
-+++ b/src/core/xport_trace_profile.inl
-@@ -0,0 +1,208 @@
-+// Required project trace profile; no game address defaults
-+struct TraceProfile {
-+  u32 game_begin = 0;
-+  u32 game_input_result = 0;
-+  u32 input_inject = 0;
-+  u32 sound_three_a = 0;
-+  u32 sound_three_b = 0;
-+  u32 sound_one = 0;
-+  u32 sound_two = 0;
-+  u32 menu_phase = 0;
-+  u32 sequence_phase = 0;
-+  u32 input_decode = 0;
-+  u32 aux_phase = 0;
-+  u32 game_tick = 0;
-+  u32 actors = 0;
-+  u32 camera = 0;
-+  u32 world_count = 0;
-+  u32 world_a = 0;
-+  u32 world_b = 0;
-+  u32 world_dynamic = 0;
-+  u32 world_c = 0;
-+  u32 world_scalar_a = 0;
-+  u32 world_scalar_b = 0;
-+  u32 ot_pointer = 0;
-+  u32 gpu_cursor_pointer = 0;
-+  u32 pad_second = 0;
-+  u32 pad_first = 0;
-+  u32 stage = 0;
-+  u32 callback = 0;
-+  u32 menu_state = 0;
-+  u32 pad_buttons = 0;
-+  u32 decoded_input = 0;
-+  u32 gpu_pool_split = 0;
-+  u32 gpu_pool_low = 0;
-+  u32 gpu_pool_end = 0;
-+  u32 ot_end = 0;
-+  u32 actors_size = 0;
-+  u32 camera_size = 0;
-+  u32 menu_state_size = 0;
-+  u32 world_a_size = 0;
-+  u32 world_b_size = 0;
-+  u32 world_item_size = 0;
-+  u32 world_c_size = 0;
-+  u32 world_max_count = 0;
-+  u32 ot_size = 0;
-+  u32 pad_size = 0;
-+  u32 gpu_phase_mask = 15;
-+  u32 gpu_full_ram = 0;
-+};
-+static TraceProfile profile;
-+static std::string profile_text;
-+
-+static bool LoadProfile()
-+{
-+  INISettingsInterface ini(Path::Combine(EmuFolders::DataRoot, "xport-trace-profile.ini"));
-+  if (!ini.Load() || ini.GetUIntValue("XportTrace", "version", 0) != 1)
-+    return false;
-+  TraceProfile candidate;
-+  if (!ini.ContainsValue("XportTrace", "game_begin")) return false;
-+  candidate.game_begin = ini.GetUIntValue("XportTrace", "game_begin", 0);
-+  if (!ini.ContainsValue("XportTrace", "game_input_result")) return false;
-+  candidate.game_input_result = ini.GetUIntValue("XportTrace", "game_input_result", 0);
-+  if (!ini.ContainsValue("XportTrace", "input_inject")) return false;
-+  candidate.input_inject = ini.GetUIntValue("XportTrace", "input_inject", 0);
-+  if (!ini.ContainsValue("XportTrace", "sound_three_a")) return false;
-+  candidate.sound_three_a = ini.GetUIntValue("XportTrace", "sound_three_a", 0);
-+  if (!ini.ContainsValue("XportTrace", "sound_three_b")) return false;
-+  candidate.sound_three_b = ini.GetUIntValue("XportTrace", "sound_three_b", 0);
-+  if (!ini.ContainsValue("XportTrace", "sound_one")) return false;
-+  candidate.sound_one = ini.GetUIntValue("XportTrace", "sound_one", 0);
-+  if (!ini.ContainsValue("XportTrace", "sound_two")) return false;
-+  candidate.sound_two = ini.GetUIntValue("XportTrace", "sound_two", 0);
-+  if (!ini.ContainsValue("XportTrace", "menu_phase")) return false;
-+  candidate.menu_phase = ini.GetUIntValue("XportTrace", "menu_phase", 0);
-+  if (!ini.ContainsValue("XportTrace", "sequence_phase")) return false;
-+  candidate.sequence_phase = ini.GetUIntValue("XportTrace", "sequence_phase", 0);
-+  if (!ini.ContainsValue("XportTrace", "input_decode")) return false;
-+  candidate.input_decode = ini.GetUIntValue("XportTrace", "input_decode", 0);
-+  if (!ini.ContainsValue("XportTrace", "aux_phase")) return false;
-+  candidate.aux_phase = ini.GetUIntValue("XportTrace", "aux_phase", 0);
-+  if (!ini.ContainsValue("XportTrace", "game_tick")) return false;
-+  candidate.game_tick = ini.GetUIntValue("XportTrace", "game_tick", 0);
-+  if (!ini.ContainsValue("XportTrace", "actors")) return false;
-+  candidate.actors = ini.GetUIntValue("XportTrace", "actors", 0);
-+  if (!ini.ContainsValue("XportTrace", "camera")) return false;
-+  candidate.camera = ini.GetUIntValue("XportTrace", "camera", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_count")) return false;
-+  candidate.world_count = ini.GetUIntValue("XportTrace", "world_count", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_a")) return false;
-+  candidate.world_a = ini.GetUIntValue("XportTrace", "world_a", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_b")) return false;
-+  candidate.world_b = ini.GetUIntValue("XportTrace", "world_b", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_dynamic")) return false;
-+  candidate.world_dynamic = ini.GetUIntValue("XportTrace", "world_dynamic", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_c")) return false;
-+  candidate.world_c = ini.GetUIntValue("XportTrace", "world_c", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_scalar_a")) return false;
-+  candidate.world_scalar_a = ini.GetUIntValue("XportTrace", "world_scalar_a", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_scalar_b")) return false;
-+  candidate.world_scalar_b = ini.GetUIntValue("XportTrace", "world_scalar_b", 0);
-+  if (!ini.ContainsValue("XportTrace", "ot_pointer")) return false;
-+  candidate.ot_pointer = ini.GetUIntValue("XportTrace", "ot_pointer", 0);
-+  if (!ini.ContainsValue("XportTrace", "gpu_cursor_pointer")) return false;
-+  candidate.gpu_cursor_pointer = ini.GetUIntValue("XportTrace", "gpu_cursor_pointer", 0);
-+  if (!ini.ContainsValue("XportTrace", "pad_second")) return false;
-+  candidate.pad_second = ini.GetUIntValue("XportTrace", "pad_second", 0);
-+  if (!ini.ContainsValue("XportTrace", "pad_first")) return false;
-+  candidate.pad_first = ini.GetUIntValue("XportTrace", "pad_first", 0);
-+  if (!ini.ContainsValue("XportTrace", "stage")) return false;
-+  candidate.stage = ini.GetUIntValue("XportTrace", "stage", 0);
-+  if (!ini.ContainsValue("XportTrace", "callback")) return false;
-+  candidate.callback = ini.GetUIntValue("XportTrace", "callback", 0);
-+  if (!ini.ContainsValue("XportTrace", "menu_state")) return false;
-+  candidate.menu_state = ini.GetUIntValue("XportTrace", "menu_state", 0);
-+  if (!ini.ContainsValue("XportTrace", "pad_buttons")) return false;
-+  candidate.pad_buttons = ini.GetUIntValue("XportTrace", "pad_buttons", 0);
-+  if (!ini.ContainsValue("XportTrace", "decoded_input")) return false;
-+  candidate.decoded_input = ini.GetUIntValue("XportTrace", "decoded_input", 0);
-+  if (!ini.ContainsValue("XportTrace", "gpu_pool_split")) return false;
-+  candidate.gpu_pool_split = ini.GetUIntValue("XportTrace", "gpu_pool_split", 0);
-+  if (!ini.ContainsValue("XportTrace", "gpu_pool_low")) return false;
-+  candidate.gpu_pool_low = ini.GetUIntValue("XportTrace", "gpu_pool_low", 0);
-+  if (!ini.ContainsValue("XportTrace", "gpu_pool_end")) return false;
-+  candidate.gpu_pool_end = ini.GetUIntValue("XportTrace", "gpu_pool_end", 0);
-+  if (!ini.ContainsValue("XportTrace", "ot_end")) return false;
-+  candidate.ot_end = ini.GetUIntValue("XportTrace", "ot_end", 0);
-+  if (!ini.ContainsValue("XportTrace", "actors_size")) return false;
-+  candidate.actors_size = ini.GetUIntValue("XportTrace", "actors_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "camera_size")) return false;
-+  candidate.camera_size = ini.GetUIntValue("XportTrace", "camera_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "menu_state_size")) return false;
-+  candidate.menu_state_size = ini.GetUIntValue("XportTrace", "menu_state_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_a_size")) return false;
-+  candidate.world_a_size = ini.GetUIntValue("XportTrace", "world_a_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_b_size")) return false;
-+  candidate.world_b_size = ini.GetUIntValue("XportTrace", "world_b_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_item_size")) return false;
-+  candidate.world_item_size = ini.GetUIntValue("XportTrace", "world_item_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_c_size")) return false;
-+  candidate.world_c_size = ini.GetUIntValue("XportTrace", "world_c_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "world_max_count")) return false;
-+  candidate.world_max_count = ini.GetUIntValue("XportTrace", "world_max_count", 0);
-+  if (!ini.ContainsValue("XportTrace", "ot_size")) return false;
-+  candidate.ot_size = ini.GetUIntValue("XportTrace", "ot_size", 0);
-+  if (!ini.ContainsValue("XportTrace", "pad_size")) return false;
-+  candidate.pad_size = ini.GetUIntValue("XportTrace", "pad_size", 0);
-+  candidate.gpu_phase_mask = ini.GetUIntValue("XportTrace", "gpu_phase_mask", 15);
-+  candidate.gpu_full_ram = ini.GetUIntValue("XportTrace", "gpu_full_ram", 0);
-+  if (candidate.game_begin < 0x80000000u || candidate.game_begin >= 0x80200000u || candidate.game_begin % 4) return false;
-+  if (candidate.game_input_result < 0x80000000u || candidate.game_input_result >= 0x80200000u || candidate.game_input_result % 4) return false;
-+  if (candidate.input_inject < 0x80000000u || candidate.input_inject >= 0x80200000u || candidate.input_inject % 4) return false;
-+  if (candidate.sound_three_a < 0x80000000u || candidate.sound_three_a >= 0x80200000u || candidate.sound_three_a % 4) return false;
-+  if (candidate.sound_three_b < 0x80000000u || candidate.sound_three_b >= 0x80200000u || candidate.sound_three_b % 4) return false;
-+  if (candidate.sound_one < 0x80000000u || candidate.sound_one >= 0x80200000u || candidate.sound_one % 4) return false;
-+  if (candidate.sound_two < 0x80000000u || candidate.sound_two >= 0x80200000u || candidate.sound_two % 4) return false;
-+  if (candidate.menu_phase < 0x80000000u || candidate.menu_phase >= 0x80200000u || candidate.menu_phase % 4) return false;
-+  if (candidate.sequence_phase < 0x80000000u || candidate.sequence_phase >= 0x80200000u || candidate.sequence_phase % 4) return false;
-+  if (candidate.input_decode < 0x80000000u || candidate.input_decode >= 0x80200000u || candidate.input_decode % 4) return false;
-+  if (candidate.aux_phase < 0x80000000u || candidate.aux_phase >= 0x80200000u || candidate.aux_phase % 4) return false;
-+  if (candidate.game_tick < 0x80000000u || candidate.game_tick >= 0x80200000u || candidate.game_tick % 4) return false;
-+  if (candidate.actors < 0x80000000u || candidate.actors >= 0x80200000u || candidate.actors % 4) return false;
-+  if (candidate.camera < 0x80000000u || candidate.camera >= 0x80200000u || candidate.camera % 4) return false;
-+  if (candidate.world_count < 0x80000000u || candidate.world_count >= 0x80200000u || candidate.world_count % 4) return false;
-+  if (candidate.world_a < 0x80000000u || candidate.world_a >= 0x80200000u || candidate.world_a % 4) return false;
-+  if (candidate.world_b < 0x80000000u || candidate.world_b >= 0x80200000u || candidate.world_b % 4) return false;
-+  if (candidate.world_dynamic < 0x80000000u || candidate.world_dynamic >= 0x80200000u || candidate.world_dynamic % 4) return false;
-+  if (candidate.world_c < 0x80000000u || candidate.world_c >= 0x80200000u || candidate.world_c % 4) return false;
-+  if (candidate.world_scalar_a < 0x80000000u || candidate.world_scalar_a >= 0x80200000u || candidate.world_scalar_a % 4) return false;
-+  if (candidate.world_scalar_b < 0x80000000u || candidate.world_scalar_b >= 0x80200000u || candidate.world_scalar_b % 4) return false;
-+  if (candidate.ot_pointer < 0x80000000u || candidate.ot_pointer >= 0x80200000u || candidate.ot_pointer % 4) return false;
-+  if (candidate.gpu_cursor_pointer < 0x80000000u || candidate.gpu_cursor_pointer >= 0x80200000u || candidate.gpu_cursor_pointer % 4) return false;
-+  if (candidate.pad_second < 0x80000000u || candidate.pad_second >= 0x80200000u || candidate.pad_second % 4) return false;
-+  if (candidate.pad_first < 0x80000000u || candidate.pad_first >= 0x80200000u || candidate.pad_first % 4) return false;
-+  if (candidate.stage < 0x80000000u || candidate.stage >= 0x80200000u || candidate.stage % 4) return false;
-+  if (candidate.callback < 0x80000000u || candidate.callback >= 0x80200000u || candidate.callback % 4) return false;
-+  if (candidate.menu_state < 0x80000000u || candidate.menu_state >= 0x80200000u || candidate.menu_state % 4) return false;
-+  if (candidate.pad_buttons < 0x80000000u || candidate.pad_buttons >= 0x80200000u || candidate.pad_buttons % 2) return false;
-+  if (candidate.decoded_input < 0x80000000u || candidate.decoded_input >= 0x80200000u || candidate.decoded_input % 4) return false;
-+  if (!candidate.actors_size || candidate.actors_size > 0x200000u) return false;
-+  if (!candidate.camera_size || candidate.camera_size > 0x200000u) return false;
-+  if (!candidate.menu_state_size || candidate.menu_state_size > 0x200000u) return false;
-+  if (!candidate.world_a_size || candidate.world_a_size > 0x200000u) return false;
-+  if (!candidate.world_b_size || candidate.world_b_size > 0x200000u) return false;
-+  if (!candidate.world_item_size || candidate.world_item_size > 0x200000u) return false;
-+  if (!candidate.world_c_size || candidate.world_c_size > 0x200000u) return false;
-+  if (!candidate.world_max_count || candidate.world_max_count > 0x200000u) return false;
-+  if (!candidate.ot_size || candidate.ot_size > 0x200000u) return false;
-+  if (!candidate.pad_size || candidate.pad_size > 0x200000u) return false;
-+  if (!candidate.gpu_phase_mask || candidate.gpu_phase_mask > 15u) return false;
-+  if (candidate.gpu_full_ram > 1u) return false;
-+  if (candidate.world_max_count > 0x200000u / candidate.world_item_size ||
-+      candidate.gpu_pool_low >= candidate.gpu_pool_split || candidate.gpu_pool_split >= candidate.gpu_pool_end ||
-+      candidate.gpu_pool_end > 0x200000u ||
-+      (candidate.ot_end > 0x200000u && candidate.ot_end != 0x00ffffffu)) return false;
-+  if (candidate.actors_size > 0x80200000u - candidate.actors) return false;
-+  if (candidate.camera_size > 0x80200000u - candidate.camera) return false;
-+  if (candidate.menu_state_size > 0x80200000u - candidate.menu_state) return false;
-+  if (candidate.world_a_size > 0x80200000u - candidate.world_a) return false;
-+  if (candidate.world_b_size > 0x80200000u - candidate.world_b) return false;
-+  if (candidate.world_c_size > 0x80200000u - candidate.world_c) return false;
-+  if (candidate.world_max_count * candidate.world_item_size > 0x80200000u - candidate.world_dynamic ||
-+      candidate.pad_size > 0x80200000u - candidate.pad_first || candidate.pad_size > 0x80200000u - candidate.pad_second) return false;
-+  const std::unordered_set<u32> hooks = {candidate.game_begin, candidate.game_input_result, candidate.input_inject, candidate.sound_three_a, candidate.sound_three_b, candidate.sound_one, candidate.sound_two, candidate.menu_phase, candidate.sequence_phase, candidate.input_decode, candidate.aux_phase};
-+  if (hooks.size() != 11) return false;
-+  profile = candidate;
-+  profile_text = ini.SaveToString();
-+  return true;
-+}
---- /dev/null
-+++ b/src/core/ff_trace_writer.h
-@@ -0,0 +1,94 @@
-+// Bounded asynchronous writer for local diagnostic records
-+#pragma once
-+#include <atomic>
-+#include <condition_variable>
-+#include <cstdio>
-+#include <deque>
-+#include <mutex>
-+#include <thread>
-+#include <vector>
-+
-+class FFTraceWriter
-+{
-+public:
-+  ~FFTraceWriter() { Finish(); }
-+
-+  bool Start(FILE* file, size_t capacity = 64 * 1024 * 1024)
-+  {
-+    if (m_thread.joinable() || !file)
-+      return false;
-+    m_file = file;
-+    m_capacity = capacity;
-+    m_pending = m_peak = 0;
-+    m_failed = false;
-+    m_closing = false;
-+    m_thread = std::thread([this] { Run(); });
-+    return true;
-+  }
-+
-+  bool Write(std::vector<unsigned char> data)
-+  {
-+    std::lock_guard lock(m_mutex);
-+    if (m_closing || m_failed || data.size() > m_capacity - m_pending)
-+    {
-+      m_failed = true;
-+      return false;
-+    }
-+    m_pending += data.size();
-+    if (m_peak < m_pending)
-+      m_peak = m_pending;
-+    m_queue.push_back(std::move(data));
-+    m_ready.notify_one();
-+    return true;
-+  }
-+
-+  bool Finish()
-+  {
-+    if (!m_thread.joinable())
-+      return !m_failed;
-+    {
-+      std::lock_guard lock(m_mutex);
-+      m_closing = true;
-+    }
-+    m_ready.notify_one();
-+    m_thread.join();
-+    if (std::fclose(m_file) != 0)
-+      m_failed = true;
-+    m_file = nullptr;
-+    return !m_failed;
-+  }
-+
-+  size_t Peak() const { return m_peak; }
-+
-+private:
-+  void Run()
-+  {
-+    for (;;)
-+    {
-+      std::vector<unsigned char> data;
-+      {
-+        std::unique_lock lock(m_mutex);
-+        m_ready.wait(lock, [this] { return m_closing || !m_queue.empty(); });
-+        if (m_queue.empty())
-+          return;
-+        data = std::move(m_queue.front());
-+        m_queue.pop_front();
-+      }
-+      if (!m_failed && std::fwrite(data.data(), 1, data.size(), m_file) != data.size())
-+        m_failed = true;
-+      {
-+        std::lock_guard lock(m_mutex);
-+        m_pending -= data.size();
-+      }
-+    }
-+  }
-+
-+  FILE* m_file = nullptr;
-+  std::thread m_thread;
-+  std::mutex m_mutex;
-+  std::condition_variable m_ready;
-+  std::deque<std::vector<unsigned char>> m_queue;
-+  std::atomic<bool> m_failed{false};
-+  bool m_closing = false;
-+  size_t m_capacity = 0, m_pending = 0, m_peak = 0;
-+};
+diff --git a/src/core/gdb_server.h b/src/core/gdb_server.h
+index 9927f11..93875fa 100644
 --- a/src/core/gdb_server.h
 +++ b/src/core/gdb_server.h
-@@ -21,6 +21,9 @@
+@@ -21,6 +21,12 @@ void Shutdown();
  
  void OnSystemPaused();
  void OnSystemResumed();
-+void OnTraceVBlank();
-+void OnTraceSettings();
-+void OnTracePad(u32 port, u32 device, u8 outgoing, u8 incoming, bool ack);
++bool IsLockstepBoundaryActive();
++bool OnLockstepBeforeInstruction(u32 pc, u32 word, const u32* registers, u32 hi, u32 lo, const u32* gte_registers,
++                                 bool prior_branch_taken);
++void OnLockstepException(u32 vector, u32 return_pc);
++void OnLockstepFrameDone();
++void OnLockstepSpuEvent(u32 kind, u32 address, u32 value, u64 ticks);
  
  } // namespace GDBServer
  
---- a/src/core/pad.cpp
-+++ b/src/core/pad.cpp
-@@ -2,6 +2,7 @@
- // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+diff --git a/src/core/gpu.cpp b/src/core/gpu.cpp
+index 470148f..8f48f7b 100644
+--- a/src/core/gpu.cpp
++++ b/src/core/gpu.cpp
+@@ -2429,6 +2429,11 @@ void GPU::ReadVRAM(u16 x, u16 y, u16 width, u16 height)
+   GPUBackend::PushCommandAndSync(cmd, true);
+ }
  
- #include "pad.h"
++void GPU::SynchronizeVRAMForLockstep()
++{
++  ReadVRAM(0, 0, VRAM_WIDTH, VRAM_HEIGHT);
++}
++
+ void GPU::UpdateVRAM(u16 x, u16 y, u16 width, u16 height, const void* data, bool set_mask, bool check_mask)
+ {
+   const u32 num_words = width * height;
+diff --git a/src/core/gpu.h b/src/core/gpu.h
+index 6c43ac0..f5dba7e 100644
+--- a/src/core/gpu.h
++++ b/src/core/gpu.h
+@@ -121,6 +121,9 @@ GSVector4i GetCRTCVRAMSourceRect();
+ // Dumps raw VRAM to a file.
+ bool DumpVRAMToFile(std::string path, Error* error);
+ 
++// Synchronize the complete canonical VRAM image for lockstep comparison
++void SynchronizeVRAMForLockstep();
++
+ // Kicks the current frame to the backend for display.
+ void UpdateDisplay(bool submit_frame);
+ 
+diff --git a/src/core/spu.cpp b/src/core/spu.cpp
+index 92b1776..8404fda 100644
+--- a/src/core/spu.cpp
++++ b/src/core/spu.cpp
+@@ -4,6 +4,7 @@
+ #include "spu.h"
+ #include "cdrom.h"
+ #include "dma.h"
 +#include "gdb_server.h"
- #include "controller.h"
+ #include "imgui_overlays.h"
  #include "interrupt_controller.h"
- #include "memory_card.h"
-@@ -841,6 +842,9 @@
+ #include "system.h"
+@@ -381,6 +382,7 @@ struct SPUState
+   TickCount ticks_carry = 0;
+   TickCount cpu_ticks_per_spu_tick = 0;
+   TickCount cpu_tick_divider = 0;
++  u64 xport_sample_counter = 0;
+ 
+   SPUCNTRegister SPUCNT = {};
+   SPUSTATRegister SPUSTAT = {};
+@@ -552,6 +554,7 @@ void SPU::Shutdown()
+ void SPU::Reset()
+ {
+   s_state.ticks_carry = 0;
++  s_state.xport_sample_counter = 0;
+ 
+   s_state.SPUCNT.bits = 0;
+   s_state.SPUSTAT.bits = 0;
+@@ -724,6 +727,7 @@ bool SPU::DoCompatibleState(StateWrapper& sw)
+ 
+   if (sw.IsReading())
+   {
++    s_state.xport_sample_counter = 0;
+     UpdateEventInterval();
+     UpdateTransferEvent();
+   }
+@@ -905,6 +909,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+     {
+       DEBUG_LOG("SPU key on low <- 0x{:04X}", value);
+       GeneratePendingSamples();
++      GDBServer::OnLockstepSpuEvent(1u, SPU_BASE + offset, value, s_state.xport_sample_counter);
+       s_state.key_on_register = (s_state.key_on_register & 0xFFFF0000) | ZeroExtend32(value);
+     }
      break;
+@@ -913,6 +918,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+     {
+       DEBUG_LOG("SPU key on high <- 0x{:04X}", value);
+       GeneratePendingSamples();
++      GDBServer::OnLockstepSpuEvent(2u, SPU_BASE + offset, value, s_state.xport_sample_counter);
+       s_state.key_on_register = (s_state.key_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+     }
+     break;
+@@ -921,6 +927,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+     {
+       DEBUG_LOG("SPU key off low <- 0x{:04X}", value);
+       GeneratePendingSamples();
++      GDBServer::OnLockstepSpuEvent(3u, SPU_BASE + offset, value, s_state.xport_sample_counter);
+       s_state.key_off_register = (s_state.key_off_register & 0xFFFF0000) | ZeroExtend32(value);
+     }
+     break;
+@@ -929,6 +936,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+     {
+       DEBUG_LOG("SPU key off high <- 0x{:04X}", value);
+       GeneratePendingSamples();
++      GDBServer::OnLockstepSpuEvent(4u, SPU_BASE + offset, value, s_state.xport_sample_counter);
+       s_state.key_off_register = (s_state.key_off_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
+     }
+     break;
+@@ -1181,8 +1189,11 @@ u16 SPU::ReadVoiceRegister(u32 offset)
+   if (reg_index >= 6 && (voice.IsOn() || s_state.key_on_register & (1u << voice_index)))
+     GeneratePendingSamples();
+ 
+-  TRACE_LOG("Read voice {} register {} -> 0x{:02X}", voice_index, reg_index, voice.regs.index[reg_index]);
+-  return voice.regs.index[reg_index];
++  const u16 value = voice.regs.index[reg_index];
++  TRACE_LOG("Read voice {} register {} -> 0x{:02X}", voice_index, reg_index, value);
++  if (reg_index == 6)
++    GDBServer::OnLockstepSpuEvent(5u, SPU_BASE + offset, value, s_state.xport_sample_counter);
++  return value;
+ }
+ 
+ void SPU::WriteVoiceRegister(u32 offset, u16 value)
+@@ -1631,6 +1642,11 @@ void SPU::GeneratePendingSamples()
+   InternalGeneratePendingSamples();
+ }
+ 
++u64 SPU::GetXportSampleCounter()
++{
++  return s_state.xport_sample_counter;
++}
++
+ void SPU::InternalGeneratePendingSamples()
+ {
+   const TickCount ticks_pending = s_state.tick_event.GetTicksSinceLastExecution();
+@@ -2403,6 +2419,7 @@ void SPU::Execute(void* param, TickCount ticks)
+     remaining_frames = static_cast<u32>((ticks + s_state.ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK);
+     s_state.ticks_carry = (ticks + s_state.ticks_carry) % SYSCLK_TICKS_PER_SPU_TICK;
+   }
++  s_state.xport_sample_counter += remaining_frames;
+ 
+   while (remaining_frames > 0)
+   {
+diff --git a/src/core/spu.h b/src/core/spu.h
+index a38e618..e3c2eeb 100644
+--- a/src/core/spu.h
++++ b/src/core/spu.h
+@@ -38,6 +38,9 @@ void DrawDebugStateWindow(float scale);
+ // Executes the SPU, generating any pending samples.
+ void GeneratePendingSamples();
+ 
++/// Exact number of SPU sample frames executed since reset or state load
++u64 GetXportSampleCounter();
++
+ /// Access to SPU RAM.
+ const std::array<u8, RAM_SIZE>& GetRAM();
+ std::array<u8, RAM_SIZE>& GetWritableRAM();
+diff --git a/src/core/system.cpp b/src/core/system.cpp
+index 06e64d0..6be8ca4 100644
+--- a/src/core/system.cpp
++++ b/src/core/system.cpp
+@@ -2140,6 +2140,10 @@ void System::FrameDone()
+     InputManager::PollSources();
    }
  
 +#ifdef ENABLE_GDB_SERVER
-+  GDBServer::OnTracePad(static_cast<u32>(s_state.JOY_CTRL.SLOT), static_cast<u32>(s_state.active_device), data_out, data_in, ack);
++  GDBServer::OnLockstepFrameDone();
 +#endif
-   s_state.receive_buffer = data_in;
-   s_state.receive_buffer_full = true;
-   if (s_state.JOY_CTRL.RXINTEN)
---- a/src/core/system.h
-+++ b/src/core/system.h
-@@ -299,7 +299,7 @@
- /// Loads state from the specified path.
- std::optional<bool> LoadState(const char* path, Error* error, bool save_undo_state, bool force_update_display);
- bool SaveState(std::string path, Error* error, bool backup_existing_save, bool ignore_memcard_busy,
--               std::function<void(bool, const Error& error)> completion_callback = {});
-+               std::function<void(bool, const Error& error)> completion_callback = {}, u32 screenshot_size = 256);
- bool SaveResumeState(Error* error);
- 
- /// Saves/load state to/from slot.
---- /dev/null
-+++ b/src/core/ff_stage_package.inl
-@@ -0,0 +1,86 @@
-+// Coherent stage entry snapshots with asynchronous file writes
-+static FFTraceWriter stage_writer;
-+static bool stage_packages_enabled = false;
-+static u32 stage_entry_tick = 0, phase_ordinal = 0, input_call_ordinal = 0;
-+static u32 prior_phase_pc = UINT32_MAX, prior_phase_stage = UINT32_MAX, prior_phase_tick = UINT32_MAX;
 +
-+static bool BeginStagePackages(const std::string& name)
+   // Frame step can still trigger exit
+   CheckForAndExitExecution();
+ 
+@@ -3340,6 +3344,27 @@ bool System::SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error*
+   return true;
+ }
+ 
++bool System::LoadStateDataFromBuffer(std::span<const u8> data, Error* error)
 +{
-+  phase_ordinal = input_call_ordinal = 0;
-+  prior_phase_pc = prior_phase_stage = prior_phase_tick = UINT32_MAX;
-+  INISettingsInterface ini(Path::Combine(EmuFolders::DataRoot, "xport-trace-profile.ini"));
-+  if (!ini.Load())
-+    return false;
-+  stage_packages_enabled = ini.GetBoolValue("XportStage", "enabled", false);
-+  stage_entry_tick = ini.GetUIntValue("XportStage", "entry_tick", 0);
-+  if (!stage_packages_enabled)
-+    return true;
-+  if (!ini.ContainsValue("XportStage", "entry_tick"))
-+    return false;
-+  const std::string path = Path::Combine(EmuFolders::SaveStates, "ff-stage-" + name + ".bin");
-+  FILE* file = std::fopen(path.c_str(), "wbx");
-+  if (!file)
-+    return false;
-+  if (!stage_writer.Start(file))
++  if (!IsValid() || !IsPaused() || IsExecuting() || data.empty())
 +  {
-+    std::fclose(file);
++    Error::SetStringView(error, "System is not stopped for checkpoint restore.");
 +    return false;
 +  }
-+  std::vector<u8> header;
-+  for (u32 value : {0x31545358u, 1u, SAVE_STATE_VERSION})
-+    Number(header, value);
-+  return stage_writer.Write(std::move(header));
-+}
 +
-+static bool StageDevice(std::vector<u8>& payload, u32 kind, bool (*save)(StateWrapper&))
-+{
-+  std::vector<u8> block(16 * 1024 * 1024);
-+  StateWrapper wrapper(std::span<u8>(block), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
-+  if (!save(wrapper) || wrapper.HasError())
++  StateWrapper sw(data, StateWrapper::Mode::Read, SAVE_STATE_VERSION);
++  if (!DoState(sw, false) || sw.HasError() || sw.GetPosition() != data.size())
++  {
++    Error::SetStringView(error, "Checkpoint state data is invalid.");
 +    return false;
-+  Number(payload, kind);
-+  Number(payload, static_cast<u32>(wrapper.GetPosition()));
-+  payload.insert(payload.end(), block.begin(), block.begin() + wrapper.GetPosition());
++  }
++
++  InterruptExecution();
++  PerformanceCounters::Reset();
++  ResetThrottler();
 +  return true;
 +}
 +
-+static bool CaptureStagePackage(u32 pc, u32 tick, u64 clock)
+ bool System::AreGlobalSaveStatesEnabled()
+ {
+   return Core::GetBaseBoolSettingValue("Main", "EnableGlobalStates", false);
+diff --git a/src/core/system.h b/src/core/system.h
+index 3c93cec..0f99ff5 100644
+--- a/src/core/system.h
++++ b/src/core/system.h
+@@ -308,6 +308,7 @@ void SaveStateToSlot(bool global, s32 slot);
+ 
+ /// State data access, use with care as the media path is not updated.
+ bool SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error* error);
++bool LoadStateDataFromBuffer(std::span<const u8> data, Error* error);
+ 
+ /// Returns true if global states should be include in the slot list.
+ bool AreGlobalSaveStatesEnabled();
+diff --git a/src/core/xport_lockstep_mips.h b/src/core/xport_lockstep_mips.h
+new file mode 100644
+index 0000000..2aa6fac
+--- /dev/null
++++ b/src/core/xport_lockstep_mips.h
+@@ -0,0 +1,581 @@
++// SPDX-FileCopyrightText: 2026 xport contributors
++// SPDX-License-Identifier: CC-BY-NC-ND-4.0
++
++#pragma once
++
++#include "common/types.h"
++
++#include <array>
++#include <string_view>
++
++namespace XportLockstep {
++
++enum class MipsEventKind
 +{
-+  const u32 stage = Read(profile.stage);
-+  const bool capture = stage_packages_enabled && pc == profile.game_begin && tick == stage_entry_tick &&
-+    (prior_phase_pc != pc || prior_phase_stage != stage || prior_phase_tick != tick);
-+  prior_phase_pc = pc;
-+  prior_phase_stage = stage;
-+  prior_phase_tick = tick;
-+  const u32 ordinal = phase_ordinal++;
-+  if (!capture)
-+    return true;
-+  std::vector<u8> payload;
-+  for (u32 value : {ordinal, pc, tick, stage, System::GetFrameNumber(), static_cast<u32>(clock),
-+                    static_cast<u32>(clock >> 32), input_call_ordinal, 5u})
-+    Number(payload, value);
-+  Number(payload, 1); Number(payload, 0x200000);
-+  if (!RAM(payload, 0x80000000, 0x200000))
-+    return false;
-+  Number(payload, 2); Number(payload, 1024);
-+  if (!RAM(payload, 0x1f800000, 1024) || !StageDevice(payload, 3, CPU::DoState) ||
-+      !StageDevice(payload, 4, GPU::DoState) || !StageDevice(payload, 5, SPU::DoState))
-+    return false;
-+  std::vector<u8> record;
-+  Number(record, 1);
-+  Number(record, static_cast<u32>(payload.size()));
-+  record.insert(record.end(), payload.begin(), payload.end());
-+  return stage_writer.Write(std::move(record));
++  None,
++  PreCall,
++  PostCall,
++  TailCall,
++  VBlank,
++  ModeTransition,
++  Fault,
++};
++
++struct MipsEvent
++{
++  MipsEventKind kind = MipsEventKind::None;
++  u64 sequence = 0;
++  u64 invocation = 0;
++  u64 parent_invocation = 0;
++  u32 context = 0;
++  u32 frame = 0;
++  u32 depth = 0;
++  u32 call_ordinal = 0;
++  u32 function = 0;
++  u32 callsite = 0;
++  u32 target = 0;
++  u32 return_pc = 0;
++  u32 instruction_word = 0;
++  u32 delay_slot_pc = 0;
++  u32 delay_slot_word = 0;
++  u32 link_register = 0;
++  u32 link_value = 0;
++  std::array<u32, 4> arguments{};
++  u32 return_value = 0;
++  u32 sp = 0;
++  u32 gp = 0;
++  u32 ra = 0;
++  u32 hi = 0;
++  u32 lo = 0;
++  u64 gte_identity = 0;
++};
++
++class MipsCallTracker final
++{
++public:
++  static constexpr u32 MAX_DEPTH = 64;
++  static constexpr u32 MAX_CONTEXTS = 8;
++  static constexpr u32 MAX_TAIL_CALLS = 64;
++  static constexpr u32 MAX_BOUNDARY_TARGETS = 2048;
++
++  void Reset();
++  void ResetEpoch();
++  void ResetCheckpointEpoch();
++  bool ModeTransition(u32 frame, MipsEvent* event);
++  bool AddBoundaryTarget(u32 target);
++  bool AddReviewedTailCall(u32 source, u32 target);
++  bool BeforeInstruction(u32 pc, u32 word, const u32* registers, u32 hi, u32 lo, const u32* gte_registers,
++                         bool prior_branch_taken, MipsEvent* event);
++  bool EnterException(u32 vector, u32 return_pc);
++  bool FrameDone(u32 frame, bool fault, MipsEvent* event);
++
++private:
++  enum class PendingKind
++  {
++    None,
++    Call,
++    Return,
++    Tail,
++    ExceptionReturn,
++  };
++
++  struct Pending
++  {
++    PendingKind kind = PendingKind::None;
++    u32 callsite = 0;
++    u32 target = 0;
++    u32 return_pc = 0;
++    u32 word = 0;
++    u32 link_register = 0;
++    u32 delay_pc = 0;
++    u32 delay_word = 0;
++    bool conditional = false;
++    bool delay_seen = false;
++    bool taken = false;
++  };
++
++  struct Frame
++  {
++    u64 invocation = 0;
++    u64 parent_invocation = 0;
++    u32 function = 0;
++    u32 callsite = 0;
++    u32 return_pc = 0;
++    u32 call_ordinal = 0;
++    u32 next_call_ordinal = 0;
++    u32 instruction_word = 0;
++    u32 delay_pc = 0;
++    u32 delay_word = 0;
++    u32 link_register = 0;
++  };
++
++  struct Context
++  {
++    u32 id = 0;
++    u32 exception_return_pc = 0;
++    u32 depth = 0;
++    bool rfe_seen = false;
++    Pending pending;
++    std::array<Frame, MAX_DEPTH> frames{};
++  };
++
++  struct TailCall
++  {
++    u32 source = 0;
++    u32 target = 0;
++  };
++
++  static bool IsJumpRegister(u32 word, u32 function);
++  static void CaptureRegisters(const u32* registers, u32 hi, u32 lo, const u32* gte_registers, MipsEvent* event);
++  bool IsReviewedTailCall(u32 source, u32 target) const;
++  bool IsBoundaryTarget(u32 target) const;
++  bool CompletePending(Context* context, u32 pc, const u32* registers, u32 hi, u32 lo,
++                       const u32* gte_registers, MipsEvent* event);
++
++  std::array<Context, MAX_CONTEXTS> m_contexts{};
++  std::array<TailCall, MAX_TAIL_CALLS> m_tail_calls{};
++  std::array<u32, MAX_BOUNDARY_TARGETS> m_boundary_targets{};
++  u32 m_context_depth = 1;
++  u32 m_tail_call_count = 0;
++  u32 m_boundary_target_count = 0;
++  u32 m_next_context = 1;
++  u64 m_next_invocation = 1;
++  u32 m_next_root_call_ordinal = 0;
++  u64 m_sequence = 0;
++};
++
++class MipsFunctionCoverage final
++{
++public:
++  static constexpr u32 MAX_FUNCTIONS = MipsCallTracker::MAX_BOUNDARY_TARGETS;
++  static constexpr u32 HASH_CAPACITY = MAX_FUNCTIONS * 2;
++  static_assert((HASH_CAPACITY & (HASH_CAPACITY - 1)) == 0);
++
++  void Reset();
++  bool AddTarget(u32 target);
++  bool BeforeInstruction(u32 pc);
++  u32 GetCount() const { return m_count; }
++  u32 GetFunction(u32 index) const { return index < m_count ? m_order[index] : 0; }
++
++private:
++  static bool Contains(const std::array<u32, HASH_CAPACITY>& table, u32 address);
++  static bool Insert(std::array<u32, HASH_CAPACITY>* table, u32 address);
++
++  std::array<u32, HASH_CAPACITY> m_targets{};
++  std::array<u32, HASH_CAPACITY> m_seen{};
++  std::array<u32, MAX_FUNCTIONS> m_order{};
++  u32 m_target_count = 0;
++  u32 m_count = 0;
++};
++
++inline void MipsFunctionCoverage::Reset()
++{
++  m_targets = {};
++  m_seen = {};
++  m_order = {};
++  m_target_count = 0;
++  m_count = 0;
 +}
 +
-+static bool FinishStagePackages(bool complete)
++inline bool MipsFunctionCoverage::Contains(const std::array<u32, HASH_CAPACITY>& table, u32 address)
 +{
-+  if (!stage_packages_enabled)
-+    return true;
-+  std::vector<u8> footer;
-+  Number(footer, 2); Number(footer, 4); Number(footer, complete ? 1 : 0);
-+  const bool queued = stage_writer.Write(std::move(footer));
-+  const bool saved = stage_writer.Finish();
-+  stage_packages_enabled = false;
-+  return queued && saved;
++  constexpr u32 mask = HASH_CAPACITY - 1;
++  u32 index = (address * 2654435761u) & mask;
++  for (u32 probe = 0; probe < HASH_CAPACITY; probe++)
++  {
++    const u32 slot = table[index];
++    if (slot == address)
++      return true;
++    if (!slot)
++      return false;
++    index = (index + 1) & mask;
++  }
++  return false;
 +}
++
++inline bool MipsFunctionCoverage::Insert(std::array<u32, HASH_CAPACITY>* table, u32 address)
++{
++  constexpr u32 mask = HASH_CAPACITY - 1;
++  u32 index = (address * 2654435761u) & mask;
++  for (u32 probe = 0; probe < HASH_CAPACITY; probe++)
++  {
++    u32& slot = (*table)[index];
++    if (slot == address)
++      return false;
++    if (!slot)
++    {
++      slot = address;
++      return true;
++    }
++    index = (index + 1) & mask;
++  }
++  return false;
++}
++
++inline bool MipsFunctionCoverage::AddTarget(u32 target)
++{
++  if (!target || (target & 3u) || m_target_count >= MAX_FUNCTIONS || !Insert(&m_targets, target))
++    return false;
++  m_target_count++;
++  return true;
++}
++
++inline bool MipsFunctionCoverage::BeforeInstruction(u32 pc)
++{
++  if (!Contains(m_targets, pc) || !Insert(&m_seen, pc))
++    return false;
++  if (m_count >= MAX_FUNCTIONS)
++    return false;
++  m_order[m_count++] = pc;
++  return true;
++}
++
++inline void MipsCallTracker::Reset()
++{
++  m_contexts = {};
++  m_context_depth = 1;
++  m_contexts[0].id = 0;
++  m_tail_calls = {};
++  m_tail_call_count = 0;
++  m_boundary_targets = {};
++  m_boundary_target_count = 0;
++  m_next_context = 1;
++  m_next_invocation = 1;
++  m_next_root_call_ordinal = 0;
++  m_sequence = 0;
++}
++
++inline void MipsCallTracker::ResetEpoch()
++{
++  m_contexts = {};
++  m_context_depth = 1;
++  m_contexts[0].id = 0;
++  m_next_context = 1;
++  m_next_invocation = 1;
++  m_next_root_call_ordinal = 0;
++}
++
++inline void MipsCallTracker::ResetCheckpointEpoch()
++{
++  ResetEpoch();
++  m_sequence = 0;
++}
++
++inline bool MipsCallTracker::ModeTransition(u32 frame, MipsEvent* event)
++{
++  *event = {};
++  event->kind = MipsEventKind::ModeTransition;
++  event->sequence = m_sequence++;
++  event->frame = frame;
++  return true;
++}
++
++inline bool MipsCallTracker::AddBoundaryTarget(u32 target)
++{
++  if ((target & 3u) || m_boundary_target_count >= MAX_BOUNDARY_TARGETS)
++    return false;
++  u32 index = 0;
++  while (index < m_boundary_target_count && m_boundary_targets[index] < target)
++    index++;
++  if (index < m_boundary_target_count && m_boundary_targets[index] == target)
++    return false;
++  for (u32 move = m_boundary_target_count; move > index; move--)
++    m_boundary_targets[move] = m_boundary_targets[move - 1];
++  m_boundary_targets[index] = target;
++  m_boundary_target_count++;
++  return true;
++}
++
++inline bool MipsCallTracker::AddReviewedTailCall(u32 source, u32 target)
++{
++  if ((source & 3u) || (target & 3u) || m_tail_call_count >= MAX_TAIL_CALLS)
++    return false;
++  m_tail_calls[m_tail_call_count++] = {source, target};
++  return true;
++}
++
++inline bool MipsCallTracker::IsJumpRegister(u32 word, u32 function)
++{
++  return (word >> 26) == 0 && (word & 0x3fu) == function;
++}
++
++inline bool MipsCallTracker::IsReviewedTailCall(u32 source, u32 target) const
++{
++  for (u32 index = 0; index < m_tail_call_count; index++)
++  {
++    if (m_tail_calls[index].source == source && m_tail_calls[index].target == target)
++      return true;
++  }
++  return false;
++}
++
++inline bool MipsCallTracker::IsBoundaryTarget(u32 target) const
++{
++  u32 first = 0;
++  u32 last = m_boundary_target_count;
++  while (first < last)
++  {
++    const u32 middle = first + ((last - first) / 2);
++    if (m_boundary_targets[middle] < target)
++      first = middle + 1;
++    else
++      last = middle;
++  }
++  return first < m_boundary_target_count && m_boundary_targets[first] == target;
++}
++
++inline void MipsCallTracker::CaptureRegisters(const u32* registers, u32 hi, u32 lo, const u32* gte_registers,
++                                              MipsEvent* event)
++{
++  for (u32 index = 0; index < 4; index++)
++    event->arguments[index] = registers[4 + index];
++  event->sp = registers[29];
++  event->gp = registers[28];
++  event->ra = registers[31];
++  event->hi = hi;
++  event->lo = lo;
++  event->return_value = registers[2];
++  u64 identity = UINT64_C(1469598103934665603);
++  for (u32 index = 0; gte_registers && index < 64; index++)
++  {
++    identity ^= gte_registers[index];
++    identity *= UINT64_C(1099511628211);
++  }
++  event->gte_identity = gte_registers ? identity : 0;
++}
++
++inline bool MipsCallTracker::CompletePending(Context* context, u32 pc, const u32* registers, u32 hi, u32 lo,
++                                             const u32* gte_registers, MipsEvent* event)
++{
++  Pending& pending = context->pending;
++  if (pending.kind == PendingKind::None)
++    return false;
++  if (!pending.delay_seen)
++  {
++    if (pc == pending.callsite + 4u)
++    {
++      pending.delay_seen = true;
++      pending.delay_pc = pc;
++      pending.delay_word = 0;
++      pending.taken = true;
++    }
++    return false;
++  }
++  if (pending.conditional && !pending.taken)
++  {
++    pending = {};
++    return false;
++  }
++  if (pending.kind == PendingKind::ExceptionReturn)
++  {
++    pending = {};
++    if (m_context_depth > 1)
++      m_context_depth--;
++    return false;
++  }
++  if (pending.kind == PendingKind::Return)
++  {
++    if (!context->depth)
++    {
++      pending = {};
++      return false;
++    }
++    const Frame frame = context->frames[--context->depth];
++    *event = {};
++    event->kind = MipsEventKind::PostCall;
++    event->sequence = m_sequence++;
++    event->invocation = frame.invocation;
++    event->parent_invocation = frame.parent_invocation;
++    event->context = context->id;
++    event->depth = context->depth;
++    event->call_ordinal = frame.call_ordinal;
++    event->function = frame.function;
++    event->callsite = frame.callsite;
++    event->target = frame.function;
++    event->return_pc = frame.return_pc;
++    event->instruction_word = pending.word;
++    event->delay_slot_pc = pending.delay_pc;
++    event->delay_slot_word = pending.delay_word;
++    event->link_register = frame.link_register;
++    CaptureRegisters(registers, hi, lo, gte_registers, event);
++    event->link_value = frame.link_register < 32 ? registers[frame.link_register] : 0;
++    pending = {};
++    return true;
++  }
++  if (!IsBoundaryTarget(pending.target))
++  {
++    pending = {};
++    return false;
++  }
++  if (context->depth >= MAX_DEPTH)
++  {
++    pending = {};
++    return false;
++  }
++  Frame frame;
++  frame.invocation = m_next_invocation++;
++  frame.parent_invocation = context->depth ? context->frames[context->depth - 1].invocation : 0;
++  frame.call_ordinal = context->depth ? context->frames[context->depth - 1].next_call_ordinal++ :
++                                        m_next_root_call_ordinal++;
++  frame.function = pending.target;
++  frame.callsite = pending.callsite;
++  frame.return_pc = pending.return_pc;
++  frame.instruction_word = pending.word;
++  frame.delay_pc = pending.delay_pc;
++  frame.delay_word = pending.delay_word;
++  frame.link_register = pending.link_register;
++  if (pending.kind == PendingKind::Tail && context->depth)
++  {
++    const Frame& replaced = context->frames[context->depth - 1];
++    frame.parent_invocation = replaced.parent_invocation;
++    frame.call_ordinal = replaced.call_ordinal;
++    frame.return_pc = replaced.return_pc;
++    context->depth--;
++  }
++  context->frames[context->depth++] = frame;
++  *event = {};
++  event->kind = pending.kind == PendingKind::Tail ? MipsEventKind::TailCall : MipsEventKind::PreCall;
++  event->sequence = m_sequence++;
++  event->invocation = frame.invocation;
++  event->parent_invocation = frame.parent_invocation;
++  event->context = context->id;
++  event->depth = context->depth - 1;
++  event->call_ordinal = frame.call_ordinal;
++  event->function = frame.function;
++  event->callsite = frame.callsite;
++  event->target = frame.function;
++  event->return_pc = frame.return_pc;
++  event->instruction_word = frame.instruction_word;
++  event->delay_slot_pc = frame.delay_pc;
++  event->delay_slot_word = frame.delay_word;
++  event->link_register = frame.link_register;
++  CaptureRegisters(registers, hi, lo, gte_registers, event);
++  event->link_value = frame.link_register < 32 ? registers[frame.link_register] : 0;
++  pending = {};
++  return true;
++}
++
++inline bool MipsCallTracker::BeforeInstruction(u32 pc, u32 word, const u32* registers, u32 hi, u32 lo,
++                                               const u32* gte_registers,
++                                               bool prior_branch_taken, MipsEvent* event)
++{
++  Context* context = &m_contexts[m_context_depth - 1];
++  if (context->pending.kind != PendingKind::None)
++  {
++    if (!context->pending.delay_seen && pc == context->pending.callsite + 4u)
++    {
++      context->pending.delay_seen = true;
++      context->pending.delay_pc = pc;
++      context->pending.delay_word = word;
++      context->pending.taken = prior_branch_taken;
++      return false;
++    }
++    if (context->pending.delay_seen)
++    {
++      const u32 previous_context_depth = m_context_depth;
++      if (CompletePending(context, pc, registers, hi, lo, gte_registers, event))
++        return true;
++      if (m_context_depth != previous_context_depth)
++        return BeforeInstruction(pc, word, registers, hi, lo, gte_registers, prior_branch_taken, event);
++    }
++    context = &m_contexts[m_context_depth - 1];
++  }
++  if (context->depth && pc == context->frames[context->depth - 1].return_pc)
++  {
++    const Frame frame = context->frames[--context->depth];
++    *event = {};
++    event->kind = MipsEventKind::PostCall;
++    event->sequence = m_sequence++;
++    event->invocation = frame.invocation;
++    event->parent_invocation = frame.parent_invocation;
++    event->context = context->id;
++    event->depth = context->depth;
++    event->call_ordinal = frame.call_ordinal;
++    event->function = frame.function;
++    event->callsite = frame.callsite;
++    event->target = frame.function;
++    event->return_pc = frame.return_pc;
++    event->instruction_word = word;
++    event->link_register = frame.link_register;
++    CaptureRegisters(registers, hi, lo, gte_registers, event);
++    event->link_value = frame.link_register < 32 ? registers[frame.link_register] : 0;
++    return true;
++  }
++  if (word == 0x42000010u)
++  {
++    context->rfe_seen = true;
++    if (m_context_depth > 1)
++    {
++      context->pending.kind = PendingKind::ExceptionReturn;
++      context->pending.delay_seen = true;
++    }
++    return false;
++  }
++
++  const u32 opcode = word >> 26;
++  Pending pending;
++  pending.callsite = pc;
++  pending.word = word;
++  pending.return_pc = pc + 8u;
++  if (opcode == 3u)
++  {
++    pending.kind = PendingKind::Call;
++    pending.target = ((pc + 4u) & 0xf0000000u) | ((word & 0x03ffffffu) << 2);
++    pending.link_register = 31;
++  }
++  else if (IsJumpRegister(word, 9u))
++  {
++    pending.target = registers[(word >> 21) & 31u];
++    pending.link_register = (word >> 11) & 31u;
++    pending.kind = pending.link_register ? PendingKind::Call : PendingKind::None;
++  }
++  else if (opcode == 1u && (((word >> 16) & 31u) == 16u || ((word >> 16) & 31u) == 17u))
++  {
++    pending.kind = PendingKind::Call;
++    pending.conditional = true;
++    pending.target = pc + 4u + (static_cast<s32>(static_cast<s16>(word)) << 2);
++    pending.link_register = 31;
++  }
++  else if (IsJumpRegister(word, 8u))
++  {
++    pending.target = registers[(word >> 21) & 31u];
++    if (context->rfe_seen && m_context_depth > 1)
++      pending.kind = PendingKind::ExceptionReturn;
++    else if (context->depth && pending.target == context->frames[context->depth - 1].return_pc)
++      pending.kind = PendingKind::Return;
++    else if (IsReviewedTailCall(pc, pending.target))
++      pending.kind = PendingKind::Tail;
++  }
++  else if (opcode == 2u)
++  {
++    pending.target = ((pc + 4u) & 0xf0000000u) | ((word & 0x03ffffffu) << 2);
++    if (IsReviewedTailCall(pc, pending.target))
++      pending.kind = PendingKind::Tail;
++  }
++  if (pending.kind != PendingKind::None)
++    context->pending = pending;
++  return false;
++}
++
++inline bool MipsCallTracker::EnterException(u32 vector, u32 return_pc)
++{
++  if (m_context_depth >= MAX_CONTEXTS)
++    return false;
++  Context& context = m_contexts[m_context_depth++];
++  context = {};
++  context.id = m_next_context++;
++  context.exception_return_pc = return_pc;
++  static_cast<void>(vector);
++  return true;
++}
++
++inline bool MipsCallTracker::FrameDone(u32 frame, bool fault, MipsEvent* event)
++{
++  *event = {};
++  event->kind = fault ? MipsEventKind::Fault : MipsEventKind::VBlank;
++  event->sequence = m_sequence++;
++  event->frame = frame;
++  return true;
++}
++
++} // Namespace XportLockstep
+diff --git a/src/core/xport_lockstep_peer.h b/src/core/xport_lockstep_peer.h
+new file mode 100644
+index 0000000..6432bb7
+--- /dev/null
++++ b/src/core/xport_lockstep_peer.h
+@@ -0,0 +1,693 @@
++// SPDX-FileCopyrightText: 2026 xport contributors
++// SPDX-License-Identifier: CC-BY-NC-ND-4.0
++
++#pragma once
++
++#include "common/types.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#ifdef _WIN32
++#include "common/windows_headers.h"
++#endif
++
++namespace XportLockstep {
++
++static constexpr u32 DRAM_SIZE = 0x200000u;
++static constexpr u32 SCRATCHPAD_SIZE = 0x400u;
++static constexpr u32 VRAM_SIZE = 0x100000u;
++static constexpr u32 MAX_DIFF_SIZE = 64u;
++static constexpr u32 DEFERRED_MAGIC = 0x44504C58u;
++static constexpr u32 DEFERRED_VERSION = 12u;
++static constexpr u32 DEFERRED_MAX_RANGES = 511u;
++static constexpr u32 DEFERRED_MAX_CANONICAL_RANGES = 32u;
++static constexpr u32 SPU_EVENT_CAPACITY = 4096u;
++
++enum class SpuEventKind : u32
++{
++  KeyOnLow = 1,
++  KeyOnHigh = 2,
++  KeyOffLow = 3,
++  KeyOffHigh = 4,
++  VoiceRead = 5,
++};
++
++struct SpuEvent
++{
++  u32 kind;
++  u32 address;
++  u32 value;
++  u32 ticks_low;
++  u32 ticks_high;
++};
++
++enum class Error
++{
++  None,
++  PlatformUnsupported,
++  InvalidIdentity,
++  AlreadyAttached,
++  OpenFailed,
++  SizeMismatch,
++  MapFailed,
++  NotAttached,
++  InvalidStackRanges,
++  UnknownStackRanges,
++  AlreadySeeded,
++  Unseeded,
++  InvalidDeferredState,
++};
++
++struct Range
++{
++  enum class Region
++  {
++    Dram,
++    Scratchpad,
++  } region;
++  u32 offset;
++  u32 size;
++};
++
++struct Difference
++{
++  enum class Region
++  {
++    None,
++    Dram,
++    Scratchpad,
++  } region = Region::None;
++  u32 offset = 0;
++  u32 length = 0;
++  std::array<u8, MAX_DIFF_SIZE> original{};
++  std::array<u8, MAX_DIFF_SIZE> candidate{};
++};
++
++struct DeferredRange
++{
++  u32 region;
++  u32 offset;
++  u32 size;
++};
++
++struct DeferredState
++{
++  u32 magic;
++  u32 version;
++  volatile u32 sequence;
++  volatile u32 generation;
++  volatile u32 range_count;
++  volatile u32 boundary_count;
++  volatile u32 catchup_count;
++  volatile u32 open;
++  volatile u32 resolved;
++  volatile u32 canonical_count;
++  DeferredRange ready;
++  DeferredRange canonical[DEFERRED_MAX_CANONICAL_RANGES];
++  DeferredRange ranges[DEFERRED_MAX_RANGES];
++  volatile u32 device_sequence;
++  volatile u32 device_ticks_low;
++  volatile u32 device_ticks_high;
++  volatile u32 spu_timeline_active;
++  volatile u32 spu_timeline_write;
++  volatile u32 spu_timeline_read;
++  volatile u32 spu_timeline_error;
++  SpuEvent spu_events[SPU_EVENT_CAPACITY];
++};
++
++class Peer final
++{
++public:
++  Peer() = default;
++  ~Peer() { Detach(); }
++
++  Peer(const Peer&) = delete;
++  Peer& operator=(const Peer&) = delete;
++
++  Error Attach(std::string_view run_id, std::string_view dram_name, std::string_view scratchpad_name,
++               std::string_view deferred_name);
++  Error Detach(std::string_view run_id = {});
++  Error SetStackRanges(std::string_view identity, std::span<const Range> ranges);
++  Error Seed(const u8* original_dram, const u8* original_scratchpad, const u8* original_vram);
++  Error Compare(std::string_view stack_identity, const u8* original_dram, const u8* original_scratchpad,
++                Difference* difference, u32* deferred_generation);
++  void PublishDeviceTicks(u64 ticks);
++  void ResetSpuTimeline();
++  void PublishSpuEvent(SpuEventKind kind, u32 address, u32 value, u64 ticks);
++
++  bool IsAttached() const
++  {
++    return m_candidate_dram != nullptr && m_candidate_scratchpad != nullptr && m_candidate_vram != nullptr &&
++           m_deferred != nullptr;
++  }
++  bool IsSeeded() const { return m_seeded; }
++  std::string_view GetRunId() const { return m_run_id; }
++
++private:
++  static bool IsRunId(std::string_view value);
++  static std::string MappingName(std::string_view run_id, std::string_view region);
++  static void FindDifference(Difference::Region region, u32 base, const u8* original, const u8* candidate,
++                             u32 size, Difference* difference);
++
++#ifdef _WIN32
++  static Error OpenMapping(std::string_view name, u32 size, HANDLE* handle, const u8** view, bool writable = false);
++  HANDLE m_dram_handle = nullptr;
++  HANDLE m_scratchpad_handle = nullptr;
++  HANDLE m_vram_handle = nullptr;
++  HANDLE m_deferred_handle = nullptr;
++#endif
++  const u8* m_candidate_dram = nullptr;
++  const u8* m_candidate_scratchpad = nullptr;
++  const u8* m_candidate_vram = nullptr;
++  DeferredState* m_deferred = nullptr;
++  std::string m_run_id;
++  std::string m_dram_name;
++  std::string m_scratchpad_name;
++  std::string m_vram_name;
++  std::string m_deferred_name;
++  std::string m_stack_identity;
++  std::vector<Range> m_stack_ranges;
++  bool m_seeded = false;
++  u32 m_resolved_deferred_generation = 0;
++  u32 m_active_deferred_generation = 0;
++  u32 m_deferred_boundaries_seen = 0;
++  u32 m_deferred_boundaries_remaining = 0;
++  u32 m_deferred_catchup = 0;
++  bool m_deferred_closed = false;
++  bool m_deferred_ready_published = false;
++  u32 m_deferred_canonical_count = 0;
++  std::array<DeferredRange, DEFERRED_MAX_CANONICAL_RANGES> m_deferred_canonical{};
++};
++
++inline void Peer::PublishDeviceTicks(u64 ticks)
++{
++#ifdef _WIN32
++  if (!m_deferred)
++    return;
++  InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_deferred->device_sequence));
++  MemoryBarrier();
++  m_deferred->device_ticks_low = static_cast<u32>(ticks);
++  m_deferred->device_ticks_high = static_cast<u32>(ticks >> 32);
++  MemoryBarrier();
++  InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_deferred->device_sequence));
++#else
++  (void)ticks;
++#endif
++}
++
++inline void Peer::ResetSpuTimeline()
++{
++#ifdef _WIN32
++  if (!m_deferred)
++    return;
++  m_deferred->spu_timeline_active = 0u;
++  MemoryBarrier();
++  m_deferred->spu_timeline_write = 0u;
++  m_deferred->spu_timeline_read = 0u;
++  m_deferred->spu_timeline_error = 0u;
++  MemoryBarrier();
++  m_deferred->spu_timeline_active = 1u;
++#endif
++}
++
++inline void Peer::PublishSpuEvent(SpuEventKind kind, u32 address, u32 value, u64 ticks)
++{
++#ifdef _WIN32
++  if (!m_deferred || !m_deferred->spu_timeline_active || m_deferred->spu_timeline_error)
++    return;
++  const u32 write = m_deferred->spu_timeline_write;
++  const u32 read = m_deferred->spu_timeline_read;
++  if (write - read >= SPU_EVENT_CAPACITY)
++  {
++    InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&m_deferred->spu_timeline_error), 1, 0);
++    return;
++  }
++  SpuEvent& event = m_deferred->spu_events[write % SPU_EVENT_CAPACITY];
++  event.kind = static_cast<u32>(kind);
++  event.address = address;
++  event.value = value;
++  event.ticks_low = static_cast<u32>(ticks);
++  event.ticks_high = static_cast<u32>(ticks >> 32);
++  MemoryBarrier();
++  InterlockedExchange(reinterpret_cast<volatile LONG*>(&m_deferred->spu_timeline_write),
++                      static_cast<LONG>(write + 1u));
++#else
++  (void)kind;
++  (void)address;
++  (void)value;
++  (void)ticks;
++#endif
++}
++
++inline bool Peer::IsRunId(std::string_view value)
++{
++  if (value.size() != 32)
++    return false;
++  for (const char character : value)
++  {
++    if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')))
++      return false;
++  }
++  return true;
++}
++
++inline std::string Peer::MappingName(std::string_view run_id, std::string_view region)
++{
++  std::string value = "Local\\xport-lockstep-";
++  value.append(run_id);
++  value.push_back('-');
++  value.append(region);
++  return value;
++}
++
++#ifdef _WIN32
++inline Error Peer::OpenMapping(std::string_view name, u32 size, HANDLE* handle, const u8** view, bool writable)
++{
++  using NtQuerySectionProc = LONG(NTAPI*)(HANDLE, u32, void*, u32, u32*);
++  struct SectionBasicInformation
++  {
++    void* base_address;
++    u32 allocation_attributes;
++    LARGE_INTEGER maximum_size;
++  };
++
++  const std::string terminated_name(name);
++  static constexpr DWORD SECTION_QUERY_ACCESS = 0x0001u;
++  const DWORD mapping_access = FILE_MAP_READ | (writable ? FILE_MAP_WRITE : 0u);
++  *handle = OpenFileMappingA(mapping_access | SECTION_QUERY_ACCESS, FALSE, terminated_name.c_str());
++  if (!*handle)
++    return Error::OpenFailed;
++  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++  const auto query = ntdll ? reinterpret_cast<NtQuerySectionProc>(GetProcAddress(ntdll, "NtQuerySection")) : nullptr;
++  SectionBasicInformation information{};
++  SYSTEM_INFO system_information{};
++  GetSystemInfo(&system_information);
++  u32 returned = 0;
++  if (!query || query(*handle, 0, &information, sizeof(information), &returned) < 0 ||
++      information.maximum_size.QuadPart < size ||
++      static_cast<u64>(information.maximum_size.QuadPart - size) >= system_information.dwPageSize ||
++      ((size % system_information.dwPageSize) == 0 && information.maximum_size.QuadPart != size))
++  {
++    CloseHandle(*handle);
++    *handle = nullptr;
++    return Error::SizeMismatch;
++  }
++  *view = static_cast<const u8*>(MapViewOfFile(*handle, mapping_access, 0, 0, size));
++  if (!*view)
++  {
++    CloseHandle(*handle);
++    *handle = nullptr;
++    return Error::MapFailed;
++  }
++  return Error::None;
++}
++#endif
++
++inline Error Peer::Attach(std::string_view run_id, std::string_view dram_name,
++                          std::string_view scratchpad_name, std::string_view deferred_name)
++{
++#ifndef _WIN32
++  return Error::PlatformUnsupported;
++#else
++  if (!IsRunId(run_id) || dram_name != MappingName(run_id, "dram") ||
++      scratchpad_name != MappingName(run_id, "scratchpad") ||
++      deferred_name != MappingName(run_id, "deferred"))
++    return Error::InvalidIdentity;
++  if (IsAttached())
++  {
++    return m_run_id == run_id && m_dram_name == dram_name && m_scratchpad_name == scratchpad_name &&
++                   m_deferred_name == deferred_name ?
++             Error::None : Error::AlreadyAttached;
++  }
++  Error error = OpenMapping(dram_name, DRAM_SIZE, &m_dram_handle, &m_candidate_dram, true);
++  if (error != Error::None)
++    return error;
++  error = OpenMapping(scratchpad_name, SCRATCHPAD_SIZE, &m_scratchpad_handle, &m_candidate_scratchpad, true);
++  if (error != Error::None)
++  {
++    UnmapViewOfFile(m_candidate_dram);
++    CloseHandle(m_dram_handle);
++    m_candidate_dram = nullptr;
++    m_dram_handle = nullptr;
++    return error;
++  }
++  const std::string vram_name = MappingName(run_id, "vram");
++  error = OpenMapping(vram_name, VRAM_SIZE, &m_vram_handle, &m_candidate_vram, true);
++  if (error != Error::None)
++  {
++    UnmapViewOfFile(m_candidate_scratchpad);
++    UnmapViewOfFile(m_candidate_dram);
++    CloseHandle(m_scratchpad_handle);
++    CloseHandle(m_dram_handle);
++    m_candidate_scratchpad = nullptr;
++    m_candidate_dram = nullptr;
++    m_scratchpad_handle = nullptr;
++    m_dram_handle = nullptr;
++    return error;
++  }
++  const u8* deferred_view = nullptr;
++  error = OpenMapping(deferred_name, sizeof(DeferredState), &m_deferred_handle, &deferred_view, true);
++  if (error != Error::None)
++  {
++    UnmapViewOfFile(m_candidate_vram);
++    UnmapViewOfFile(m_candidate_scratchpad);
++    UnmapViewOfFile(m_candidate_dram);
++    CloseHandle(m_vram_handle);
++    CloseHandle(m_scratchpad_handle);
++    CloseHandle(m_dram_handle);
++    m_candidate_vram = nullptr;
++    m_candidate_scratchpad = nullptr;
++    m_candidate_dram = nullptr;
++    m_vram_handle = nullptr;
++    m_scratchpad_handle = nullptr;
++    m_dram_handle = nullptr;
++    return error;
++  }
++  m_deferred = const_cast<DeferredState*>(reinterpret_cast<const DeferredState*>(deferred_view));
++  if (m_deferred->magic != DEFERRED_MAGIC || m_deferred->version != DEFERRED_VERSION)
++  {
++    UnmapViewOfFile(m_deferred);
++    CloseHandle(m_deferred_handle);
++    m_deferred = nullptr;
++    m_deferred_handle = nullptr;
++    UnmapViewOfFile(m_candidate_vram);
++    UnmapViewOfFile(m_candidate_scratchpad);
++    UnmapViewOfFile(m_candidate_dram);
++    CloseHandle(m_vram_handle);
++    CloseHandle(m_scratchpad_handle);
++    CloseHandle(m_dram_handle);
++    m_candidate_vram = nullptr;
++    m_candidate_scratchpad = nullptr;
++    m_candidate_dram = nullptr;
++    m_vram_handle = nullptr;
++    m_scratchpad_handle = nullptr;
++    m_dram_handle = nullptr;
++    return Error::InvalidDeferredState;
++  }
++  m_run_id = run_id;
++  m_dram_name = dram_name;
++  m_scratchpad_name = scratchpad_name;
++  m_vram_name = vram_name;
++  m_deferred_name = deferred_name;
++  return Error::None;
++#endif
++}
++
++inline Error Peer::Detach(std::string_view run_id)
++{
++  if (!IsAttached())
++    return Error::None;
++  if (!run_id.empty() && run_id != m_run_id)
++    return Error::InvalidIdentity;
++#ifdef _WIN32
++  UnmapViewOfFile(m_deferred);
++  UnmapViewOfFile(m_candidate_vram);
++  UnmapViewOfFile(m_candidate_scratchpad);
++  UnmapViewOfFile(m_candidate_dram);
++  CloseHandle(m_deferred_handle);
++  CloseHandle(m_vram_handle);
++  CloseHandle(m_scratchpad_handle);
++  CloseHandle(m_dram_handle);
++  m_deferred_handle = nullptr;
++  m_vram_handle = nullptr;
++  m_scratchpad_handle = nullptr;
++  m_dram_handle = nullptr;
++#endif
++  m_deferred = nullptr;
++  m_candidate_scratchpad = nullptr;
++  m_candidate_vram = nullptr;
++  m_candidate_dram = nullptr;
++  m_run_id.clear();
++  m_dram_name.clear();
++  m_scratchpad_name.clear();
++  m_vram_name.clear();
++  m_deferred_name.clear();
++  m_stack_identity.clear();
++  m_stack_ranges.clear();
++  m_seeded = false;
++  m_resolved_deferred_generation = 0;
++  m_active_deferred_generation = 0;
++  m_deferred_boundaries_seen = 0;
++  m_deferred_boundaries_remaining = 0;
++  m_deferred_catchup = 0;
++  m_deferred_closed = false;
++  m_deferred_ready_published = false;
++  m_deferred_canonical_count = 0;
++  m_deferred_canonical = {};
++  return Error::None;
++}
++
++inline Error Peer::SetStackRanges(std::string_view identity, std::span<const Range> ranges)
++{
++  if (!IsAttached() || identity.empty() || ranges.empty())
++    return Error::InvalidStackRanges;
++  Range::Region prior_region = ranges.front().region;
++  u32 prior_end = 0;
++  for (const Range& range : ranges)
++  {
++    const u32 region_size = range.region == Range::Region::Dram ? DRAM_SIZE : SCRATCHPAD_SIZE;
++    if (range.region < prior_region)
++      return Error::InvalidStackRanges;
++    if (range.region != prior_region)
++    {
++      prior_region = range.region;
++      prior_end = 0;
++    }
++    if (!range.size || range.offset > region_size - range.size || range.offset < prior_end)
++      return Error::InvalidStackRanges;
++    prior_end = range.offset + range.size;
++  }
++  m_stack_identity = identity;
++  m_stack_ranges.assign(ranges.begin(), ranges.end());
++  return Error::None;
++}
++
++inline Error Peer::Seed(const u8* original_dram, const u8* original_scratchpad, const u8* original_vram)
++{
++#ifndef _WIN32
++  return Error::PlatformUnsupported;
++#else
++  if (!IsAttached() || !original_dram || !original_scratchpad || !original_vram)
++    return Error::NotAttached;
++  if (m_seeded)
++    return Error::AlreadySeeded;
++  const auto copy_mapping = [](const std::string& name, const u8* source, u32 size) {
++    HANDLE handle = OpenFileMappingA(FILE_MAP_WRITE, FALSE, name.c_str());
++    if (!handle)
++      return false;
++    void* view = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, size);
++    if (view)
++    {
++      std::memcpy(view, source, size);
++      FlushViewOfFile(view, size);
++      UnmapViewOfFile(view);
++    }
++    CloseHandle(handle);
++    return view != nullptr;
++  };
++  if (!copy_mapping(m_dram_name, original_dram, DRAM_SIZE) ||
++      !copy_mapping(m_scratchpad_name, original_scratchpad, SCRATCHPAD_SIZE) ||
++      !copy_mapping(m_vram_name, original_vram, VRAM_SIZE))
++    return Error::MapFailed;
++  m_seeded = true;
++  return Error::None;
++#endif
++}
++
++inline void Peer::FindDifference(Difference::Region region, u32 base, const u8* original, const u8* candidate,
++                                 u32 size, Difference* difference)
++{
++  if (size == 0 || std::memcmp(original, candidate, size) == 0)
++    return;
++  u32 offset = 0;
++  while (original[offset] == candidate[offset])
++    offset++;
++  difference->region = region;
++  difference->offset = base + offset;
++  while (offset + difference->length < size && difference->length < MAX_DIFF_SIZE &&
++         original[offset + difference->length] != candidate[offset + difference->length])
++  {
++    difference->original[difference->length] = original[offset + difference->length];
++    difference->candidate[difference->length] = candidate[offset + difference->length];
++    difference->length++;
++  }
++}
++
++inline Error Peer::Compare(std::string_view stack_identity, const u8* original_dram,
++                           const u8* original_scratchpad, Difference* difference,
++                           u32* deferred_generation)
++{
++  if (!IsAttached())
++    return Error::NotAttached;
++  if (!m_seeded)
++    return Error::Unseeded;
++  if (stack_identity != m_stack_identity || m_stack_ranges.empty())
++    return Error::UnknownStackRanges;
++  if (!deferred_generation)
++    return Error::InvalidDeferredState;
++  *difference = {};
++  *deferred_generation = 0;
++  DeferredState snapshot{};
++  for (u32 attempt = 0; attempt < 4; attempt++)
++  {
++    const u32 before = m_deferred->sequence;
++    if (before & 1u)
++      continue;
++    std::memcpy(&snapshot, m_deferred, sizeof(snapshot));
++#ifdef _WIN32
++    MemoryBarrier();
++#endif
++    if (before == m_deferred->sequence && !(before & 1u))
++      break;
++    snapshot.magic = 0;
++  }
++  if (snapshot.magic != DEFERRED_MAGIC || snapshot.version != DEFERRED_VERSION ||
++      snapshot.range_count > DEFERRED_MAX_RANGES ||
++      snapshot.canonical_count > DEFERRED_MAX_CANONICAL_RANGES ||
++      snapshot.open > 1u || snapshot.resolved > 1u ||
++      snapshot.spu_timeline_active > 1u || snapshot.spu_timeline_error ||
++      snapshot.spu_timeline_read != snapshot.spu_timeline_write)
++    return Error::InvalidDeferredState;
++  if (m_deferred_ready_published)
++  {
++    for (u32 index = 0; index < m_deferred_canonical_count; index++)
++    {
++      const DeferredRange& canonical = m_deferred_canonical[index];
++      const u8* original = canonical.region == 1u ? original_dram : original_scratchpad;
++      u8* candidate = const_cast<u8*>(canonical.region == 1u ? m_candidate_dram : m_candidate_scratchpad);
++      std::memcpy(candidate + canonical.offset, original + canonical.offset, canonical.size);
++    }
++    m_resolved_deferred_generation = m_active_deferred_generation;
++    m_active_deferred_generation = 0;
++    m_deferred_ready_published = false;
++    m_deferred_canonical_count = 0;
++  }
++  if (snapshot.generation && snapshot.generation != m_resolved_deferred_generation)
++  {
++    if (snapshot.generation != m_active_deferred_generation)
++    {
++      m_active_deferred_generation = snapshot.generation;
++      m_deferred_boundaries_seen = 0;
++      m_deferred_boundaries_remaining = 0;
++      m_deferred_catchup = 0;
++      m_deferred_closed = false;
++      m_deferred_ready_published = false;
++      m_deferred_canonical_count = 0;
++    }
++    if (snapshot.open)
++    {
++      if (m_deferred_closed)
++        return Error::InvalidDeferredState;
++      m_deferred_boundaries_seen++;
++      *deferred_generation = snapshot.generation;
++      return Error::None;
++    }
++    if (!m_deferred_closed)
++    {
++      if (!snapshot.range_count || m_deferred_boundaries_seen > snapshot.boundary_count)
++        return Error::InvalidDeferredState;
++      for (u32 index = 0; index < snapshot.range_count; index++)
++      {
++        const DeferredRange& source = snapshot.ranges[index];
++        const Range::Region region = source.region == 1u ? Range::Region::Dram :
++                                     source.region == 2u ? Range::Region::Scratchpad :
++                                                           static_cast<Range::Region>(2);
++        const u32 limit = region == Range::Region::Dram ? DRAM_SIZE : SCRATCHPAD_SIZE;
++        if ((source.region != 1u && source.region != 2u) || !source.size ||
++            source.offset > limit - source.size)
++          return Error::InvalidDeferredState;
++      }
++      const u32 ready_limit = snapshot.ready.region == 1u ? DRAM_SIZE :
++                              snapshot.ready.region == 2u ? SCRATCHPAD_SIZE : 0u;
++      if (!ready_limit || !snapshot.ready.size ||
++          snapshot.ready.offset > ready_limit - snapshot.ready.size)
++        return Error::InvalidDeferredState;
++      if (!snapshot.canonical_count)
++        return Error::InvalidDeferredState;
++      for (u32 index = 0; index < snapshot.canonical_count; index++)
++      {
++        const DeferredRange& canonical = snapshot.canonical[index];
++        const u32 canonical_limit = canonical.region == 1u ? DRAM_SIZE :
++                                    canonical.region == 2u ? SCRATCHPAD_SIZE : 0u;
++        if (!canonical_limit || !canonical.size || canonical.offset > canonical_limit - canonical.size)
++          return Error::InvalidDeferredState;
++      }
++      m_deferred_boundaries_remaining = snapshot.boundary_count - m_deferred_boundaries_seen;
++      m_deferred_catchup = m_deferred_boundaries_remaining;
++      m_deferred_closed = true;
++    }
++    if (m_deferred_boundaries_remaining)
++    {
++      m_deferred_boundaries_remaining--;
++      *deferred_generation = snapshot.generation;
++      return Error::None;
++    }
++    const u8* ready_original = snapshot.ready.region == 1u ? original_dram : original_scratchpad;
++    const u8* ready_candidate = snapshot.ready.region == 1u ? m_candidate_dram : m_candidate_scratchpad;
++    if (std::memcmp(ready_original + snapshot.ready.offset, ready_candidate + snapshot.ready.offset,
++                    snapshot.ready.size) != 0)
++    {
++      if (m_deferred_catchup == 0xffffffffu)
++        return Error::InvalidDeferredState;
++      m_deferred_catchup++;
++      *deferred_generation = snapshot.generation;
++      return Error::None;
++    }
++    if (!m_deferred_ready_published)
++    {
++      for (u32 index = 0; index < snapshot.canonical_count; index++)
++      {
++        const DeferredRange& canonical = snapshot.canonical[index];
++        const u8* original = canonical.region == 1u ? original_dram : original_scratchpad;
++        u8* candidate = const_cast<u8*>(canonical.region == 1u ? m_candidate_dram : m_candidate_scratchpad);
++        std::memcpy(candidate + canonical.offset, original + canonical.offset, canonical.size);
++        m_deferred_canonical[index] = canonical;
++      }
++      m_deferred_canonical_count = snapshot.canonical_count;
++#ifdef _WIN32
++      InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_deferred->sequence));
++#endif
++      m_deferred->catchup_count = m_deferred_catchup;
++      m_deferred->resolved = 1u;
++#ifdef _WIN32
++      MemoryBarrier();
++      InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_deferred->sequence));
++#endif
++      m_deferred_ready_published = true;
++      *deferred_generation = snapshot.generation;
++      return Error::None;
++    }
++  }
++  std::vector<Range> compare_ranges = m_stack_ranges;
++  const auto compare_region = [difference](const std::vector<Range>& ranges, Range::Region range_region,
++                                            Difference::Region difference_region, const u8* original,
++                                            const u8* candidate, u32 size) {
++    u32 begin = 0;
++    for (const Range& range : ranges)
++    {
++      if (range.region != range_region)
++        continue;
++      FindDifference(difference_region, begin, original + begin, candidate + begin, range.offset - begin, difference);
++      if (difference->region != Difference::Region::None)
++        return;
++      begin = range.offset + range.size;
++    }
++    FindDifference(difference_region, begin, original + begin, candidate + begin, size - begin, difference);
++  };
++  compare_region(compare_ranges, Range::Region::Dram, Difference::Region::Dram,
++                 original_dram, m_candidate_dram, DRAM_SIZE);
++  if (difference->region == Difference::Region::None)
++    compare_region(compare_ranges, Range::Region::Scratchpad, Difference::Region::Scratchpad, original_scratchpad,
++                   m_candidate_scratchpad, SCRATCHPAD_SIZE);
++  if (difference->region == Difference::Region::None)
++    return Error::None;
++  return Error::None;
++}
++
++} // Namespace XportLockstep

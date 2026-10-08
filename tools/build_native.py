@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from xport_project import project_path, artifact_path
+from xport_project import project_path, artifact_path, native_executable_path
 from xport_process import normalized_environment
 
 
@@ -13,8 +13,9 @@ def main():
     parser.add_argument('--msbuild', type=Path)
     parser.add_argument('--configuration', choices=('Debug', 'Release'), default='Debug')
     parser.add_argument('--plan', action='store_true')
+    parser.add_argument('--rebuild', action='store_true', help='Force a complete rebuild of the selected configuration')
     args = parser.parse_args()
-    executable = project_path('native_executable')
+    executable = native_executable_path(args.configuration)
     solution = project_path('native_solution')
     if not solution.is_file():
         parser.error('Configured solution does not exist')
@@ -30,6 +31,8 @@ def main():
         msbuild = Path(paths[0])
     command = [str(msbuild), str(solution), '/p:Configuration='+args.configuration, '/p:Platform=x86',
                '/m', '/nr:false', '/v:minimal', '/nologo']
+    if args.rebuild:
+        command.append('/t:Rebuild')
     if args.plan:
         print(json.dumps({'command': command, 'configuration': args.configuration, 'executable': str(executable),
                           'working_directory': str(project_path('native_working_directory', 'bin'))}))

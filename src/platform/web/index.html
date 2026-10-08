@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>@@FULL_NAME@@</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; color: #fff; font: 14px system-ui, sans-serif; }
+    body { display: grid; place-items: center; }
+    #game { position: relative; width: min(100vw, calc(100dvh * 4 / 3)); height: min(100dvh, calc(100vw * 3 / 4)); background: #000; }
+    canvas { width: 100%; height: 100%; display: block; outline: none; image-rendering: pixelated; }
+    html:fullscreen { cursor: none; }
+    #boot { position: absolute; inset: 0; display: grid; place-content: center; gap: 12px; padding: 24px; background: #111; text-align: center; }
+    progress { width: min(70vw, 420px); height: 18px; }
+    button { padding: 10px 16px; border: 1px solid #777; border-radius: 5px; background: #222; color: #fff; font: inherit; }
+    button:disabled { opacity: .45; }
+    #fullscreen { position: absolute; top: 10px; right: 10px; z-index: 3; width: 40px; height: 40px; padding: 0; border-color: #aaa; background: #111a; font-size: 22px; line-height: 1; }
+    #fullscreen:hover, #fullscreen:focus-visible { background: #222e; }
+    #loading { position: absolute; inset: 0; z-index: 4; background: #111b; color: white; border: 0; }
+    #loading[hidden] { display: none; }
+    #touch { display: none; position: absolute; inset: 0; pointer-events: none; }
+    .touch-group { position: absolute; bottom: max(18px, env(safe-area-inset-bottom)); display: grid; gap: 7px; pointer-events: auto; }
+    .touch-group button { width: 54px; height: 54px; padding: 0; opacity: .6; touch-action: none; user-select: none; }
+    #dpad { left: max(18px, env(safe-area-inset-left)); grid-template-columns: repeat(3, 54px); }
+    #actions { right: max(18px, env(safe-area-inset-right)); grid-template-columns: repeat(2, 54px); transform: rotate(-12deg); }
+    .empty { visibility: hidden; }
+    @media (pointer: coarse) { #touch.running { display: block; } }
+  </style>
+</head>
+<body>
+  <div id="game">
+    <canvas id="canvas" tabindex="0"></canvas>
+    <button id="loading" hidden>Loading…</button>
+    <button id="fullscreen" type="button" title="Fullscreen (Shift+F)" aria-label="Fullscreen">⛶</button>
+    <div id="boot">
+      <div id="status">Loading…</div>
+      <progress id="progress" value="0" max="100"></progress>
+      <button id="start" type="button" disabled>Start</button>
+    </div>
+    <div id="touch">
+      <div id="dpad" class="touch-group">
+        <button class="empty"></button><button data-pad="4096">▲</button><button class="empty"></button>
+        <button data-pad="32768">◀</button><button class="empty"></button><button data-pad="8192">▶</button>
+        <button class="empty"></button><button data-pad="16384">▼</button><button class="empty"></button>
+      </div>
+      <div id="actions" class="touch-group">
+        <button data-pad="128">□</button><button data-pad="16">△</button>
+        <button data-pad="64">×</button><button data-pad="32">○</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    const game = document.getElementById('game');
+    const boot = document.getElementById('boot');
+    const start = document.getElementById('start');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    const touch = document.getElementById('touch');
+    const pressed = new Map();
+    let ready = false;
+    let gamepadName = '';
+
+    function updateGamepadStatus() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const pad = [...pads].find(item => item && item.connected);
+      gamepadName = pad ? pad.id : '';
+      if (ready)
+        status.textContent = gamepadName ? `Ready — ${gamepadName}` : 'Ready';
+    }
+
+    addEventListener('gamepadconnected', updateGamepadStatus);
+    addEventListener('gamepaddisconnected', updateGamepadStatus);
+
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      noInitialRun: true,
+      xportTouchButtons: 0,
+      xportAudioRate: 44100,
+      locateFile(path) {
+        return path === 'xport-runtime.wasm' ? path + location.search : path;
+      },
+      setStatus(text) {
+        status.textContent = text;
+        if (text && !document.getElementById('loading').hidden)
+          document.getElementById('loading').textContent = text;
+        const match = text.match(/\((\d+(?:\.\d+)?)\/(\d+)\)/);
+        if (match) {
+          progress.max = Number(match[2]);
+          progress.value = Number(match[1]);
+        }
+      },
+      monitorRunDependencies(left) {
+        if (left) {
+          progress.max = Math.max(progress.max, this.totalDependencies || left);
+          this.totalDependencies = progress.max;
+          progress.value = progress.max - left;
+        }
+      },
+      onRuntimeInitialized() {
+        ready = true;
+        progress.value = progress.max;
+        updateGamepadStatus();
+        start.disabled = false;
+      }
+    };
+
+    async function startAudio() {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass)
+        throw new Error('Web Audio is unavailable');
+      const context = new AudioContextClass({ latencyHint: 'interactive' });
+      await context.resume();
+      Module.xportAudioContext = context;
+      if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+        const queue = [];
+        let offset = 0;
+        const node = context.createScriptProcessor(2048, 0, 2);
+        node.onaudioprocess = event => {
+          const left = event.outputBuffer.getChannelData(0);
+          const right = event.outputBuffer.getChannelData(1);
+          for (let frame = 0; frame < left.length; ++frame) {
+            while (queue.length && offset >= queue[0].length / 2) {
+              queue.shift();
+              offset = 0;
+            }
+            if (queue.length) {
+              left[frame] = queue[0][offset * 2];
+              right[frame] = queue[0][offset * 2 + 1];
+              ++offset;
+            } else {
+              left[frame] = 0;
+              right[frame] = 0;
+            }
+          }
+        };
+        node.connect(context.destination);
+        Module.xportAudioRate = context.sampleRate;
+        Module.xportAudioPush = block => {
+          if (queue.length >= 8) {
+            queue.length = 0;
+            offset = 0;
+          }
+          queue.push(block);
+        };
+        Module.xportAudioNode = node;
+        document.body.dataset.xportAudio = 'script-processor';
+        return;
+      }
+      const source = `
+        class XportAudioProcessor extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.queue = [];
+            this.offset = 0;
+            this.port.onmessage = event => {
+              if (this.queue.length >= 8) {
+                this.queue.length = 0;
+                this.offset = 0;
+              }
+              this.queue.push(event.data);
+            };
+          }
+          process(inputs, outputs) {
+            const left = outputs[0][0];
+            const right = outputs[0][1];
+            for (let frame = 0; frame < left.length; ++frame) {
+              while (this.queue.length && this.offset >= this.queue[0].length / 2) {
+                this.queue.shift();
+                this.offset = 0;
+              }
+              if (this.queue.length) {
+                const block = this.queue[0];
+                left[frame] = block[this.offset * 2];
+                right[frame] = block[this.offset * 2 + 1];
+                ++this.offset;
+              } else {
+                left[frame] = 0;
+                right[frame] = 0;
+              }
+            }
+            return true;
+          }
+        }
+        registerProcessor('xport-audio', XportAudioProcessor);
+      `;
+      const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      await context.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      const node = new AudioWorkletNode(context, 'xport-audio', { outputChannelCount: [2] });
+      node.connect(context.destination);
+      Module.xportAudioRate = context.sampleRate;
+      Module.xportAudioPush = block => node.port.postMessage(block, [block.buffer]);
+      Module.xportAudioNode = node;
+      document.body.dataset.xportAudio = 'worklet';
+    }
+
+    async function toggleFullscreen() {
+      if (document.fullscreenElement)
+        await document.exitFullscreen();
+      else
+        await document.documentElement.requestFullscreen();
+    }
+
+    document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
+    addEventListener('keydown', event => {
+      if (event.shiftKey && event.code === 'KeyF') {
+        event.preventDefault();
+        toggleFullscreen();
+      }
+    });
+
+    document.querySelectorAll('[data-pad]').forEach(button => {
+      button.addEventListener('pointerdown', event => {
+        event.preventDefault();
+        button.setPointerCapture(event.pointerId);
+        pressed.set(event.pointerId, Number(button.dataset.pad));
+        Module.xportTouchButtons = [...pressed.values()].reduce((mask, value) => mask | value, 0);
+      });
+      const release = event => {
+        pressed.delete(event.pointerId);
+        Module.xportTouchButtons = [...pressed.values()].reduce((mask, value) => mask | value, 0);
+      };
+      button.addEventListener('pointerup', release);
+      button.addEventListener('pointercancel', release);
+    });
+
+    start.addEventListener('click', async () => {
+      if (!ready)
+        return;
+      start.disabled = true;
+      status.textContent = 'Starting…';
+      startAudio().catch(error => {
+        Module.xportAudioError = String(error && error.message || error);
+        document.body.dataset.xportAudio = 'error';
+        document.body.dataset.xportAudioError = Module.xportAudioError;
+        console.error('Web audio initialization failed:', error);
+      });
+      boot.style.display = 'none';
+      touch.classList.add('running');
+      Module.canvas.focus();
+      Module.callMain([]);
+    });
+  </script>
+  <script src="@@PACKAGES@@"></script>
+  <script src="@@ASSETS@@"></script>
+  <script>
+    const runtimeScript = document.createElement('script');
+    runtimeScript.src = 'xport-runtime.js' + location.search;
+    document.body.appendChild(runtimeScript);
+  </script>
+</body>
+</html>

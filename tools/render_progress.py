@@ -1,5 +1,6 @@
 """Render project progress directly from image-aware SQLite analysis"""
 import datetime
+from contextlib import closing
 import html
 import json
 from pathlib import Path
@@ -11,7 +12,8 @@ def render():
     root, config = load_project()
     database = project_path('analysis_database', 'status/analysis.sqlite')
     ledger_path = root / 'status/translation-ledger.json'
-    ledger_entries = json.loads(ledger_path.read_text(encoding='utf-8-sig'))['entries']
+    ledger_document = json.loads(ledger_path.read_text(encoding='utf-8-sig'))
+    ledger_entries = ledger_document['entries']
     ledger = {}
     for entry in ledger_entries:
         key = (entry['image'], entry['address'])
@@ -20,7 +22,7 @@ def render():
         if entry['status'] not in ('TODO', 'WIP', 'DONE', 'SKIP'):
             raise ValueError('Unknown ledger status: ' + str(entry['status']))
         ledger[key] = entry
-    with sqlite3.connect(database.as_uri()+'?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True)) as db:
         db.row_factory = sqlite3.Row
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
         required = {'functions', 'symbols', 'edges', 'edge_candidates', 'indirect_transfers'}
@@ -59,6 +61,10 @@ def render():
                       target='%s:%08X'%(r['target_image'],r['target_function']),kind=r['kind'])
                  for r in db.execute("SELECT e.*,c.target_image,c.target_function FROM edges e JOIN edge_candidates c ON e.id=c.edge WHERE e.resolution IN ('same_image','resident')")]
         indirect = db.execute('SELECT count(*) FROM indirect_transfers').fetchone()[0]
+        source_summary = None
+        if {'implementations', 'source_files', 'source_declarations'} <= tables:
+            from source_index import mapping_summary
+            source_summary = mapping_summary(db)
     payload = dict(functions=functions, data=data, graph=dict(nodes=functions,edges=edges,
                    meta=dict(asmFunctions=len(functions),directEdges=len(edges),unresolvedIndirectCalls=indirect)))
     template = Path(__file__).with_name('status-template.html').read_text(encoding='utf-8')
@@ -74,6 +80,16 @@ def render():
     output = artifact_path('status/progress.html')
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(template,encoding='utf-8')
+    snapshot_path = artifact_path('status/progress-data.json')
+    if snapshot_path.is_file():
+        snapshot = json.loads(snapshot_path.read_text(encoding='utf-8-sig'))
+        snapshot['decompilation_status'] = counts
+        snapshot['translation_ledger'] = ledger_document
+        if source_summary is not None:
+            snapshot['source_index'] = source_summary
+        temporary = snapshot_path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(snapshot, indent=2)+'\n', encoding='utf-8')
+        temporary.replace(snapshot_path)
     return {'output':str(output),'functions':len(functions),'data':len(data),'edges':len(edges),'counts':counts}
 
 

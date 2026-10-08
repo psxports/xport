@@ -1,13 +1,30 @@
 """Resolve one shared emulator installation and isolated project data"""
 import configparser
 import ctypes
+import hashlib
+import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import time
 from ctypes import wintypes as w
 from xport_project import load_project
 from xport_process import normalized_environment
+from windows_desktop import launch_default_desktop_process
 
 DATA_ROOT_VARIABLE = 'XPORT_DUCKSTATION_DATA_ROOT'
+
+
+def launch_process(command, directory, process_environment, visible):
+    """Launch DuckStation with the shared interactive or hidden window contract"""
+    if visible:
+        return launch_default_desktop_process(
+            command, directory, visible=True, environment=process_environment)
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0
+    return subprocess.Popen(command, cwd=directory, env=process_environment, startupinfo=startup)
 
 
 def show_window(pid):
@@ -41,10 +58,51 @@ def show_window(pid):
 
 
 def executable():
-    path = Path(__file__).resolve().parent/'duckstation/distribution/duckstation-qt-x64-ReleaseLTCG.exe'
+    override = os.environ.get('XPORT_DUCKSTATION_EXECUTABLE')
+    path = (Path(override).expanduser().resolve() if override else
+            Path(__file__).resolve().parent/'duckstation/distribution/duckstation-qt-x64-ReleaseLTCG.exe')
     if not path.is_file():
         raise ValueError('Shared DuckStation executable is missing')
     return path
+
+
+def runtime_identity(path):
+    path = Path(path).resolve()
+    receipt_path = path.parent / 'xport-runtime.json'
+    if not receipt_path.is_file():
+        raise ValueError('DuckStation runtime receipt is missing')
+    receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+    if receipt.get('schema') != 2 or receipt.get('compatibility_executable_name') != path.name:
+        raise ValueError('DuckStation runtime receipt is incompatible')
+    sha = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            sha.update(block)
+    executable_sha256 = sha.hexdigest()
+    if (receipt.get('exe_sha256') != executable_sha256 or
+            (receipt.get('runtime_files') or {}).get(path.name) != executable_sha256):
+        raise ValueError('DuckStation executable differs from its runtime receipt')
+    identity = {
+        'executable_sha256': executable_sha256,
+        'manifest_identity': receipt.get('manifest_identity'),
+        'upstream_commit': receipt.get('upstream_commit'),
+        'patch_sha256': receipt.get('patch_sha256'),
+        'lockstep_protocol_version': receipt.get('lockstep_protocol_version'),
+        'lockstep_record_version': receipt.get('lockstep_record_version'),
+    }
+    lengths = {'manifest_identity': 64, 'upstream_commit': 40, 'patch_sha256': 64}
+    if (any(not isinstance(identity[key], str) or len(identity[key]) != length or
+            any(character not in '0123456789abcdef' for character in identity[key])
+            for key, length in lengths.items()) or
+            type(identity['lockstep_protocol_version']) is not int or
+            type(identity['lockstep_record_version']) is not int):
+        raise ValueError('DuckStation runtime identity is incomplete')
+    manifest = json.loads((Path(__file__).parent / 'duckstation' /
+                           'duckstation-manifest.json').read_text(encoding='utf-8'))
+    if any(identity[key] != manifest['runtime'][key]
+           for key in ('lockstep_protocol_version', 'lockstep_record_version')):
+        raise ValueError('DuckStation runtime protocol differs from the current toolset')
+    return identity
 
 
 def data_directory(override=None, role=None):
@@ -184,12 +242,6 @@ def record_owner(directory, port, pid):
     path.parent.mkdir(parents=True, exist_ok=True)
     write_receipt(path, record)
     write_receipt(root/'status/runtime/duckstation-process.json', record)
-    trace=os.environ.get('XPORT_TRACE_NAME');lease_root=os.environ.get('XPORT_CONVERGE_LEASE_ROOT')
-    if trace and lease_root:
-        expected=(root/'status/stage-pipeline/workers'/trace/'emulator-leases').resolve()
-        if Path(lease_root).resolve()!=expected:raise ValueError('Invalid converge lease directory')
-        expected.mkdir(parents=True,exist_ok=True)
-        write_receipt(expected/(str(pid)+'.json'),dict(record,trace=trace,purpose='converge_check'))
     return record
 
 
@@ -211,25 +263,22 @@ def verify_owner(directory, port, process):
     return record
 
 
-def prepare_trace_profile(directory, port):
-    """Install the validated project profile only while the endpoint is idle"""
-    from trace_profile import validate
-    from trace_cache import digest
+def stop_owned_endpoint(directory, port):
+    """Stop one verified project-owned DuckStation endpoint"""
     from gdb_endpoint import listener_process
-    import shutil
-    root, project = load_project()
-    directory = validate_settings(directory, port)
-    source = (root/project['duckstation']['trace_profile']).resolve(strict=True)
-    validate(source)
-    target = directory/'xport-trace-profile.ini'
-    if not target.is_file() or digest(target) != digest(source):
+    try:
+        process = listener_process(port)
+    except OSError:
+        return False
+    verify_owner(directory, port, process)
+    os.kill(process['Id'], signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
         try:
-            owner = listener_process(port)
+            listener_process(port)
         except OSError:
-            owner = None
-        if owner:
-            raise RuntimeError('Trace profile differs while emulator is running; preserve it and restart explicitly')
-        temporary = directory/'xport-trace-profile.ini.pending'
-        shutil.copyfile(source, temporary)
-        temporary.replace(target)
-    return dict(path=str(target), sha256=digest(target))
+            return True
+        time.sleep(0.05)
+    raise RuntimeError('Verified DuckStation endpoint did not stop')
+
+

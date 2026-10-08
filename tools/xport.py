@@ -16,10 +16,15 @@ def main():
     parser.add_argument('tool', help='Shared script name or doctor')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.tool.removesuffix('.py') == 'startup':
+    tool = args.tool.removesuffix('.py')
+    tool_arguments = list(args.arguments)
+    if tool == 'stop':
+        tool = 'record'
+        tool_arguments.insert(0, 'stop')
+    if tool == 'startup':
         parser.error('Run startup.py directly because a new project has no xport-project.json')
     removed = {'project_init', 'ida_accept', 'ghidra_recognize'}
-    if args.tool.removesuffix('.py') in removed:
+    if tool in removed:
         parser.error('This startup-only stage is owned by startup.py')
     root, config = load_project(args.project)
     os.environ['XPORT_PROJECT'] = str(root)
@@ -31,11 +36,11 @@ def main():
         return
     if Path(args.tool).name != args.tool:
         parser.error('Use a tool name, not a path')
-    script = Path(__file__).resolve().parent/(args.tool.removesuffix('.py')+'.py')
+    script = Path(__file__).resolve().parent/(tool+'.py')
     if not script.is_file() or script.name == 'xport.py':
         parser.error('Unknown shared tool: '+args.tool)
     os.chdir(root)
-    sys.argv = [str(script), *args.arguments]
+    sys.argv = [str(script), *tool_arguments]
     runpy.run_path(str(script), run_name='__main__')
 
 
