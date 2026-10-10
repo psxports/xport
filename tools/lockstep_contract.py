@@ -165,7 +165,15 @@ def validate_event(value):
                 raise ContractError("Controller state is out of range")
     if value["kind"] == "MODE_TRANSITION":
         source = require_object(value.get("source"), "source")
-        exact_keys(source, ("previous_mode", "next_mode", "target_frame"))
+        exact_keys(source, ("previous_mode", "next_mode", "target_frame"),
+                   ("transport_image", "image_binding"))
+        if "transport_image" in source or "image_binding" in source:
+            if value["side"] != "original" or source.get("transport_image") != "MAIN.EXE":
+                raise ContractError("Invalid original transport image binding")
+            binding = require_object(source.get("image_binding"), "image_binding")
+            exact_keys(binding, ("record_id", "executable_sha256", "patch_sha256"))
+            for field in ("record_id", "executable_sha256", "patch_sha256"):
+                digest(binding[field], "image_binding." + field)
         if source["previous_mode"] not in LOCKSTEP_MODES or source["next_mode"] not in LOCKSTEP_MODES:
             raise ContractError("Unknown transition mode")
         if source["previous_mode"] == source["next_mode"]:

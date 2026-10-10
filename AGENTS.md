@@ -21,7 +21,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - `record SLOT NAME`, `stop` and capture validation: read [docs/RECORDING.md](docs/RECORDING.md)
 - `function_converge NAME` and its matching `stop`: read [docs/FUNCTION_COVERAGE.md](docs/FUNCTION_COVERAGE.md)
 - `boost NAME` or `boost` with an explicitly supplied function set: read [docs/BOOST.md](docs/BOOST.md); run one fast three-agent draft translation pass without a goal, audit, build or runtime workflow
-- `coverage NAME`: create an active goal, then read [docs/COVERAGE.md](docs/COVERAGE.md); process evidence-bound batches of 16 in first-call order until the final Release build passes, then mark the goal complete
+- `coverage NAME`: read [docs/COVERAGE.md](docs/COVERAGE.md); default to native-first saved C, integration and a bounded playable scenario; preserve existing translations and proof history, use three workers, and separate draft progress from proof counts. Use strict audit gates only for an explicitly requested strict deliverable
 - `converge NAME`: create an active goal, then read [docs/CONVERGENCE.md](docs/CONVERGENCE.md); keep the same supervisor alive and under event-driven observation until full-record `MATCH`, required user input or an explicit user stop; mark the goal complete only after verified `MATCH`
 - Manual translation or repair of decompiled C: read [docs/DECOMPILATION.md](docs/DECOMPILATION.md)
 - Lockstep protocols and repair artifacts: read [docs/LOCKSTEP.md](docs/LOCKSTEP.md)

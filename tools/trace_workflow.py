@@ -10,7 +10,7 @@ import sys
 import time
 
 from trace_worker import alive, process_identity, write_receipt
-from windows_desktop import launch_default_desktop
+from windows_desktop import launch_default_desktop, process_desktop
 from xport_process import normalized_environment
 from xport_project import load_project
 
@@ -156,7 +156,7 @@ def launch_converge(root, name, wait, telemetry, reprobe=False, run_name=None):
     receipt = {
         "schema": 1, "contract": "xport-lockstep-supervisor-process-v1",
         "name": run_name, "record": name, "process": identity,
-        "desktop": "WinSta0\\Default",
+        "desktop": process_desktop(),
     }
     write_receipt(receipt_path, receipt)
     return {"status": "running", "name": run_name, "record": name, "process": identity,

@@ -13,13 +13,13 @@ Normative agent contract for `boost NAME` or bare `boost`. This command produces
 ## Execution
 
 1. Do not create a goal
-2. Create exactly three worker agents
+2. The active model performs every translation itself; do not create worker agents or delegate functions to other chats
 3. Preserve usable existing C; do not restart translations
-4. Sort remaining functions by descending listing bytes; assign each to the worker with the smallest assigned byte total
-5. Before translation, save one shared signature registry at `status/boost/NAME/signatures.json`: image, address, C symbol, return type, parameters, stack arguments and uncertainty. Resolve conflicts centrally; workers must not invent alternate prototypes
-6. Preassign disjoint `game_batchN.c` modules to workers; no two workers edit one file
-7. Workers save completed functions directly to project source as they finish
-8. Stop after every selected function has been processed once and all workers have stopped
+4. Sort remaining functions by descending listing bytes and process them in that order
+5. Before translation, save one signature registry at `status/boost/NAME/signatures.json`: image, address, C symbol, return type, parameters, stack arguments and uncertainty. Resolve every prototype against this registry
+6. Reserve `game_batchN.c` modules before use and keep each within the line limit
+7. Save completed functions directly to project source as they finish
+8. Stop after every selected function has been processed once
 
 Use `manual` instead of `NAME` for a bare set.
 

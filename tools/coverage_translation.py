@@ -218,6 +218,12 @@ def prepare_translations(root, packet, proposal):
         if len(parsed) != 1 or parsed[0]["name"] != row["symbol"] or parsed[0]["markers"] != [key]:
             raise ValueError("Translation needs one function and its exact image/address marker")
         audit = audits.get((row["image"], row["address"]))
+        if audit and audit.get('replacement_kind') == 'user_authorized_native_abi_frame':
+            from coverage_native_abi_frame import authorized_native_abi_frame
+            binding = bindings.get((row['image'], row['address']))
+            if binding is None:
+                raise ValueError('Native ABI owner has no required original binding')
+            authorized_native_abi_frame(root, packet, proposal, binding, audit)
         if audit and audit.get("replacement_kind") == "user_authorized_guest_frame_delegation":
             from coverage_game_frame_delegation import authorized_frame_delegation
             binding = bindings.get((row["image"], row["address"]))
@@ -271,6 +277,8 @@ def apply_translations(root, packet_path, packet, before, proposal, validate, fi
     frame_bindings = packet["source_context"].get("audit_contract", {}).get("required_functions", [])
     validate_frame_delegated_sources(root, packet, proposal, shared_root,
                                      {**game_changes, **shared_changes}, frame_bindings)
+    from coverage_native_abi_frame import validate_native_abi_sources
+    validate_native_abi_sources(root, packet, proposal, game_changes, frame_bindings)
     receipt_path = packet_path.with_suffix(".audit.json")
     originals = {target: target.read_bytes() if target.is_file() else None,
                  receipt_path: receipt_path.read_bytes() if receipt_path.is_file() else None}
@@ -307,6 +315,9 @@ def apply_translations(root, packet_path, packet, before, proposal, validate, fi
         receipt["function_audits"] = proposal.get("function_audits")
         from coverage_game_frame_delegation import frame_delegation_summary
         receipt["game_frame_delegation_admissions"] = frame_delegation_summary(proposal)
+        from coverage_native_abi_frame import native_abi_summary
+        receipt['native_abi_frame_admissions'] = native_abi_summary(proposal)
+        receipt['native_abi_frame_count'] = len(receipt['native_abi_frame_admissions'])
         receipt["game_frame_delegation_count"] = len(receipt["game_frame_delegation_admissions"])
         receipt["sdk_audits"] = proposal.get("sdk_audits") or []
         if proposal.get("sdk_helper_corrections"):

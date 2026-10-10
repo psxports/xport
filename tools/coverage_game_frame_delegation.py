@@ -88,6 +88,10 @@ def authorized_frame_delegation(root,packet,proposal,binding,audit):
 
     if audit.get('replacement_kind')!=REPLACEMENT:return None
 
+    if binding.get('address') != ADDRESS:
+        from coverage_batch10_frame_delegation import authorized_batch10_frame
+        return authorized_batch10_frame(root, packet, proposal, binding, audit)
+
     if root is None or packet.get('contract')!='xport-function-audit-packet-v1' or binding.get('address')!=ADDRESS or binding.get('image')!='SLUS_005.10' or binding.get('library_classification'):raise ValueError('Frame waiver exceeds explicitly approved single ordinary owner')
 
     if any(audit.get(k)!=binding.get(k) for k in FIELDS) or audit.get('complete_mips_audit') is not True or audit.get('pseudocode_used_as_baseline') is not binding.get('pseudocode_complete'):raise ValueError('Frame whole-original audit binding changed')
@@ -195,6 +199,8 @@ def validate_frame_delegated_sources(root,packet,proposal,shared_root,changes,bi
 
         if isinstance(text,bytes):text=text.decode('utf-8-sig')
 
+        frame_size = admitted['review']['frame_size']
+        frame_checks = admitted.get('frame_machine_checks', audit['waived_machine_checks'])
         for entry in admitted['entries']:
 
             fs=[f for f in functions(text,str(path)) if f['name']==entry['symbol']]
@@ -213,22 +219,46 @@ def validate_frame_delegated_sources(root,packet,proposal,shared_root,changes,bi
                 ids=group.get('check_ids',[])
                 if group.get('check_range') is not None:
                     lo,hi=group['check_range'];ids=[c['id'] for c in original_checks[lo:hi+1]]
-                overlap=[i for i in ids if i in audit['waived_machine_checks']]
+                overlap=[i for i in ids if i in frame_checks]
                 if not overlap:continue
                 required=[]
                 for i in overlap:
                     w=int(owner_checks[i]['word'],0);op=w>>26
-                    release=op==35 or (op==9 and (w&65535)==96)
+                    release=op==35 or (op==9 and (w&65535)==frame_size)
                     if release==('release' in entry['symbol']):required.append(i)
                 if required:
                     if len(required)!=len(ids) or group.get('source_file')!=entry['source_file'] or group.get('source_symbol')!=entry['symbol'] or group.get('source_line')!=abort_line:raise ValueError('Frame waived checks must map only to exact corresponding service abort line')
                     waived.extend(required)
-            expected=[i for i in audit['waived_machine_checks'] if ((int(owner_checks[i]['word'],0)>>26)==35 or ((int(owner_checks[i]['word'],0)>>26)==9 and (int(owner_checks[i]['word'],0)&65535)==96))==('release' in entry['symbol'])]
+            expected=[i for i in frame_checks if ((int(owner_checks[i]['word'],0)>>26)==35 or ((int(owner_checks[i]['word'],0)>>26)==9 and (int(owner_checks[i]['word'],0)&65535)==frame_size))==('release' in entry['symbol'])]
             if waived!=expected:raise ValueError('Frame waived source mappings missing or out of order')
+
+        callback = admitted.get('callback')
+        if callback is not None:
+            entry = callback['entry']
+            fs = [f for f in functions(text, str(path)) if f['name'] == entry['symbol']]
+            if len(fs) != 1:
+                raise ValueError('Callback service lacks unique actual body')
+            function = fs[0]
+            body = text[function['start']:function['end']]
+            validate_stub_body(body, entry)
+            abort_line = text[:function['start']].count('\n') + 1 + next(i for i, line in enumerate(body.splitlines()) if line.strip() == 'abort();')
+            callback_covered = []
+            for group in audit.get('machine_coverage', []):
+                ids = group.get('check_ids', [])
+                if group.get('check_range') is not None:
+                    lo, hi = group['check_range']
+                    ids = [c['id'] for c in original_checks[lo:hi+1]]
+                overlap = [i for i in ids if i in callback['check_ids']]
+                if overlap:
+                    if overlap != ids or group.get('source_file') != entry['source_file'] or group.get('source_symbol') != entry['symbol'] or group.get('source_line') != abort_line:
+                        raise ValueError('Callback waived checks must identify exact dispatcher abort line only')
+                    callback_covered.extend(overlap)
+            if callback_covered != callback['check_ids']:
+                raise ValueError('Callback waived source mappings missing or out of order')
 
 def frame_delegation_summary(proposal):
 
     keys=('image','address','source_file','source_symbol','replacement_kind','original_equivalence','unresolved_semantics','waived_original_effects','waived_machine_checks','guest_frame_review','guest_frame_authorization','implementation_status')
 
-    return [{k:a[k] for k in keys} for a in proposal.get('function_audits',[]) if a.get('replacement_kind')==REPLACEMENT]
+    return [{**{k:a[k] for k in keys}, **{k:a[k] for k in ('callback_abi_authorization', 'gte_projection_review') if k in a}} for a in proposal.get('function_audits',[]) if a.get('replacement_kind')==REPLACEMENT]
 

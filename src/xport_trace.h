@@ -97,9 +97,6 @@ extern "C"
 
     void *xport_guest_ptr(uint32 address, size_t length);
     const void *xport_guest_cptr(uint32 address, size_t length);
-    sint8 r_s8(uint32 address);
-    sint16 r_s16(uint32 address);
-    sint32 r_s32(uint32 address);
     sint32 xport_update_u8(uint32 address, XportMemoryUpdate operation, uint32 value);
     sint32 xport_update_u16(uint32 address, XportMemoryUpdate operation, uint32 value);
     sint32 xport_update_u32(uint32 address, XportMemoryUpdate operation, uint32 value);

@@ -118,7 +118,16 @@ def prepare_sdk_translations(packet, proposal, shared_root, shared_before, solut
                   c["function"]["address"] == entry["caller_address"] and
                   c["function"]["sha256"] == entry["caller_function_sha256"]]
         if len(caller) != 1:
-            raise ValueError("Missing system bridge has no exact required caller binding")
+            from coverage_sdk_nested_delegation import nested_caller_chain
+            delegated_targets = [b for b in dependencies.values() if
+                b.get("image") == entry["caller_image"] and b.get("caller_address") == entry["caller_address"] and
+                b.get("caller_function_sha256") == entry["caller_function_sha256"] and
+                any(a.get("replacement_kind") == "user_authorized_system_delegation" and
+                    any(r.get("symbol") == row["symbol"] for r in a.get("system_delegations", []))
+                    for a in proposal.get("sdk_audits", []) if
+                    (a.get("image"), a.get("address")) == (b["image"], b["address"]))]
+            if len(delegated_targets) != 1 or not nested_caller_chain(project_root, packet, proposal, delegated_targets[0]):
+                raise ValueError("Missing system bridge has no exact required caller binding")
         game_bodies = [r["text"] for r in proposal.get("translations") or []
                        if r["image"] == entry["caller_image"] and r["address"] == entry["caller_address"]]
         if not any(re.search(r"\b" + re.escape(row["symbol"]) + r"\s*\(", text) for text in game_bodies):

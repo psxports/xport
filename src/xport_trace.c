@@ -1,5 +1,6 @@
 #define XPORT_MEMORY_IMPLEMENTATION
 #include "xport_trace.h"
+#include "psx.h"
 
 /* Memory access */
 #include <string.h>
@@ -74,7 +75,7 @@ static sint32 xport_map(XportMemoryContext *context, uint32 address, size_t leng
         uint32 offset = physical % (uint32)context->dram_size;
         if (length <= context->dram_size - offset)
         {
-            mapped->pointer = context->dram + offset;
+            mapped->pointer = context->dram == (uint8 *)DRAM && context->dram_size == sizeof(DRAM) && (physical < PSX_DRAM_SIZE || (address & 0xe0000000u) != 0u) ? (uint8 *)psx_addr(address, length) : context->dram + offset;
             mapped->region = XPORT_MEMORY_DRAM;
             mapped->offset = offset;
             mapped->readonly = 0;
@@ -86,7 +87,7 @@ static sint32 xport_map(XportMemoryContext *context, uint32 address, size_t leng
         uint32 offset = physical - 0x1f800000u;
         if (offset <= context->scratchpad_size && length <= context->scratchpad_size - offset)
         {
-            mapped->pointer = context->scratchpad + offset;
+            mapped->pointer = context->scratchpad == (uint8 *)SCRATCHPAD && context->scratchpad_size == sizeof(SCRATCHPAD) ? (uint8 *)psx_addr(address, length) : context->scratchpad + offset;
             mapped->region = XPORT_MEMORY_SCRATCHPAD;
             mapped->offset = offset;
             mapped->readonly = 0;
@@ -267,24 +268,6 @@ const void *xport_guest_cptr(uint32 address, size_t length)
     XportMemoryContext *context = &memory_context;
     XportMappedRange mapped;
     return xport_map(context, address, length, 0, &mapped) ? mapped.pointer : NULL;
-}
-
-sint8 r_s8(uint32 address)
-{
-    uint8 value = r_u8(address);
-    return value <= INT8_MAX ? (sint8)value : (sint8)(-1 - (sint32)(uint8)~value);
-}
-
-sint16 r_s16(uint32 address)
-{
-    uint16 value = r_u16(address);
-    return value <= INT16_MAX ? (sint16)value : (sint16)(-1 - (sint32)(uint16)~value);
-}
-
-sint32 r_s32(uint32 address)
-{
-    uint32 value = r_u32(address);
-    return value <= INT32_MAX ? (sint32)value : -1 - (sint32)~value;
 }
 
 static sint32 xport_update_value(uint32 address, uint32 width, XportMemoryUpdate operation, uint32 operand)
@@ -1601,6 +1584,7 @@ XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_epoch;
 XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_target_frame;
 
 static uint64 boundary_sequence;
+static char frame_image[32];
 static uint32 boundary_frame;
 static LOCKSTEP_BOUNDARY_HIT last_hit;
 
@@ -1692,7 +1676,7 @@ void xport_lockstep_boundary_resume_from_checkpoint(uint32 next_frame)
     hit.kind = XPORT_LOCKSTEP_MODE_TRANSITION;
     hit.sequence = boundary_sequence++;
     hit.contract = xport_lockstep_boundary_contract;
-    hit.image = "MAIN.EXE";
+    hit.image = frame_image;
     hit.function = "FrameDone";
     hit.file = "xport_lockstep_checkpoint";
     hit.return_kind = XPORT_CALL_VALUE_VOID;
@@ -1777,7 +1761,6 @@ typedef struct LOCKSTEP_INPUT_ENTRY
 static LOCKSTEP_INPUT_ENTRY *frame_entries;
 static uint32 frame_entry_count;
 static uint32 frame_entry_index;
-static char frame_image[32];
 static const char *frame_error;
     #if defined(XPORT_MEMORY_DIAGNOSTICS)
 GDB_DATA const uint32 xport_lockstep_write_ring_available = 1u;

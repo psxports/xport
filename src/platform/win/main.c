@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
+// This backend uses the Windows critical-section API
+#define XPORT_NO_PSYQ_CRITICAL_SECTION
 #include "psx_spu.h"
 #include "xport.h"
 #include "xport_trace.h"
@@ -389,6 +391,96 @@ sint32 xport_window_init(void)
     return 1;
 }
 
+/* Save bounded producer pixels without desktop readback */
+static void xport_capture_present(const uint32 *pixels, sint32 bw, sint32 bh, sint32 sx, sint32 sy, sint32 sw, sint32 sh, sint32 cw, sint32 ch, sint32 result)
+{
+    static uint32 attempted, saved, seen, configured, start, interval = 1u;
+    const char *directory = getenv("XPORT_FRAME_CAPTURE_DIR");
+    const char *setting;
+    char *end;
+    unsigned long parsed;
+    uint32 present_index;
+    char path[1024];
+    uint8 row[4096 * 3];
+    sint32 x, y, nonblack = 0, complete = 1;
+    FILE *file;
+    if (directory == NULL || directory[0] == 0 || saved >= 4u || attempted >= 256u)
+        return;
+    if (configured == 0u)
+    {
+        configured = 1u;
+        setting = getenv("XPORT_FRAME_CAPTURE_START");
+        if (setting != NULL && setting[0] >= '0' && setting[0] <= '9')
+        {
+            parsed = strtoul(setting, &end, 10);
+            if (*end == 0 && parsed <= 1000000ul)
+                start = (uint32)parsed;
+        }
+        setting = getenv("XPORT_FRAME_CAPTURE_INTERVAL");
+        if (setting != NULL && setting[0] >= '0' && setting[0] <= '9')
+        {
+            parsed = strtoul(setting, &end, 10);
+            if (*end == 0 && parsed >= 1ul && parsed <= 1000000ul)
+                interval = (uint32)parsed;
+        }
+    }
+    if (seen >= 1000000u)
+        return;
+    present_index = seen++;
+    if (present_index < start || (present_index - start) % interval != 0u)
+        return;
+    ++attempted;
+    if (bw > 4096 || bh > 4096 || sw > 4096 || sh > 4096)
+        return;
+    for (y = 0; y < sh && !nonblack; ++y)
+        for (x = 0; x < sw; ++x)
+            if (pixels[(size_t)(sy + y) * bw + sx + x] & 0xFFFFFFu)
+            {
+                nonblack = 1;
+                break;
+            }
+    if (!nonblack)
+        return;
+    if (snprintf(path, sizeof(path), "%s/present-%03u.ppm", directory, saved) < 0 || strlen(path) >= sizeof(path) - 1)
+        return;
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return;
+    if (fprintf(file, "P6\n%d %d\n255\n", sw, sh) < 0)
+        complete = 0;
+    for (y = 0; y < sh && complete; ++y)
+    {
+        for (x = 0; x < sw; ++x)
+        {
+            uint32 pixel = pixels[(size_t)(sy + y) * bw + sx + x];
+            row[3 * x] = (uint8)(pixel >> 16);
+            row[3 * x + 1] = (uint8)(pixel >> 8);
+            row[3 * x + 2] = (uint8)pixel;
+        }
+        if (fwrite(row, 3u, (size_t)sw, file) != (size_t)sw)
+            complete = 0;
+    }
+    if (fclose(file) != 0)
+        complete = 0;
+    if (!complete)
+        return;
+    if (snprintf(path, sizeof(path), "%s/present-%03u.json", directory, saved) < 0 || strlen(path) >= sizeof(path) - 1)
+        return;
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return;
+    complete = fprintf(file,
+                       "{\"present_index\":%u,\"sample_start\":%u,\"sample_interval\":%u,\"bitmap_width\":%d,\"bitmap_height\":%d,\"source_crop\":[%d,%d,%d,%d],"
+                       "\"client_width\":%d,\"client_height\":%d,\"stretch_dibits_result\":%d,"
+                       "\"presentation_api_success\":%s,\"visible_desktop_claim\":false,"
+                       "\"producer_format\":\"BI_RGB32 BGRX little endian\",\"nonblack\":true}\n",
+                       present_index, start, interval, bw, bh, sx, sy, sw, sh, cw, ch, result, result != 0 && result != GDI_ERROR ? "true" : "false") >= 0;
+    if (fclose(file) != 0)
+        complete = 0;
+    if (complete)
+        ++saved;
+}
+
 sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title)
 {
     RECT client;
@@ -426,6 +518,7 @@ sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_he
     ReleaseDC(platform_window, device);
     end = xport_timer_get();
     xport_frame_profile_record(begin, end);
+    xport_capture_present(pixels, bitmap_width, bitmap_height, source_x, source_y, source_width, source_height, client_width, client_height, result);
     if (title != NULL)
         SetWindowText(platform_window, title);
     return result != 0 && result != GDI_ERROR;

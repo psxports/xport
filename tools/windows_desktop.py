@@ -5,6 +5,15 @@ from ctypes import wintypes
 import os
 from pathlib import Path
 import subprocess
+import re
+
+
+def process_desktop(environment=None):
+    source = os.environ if environment is None else environment
+    name = source.get("XPORT_WINDOWS_DESKTOP", "WinSta0\\Default")
+    if not re.fullmatch(r"WinSta0\\[A-Za-z0-9_-]{1,64}", name):
+        raise ValueError("Invalid Windows process desktop")
+    return name
 
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -78,7 +87,7 @@ def _create_default_desktop(command, directory: Path, visible: bool, environment
     create.restype = wintypes.BOOL
     startup = StartupInfo()
     startup.cb = ctypes.sizeof(startup)
-    startup.lpDesktop = "WinSta0\\Default"
+    startup.lpDesktop = process_desktop(environment)
     startup.dwFlags = 0 if visible else STARTF_USESHOWWINDOW
     startup.wShowWindow = SW_SHOWNORMAL if visible else SW_HIDE
     process = ProcessInformation()

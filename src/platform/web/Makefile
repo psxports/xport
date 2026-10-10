@@ -14,6 +14,11 @@ XPORT_SOURCES := \
 	$(XPORT_ROOT)/src/psx.c \
 	$(XPORT_ROOT)/src/psx_gpu.c \
 	$(XPORT_ROOT)/src/psx_spu.c \
+	$(XPORT_ROOT)/src/psx_xa.c \
+	$(XPORT_ROOT)/src/psx_mdec.c \
+	$(XPORT_ROOT)/src/psx_press.c \
+	$(XPORT_ROOT)/src/psx_vlc.c \
+	$(XPORT_ROOT)/src/psx_stream.c \
 	$(XPORT_ROOT)/src/xport_trace.c
 SOURCES := $(XPORT_SOURCES) $(APP_SOURCES)
 OBJ_DIR := ../../../_build/web/$(CONFIG)

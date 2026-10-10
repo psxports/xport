@@ -1,5 +1,5 @@
 """Index C implementations and declarations without requiring one function per file"""
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 import argparse
@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-source-index-v6'
+PARSER_VERSION='c-source-index-v7'
 IDENT=re.compile(r'\b[A-Za-z_]\w*\b')
 CONTROL={'if','for','while','switch','sizeof','return'}
 KEYWORDS={'auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','restrict','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','_Bool','_Atomic','_Complex'}
@@ -259,6 +259,30 @@ def populate(db,root,ledger):
             for name in item['identifiers']:
                 rows=[row for row in declaration_ids.get(name,[]) if row[1] in allowed]
                 db.executemany('INSERT OR IGNORE INTO implementation_declarations VALUES(?,?,?,?)',[(image,address,row[0],'lexical_identifier_in_include_closure') for row in rows])
+    # Discover saved drafts without changing ledger status or admitting evidence
+    bound={(entry['image'],entry['address']) for entry in ledger}
+    originals=list(db.execute('SELECT image,address,name FROM functions'))
+    address_counts=Counter(row[1] for row in originals)
+    bodies=[item for items in parsed.values() for item in items]
+    for image,address,name in originals:
+        if (image,address) in bound or address_counts[address]!=1:
+            continue
+        if not re.fullmatch(r'(?:sub_|FUN_)(?:SLUS_)?'+f'{address:08X}',name,re.I):
+            continue
+        candidates=[item for item in bodies if item['name']==name]
+        if len(candidates)!=1:
+            continue
+        item=candidates[0];rel=item['path']
+        if any(marker!=(address,image) for marker in item['markers']):
+            continue
+        db.execute('INSERT INTO implementations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            (image,address,rel,item['name'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256'],'mapped','unique_original_address_symbol',PARSER_VERSION))
+        db.executemany('INSERT INTO implementation_identifiers VALUES(?,?,?)',[(image,address,token) for token in item['identifiers']])
+        allowed=include_closure(root,rel,texts)
+        for token in item['identifiers']:
+            links=[row for row in declaration_ids.get(token,[]) if row[1] in allowed]
+            db.executemany('INSERT OR IGNORE INTO implementation_declarations VALUES(?,?,?,?)',[(image,address,row[0],'lexical_identifier_in_include_closure') for row in links])
+        mapped+=1
     return dict(parser_version=PARSER_VERSION,source_files=len(paths),declarations=len(decls),mapped=mapped,ambiguous=ambiguous,unmapped=unmapped)
 
 
@@ -421,12 +445,12 @@ def rebuild(format_changed=True):
                 formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha(style.read_bytes()))
         else:formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha((Path(__file__).resolve().parents[1]/'src/.clang-format').read_bytes()))
         indexed_mappings={(image,address):source for image,address,source in db.execute('SELECT image,address,source_path FROM implementations')} if required<=tables else {}
-        previous_status_identities=set(indexed_mappings)
+        previous_status_identities={(image,address) for image,address in db.execute("SELECT image,address FROM implementations WHERE mapping_basis!='unique_original_address_symbol'")} if required<=tables else set()
         ledger_mappings={(entry['image'],entry['address']):relative_source(root,entry['source'])[0] for entry in ledger}
         mapping_changes=set(indexed_mappings)^set(ledger_mappings)
         mapping_changes.update(key for key in set(indexed_mappings)&set(ledger_mappings) if indexed_mappings[key]!=ledger_mappings[key])
         changed=sorted(set(changed)|{ledger_mappings[key] for key in mapping_changes if key in ledger_mappings}) if isinstance(changed,list) else changed
-        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and all(path.lower().endswith(('.c','.h')) for path in changed)
+        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and set(indexed_mappings)==set(ledger_mappings) and all(path.lower().endswith(('.c','.h')) for path in changed)
         if can_increment:
             removed=set(indexed_mappings)-set(ledger_mappings)
             for image,address in removed:

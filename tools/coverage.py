@@ -128,7 +128,7 @@ def function_rows(root: Path, database: Path, image: str,
         for address in addresses:
             row = db.execute(
                 """SELECT f.address,f.name,f.status,f.sha256,f.listing,f.pseudocode,
-                          i.mapping_status,i.source_path,i.symbol,i.body_sha256,
+                          i.mapping_status,i.source_path,i.symbol,i.body_sha256,i.mapping_basis,
                           lc.alias AS library_alias
                    FROM functions f LEFT JOIN implementations i
                      ON i.image=f.image AND i.address=f.address
@@ -268,9 +268,9 @@ def sync_link_stubs(root: Path, project: dict, image: str,
 
 
 def is_c_implementation(row: dict) -> bool:
-    return row.get("mapping_status") == "mapped" and row.get("status") in {
+    return row.get("mapping_status") == "mapped" and (row.get("status") in {
         "WIP", "DONE", "SKIP"
-    }
+    } or row.get("mapping_basis") == "unique_original_address_symbol")
 
 
 def eligible_rows(rows: list[dict]) -> list[dict]:
@@ -481,6 +481,8 @@ def load_state(name: str) -> tuple[Path, dict, dict, dict[str, Path]]:
     validate_inline_state(root, project, state)
     from coverage_indirect import validate_state as validate_indirect_state
     validate_indirect_state(root, project, state)
+    from coverage_native_abi_frame import validate_native_abi_state
+    validate_native_abi_state(root, state)
     return root, project, state, selected
 
 
@@ -570,6 +572,8 @@ def status(name: str) -> dict:
             "sdk_system_delegations": state.get("sdk_system_delegations", []),
             "game_frame_delegation_count": state.get("game_frame_delegation_count", 0),
             "game_frame_delegations": state.get("game_frame_delegations", []),
+            "native_abi_frame_count": state.get('native_abi_frame_count', 0),
+            "native_abi_frames": state.get('native_abi_frames', []),
             "absent_device_count": state.get("absent_device_count", 0),
             "absent_devices": state.get("absent_devices", []),
             "dependency_pending": state.get("dependency_pending", []),
@@ -788,6 +792,10 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
         absent_waiver = authorized_absent_audit(after.get("root"), receipt, binding, audit)
         from coverage_game_frame_delegation import authorized_frame_delegation
         frame_delegation = authorized_frame_delegation(after.get("root"), packet, receipt, binding, audit)
+        from coverage_native_abi_frame import authorized_native_abi_frame
+        native_abi = authorized_native_abi_frame(after.get("root"), packet, receipt, binding, audit)
+        if native_abi is not None and key in sdk_keys:
+            raise ValueError("Native ABI scope cannot waive an SDK audit")
         if frame_delegation is not None and key in sdk_keys:
             raise ValueError("Guest-frame scope cannot be relabeled as an SDK audit")
         from coverage_sdk_system_delegation import authorized_delegation
@@ -838,9 +846,11 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
         if (audit.get("complete_mips_audit") is not True or
                 audit.get("pseudocode_used_as_baseline") is not
                 binding.get("pseudocode_complete") or
-                (audit.get("unresolved_semantics") != [] and waiver is None and absent_waiver is None and delegation is None and frame_delegation is None)):
+                (audit.get("unresolved_semantics") != [] and waiver is None and absent_waiver is None and delegation is None and frame_delegation is None and native_abi is None)):
             raise ValueError("Coverage audit is incomplete")
         expected = [item["id"] for item in context["machine_audit"]["checks"]]
+        if native_abi is not None:
+            expected = [check for check in expected if check not in audit['waived_machine_checks']]
         reachable = source_index = None
         if key in sdk_keys:
             from lockstep_source_coverage import index_functions, reachable_functions
@@ -900,6 +910,11 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
         if covered != expected:
             raise ValueError("MIPS-to-C coverage must cover every machine check once in order")
     from coverage_sdk_system_delegation import validate_delegated_sources, delegation_summary
+    from coverage_native_abi_frame import validate_native_abi_sources, native_abi_summary
+    native_admissions = native_abi_summary(receipt)
+    if receipt.get('native_abi_frame_admissions', []) != native_admissions or type(receipt.get('native_abi_frame_count', 0)) is not int or receipt.get('native_abi_frame_count', 0) != len(native_admissions):
+        raise ValueError('Native ABI receipt inventory or count differs from explicit scope')
+    validate_native_abi_sources(after['root'], packet, receipt, {}, required)
     from coverage_game_frame_delegation import validate_frame_delegated_sources, frame_delegation_summary
     if receipt.get("game_frame_delegation_admissions", []) != frame_delegation_summary(receipt):
         raise ValueError("Guest-frame receipt inventory differs from its explicit scope")
@@ -1048,6 +1063,10 @@ def update_ledger(root: Path, packet_path: Path, packet: dict,
         entry["static_evidence"] = evidence
         audit = next((a for a in proposal.get("function_audits") or []
                       if (a.get("image"), a.get("address")) == key), {})
+        if audit.get('replacement_kind') == 'user_authorized_native_abi_frame':
+            entry['status'] = 'WIP'
+            for field in ('replacement_kind', 'original_equivalence', 'native_abi_authorization', 'waived_original_effects', 'unresolved_semantics'):
+                entry[field] = audit[field]
         if audit.get("replacement_kind") == "user_authorized_missing_stub":
             entry["status"] = "WIP"
             entry["replacement_kind"] = audit["replacement_kind"]
@@ -1255,6 +1274,9 @@ def prove(name: str, proposal_path: Path) -> dict:
         "function_audits": audits,
         "sdk_audits": proposal.get("sdk_audits") or [],
     }
+    from coverage_native_abi_frame import native_abi_summary
+    receipt['native_abi_frame_admissions'] = native_abi_summary(proposal)
+    receipt['native_abi_frame_count'] = len(receipt['native_abi_frame_admissions'])
     if shared is not None:
         receipt["shared_source_identity"] = shared["identity"]
     write_receipt(packet_path.with_suffix(".audit.json"), receipt)
@@ -1296,6 +1318,12 @@ def accept_proof(state: dict, selected: dict[str, Path], packet: dict,
             delegated.append(admission)
     state["sdk_system_delegation_count"] = len(delegated)
     frame_admissions = receipt.get("game_frame_delegation_admissions") or []
+    native_admissions = receipt.get('native_abi_frame_admissions') or []
+    native_retained = state.setdefault('native_abi_frames', [])
+    for admission in native_admissions:
+        if admission not in native_retained:
+            native_retained.append(admission)
+    state['native_abi_frame_count'] = len(native_retained)
     retained_frames = state.setdefault("game_frame_delegations", [])
     for admission in frame_admissions:
         if admission not in retained_frames:
@@ -1308,6 +1336,9 @@ def accept_proof(state: dict, selected: dict[str, Path], packet: dict,
             item["c_status"] = "decompiled"
             item["proof_status"] = "proved"
             item["proof_basis"] = "coverage_audit"
+            if any(s['image'] == image_of(state, item) and s['address'] == item['address'] for s in native_admissions):
+                item['proof_basis'] = 'user_authorized_native_abi_frame_scoped_audit'
+                item['original_equivalence'] = False
             if any(s["image"] == image_of(state, item) and s["address"] == item["address"] for s in frame_admissions):
                 item["proof_basis"] = "user_authorized_guest_frame_scoped_audit"
                 item["original_equivalence"] = False

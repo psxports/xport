@@ -16,6 +16,7 @@ enum
 static sint32 platform_headless;
 static sint32 platform_quit;
 static uint32 platform_pad_buttons;
+static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static uint64 platform_frame_deadline;
@@ -35,7 +36,14 @@ volatile uint32 g_xport_audio_backend_active;
 volatile uint32 g_xport_audio_output_muted;
 volatile uint32 g_xport_audio_callback_overruns;
 
-EM_JS(uint32, xport_touch_buttons, (), { return Module.xportTouchButtons | 0; });
+#if defined(__cplusplus)
+extern "C"
+#endif
+    EMSCRIPTEN_KEEPALIVE void
+    xport_touch_set(uint32 buttons)
+{
+    platform_touch_buttons = buttons & 0xffffu;
+}
 
 // clang-format off
 EM_JS(uint32, xport_gamepad_buttons, (), {
@@ -206,6 +214,7 @@ void xport_timer_wait_frame(uint32 refresh_rate)
 sint32 xport_input_init(void)
 {
     platform_pad_buttons = 0;
+    platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
     emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, key_event);
@@ -220,13 +229,13 @@ sint32 xport_poll(void)
     return !platform_quit;
 }
 
-uint32 xport_input_read(sint32 controller)
+EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
 {
     if (controller != 0)
         return 0;
     if (platform_pad_override)
         return platform_override_buttons;
-    return platform_pad_buttons | xport_touch_buttons() | xport_gamepad_buttons();
+    return platform_pad_buttons | platform_touch_buttons | xport_gamepad_buttons();
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)

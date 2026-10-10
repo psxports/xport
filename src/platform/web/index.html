@@ -6,7 +6,7 @@
   <title>@@FULL_NAME@@</title>
   <style>
     * { box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; color: #fff; font: 14px system-ui, sans-serif; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; background: #000; color: #fff; font: 14px system-ui, sans-serif; }
     body { display: grid; place-items: center; }
     #game { position: relative; width: min(100vw, calc(100dvh * 4 / 3)); height: min(100dvh, calc(100vw * 3 / 4)); background: #000; }
     canvas { width: 100%; height: 100%; display: block; outline: none; image-rendering: pixelated; }
@@ -19,13 +19,21 @@
     #fullscreen:hover, #fullscreen:focus-visible { background: #222e; }
     #loading { position: absolute; inset: 0; z-index: 4; background: #111b; color: white; border: 0; }
     #loading[hidden] { display: none; }
-    #touch { display: none; position: absolute; inset: 0; pointer-events: none; }
-    .touch-group { position: absolute; bottom: max(18px, env(safe-area-inset-bottom)); display: grid; gap: 7px; pointer-events: auto; }
-    .touch-group button { width: 54px; height: 54px; padding: 0; opacity: .6; touch-action: none; user-select: none; }
-    #dpad { left: max(18px, env(safe-area-inset-left)); grid-template-columns: repeat(3, 54px); }
-    #actions { right: max(18px, env(safe-area-inset-right)); grid-template-columns: repeat(2, 54px); transform: rotate(-12deg); }
+    #touch { display: none; position: fixed; inset: 0; z-index: 2; pointer-events: none; touch-action: none; }
+    .touch-group { position: absolute; display: grid; gap: 7px; pointer-events: auto; }
+    .pad-button { display: grid; place-items: center; width: 54px; height: 54px; padding: 0; border: 1px solid #777; border-radius: 5px; background: #222; color: #fff; opacity: .62; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-user-drag: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+    .pad-button.active { opacity: .9; background: #555; }
+    #dpad { left: max(18px, env(safe-area-inset-left)); bottom: max(18px, env(safe-area-inset-bottom)); grid-template-columns: repeat(3, 54px); }
+    #actions { right: max(18px, env(safe-area-inset-right)); bottom: max(18px, env(safe-area-inset-bottom)); grid-template-columns: repeat(2, 54px); transform: rotate(-12deg); }
+    #system { left: 50%; bottom: max(18px, env(safe-area-inset-bottom)); grid-template-columns: repeat(2, 66px); transform: translateX(-50%); }
+    #system .pad-button { width: 66px; height: 38px; font-size: 11px; }
+    #left-shoulders { left: max(18px, env(safe-area-inset-left)); top: max(18px, env(safe-area-inset-top)); grid-template-columns: repeat(2, 62px); }
+    #right-shoulders { right: max(18px, env(safe-area-inset-right)); top: max(18px, env(safe-area-inset-top)); grid-template-columns: repeat(2, 62px); }
+    .shoulders .pad-button { width: 62px; height: 42px; }
     .empty { visibility: hidden; }
     @media (pointer: coarse) { #touch.running { display: block; } }
+    @media (pointer: coarse) { #fullscreen { left: 50%; right: auto; transform: translateX(-50%); } }
+    @media (pointer: coarse) and (orientation: portrait) { #system { bottom: max(190px, calc(env(safe-area-inset-bottom) + 190px)); } }
   </style>
 </head>
 <body>
@@ -38,16 +46,25 @@
       <progress id="progress" value="0" max="100"></progress>
       <button id="start" type="button" disabled>Start</button>
     </div>
-    <div id="touch">
-      <div id="dpad" class="touch-group">
-        <button class="empty"></button><button data-pad="4096">▲</button><button class="empty"></button>
-        <button data-pad="32768">◀</button><button class="empty"></button><button data-pad="8192">▶</button>
-        <button class="empty"></button><button data-pad="16384">▼</button><button class="empty"></button>
-      </div>
-      <div id="actions" class="touch-group">
-        <button data-pad="128">□</button><button data-pad="16">△</button>
-        <button data-pad="64">×</button><button data-pad="32">○</button>
-      </div>
+  </div>
+  <div id="touch">
+    <div id="left-shoulders" class="touch-group shoulders">
+      <span class="pad-button" role="button" aria-label="L2" data-pad="1">L2</span><span class="pad-button" role="button" aria-label="L1" data-pad="4">L1</span>
+    </div>
+    <div id="right-shoulders" class="touch-group shoulders">
+      <span class="pad-button" role="button" aria-label="R1" data-pad="8">R1</span><span class="pad-button" role="button" aria-label="R2" data-pad="2">R2</span>
+    </div>
+    <div id="dpad" class="touch-group">
+      <span class="empty"></span><span class="pad-button" role="button" aria-label="Up" data-pad="4096">▲</span><span class="empty"></span>
+      <span class="pad-button" role="button" aria-label="Left" data-pad="32768">◀</span><span class="empty"></span><span class="pad-button" role="button" aria-label="Right" data-pad="8192">▶</span>
+      <span class="empty"></span><span class="pad-button" role="button" aria-label="Down" data-pad="16384">▼</span><span class="empty"></span>
+    </div>
+    <div id="system" class="touch-group">
+      <span class="pad-button" role="button" aria-label="Select" data-pad="256">SELECT</span><span class="pad-button" role="button" aria-label="Start" data-pad="2048">START</span>
+    </div>
+    <div id="actions" class="touch-group">
+      <span class="pad-button" role="button" aria-label="Square" data-pad="128">□</span><span class="pad-button" role="button" aria-label="Triangle" data-pad="16">△</span>
+      <span class="pad-button" role="button" aria-label="Cross" data-pad="64">×</span><span class="pad-button" role="button" aria-label="Circle" data-pad="32">○</span>
     </div>
   </div>
   <script>
@@ -75,7 +92,6 @@
     var Module = {
       canvas: document.getElementById('canvas'),
       noInitialRun: true,
-      xportTouchButtons: 0,
       xportAudioRate: 44100,
       locateFile(path) {
         return path === 'xport-runtime.wasm' ? path + location.search : path;
@@ -210,19 +226,83 @@
       }
     });
 
+    function publishTouchButtons() {
+      const buttons = [...pressed.values()].reduce((mask, state) => mask | state.value, 0);
+      Module.xportTouchButtons = buttons;
+      if (Module._xport_touch_set)
+        Module._xport_touch_set(buttons);
+    }
+
+    function padAt(x, y) {
+      const element = document.elementFromPoint(x, y);
+      return element && element.closest('[data-pad]');
+    }
+
+    function refreshPressedButtons() {
+      document.querySelectorAll('[data-pad]').forEach(button => {
+        button.classList.toggle('active', [...pressed.values()].some(state => state.button === button));
+      });
+      publishTouchButtons();
+    }
+
+    function updateTouches(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      for (let index = 0; index < event.changedTouches.length; ++index) {
+        const point = event.changedTouches[index];
+        const button = padAt(point.clientX, point.clientY);
+        if (button)
+          pressed.set(`t${point.identifier}`, { button, value: Number(button.dataset.pad) });
+        else
+          pressed.delete(`t${point.identifier}`);
+      }
+      refreshPressedButtons();
+    }
+
+    function releaseTouches(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      for (let index = 0; index < event.changedTouches.length; ++index)
+        pressed.delete(`t${event.changedTouches[index].identifier}`);
+      refreshPressedButtons();
+    }
+
+    touch.addEventListener('touchstart', updateTouches, { passive: false });
+    touch.addEventListener('touchmove', updateTouches, { passive: false });
+    touch.addEventListener('touchend', releaseTouches, { passive: false });
+    touch.addEventListener('touchcancel', releaseTouches, { passive: false });
+    touch.addEventListener('contextmenu', event => event.preventDefault());
+
     document.querySelectorAll('[data-pad]').forEach(button => {
       button.addEventListener('pointerdown', event => {
+        if (event.pointerType === 'touch')
+          return;
         event.preventDefault();
-        button.setPointerCapture(event.pointerId);
-        pressed.set(event.pointerId, Number(button.dataset.pad));
-        Module.xportTouchButtons = [...pressed.values()].reduce((mask, value) => mask | value, 0);
-      });
+        pressed.set(`p${event.pointerId}`, { button, value: Number(button.dataset.pad) });
+        refreshPressedButtons();
+      }, { passive: false });
       const release = event => {
-        pressed.delete(event.pointerId);
-        Module.xportTouchButtons = [...pressed.values()].reduce((mask, value) => mask | value, 0);
+        if (event.pointerType === 'touch')
+          return;
+        event.preventDefault();
+        pressed.delete(`p${event.pointerId}`);
+        refreshPressedButtons();
       };
-      button.addEventListener('pointerup', release);
-      button.addEventListener('pointercancel', release);
+      button.addEventListener('pointerup', release, { passive: false });
+      button.addEventListener('pointercancel', release, { passive: false });
+      button.addEventListener('pointerleave', release, { passive: false });
+    });
+
+    function clearTouchButtons() {
+      pressed.clear();
+      document.querySelectorAll('[data-pad].active').forEach(button => button.classList.remove('active'));
+      publishTouchButtons();
+    }
+
+    addEventListener('blur', clearTouchButtons);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden)
+        clearTouchButtons();
     });
 
     start.addEventListener('click', async () => {

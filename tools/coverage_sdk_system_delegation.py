@@ -188,12 +188,21 @@ def validate_delegated_sources(root, packet, proposal, shared_root, changes):
             return (result, text) if with_source else result
 
         adapter = body(audit["source_file"], audit["source_symbol"])
-        caller = [t for t in proposal.get("translations") or [] if t["image"] == binding["image"] and
-                  t["address"] == binding.get("caller_address")]
+        from coverage_sdk_nested_delegation import nested_caller_chain
+        chain = nested_caller_chain(root, packet, proposal, binding)
+        child_symbol = audit["source_symbol"]
+        for parent_binding, parent_audit in chain:
+            parent_body = body(parent_audit["source_file"], parent_audit["source_symbol"])
+            if not _direct_call(parent_body[parent_body.index("{") + 1:], child_symbol):
+                raise ValueError("Nested SDK caller does not directly call its canonical dependency")
+            child_symbol = parent_audit["source_symbol"]
+        caller_binding = chain[-1][0] if chain else binding
+        caller = [t for t in proposal.get("translations") or [] if t["image"] == caller_binding["image"] and
+                  t["address"] == caller_binding.get("caller_address")]
         if not caller:
             owner_audits = [a for a in proposal.get("function_audits") or [] if a.get("image") == binding["image"] and
-                            a.get("address") == binding.get("caller_address") and
-                            a.get("function_sha256") == binding.get("caller_function_sha256")]
+                            a.get("address") == caller_binding.get("caller_address") and
+                            a.get("function_sha256") == caller_binding.get("caller_function_sha256")]
             if len(owner_audits) == 1:
                 owner = owner_audits[0]
                 relative = Path(owner.get("source_file", ""))
@@ -204,7 +213,7 @@ def validate_delegated_sources(root, packet, proposal, shared_root, changes):
                 parsed = [f for f in functions(text, str(relative)) if f["name"] == owner.get("source_symbol")]
                 if len(parsed) == 1:
                     caller = [{"text": text[parsed[0]["start"]:parsed[0]["end"]]}]
-        if len(caller) != 1 or not _direct_call(caller[0]["text"][caller[0]["text"].index("{") + 1:], audit["source_symbol"]):
+        if len(caller) != 1 or not _direct_call(caller[0]["text"][caller[0]["text"].index("{") + 1:], child_symbol):
             raise ValueError("Recorded caller does not call the delegated SDK adapter")
         code = _code(adapter[adapter.index("{") + 1:adapter.rfind("}")])
         if re.search(r"\bgoto\b|\bwhile\s*\(\s*(?:0[uUlL]*|false)\s*\)", code):

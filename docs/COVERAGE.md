@@ -1,4 +1,58 @@
-# Evidence-bound function coverage audit
+# Function coverage: native-first delivery
+
+## Current execution policy
+
+This section supersedes the default execution order, proof-before-source requirement, indivisible admission pacing, reporting and goal completion rules in the legacy strict-audit reference below. That reference remains the contract of existing proof commands; this documentation does not change their implementation or make draft C a proof.
+
+For `coverage NAME`, default to translating the recorded set into usable native C, integrating it, then repairing a bounded real gameplay scenario. Run strict per-function proof or full-record convergence only when the user explicitly requests that deliverable. A more specific user instruction, including draft-only, no-build or an existing strict-equivalence objective, takes precedence. Do not silently replace a user's explicit converge objective.
+
+### Resume and record the deliverable
+
+- Resolve project identity and NAME from the current project and preserve the immutable recording, original exports, source, ledger and existing receipts
+- Resume usable translations; never restart the project or reaudit unchanged bodies just to adopt this policy
+- Save `status/function-coverage/NAME/native-delivery.json` with mode `native_first`, selected image/address set, source links, unresolved functions, agreed signatures, current runtime blocker, scenario, build and runtime results
+- Keep the recorded denominator fixed. Additional functions needed by an observed native blocker form a separately listed dependency set
+- Keep existing strict proof state intact. Do not fabricate complete state, edit proof receipts, advance accepted-proof counts or mark drafts DONE
+- Use the existing goal if one is active; record its revised native-delivery acceptance criteria separately. Completion means the selected set has saved full C bodies, required Debug/Release builds pass and the named scenario works. A partial set or launch-only result does not satisfy this full deliverable
+- If the user requested only a draft pass, follow its narrower terminal condition and omit integration/runtime
+
+### Translation ownership
+
+1. Inventory saved bodies and actual shared PsyQ implementations once
+2. Agree one signature registry before translating: image, address, native symbol, return type, arguments, semantic stack arguments, pointer representation and uncertainty
+3. The active model performs the complete translation itself. Do not create worker agents or delegate functions to other chats
+4. Keep one owner for signatures, source modules, shared headers, project registration, caller wiring, integration and runtime. Save complete C directly in the project modules
+5. Use complete available pseudocode as the structural baseline and original MIPS to recover lost or ambiguous logic. With missing/partial pseudocode, reconstruct from complete MIPS and state the limitation
+6. Preserve memory access widths, arithmetic, branches, side-effect and call order, semantic stack arguments, addressable locals and genuinely carried values. Use ordinary C ABI; do not reconstruct guest frames, register saves or artificial register variables solely for future comparisons
+7. Mark unresolved logic with explicit TODO. A prototype, partial body, generated abort stub or chat-only code is not a translated full body
+8. Review named ABI, arithmetic, aliasing or control-flow uncertainties. Do not automatically assign a second full-body audit or require instruction-to-line proof maps before saving C
+
+### Integration and native repair
+
+- Reuse the translation-only supervisor route when supported and authorized by the project. It admits zero proofs. Its complete-packet requirement is a tool constraint, not a reason to delay saving independent drafts
+- If existing coverage tooling cannot admit the native-first edit, save it through the ordinary project source workflow with explicit unverified metadata. Do not bypass validators, invent waiver instructions or spend the delivery pass expanding proof infrastructure. Preserve historical accepted receipts; document any changed body as no longer covered by its old source hash
+- Integrate coherent dependency clusters. Run one normal build per integrated cluster; repeat after a source change or actual failure, not per unchanged function
+- Run the native executable under cdb when needed. Advance through a bounded scenario such as menu selection, level load, movement and an action; diagnose the first actual failure from the original caller/callee evidence
+- Resolve only dependencies needed by that scenario. Do not recursively expand every unresolved callee or redesign unrelated data structures
+- Prefer existing shared PsyQ services. Explicitly authorized missing BIOS/SDK/adapter stubs must fail fast and name the missing service; do not fabricate successful behavior or replace existing implementations with stubs
+- Keep shared runtime live. Review changes in actual dependency bodies/ABI/headers; unrelated source changes do not trigger complete retranslation or repeated semantic review
+- Before changing a shared contract, identify consumers and required project registrations. Preserve compatibility or publish the concrete migration and notify affected active projects; avoid silently shifting integration cost to them
+- Keep tests proportional to changed behavior. No routine per-function MIPS/native comparisons, equivalence fixtures, guest-stack reconstruction, full-record replay or proof-tool development in this delivery mode
+- Check actual pixels/input and, when requested, audio output. Build success and function execution alone do not establish playable rendering or audible music
+- Run automation hidden and muted; preserve user-owned interactive processes
+
+### Progress and completion
+
+Report saved full bodies as T/N, the concrete build/runtime stage and the next blocker. If strict X/Y/Z is also shown, label it separately; proof count is never a gate for T. Report behavior and evidence scope plainly, without equivalence claims.
+
+Finish the selected translations and requested scenario before marking the native-delivery goal complete. Record exact tested configuration and remaining modes/levels/media. Do not require `coverage status` to report strict proof completion for this native-first goal.
+
+If one hour passes without saved C or an improved runtime stage, identify the actual critical dependency, focus the active model on it and remove repeated reads, reviews and builds. Retain completed work and report the specific blocker.
+
+## Legacy strict-audit command reference
+
+The remainder applies only to an explicitly requested strict audit and to the validation contracts of the existing strict supervisor commands. It does not override the current native-first execution policy above.
+
 
 Normative extension of `../AGENTS.md` for the chat command:
 
@@ -30,6 +84,8 @@ Print `X/Y/Z` when the command starts, after every accepted batch and on complet
 `next` creates one immutable `coverage-batch-NNNN.json` containing up to 16 pending functions in first-call order. Every function context contains the complete immutable MIPS, complete available IDA pseudocode with explicit completeness, current mapped C, exact hashes and a machine-derived checklist. Treat complete pseudocode as the structural baseline and MIPS as semantic authority. Audit every basic block, branch target, delay slot, callsite, argument, return, register-carried value and memory effect. Do not return a local observed-case patch or simplified algorithm.
 
 Packets bind both consuming-project `src` and shared xport `src` identities. Shared runtime edits and machine mappings use `@xport/src/...`; the supervisor applies project and shared changes in one rollback transaction. Reject shared edits without the packet binding or after either bound source identity changes.
+
+Before reusing saved drafts without ledger bindings, run `X source_index --rebuild --no-format`. The derived index admits only a unique native body whose exact original address symbol belongs to one image and has no conflicting explicit marker. Ledger bindings take precedence. Discovery changes neither ledger status nor accepted coverage; audit the existing body through the normal packet contract. Rebuilding refreshes or removes these derived bindings after source changes.
 
 To bind shared sources for an older active packet, run `X coverage next NAME --reissue`. Reissue preserves the previous packet bytes, records its SHA-256 and replacement path in `packet_revisions`, and creates `coverage-batch-NNNN-revision-RRRR.json`. It rejects changed original function, MIPS, pseudocode, checklist hashes or batch order. Reaudit changed C before proposing proof against the replacement packet; previous draft claims do not become accepted proofs.
 
@@ -89,6 +145,20 @@ Read `coverage_permissions` only from the selected consuming project's `xport-pr
 Permission does not claim implementation or proof. Keep unverified translations out of the accepted-proof counter. Missing-call stubs still require exact identity, prototype and replacement scope; never invent successful behavior. Keep the final requested Release build as a structural deliverable.
 
 For an authorized consuming project, use `X coverage next NAME --unverified` and `X coverage translate NAME --proposal PROJECT_STATUS_JSON`. The proposal has `schema: 1`, `mode: "unverified_translation"` and the complete packet in `functions`, with exact `image`, `address`, `symbol` and C `text` per row. Supply declarations and caller/prototype edits required by those translations. The supervisor writes a separate translation receipt and counts `unverified_translated`; it admits zero semantic proofs. Reissue stale source bindings with `X coverage next NAME --unverified --reissue`. The existing `coverage apply` proof contract remains unchanged; never fabricate audit fields.
+## Explicit native C ABI frame permission
+
+An explicit user instruction may authorize native C ABI handling of service-only guest frame saves for individually reviewed owners. Bind the instruction in a project-owned JSON policy with `contract: "xport-user-authorized-native-abi-frames-v1"`, exact project identity, full-original frame review and each owner's four original audit hashes. Restrict the permission to decoded SP adjustment and callee-saved register save/restore checks. Preserve stack arguments, addressable locals and algorithm-carried values; reject other frame uses or missing retained-semantic reviews.
+
+Keep these admissions separate from original-equivalence proofs. Require `original_equivalence: false`, `WIP`, complete retained original audits and explicit frame-check inventories. Ordinary game memory, calls, branches, SDK and device effects retain their normal requirements. A policy is authorization only; it does not itself admit a function or increase coverage.
+
+The policy has exactly `schema: 1`, `contract`, `project`, `user_instruction`, `review`, `owners`, `original_equivalence: false` and `implementation_status: "WIP"`. `project` binds resolved project `path` and `xport_project_sha256`; `review` binds a project-owned status path/SHA-256. Each owner contains the six normal identity/hash fields plus exact ordered `frame_checks` copied from the packet. The supported instruction is `Да, обычный C ABI с явным допуском`; never supply it without the user's authorization.
+
+Each owner audit uses `replacement_kind: "user_authorized_native_abi_frame"`, `native_abi_authorization` path/SHA-256, `waived_machine_checks`, `native_body_sha256` of the LF-normalized complete native body, `source_file`, `source_symbol`, `native_register_bindings`, `retained_semantics_complete: true`, `retained_unresolved_semantics: []`, `original_equivalence: false` and `implementation_status: "WIP"`. Keep explicit nonempty `unresolved_semantics` equal to `waived_original_effects` for the permitted guest frame memory gap only. Register bindings name every saved S0–S7/FP register in numeric order with `register`, `native_representation`, `source_file`, `source_symbol`, `source_line`, `source_anchor` and `explanation`; RA uses ordinary C return handling. Preserve the exact original marker. Map every retained machine check once in order; omit only the exact authorized frame checks from normal mappings.
+
+`native_representation` is a native identifier or an exact unsigned integer literal present as a complete token in its source anchor. A folded constant still requires an explanation of its complete original definition and uses; do not introduce artificial register variables solely to satisfy the inventory.
+
+The supervisor retains `native_abi_frame_admissions` and `native_abi_frame_count` in receipts, and `native_abi_frames` with the count in coverage state. Revalidate persisted policy, original and native source bindings on resume. Accepted scoped owners remain ledger `WIP`, with `proof_basis: "user_authorized_native_abi_frame_scoped_audit"` and explicit non-equivalence. All normal complete-batch, source-index, rollback and final build gates remain mandatory.
+
 ## Explicit missing system and SDK replacement policy
 
 The default original audit validator remains unchanged. An explicit user instruction permitting missing system/SDK stubs may authorize an unconditional fail-fast replacement without claiming original equivalence. Existing canonical implementations and ordinary game functions cannot use this exception.

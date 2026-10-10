@@ -76,6 +76,12 @@ class MipsFunctionFixture:
                     r[rd] = {0: lambda: r[rt] << shift,
                              2: lambda: r[rt] >> shift,
                              3: lambda: self.signed(r[rt]) >> shift}[fn]()
+                elif fn in (4, 6, 7):
+                    destination = rd
+                    shift = r[rs] & 31
+                    r[rd] = {4: lambda: r[rt] << shift,
+                             6: lambda: r[rt] >> shift,
+                             7: lambda: self.signed(r[rt]) >> shift}[fn]()
                 elif fn == 8:
                     pending_branch = r[rs]
                 elif fn == 9:
@@ -104,10 +110,11 @@ class MipsFunctionFixture:
                             quotient = -quotient
                         self.lo = quotient & 0xffffffff
                         self.hi = (dividend - quotient * divisor) & 0xffffffff
-                elif fn in (33, 35, 36, 37, 42, 43):
+                elif fn in (33, 35, 36, 37, 38, 39, 42, 43):
                     destination = rd
                     r[rd] = {33: lambda: r[rs] + r[rt], 35: lambda: r[rs] - r[rt],
-                             36: lambda: r[rs] & r[rt], 37: lambda: r[rs] | r[rt],
+                             36: lambda: r[rs] & r[rt], 37: lambda: r[rs] | r[rt], 38: lambda: r[rs] ^ r[rt],
+                             39: lambda: ~(r[rs] | r[rt]),
                              42: lambda: int(self.signed(r[rs]) < self.signed(r[rt])),
                              43: lambda: int(r[rs] < r[rt])}[fn]()
                 else:

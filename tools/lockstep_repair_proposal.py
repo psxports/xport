@@ -217,6 +217,9 @@ def apply_proposal(root: Path, source_roots: tuple[Path, ...], packet_path: Path
             receipt['shared_source_identity'] = shared_after['identity']
             receipt['changed_shared_files'] = sorted(changed_shared)
         receipt["function_audits"] = bound_audits
+        from coverage_native_abi_frame import native_abi_summary
+        receipt['native_abi_frame_admissions'] = native_abi_summary(proposal)
+        receipt['native_abi_frame_count'] = len(receipt['native_abi_frame_admissions'])
         receipt["sdk_audits"] = proposal.get("sdk_audits") or []
         receipt["adapter_audits"] = adapter_audits
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")

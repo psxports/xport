@@ -2,6 +2,74 @@
 #include <stdio.h>
 #include <string.h>
 #include "psx.h"
+
+#if defined(XPORT_MEMORY_DIAGNOSTICS)
+    #undef w_u8
+    #undef w_u16
+    #undef w_u32
+    #undef w_masked_u32
+#endif
+
+GDB_CALL uint8 r_u8(uint32 address)
+{
+    return (uint8)xport_memory_read(address, 1u);
+}
+
+GDB_CALL uint16 r_u16(uint32 address)
+{
+    return (uint16)xport_memory_read(address, 2u);
+}
+
+GDB_CALL uint32 r_u32(uint32 address)
+{
+    return xport_memory_read(address, 4u);
+}
+
+GDB_CALL sint8 r_s8(uint32 address)
+{
+    uint8 value = r_u8(address);
+    return value <= INT8_MAX ? (sint8)value : (sint8)(-1 - (sint32)(uint8)~value);
+}
+
+GDB_CALL sint16 r_s16(uint32 address)
+{
+    uint16 value = r_u16(address);
+    return value <= INT16_MAX ? (sint16)value : (sint16)(-1 - (sint32)(uint16)~value);
+}
+
+GDB_CALL sint32 r_s32(uint32 address)
+{
+    uint32 value = r_u32(address);
+    return value <= INT32_MAX ? (sint32)value : -1 - (sint32)~value;
+}
+
+GDB_CALL sint32 w_u8(uint32 address, uint32 value)
+{
+    return xport_memory_write(address, 1u, value, 1u);
+}
+
+GDB_CALL sint32 w_u16(uint32 address, uint32 value)
+{
+    return xport_memory_write(address, 2u, value, 3u);
+}
+
+GDB_CALL sint32 w_u32(uint32 address, uint32 value)
+{
+    return xport_memory_write(address, 4u, value, 15u);
+}
+
+GDB_CALL sint32 w_masked_u32(uint32 address, uint32 value, uint32 byte_mask)
+{
+    return xport_memory_write(address, 4u, value, byte_mask);
+}
+
+#if defined(XPORT_MEMORY_DIAGNOSTICS)
+    #define w_u8(address, value) w_u8_at((address), (value), __FILE__, __LINE__, __func__, NULL)
+    #define w_u16(address, value) w_u16_at((address), (value), __FILE__, __LINE__, __func__, NULL)
+    #define w_u32(address, value) w_u32_at((address), (value), __FILE__, __LINE__, __func__, NULL)
+    #define w_masked_u32(address, value, mask) w_masked_u32_at((address), (value), (mask), __FILE__, __LINE__, __func__, NULL)
+#endif
+
 #include "xport_trace.h"
 #include "psx_gpu.h"
 #include "psx_spu.h"
@@ -16,16 +84,20 @@ typedef struct
     uint32 specification;
     uint32 mode;
     uint32 callback;
-    uint8 enabled;
+    uint8 enabled, allocated, pending;
+    PsxEventCallback native_callback;
 } BiosNativeEvent;
 
-static BiosNativeEvent bios_native_events[8];
-static uint32 bios_native_next_event = 1u;
+static BiosNativeEvent bios_native_events[32];
 static PsxIrqState native_root_irq;
 static uint32 native_root_control_slot, native_root_mask_table;
 static uint64 native_root_last_us, native_root_tick_fraction;
-static uint32 native_root_polling;
+static uint32 native_root_polling, native_root_clock_started;
+static sint32 native_video_mode;
 void psx_root_counter_poll(void);
+static void mc_poll(void);
+static void bios_native_irq_dispatch(void);
+
 static uint32 bios_interrupts_enabled = 1u;
 static uint32 bios_vblank_pending;
 static uint32 bios_vsync_callback;
@@ -39,7 +111,14 @@ static uint32 bios_card_copy_source, bios_card_first_source, bios_card_second_so
 static uint32 bios_card_first_destination, bios_card_second_destination;
 static uint32 bios_card_patches_bound;
 static uint32 bios_card_pending_ports;
+static void (*bios_card_irq_initializer)(void);
 static void bios_native_card_complete(void);
+static sint32 bios_native_card_medium_present(uint32 port);
+
+void psx_bios_bind_card_irq_initializer(void (*initializer)(void))
+{
+    bios_card_irq_initializer = initializer;
+}
 
 void psx_bios_bind_card_patches(uint32 copy_source, uint32 first_source, uint32 second_source, uint32 first_destination, uint32 second_destination)
 {
@@ -124,13 +203,13 @@ sint32 _card_info(sint32 channel)
         return 0;
     }
     offset = (uint32)port * 4u;
-    w_u32(0xA0019F20u + offset, 1u);
+    w_u32(0xA0009F20u + offset, 1u);
     if (!bios_card_bound)
     {
         uint32 flag = 0x7568u + (uint32)port;
         if (!(r_u8(flag) & 1u))
         {
-            w_u32(0xA0019F20u + offset, 0u);
+            w_u32(0xA0009F20u + offset, 0u);
             return 0;
         }
         w_u32(0x7514u, 0u);
@@ -257,17 +336,18 @@ uint32 SysDeqIntRP(uint32 priority, uint32 node)
     return 0u;
 }
 
-sint32 CloseEvent(uint32 handle)
+sint32 CloseEvent(sint32 event_handle)
 {
+    uint32 handle = (uint32)event_handle;
     uint32 index = handle & 0xffffu;
     uint32 base;
 
     /* Native handles are untagged; BIOS handles retain their guest table path */
     if ((handle & 0xffff0000u) == 0u)
     {
-        if (handle < 1u || handle > 8u)
+        if (handle < 1u || handle > 32u || !bios_native_events[handle - 1u].allocated)
             return 0;
-        bios_native_events[handle - 1u].enabled = 0u;
+        memset(&bios_native_events[handle - 1u], 0, sizeof(BiosNativeEvent));
         return 1;
     }
     base = r_u32(0xA0000120u);
@@ -275,12 +355,24 @@ sint32 CloseEvent(uint32 handle)
     return 1;
 }
 
-sint32 TestEvent(uint32 handle)
+sint32 TestEvent(sint32 event_handle)
 {
+    uint32 handle = (uint32)event_handle;
     uint32 index = handle & 0xffffu;
     uint32 status, enabled = 0x2000u;
     uint8 *record;
     bios_native_card_complete();
+    if ((handle & 0xFFFF0000u) == 0u)
+    {
+        BiosNativeEvent *event;
+        if (handle < 1u || handle > 32u)
+            return 0;
+        event = &bios_native_events[handle - 1u];
+        if (!event->allocated || !event->enabled || !event->pending)
+            return 0;
+        event->pending = 0u;
+        return 1;
+    }
     if (!bios_events_count || index >= bios_events_count)
     {
         bios_events_failure = 1;
@@ -317,7 +409,12 @@ static void bios_native_card_complete(void)
         uint32 requested;
         if (!(pending & (1u << port)))
             continue;
-        requested = r_u32(0xA0019F20u + 4u * port);
+        if (bios_native_card_medium_present(port))
+        {
+            fprintf(stderr, "PSX: pending mounted-card BIOS sector completion and event transport\n");
+            abort();
+        }
+        requested = r_u32(0xA0009F20u + 4u * port);
         w_u8(0x7568u + port, 0x21u);
         w_u32(0x751Cu, port);
         w_u32(0x74C0u, 0u);
@@ -327,16 +424,58 @@ static void bios_native_card_complete(void)
             w_u32(bios_card.requested + port * 4u, 0u);
         }
         /* BIOS A0:A8 forwards an I/O error to the pending filesystem request */
-        w_u32(0xA001B9D4u, 1u);
+        w_u32(0xA000B9D4u, 1u);
         if (requested)
         {
-            w_u32(0xA0019F20u + 4u * port, 0u);
-            w_u32(0xA0019F28u + 4u * port, 0u);
-            w_u32(0xA0019F30u + 4u * port, 0u);
+            w_u32(0xA0009F20u + 4u * port, 0u);
+            w_u32(0xA0009F28u + 4u * port, 0u);
+            w_u32(0xA0009F30u + 4u * port, 0u);
             DeliverEvent(0xF4000001u, 0x8000u);
         }
         /* No native card medium is mounted; complete with the BIOS I/O error */
         DeliverEvent(0xF0000011u, 0x8000u);
+    }
+}
+
+uint32 psx_bios_card_read_guest(uint32 channel, uint32 sector, uint32 buffer)
+{
+    sint32 port = (sint32)channel / 16;
+    uint32 offset;
+    if (port < 0 || port > 1 || (sint32)sector < 0 || (sint32)sector > 0x400)
+        return 0u;
+    if (!(r_u8(0x7568u + (uint32)port) & 1u))
+        return 0u;
+    offset = (uint32)port * 4u;
+    w_u32(0x7514u, 0u);
+    w_u32(0x74A4u, 0u);
+    w_u32(0x7500u + offset, channel);
+    w_u32(0x7550u + offset, buffer);
+    w_u32(0x7528u + offset, 0x5688u);
+    w_u32(0x7508u + offset, sector);
+    w_u8(0x7568u + (uint32)port, 2u);
+    bios_card_pending_ports |= 1u << port;
+    return 1u;
+}
+
+void psx_bios_card_poll(void)
+{
+    bios_native_card_complete();
+}
+
+void UnDeliverEvent(uint32 event_class, uint32 spec)
+{
+    uint32 index;
+    for (index = 0u; index < 32u; ++index)
+    {
+        BiosNativeEvent *event = &bios_native_events[index];
+        if (event->allocated && event->enabled && event->pending && event->event_class == event_class && event->specification == spec && event->mode == 0x2000u)
+            event->pending = 0u;
+    }
+    for (index = 0u; index < bios_events_count; ++index)
+    {
+        uint32 record = bios_events_base + index * 28u;
+        if (r_u32(record + 4u) == 0x4000u && r_u32(record) == event_class && r_u32(record + 8u) == spec && r_u32(record + 12u) == 0x2000u)
+            w_u32(record + 4u, 0x2000u);
     }
 }
 
@@ -365,20 +504,20 @@ uint32 psx_bios_card_load_guest(uint32 channel)
     if (port < 0 || port > 1)
         return 0u;
     offset = (uint32)port * 4u;
-    w_u32(0xA0019F20u + offset, 4u);
+    w_u32(0xA0009F20u + offset, 4u);
     if (!(r_u8(0x7568u + (uint32)port) & 1u))
     {
-        w_u32(0xA0019F20u + offset, 0u);
+        w_u32(0xA0009F20u + offset, 0u);
         return 0u;
     }
     w_u32(0x7514u, 0u);
     w_u32(0x74A4u, 0u);
     w_u32(0x7500u + offset, channel);
-    w_u32(0x7550u + offset, 0xA001BE48u + 128u * (uint32)port);
+    w_u32(0x7550u + offset, 0xA000BE48u + 128u * (uint32)port);
     w_u32(0x7528u + offset, 0x4F90u);
     w_u32(0x7508u + offset, 0u);
     w_u8(0x7568u + (uint32)port, 2u);
-    w_u32(0xA0019F28u + offset, 1u);
+    w_u32(0xA0009F28u + offset, 1u);
     bios_card_pending_ports |= 1u << port;
     return 1u;
 }
@@ -386,9 +525,26 @@ uint32 psx_bios_card_load_guest(uint32 channel)
 void DeliverEvent(uint32 event_class, uint32 spec)
 {
     uint32 index;
+    for (index = 0; index < 32u; ++index)
+    {
+        BiosNativeEvent *event = &bios_native_events[index];
+        if (!event->allocated || !event->enabled || event->event_class != event_class || event->specification != spec)
+            continue;
+        if (event->mode == 0x2000u)
+            event->pending = 1u;
+        else if (event->mode == 0x1000u)
+        {
+            if (event->native_callback)
+                (void)event->native_callback();
+            else if (event->callback && (!bios_native_dispatch || !bios_native_dispatch(bios_native_dispatch_context, event->callback)))
+            {
+                bios_events_failure = 1;
+                return;
+            }
+        }
+    }
     if (!bios_events_count)
     {
-        bios_events_failure = 1;
         return;
     }
     for (index = 0; index < bios_events_count; ++index)
@@ -608,7 +764,7 @@ sint32 psx_dma_write(PsxDmaState *state, PsxIrqState *irq, uint32 offset, uint32
     return 1;
 }
 
-static void *vsync_callback;
+static PsxInterruptCallback vsync_callback;
 
 static sint32 dma_unhalt(void *context, uint64 now)
 {
@@ -685,6 +841,7 @@ static PsxVBlankWait vblank_wait;
 static void *vblank_wait_context;
 static sint32 vblank_wait_failed;
 static uint32 *vblank_guest_counter;
+static uint32 *vblank_native_guest_counter;
 static uint32 *vblank_guest_callbacks;
 static PsxGuestCallback vblank_guest_dispatch;
 static void *vblank_guest_context;
@@ -856,16 +1013,7 @@ void psx_vblank_signal(void)
     }
     xport_audio_vblank(vblank_count, FIELD_RATE);
     bios_native_pad_poll();
-    if (native_root_control_slot)
-    {
-        psx_irq_line(&native_root_irq, 0u, 1u);
-        if (native_root_irq.status & native_root_irq.mask & 1u)
-        {
-            DeliverEvent(0xF2000003u, 2u);
-            psx_irq_write(&native_root_irq, 0u, ~1u);
-        }
-        psx_irq_line(&native_root_irq, 0u, 0u);
-    }
+    psx_interrupt_raise(0u);
     if (!bios_callbacks_running)
         return;
     if (vblank_guest_counter)
@@ -884,7 +1032,10 @@ void psx_vblank_signal(void)
         vblank_dispatching = 0;
         return;
     }
-    ++vblank_count;
+    if (vblank_native_guest_counter)
+        vblank_count = ++*vblank_native_guest_counter;
+    else
+        ++vblank_count;
     if (bios_callbacks_running && bios_vsync_callback)
     {
         if (!bios_native_dispatch || !bios_native_dispatch(bios_native_dispatch_context, bios_vsync_callback))
@@ -894,7 +1045,8 @@ void psx_vblank_signal(void)
         }
     }
     if (bios_callbacks_running && vsync_callback)
-        ((void (*)(void))vsync_callback)();
+        vsync_callback();
+    mc_poll();
 }
 
 static uint32 *psx_vblank_guest_words(uint32 address, uint32 count)
@@ -904,6 +1056,17 @@ static uint32 *psx_vblank_guest_words(uint32 address, uint32 count)
     if ((segment && segment != 0x80000000u && segment != 0xa0000000u) || (physical & 3u) || physical > PSX_DRAM_SIZE - count * 4u)
         return NULL;
     return (uint32 *)(DRAM + physical);
+}
+
+sint32 psx_vblank_bind_native_counter(uint32 counter)
+{
+    uint32 *words = counter ? psx_vblank_guest_words(counter, 1u) : NULL;
+    if (vblank_dispatching || (counter && !words))
+        return 0;
+    vblank_native_guest_counter = words;
+    if (words)
+        vblank_count = *words;
+    return 1;
 }
 
 sint32 psx_vblank_bind_guest(uint32 counter, uint32 callbacks, PsxGuestCallback dispatch, void *context)
@@ -1159,17 +1322,10 @@ static uint8 native_timer_irq_fired[3];
 static void psx_timer_irq(uint32 index)
 {
     uint32 mode = timers.mode[index];
-    uint32 bit = 1u << (index + 4u);
     if (!(mode & 0x40u) && native_timer_irq_fired[index])
         return;
     native_timer_irq_fired[index] = 1u;
-    psx_irq_line(&native_root_irq, index + 4u, 1u);
-    if (native_root_control_slot && bios_interrupts_enabled && (native_root_irq.status & native_root_irq.mask & bit))
-    {
-        DeliverEvent(0xF2000000u + index, 2u);
-        psx_irq_write(&native_root_irq, 0u, ~bit);
-    }
-    psx_irq_line(&native_root_irq, index + 4u, 0u);
+    psx_interrupt_raise(index + 4u);
 }
 
 static void psx_timer_add(uint32 index, uint32 ticks)
@@ -1226,7 +1382,7 @@ sint32 psx_timers_advance(uint32 cpu_ticks, uint32 dot_ticks, uint32 hblank_tick
     return 1;
 }
 
-sint32 SetRCnt(uint32 counter, uint16 target, uint32 mode)
+sint32 SetRCnt(uint32 counter, uint16 target, sint32 mode)
 {
     uint32 bits = 0x48u;
     psx_root_counter_poll();
@@ -1301,22 +1457,83 @@ void *psx_addr(uint32 address, size_t count)
     return base + physical;
 }
 
-#if !defined(XPORT_PSX_MEMORY_ONLY)
+static PsxInterruptCallback native_irq_callbacks[11];
+
+PsxInterruptCallback InterruptCallback(sint32 interrupt, PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous;
+    uint32 bit;
+    if (interrupt < 0 || interrupt >= 11)
+        return NULL;
+    previous = native_irq_callbacks[interrupt];
+    if (previous == callback)
+        return previous;
+    bit = 1u << interrupt;
+    native_irq_callbacks[interrupt] = callback;
+    if (callback)
+        native_root_irq.mask |= bit;
+    else
+        native_root_irq.mask &= ~bit;
+    if (interrupt == 0)
+    {
+        ChangeClearPAD(callback == NULL);
+        ChangeClearRCnt(3u, callback == NULL);
+    }
+    if (interrupt >= 4 && interrupt <= 6)
+        ChangeClearRCnt((uint32)interrupt - 4u, callback == NULL);
+    return previous;
+}
+
+static uint32 native_irq_dispatching;
+
+static void bios_native_irq_dispatch(void)
+{
+    uint32 interrupt;
+    if (!bios_interrupts_enabled || native_irq_dispatching)
+        return;
+    native_irq_dispatching = 1u;
+    for (interrupt = 0u; interrupt < 11u && bios_interrupts_enabled; ++interrupt)
+    {
+        uint32 bit = 1u << interrupt;
+        if (!(native_root_irq.status & native_root_irq.mask & bit))
+            continue;
+        if (native_irq_callbacks[interrupt])
+            native_irq_callbacks[interrupt]();
+        else if (interrupt == 0u)
+            DeliverEvent(0xF2000003u, 2u);
+        else if (interrupt >= 4u && interrupt <= 6u)
+            DeliverEvent(0xF2000000u + interrupt - 4u, 2u);
+        else
+            continue;
+        psx_irq_write(&native_root_irq, 0u, ~bit);
+    }
+    if (bios_interrupts_enabled)
+        cd_dispatch_ready_event();
+    native_irq_dispatching = 0u;
+}
+
+void psx_interrupt_raise(uint32 interrupt)
+{
+    if (interrupt >= 11u)
+        return;
+    psx_irq_line(&native_root_irq, interrupt, 1u);
+    bios_native_irq_dispatch();
+    psx_irq_line(&native_root_irq, interrupt, 0u);
+}
 
 sint32 ResetCallback(void)
 {
     vsync_callback = NULL;
+    memset(native_irq_callbacks, 0, sizeof(native_irq_callbacks));
     return 0;
 }
 
-void *VSyncCallback(void *callback)
+sint32 VSyncCallback(PsxInterruptCallback callback)
 {
-    void *previous = vsync_callback;
+    PsxInterruptCallback previous = vsync_callback;
     vsync_callback = callback;
-    return previous;
+    return (sint32)(intptr)previous;
 }
-
-#endif
 
 /* Fixed-point trigonometry and PsyQ GTE implementation. */
 /* Each entry is {s16 sin,s16 cos} in 4.12 format */
@@ -1335,6 +1552,12 @@ static const sint16 psyq_sine_quarter[1025] = {0,    6,    13,   19,   25,   31,
 static const sint16 psyq_sqrt_table[192] = {
     4096, 4127, 4159, 4190, 4222, 4252, 4283, 4314, 4344, 4374, 4404, 4434, 4463, 4492, 4521, 4550, 4579, 4608, 4636, 4664, 4692, 4720, 4748, 4775, 4802, 4830, 4857, 4884, 4910, 4937, 4964, 4990, 5016, 5042, 5068, 5094, 5120, 5145, 5170, 5196, 5221, 5246, 5271, 5296, 5320, 5345, 5369, 5394, 5418, 5442, 5466, 5490, 5514, 5538, 5561, 5585, 5608, 5632, 5655, 5678, 5701, 5724, 5747, 5769, 5792, 5815, 5837, 5860, 5882, 5904, 5926, 5948, 5970, 5992, 6014, 6036, 6058, 6079, 6101, 6122, 6144, 6165, 6186, 6207, 6228, 6249, 6270, 6291, 6312, 6333, 6353, 6374, 6394, 6415, 6435, 6456,
     6476, 6496, 6516, 6536, 6556, 6576, 6596, 6616, 6636, 6656, 6675, 6695, 6714, 6734, 6753, 6773, 6792, 6811, 6830, 6850, 6869, 6888, 6907, 6926, 6945, 6963, 6982, 7001, 7020, 7038, 7057, 7075, 7094, 7112, 7131, 7149, 7168, 7186, 7204, 7222, 7240, 7258, 7276, 7294, 7312, 7330, 7348, 7366, 7384, 7401, 7419, 7437, 7454, 7472, 7489, 7507, 7524, 7542, 7559, 7576, 7594, 7611, 7628, 7645, 7662, 7680, 7697, 7714, 7731, 7747, 7764, 7781, 7798, 7815, 7832, 7848, 7865, 7882, 7898, 7915, 7931, 7948, 7964, 7981, 7997, 8014, 8030, 8046, 8062, 8079, 8095, 8111, 8127, 8143, 8159, 8175,
+};
+
+// Exact PsyQ reciprocal square-root table
+static const sint16 psyq_rsqrt_table[192] = {
+    4096, 4064, 4033, 4003, 3973, 3944, 3916, 3888, 3861, 3835, 3809, 3783, 3758, 3734, 3710, 3686, 3663, 3640, 3618, 3596, 3575, 3554, 3533, 3513, 3493, 3473, 3454, 3435, 3416, 3397, 3379, 3361, 3344, 3327, 3310, 3293, 3276, 3260, 3244, 3228, 3213, 3197, 3182, 3167, 3153, 3138, 3124, 3110, 3096, 3082, 3069, 3055, 3042, 3029, 3016, 3003, 2991, 2978, 2966, 2954, 2942, 2930, 2919, 2907, 2896, 2885, 2873, 2862, 2852, 2841, 2830, 2820, 2809, 2799, 2789, 2779, 2769, 2759, 2749, 2740, 2730, 2721, 2711, 2702, 2693, 2684, 2675, 2666, 2657, 2649, 2640, 2631, 2623, 2615, 2606, 2598,
+    2590, 2582, 2574, 2566, 2558, 2550, 2543, 2535, 2528, 2520, 2513, 2505, 2498, 2491, 2484, 2477, 2469, 2462, 2456, 2449, 2442, 2435, 2428, 2422, 2415, 2409, 2402, 2396, 2389, 2383, 2377, 2371, 2364, 2358, 2352, 2346, 2340, 2334, 2328, 2322, 2317, 2311, 2305, 2299, 2294, 2288, 2283, 2277, 2272, 2266, 2261, 2255, 2250, 2245, 2239, 2234, 2229, 2224, 2219, 2214, 2209, 2204, 2199, 2194, 2189, 2184, 2179, 2174, 2170, 2165, 2160, 2155, 2151, 2146, 2142, 2137, 2133, 2128, 2124, 2119, 2115, 2110, 2106, 2102, 2097, 2093, 2089, 2084, 2080, 2076, 2072, 2068, 2064, 2060, 2056, 2052,
 };
 
 /* Original tables have nine halfwords between the sine and square-root arrays */
@@ -1384,38 +1607,53 @@ static sint32 psyq_sine(sint32 a)
     return -psyq_sine_quarter[0x1000u - angle];
 }
 
-void rsincos(sint32 a, sint32 *sine, sint32 *cosine)
+// PsyQ packed sin/cos quarter with duplicated quadrant endpoints
+static const sint16 gte_sincos_quarter[1024][2] = {
+    {0, 4096},    {6, 4096},    {13, 4096},   {19, 4096},   {25, 4096},   {31, 4096},   {38, 4096},   {44, 4096},   {50, 4096},   {57, 4096},   {63, 4095},   {69, 4095},   {75, 4095},   {82, 4095},   {88, 4095},   {94, 4095},   {101, 4095},  {107, 4094},  {113, 4094},  {119, 4094},  {126, 4094},  {132, 4094},  {138, 4093},  {144, 4093},  {151, 4093},  {157, 4093},  {163, 4092},  {170, 4092},  {176, 4092},  {182, 4092},  {188, 4091},  {195, 4091},  {201, 4091},  {207, 4090},  {214, 4090},  {220, 4090},  {226, 4089},  {232, 4089},  {239, 4089},  {245, 4088},  {251, 4088},  {257, 4088},  {264, 4087},  {270, 4087},  {276, 4086},  {283, 4086},  {289, 4085},  {295, 4085},  {301, 4084},  {308, 4084},  {314, 4083},  {320, 4083},  {326, 4082},  {333, 4082},  {339, 4081},  {345, 4081},  {351, 4080},  {358, 4080},  {364, 4079},  {370, 4079},  {376, 4078},  {383, 4077},  {389, 4077},  {395, 4076},  {401, 4076},  {408, 4075},  {414, 4074},  {420, 4074},  {426, 4073},
+    {433, 4072},  {439, 4072},  {445, 4071},  {451, 4070},  {458, 4070},  {464, 4069},  {470, 4068},  {476, 4067},  {483, 4067},  {489, 4066},  {495, 4065},  {501, 4064},  {508, 4064},  {514, 4063},  {520, 4062},  {526, 4061},  {533, 4060},  {539, 4060},  {545, 4059},  {551, 4058},  {557, 4057},  {564, 4056},  {570, 4055},  {576, 4054},  {582, 4053},  {589, 4053},  {595, 4052},  {601, 4051},  {607, 4050},  {613, 4049},  {620, 4048},  {626, 4047},  {632, 4046},  {638, 4045},  {644, 4044},  {651, 4043},  {657, 4042},  {663, 4041},  {669, 4040},  {675, 4039},  {682, 4038},  {688, 4037},  {694, 4036},  {700, 4035},  {706, 4034},  {713, 4032},  {719, 4031},  {725, 4030},  {731, 4029},  {737, 4028},  {744, 4027},  {750, 4026},  {756, 4024},  {762, 4023},  {768, 4022},  {774, 4021},  {781, 4020},  {787, 4019},  {793, 4017},  {799, 4016},  {805, 4015},  {811, 4014},  {818, 4012},  {824, 4011},  {830, 4010},  {836, 4008},  {842, 4007},  {848, 4006},  {854, 4005},
+    {861, 4003},  {867, 4002},  {873, 4001},  {879, 3999},  {885, 3998},  {891, 3996},  {897, 3995},  {904, 3994},  {910, 3992},  {916, 3991},  {922, 3989},  {928, 3988},  {934, 3987},  {940, 3985},  {946, 3984},  {953, 3982},  {959, 3981},  {965, 3979},  {971, 3978},  {977, 3976},  {983, 3975},  {989, 3973},  {995, 3972},  {1001, 3970}, {1007, 3969}, {1014, 3967}, {1020, 3965}, {1026, 3964}, {1032, 3962}, {1038, 3961}, {1044, 3959}, {1050, 3958}, {1056, 3956}, {1062, 3954}, {1068, 3953}, {1074, 3951}, {1080, 3949}, {1086, 3948}, {1092, 3946}, {1099, 3944}, {1105, 3943}, {1111, 3941}, {1117, 3939}, {1123, 3937}, {1129, 3936}, {1135, 3934}, {1141, 3932}, {1147, 3930}, {1153, 3929}, {1159, 3927}, {1165, 3925}, {1171, 3923}, {1177, 3921}, {1183, 3920}, {1189, 3918}, {1195, 3916}, {1201, 3914}, {1207, 3912}, {1213, 3910}, {1219, 3909}, {1225, 3907}, {1231, 3905}, {1237, 3903}, {1243, 3901}, {1249, 3899}, {1255, 3897}, {1261, 3895}, {1267, 3893}, {1273, 3891},
+    {1279, 3889}, {1285, 3887}, {1291, 3885}, {1297, 3883}, {1303, 3881}, {1309, 3879}, {1315, 3877}, {1321, 3875}, {1327, 3873}, {1332, 3871}, {1338, 3869}, {1344, 3867}, {1350, 3865}, {1356, 3863}, {1362, 3861}, {1368, 3859}, {1374, 3857}, {1380, 3854}, {1386, 3852}, {1392, 3850}, {1398, 3848}, {1404, 3846}, {1409, 3844}, {1415, 3842}, {1421, 3839}, {1427, 3837}, {1433, 3835}, {1439, 3833}, {1445, 3831}, {1451, 3828}, {1457, 3826}, {1462, 3824}, {1468, 3822}, {1474, 3819}, {1480, 3817}, {1486, 3815}, {1492, 3812}, {1498, 3810}, {1503, 3808}, {1509, 3805}, {1515, 3803}, {1521, 3801}, {1527, 3798}, {1533, 3796}, {1538, 3794}, {1544, 3791}, {1550, 3789}, {1556, 3787}, {1562, 3784}, {1567, 3782}, {1573, 3779}, {1579, 3777}, {1585, 3775}, {1591, 3772}, {1596, 3770}, {1602, 3767}, {1608, 3765}, {1614, 3762}, {1620, 3760}, {1625, 3757}, {1631, 3755}, {1637, 3752}, {1643, 3750}, {1648, 3747}, {1654, 3745}, {1660, 3742}, {1666, 3739}, {1671, 3737}, {1677, 3734},
+    {1683, 3732}, {1689, 3729}, {1694, 3727}, {1700, 3724}, {1706, 3721}, {1711, 3719}, {1717, 3716}, {1723, 3713}, {1729, 3711}, {1734, 3708}, {1740, 3705}, {1746, 3703}, {1751, 3700}, {1757, 3697}, {1763, 3695}, {1768, 3692}, {1774, 3689}, {1780, 3686}, {1785, 3684}, {1791, 3681}, {1797, 3678}, {1802, 3675}, {1808, 3673}, {1813, 3670}, {1819, 3667}, {1825, 3664}, {1830, 3661}, {1836, 3659}, {1842, 3656}, {1847, 3653}, {1853, 3650}, {1858, 3647}, {1864, 3644}, {1870, 3642}, {1875, 3639}, {1881, 3636}, {1886, 3633}, {1892, 3630}, {1898, 3627}, {1903, 3624}, {1909, 3621}, {1914, 3618}, {1920, 3615}, {1925, 3612}, {1931, 3609}, {1936, 3606}, {1942, 3603}, {1947, 3600}, {1953, 3597}, {1958, 3594}, {1964, 3591}, {1970, 3588}, {1975, 3585}, {1981, 3582}, {1986, 3579}, {1992, 3576}, {1997, 3573}, {2002, 3570}, {2008, 3567}, {2013, 3564}, {2019, 3561}, {2024, 3558}, {2030, 3555}, {2035, 3551}, {2041, 3548}, {2046, 3545}, {2052, 3542}, {2057, 3539}, {2062, 3536},
+    {2068, 3532}, {2073, 3529}, {2079, 3526}, {2084, 3523}, {2090, 3520}, {2095, 3516}, {2100, 3513}, {2106, 3510}, {2111, 3507}, {2117, 3504}, {2122, 3500}, {2127, 3497}, {2133, 3494}, {2138, 3490}, {2143, 3487}, {2149, 3484}, {2154, 3481}, {2159, 3477}, {2165, 3474}, {2170, 3471}, {2175, 3467}, {2181, 3464}, {2186, 3461}, {2191, 3457}, {2197, 3454}, {2202, 3450}, {2207, 3447}, {2213, 3444}, {2218, 3440}, {2223, 3437}, {2228, 3433}, {2234, 3430}, {2239, 3426}, {2244, 3423}, {2249, 3420}, {2255, 3416}, {2260, 3413}, {2265, 3409}, {2270, 3406}, {2276, 3402}, {2281, 3399}, {2286, 3395}, {2291, 3392}, {2296, 3388}, {2302, 3385}, {2307, 3381}, {2312, 3378}, {2317, 3374}, {2322, 3370}, {2328, 3367}, {2333, 3363}, {2338, 3360}, {2343, 3356}, {2348, 3352}, {2353, 3349}, {2359, 3345}, {2364, 3342}, {2369, 3338}, {2374, 3334}, {2379, 3331}, {2384, 3327}, {2389, 3323}, {2394, 3320}, {2399, 3316}, {2405, 3312}, {2410, 3309}, {2415, 3305}, {2420, 3301}, {2425, 3297},
+    {2430, 3294}, {2435, 3290}, {2440, 3286}, {2445, 3282}, {2450, 3279}, {2455, 3275}, {2460, 3271}, {2465, 3267}, {2470, 3264}, {2475, 3260}, {2480, 3256}, {2485, 3252}, {2490, 3248}, {2495, 3244}, {2500, 3241}, {2505, 3237}, {2510, 3233}, {2515, 3229}, {2520, 3225}, {2525, 3221}, {2530, 3217}, {2535, 3214}, {2540, 3210}, {2545, 3206}, {2550, 3202}, {2555, 3198}, {2559, 3194}, {2564, 3190}, {2569, 3186}, {2574, 3182}, {2579, 3178}, {2584, 3174}, {2589, 3170}, {2594, 3166}, {2598, 3162}, {2603, 3158}, {2608, 3154}, {2613, 3150}, {2618, 3146}, {2623, 3142}, {2628, 3138}, {2632, 3134}, {2637, 3130}, {2642, 3126}, {2647, 3122}, {2652, 3118}, {2656, 3114}, {2661, 3110}, {2666, 3106}, {2671, 3102}, {2675, 3097}, {2680, 3093}, {2685, 3089}, {2690, 3085}, {2694, 3081}, {2699, 3077}, {2704, 3073}, {2709, 3068}, {2713, 3064}, {2718, 3060}, {2723, 3056}, {2727, 3052}, {2732, 3048}, {2737, 3043}, {2741, 3039}, {2746, 3035}, {2751, 3031}, {2755, 3026}, {2760, 3022},
+    {2765, 3018}, {2769, 3014}, {2774, 3009}, {2779, 3005}, {2783, 3001}, {2788, 2997}, {2792, 2992}, {2797, 2988}, {2802, 2984}, {2806, 2979}, {2811, 2975}, {2815, 2971}, {2820, 2967}, {2824, 2962}, {2829, 2958}, {2833, 2953}, {2838, 2949}, {2843, 2945}, {2847, 2940}, {2852, 2936}, {2856, 2932}, {2861, 2927}, {2865, 2923}, {2870, 2918}, {2874, 2914}, {2878, 2910}, {2883, 2905}, {2887, 2901}, {2892, 2896}, {2896, 2892}, {2901, 2887}, {2905, 2883}, {2910, 2878}, {2914, 2874}, {2918, 2870}, {2923, 2865}, {2927, 2861}, {2932, 2856}, {2936, 2852}, {2940, 2847}, {2945, 2843}, {2949, 2838}, {2953, 2833}, {2958, 2829}, {2962, 2824}, {2967, 2820}, {2971, 2815}, {2975, 2811}, {2979, 2806}, {2984, 2802}, {2988, 2797}, {2992, 2792}, {2997, 2788}, {3001, 2783}, {3005, 2779}, {3009, 2774}, {3014, 2769}, {3018, 2765}, {3022, 2760}, {3026, 2755}, {3031, 2751}, {3035, 2746}, {3039, 2741}, {3043, 2737}, {3048, 2732}, {3052, 2727}, {3056, 2723}, {3060, 2718}, {3064, 2713},
+    {3068, 2709}, {3073, 2704}, {3077, 2699}, {3081, 2694}, {3085, 2690}, {3089, 2685}, {3093, 2680}, {3097, 2675}, {3102, 2671}, {3106, 2666}, {3110, 2661}, {3114, 2656}, {3118, 2652}, {3122, 2647}, {3126, 2642}, {3130, 2637}, {3134, 2632}, {3138, 2628}, {3142, 2623}, {3146, 2618}, {3150, 2613}, {3154, 2608}, {3158, 2603}, {3162, 2598}, {3166, 2594}, {3170, 2589}, {3174, 2584}, {3178, 2579}, {3182, 2574}, {3186, 2569}, {3190, 2564}, {3194, 2559}, {3198, 2555}, {3202, 2550}, {3206, 2545}, {3210, 2540}, {3214, 2535}, {3217, 2530}, {3221, 2525}, {3225, 2520}, {3229, 2515}, {3233, 2510}, {3237, 2505}, {3241, 2500}, {3244, 2495}, {3248, 2490}, {3252, 2485}, {3256, 2480}, {3260, 2475}, {3264, 2470}, {3267, 2465}, {3271, 2460}, {3275, 2455}, {3279, 2450}, {3282, 2445}, {3286, 2440}, {3290, 2435}, {3294, 2430}, {3297, 2425}, {3301, 2420}, {3305, 2415}, {3309, 2410}, {3312, 2405}, {3316, 2399}, {3320, 2394}, {3323, 2389}, {3327, 2384}, {3331, 2379}, {3334, 2374},
+    {3338, 2369}, {3342, 2364}, {3345, 2359}, {3349, 2353}, {3352, 2348}, {3356, 2343}, {3360, 2338}, {3363, 2333}, {3367, 2328}, {3370, 2322}, {3374, 2317}, {3378, 2312}, {3381, 2307}, {3385, 2302}, {3388, 2296}, {3392, 2291}, {3395, 2286}, {3399, 2281}, {3402, 2276}, {3406, 2270}, {3409, 2265}, {3413, 2260}, {3416, 2255}, {3420, 2249}, {3423, 2244}, {3426, 2239}, {3430, 2234}, {3433, 2228}, {3437, 2223}, {3440, 2218}, {3444, 2213}, {3447, 2207}, {3450, 2202}, {3454, 2197}, {3457, 2191}, {3461, 2186}, {3464, 2181}, {3467, 2175}, {3471, 2170}, {3474, 2165}, {3477, 2159}, {3481, 2154}, {3484, 2149}, {3487, 2143}, {3490, 2138}, {3494, 2133}, {3497, 2127}, {3500, 2122}, {3504, 2117}, {3507, 2111}, {3510, 2106}, {3513, 2100}, {3516, 2095}, {3520, 2090}, {3523, 2084}, {3526, 2079}, {3529, 2073}, {3532, 2068}, {3536, 2062}, {3539, 2057}, {3542, 2052}, {3545, 2046}, {3548, 2041}, {3551, 2035}, {3555, 2030}, {3558, 2024}, {3561, 2019}, {3564, 2013}, {3567, 2008},
+    {3570, 2002}, {3573, 1997}, {3576, 1992}, {3579, 1986}, {3582, 1981}, {3585, 1975}, {3588, 1970}, {3591, 1964}, {3594, 1958}, {3597, 1953}, {3600, 1947}, {3603, 1942}, {3606, 1936}, {3609, 1931}, {3612, 1925}, {3615, 1920}, {3618, 1914}, {3621, 1909}, {3624, 1903}, {3627, 1898}, {3630, 1892}, {3633, 1886}, {3636, 1881}, {3639, 1875}, {3642, 1870}, {3644, 1864}, {3647, 1858}, {3650, 1853}, {3653, 1847}, {3656, 1842}, {3659, 1836}, {3661, 1830}, {3664, 1825}, {3667, 1819}, {3670, 1813}, {3673, 1808}, {3675, 1802}, {3678, 1797}, {3681, 1791}, {3684, 1785}, {3686, 1780}, {3689, 1774}, {3692, 1768}, {3695, 1763}, {3697, 1757}, {3700, 1751}, {3703, 1746}, {3705, 1740}, {3708, 1734}, {3711, 1729}, {3713, 1723}, {3716, 1717}, {3719, 1711}, {3721, 1706}, {3724, 1700}, {3727, 1694}, {3729, 1689}, {3732, 1683}, {3734, 1677}, {3737, 1671}, {3739, 1666}, {3742, 1660}, {3745, 1654}, {3747, 1648}, {3750, 1643}, {3752, 1637}, {3755, 1631}, {3757, 1625}, {3760, 1620},
+    {3762, 1614}, {3765, 1608}, {3767, 1602}, {3770, 1596}, {3772, 1591}, {3775, 1585}, {3777, 1579}, {3779, 1573}, {3782, 1567}, {3784, 1562}, {3787, 1556}, {3789, 1550}, {3791, 1544}, {3794, 1538}, {3796, 1533}, {3798, 1527}, {3801, 1521}, {3803, 1515}, {3805, 1509}, {3808, 1503}, {3810, 1498}, {3812, 1492}, {3815, 1486}, {3817, 1480}, {3819, 1474}, {3822, 1468}, {3824, 1462}, {3826, 1457}, {3828, 1451}, {3831, 1445}, {3833, 1439}, {3835, 1433}, {3837, 1427}, {3839, 1421}, {3842, 1415}, {3844, 1409}, {3846, 1404}, {3848, 1398}, {3850, 1392}, {3852, 1386}, {3854, 1380}, {3857, 1374}, {3859, 1368}, {3861, 1362}, {3863, 1356}, {3865, 1350}, {3867, 1344}, {3869, 1338}, {3871, 1332}, {3873, 1327}, {3875, 1321}, {3877, 1315}, {3879, 1309}, {3881, 1303}, {3883, 1297}, {3885, 1291}, {3887, 1285}, {3889, 1279}, {3891, 1273}, {3893, 1267}, {3895, 1261}, {3897, 1255}, {3899, 1249}, {3901, 1243}, {3903, 1237}, {3905, 1231}, {3907, 1225}, {3909, 1219}, {3910, 1213},
+    {3912, 1207}, {3914, 1201}, {3916, 1195}, {3918, 1189}, {3920, 1183}, {3921, 1177}, {3923, 1171}, {3925, 1165}, {3927, 1159}, {3929, 1153}, {3930, 1147}, {3932, 1141}, {3934, 1135}, {3936, 1129}, {3937, 1123}, {3939, 1117}, {3941, 1111}, {3943, 1105}, {3944, 1099}, {3946, 1092}, {3948, 1086}, {3949, 1080}, {3951, 1074}, {3953, 1068}, {3954, 1062}, {3956, 1056}, {3958, 1050}, {3959, 1044}, {3961, 1038}, {3962, 1032}, {3964, 1026}, {3965, 1020}, {3967, 1014}, {3969, 1007}, {3970, 1001}, {3972, 995},  {3973, 989},  {3975, 983},  {3976, 977},  {3978, 971},  {3979, 965},  {3981, 959},  {3982, 953},  {3984, 946},  {3985, 940},  {3987, 934},  {3988, 928},  {3989, 922},  {3991, 916},  {3992, 910},  {3994, 904},  {3995, 897},  {3996, 891},  {3998, 885},  {3999, 879},  {4001, 873},  {4002, 867},  {4003, 861},  {4005, 854},  {4006, 848},  {4007, 842},  {4008, 836},  {4010, 830},  {4011, 824},  {4012, 818},  {4014, 811},  {4015, 805},  {4016, 799},  {4017, 793},
+    {4019, 787},  {4020, 781},  {4021, 774},  {4022, 768},  {4023, 762},  {4024, 756},  {4026, 750},  {4027, 744},  {4028, 737},  {4029, 731},  {4030, 725},  {4031, 719},  {4032, 713},  {4034, 706},  {4035, 700},  {4036, 694},  {4037, 688},  {4038, 682},  {4039, 675},  {4040, 669},  {4041, 663},  {4042, 657},  {4043, 651},  {4044, 644},  {4045, 638},  {4046, 632},  {4047, 626},  {4048, 620},  {4049, 613},  {4050, 607},  {4051, 601},  {4052, 595},  {4053, 589},  {4053, 582},  {4054, 576},  {4055, 570},  {4056, 564},  {4057, 557},  {4058, 551},  {4059, 545},  {4060, 539},  {4060, 533},  {4061, 526},  {4062, 520},  {4063, 514},  {4064, 508},  {4064, 501},  {4065, 495},  {4066, 489},  {4067, 483},  {4067, 476},  {4068, 470},  {4069, 464},  {4070, 458},  {4070, 451},  {4071, 445},  {4072, 439},  {4072, 433},  {4073, 426},  {4074, 420},  {4074, 414},  {4075, 408},  {4076, 401},  {4076, 395},  {4077, 389},  {4077, 383},  {4078, 376},  {4079, 370},  {4079, 364},
+    {4080, 358},  {4080, 351},  {4081, 345},  {4081, 339},  {4082, 333},  {4082, 326},  {4083, 320},  {4083, 314},  {4084, 308},  {4084, 301},  {4085, 295},  {4085, 289},  {4086, 283},  {4086, 276},  {4087, 270},  {4087, 264},  {4088, 257},  {4088, 251},  {4088, 245},  {4089, 239},  {4089, 232},  {4089, 226},  {4090, 220},  {4090, 214},  {4090, 207},  {4091, 201},  {4091, 195},  {4091, 188},  {4092, 182},  {4092, 176},  {4092, 170},  {4092, 163},  {4093, 157},  {4093, 151},  {4093, 144},  {4093, 138},  {4094, 132},  {4094, 126},  {4094, 119},  {4094, 113},  {4094, 107},  {4095, 101},  {4095, 94},   {4095, 88},   {4095, 82},   {4095, 75},   {4095, 69},   {4095, 63},   {4096, 57},   {4096, 50},   {4096, 44},   {4096, 38},   {4096, 31},   {4096, 25},   {4096, 19},   {4096, 13},   {4096, 6},    {4096, 0},
+};
+
+void rsincos(sint32 angle, sint32 *sine, sint32 *cosine)
 {
-    uint32 angle;
-    sint32 sign = 1;
+    uint32 phase = angle < 0 ? (0u - (uint32)angle) & 0xfffu : (uint32)angle & 0xfffu;
+    const sint16 *pair = gte_sincos_quarter[phase & 0x3ffu];
+    sint32 s = pair[0];
+    sint32 c = pair[1];
 
-    if (a < 0)
+    switch (phase >> 10)
     {
-        angle = (0u - (uint32)a) & 0xfffu;
-        sign = -1;
+        case 0:
+            *sine = s;
+            *cosine = c;
+            break;
+        case 1:
+            *sine = c;
+            *cosine = -s;
+            break;
+        case 2:
+            *sine = -s;
+            *cosine = -c;
+            break;
+        default:
+            *sine = -c;
+            *cosine = s;
+            break;
     }
-    else
-        angle = (uint32)a & 0xfffu;
-
-    if (angle < 0x400u)
-        *sine = psyq_sine_quarter[angle];
-    else if (angle < 0x800u)
-        *sine = psyq_sine_quarter[0x800u - angle];
-    else if (angle < 0xc00u)
-        *sine = -psyq_sine_quarter[angle - 0x800u];
-    else
-        *sine = -psyq_sine_quarter[0x1000u - angle];
-    *sine *= sign;
-
-    angle = (angle + 0x400u) & 0xfffu;
-    if (angle < 0x400u)
-        *cosine = psyq_sine_quarter[angle];
-    else if (angle < 0x800u)
-        *cosine = psyq_sine_quarter[0x800u - angle];
-    else if (angle < 0xc00u)
-        *cosine = -psyq_sine_quarter[angle - 0x800u];
-    else
-        *cosine = -psyq_sine_quarter[0x1000u - angle];
+    if (angle < 0)
+        *sine = -*sine;
 }
 
 sint32 csin(sint32 a)
@@ -1526,15 +1764,13 @@ static sint32 vector_normal_components(VECTOR *input, sint32 *x, sint32 *y, sint
     sum = (uint32)((sint32)source.vx * source.vx + (sint32)source.vy * source.vy + (sint32)source.vz * source.vz);
     leading = vector_leading_zero_count(sum) & ~1u;
     normalized = leading < 24u ? sum >> (24u - leading) : sum << (leading - 24u);
-    memcpy(&coefficient, psx_addr(0x8009B3B8u + 2u * (normalized - 64u), sizeof(coefficient)), sizeof(coefficient));
+    // Zero vectors use a defined coefficient instead of reading before the table
+    coefficient = sum != 0u ? psyq_rsqrt_table[normalized - 64u] : 0;
     shift = (31 - (sint32)leading) >> 1;
-#if !defined(XPORT_PSX_MEMORY_ONLY)
     gte_gpf0(&source, coefficient, &product);
-#else
     product.vx = (sint32)source.vx * coefficient;
     product.vy = (sint32)source.vy * coefficient;
     product.vz = (sint32)source.vz * coefficient;
-#endif
     if (sum == 0u)
     {
         *x = 0;
@@ -1626,15 +1862,15 @@ sint32 Lzc(sint32 value)
     return count;
 }
 
-#if !defined(XPORT_PSX_MEMORY_ONLY)
-
 /* PsyQ-compatible GTE implementation. */
 /* Types. */
 /* Variables. */
 static PsxGteSnapshot gte;
-    #if defined(LOCKSTEP_DEBUG) && defined(_MSC_VER)
+static uint32 gte_lzcs, gte_lzcr;
+static uint16 native_gte_ofx_fraction, native_gte_ofy_fraction;
+#if defined(LOCKSTEP_DEBUG) && defined(_MSC_VER)
 extern __declspec(dllexport) const volatile PsxGteSnapshot *xport_lockstep_gte_state = &gte;
-    #endif
+#endif
 
 static MATRIX matrix_stack[20];
 
@@ -1928,6 +2164,57 @@ void gte_gpl0(const SVECTOR *input, sint32 scale, VECTOR *output)
     finish_flag();
 }
 
+uint32 LoadAverageShort12(SVECTOR *first, SVECTOR *second, sint32 first_weight, sint32 second_weight, SVECTOR *output)
+{
+    SVECTOR input;
+    VECTOR result;
+    uint32 returned;
+    input.vx = first->vx;
+    input.vy = first->vy;
+    input.vz = first->vz;
+    gte_gpf12(&input, first_weight, &result);
+    returned = xport_gte_read_data(31u);
+    input.vx = second->vx;
+    input.vy = second->vy;
+    input.vz = second->vz;
+    gte_gpl12(&input, second_weight, &result);
+    xport_store_le16((uint8 *)output, (uint16)result.vx);
+    xport_store_le16((uint8 *)output + 2u, (uint16)result.vy);
+    xport_store_le32((uint8 *)output + 4u, (uint32)result.vz);
+    return returned;
+}
+
+static uint32 load_average_bytes(uint8 *first, uint8 *second, sint32 first_weight, sint32 second_weight, uint8 *output, uint32 count)
+{
+    SVECTOR input;
+    VECTOR result;
+    uint32 returned;
+    input.vx = first[0];
+    input.vy = first[1];
+    input.vz = count == 3u ? first[2] : (sint16)xport_gte_read_data(11u);
+    gte_gpf0(&input, first_weight, &result);
+    returned = xport_gte_read_data(31u);
+    input.vx = second[0];
+    input.vy = second[1];
+    input.vz = count == 3u ? second[2] : (sint16)xport_gte_read_data(11u);
+    gte_gpl0(&input, second_weight, &result);
+    output[0] = (uint8)(result.vx >> 12);
+    output[1] = (uint8)(result.vy >> 12);
+    if (count == 3u)
+        output[2] = (uint8)(result.vz >> 12);
+    return returned;
+}
+
+uint32 LoadAverageByte(uint8 *first, uint8 *second, sint32 first_weight, sint32 second_weight, uint8 *output)
+{
+    return load_average_bytes(first, second, first_weight, second_weight, output, 2u);
+}
+
+uint32 LoadAverageCol(uint8 *first, uint8 *second, sint32 first_weight, sint32 second_weight, uint8 *output)
+{
+    return load_average_bytes(first, second, first_weight, second_weight, output, 3u);
+}
+
 static MATRIX *multiply_matrix_rotation(MATRIX *source, MATRIX *input_matrix, MATRIX *destination)
 {
     sint16 input[3][3];
@@ -2066,18 +2353,21 @@ void InitGeom(void)
     gte.dqb = 0x01400000;
     gte.ofx = 0;
     gte.ofy = 0;
+    native_gte_ofx_fraction = 0u;
+    native_gte_ofy_fraction = 0u;
 }
 
 void SetGeomOffset(sint32 x, sint32 y)
 {
-    gte.ofx = x;
-    gte.ofy = y;
+    gte.ofx = (sint16)(uint16)x;
+    gte.ofy = (sint16)(uint16)y;
+    native_gte_ofx_fraction = 0u;
+    native_gte_ofy_fraction = 0u;
 }
 
 void SetGeomScreen(sint32 h)
 {
-    if (h > 0)
-        gte.h = h;
+    gte.h = (uint16)h;
 }
 
 /* Raw CTC2 H write, including zero, used by translated SDK entries. */
@@ -2131,6 +2421,8 @@ sint32 psx_gte_import_control_registers(const uint32 registers[32])
     gte.far_color[2] = (sint32)registers[23];
     gte.ofx = (sint32)registers[24] >> 16;
     gte.ofy = (sint32)registers[25] >> 16;
+    native_gte_ofx_fraction = (uint16)registers[24];
+    native_gte_ofy_fraction = (uint16)registers[25];
     gte.h = (sint32)(registers[26] & 0xffffu);
     gte.dqa = (sint16)(uint16)registers[27];
     gte.dqb = (sint32)registers[28];
@@ -2835,9 +3127,11 @@ void xport_gte_write_control(uint32 index, uint32 value)
             break;
         case 24:
             gte.ofx = (sint32)value >> 16;
+            native_gte_ofx_fraction = (uint16)value;
             break;
         case 25:
             gte.ofy = (sint32)value >> 16;
+            native_gte_ofy_fraction = (uint16)value;
             break;
         case 26:
             gte.h = (uint16)value;
@@ -3197,6 +3491,7 @@ sint32 AverageZ4(sint32 a, sint32 b, sint32 c, sint32 d)
 static void psx_native_vblank_poll(void)
 {
     uint64 now, elapsed, fields;
+    uint32 present_field;
     if (native_vblank_polling || vsync_sample || vblank_wait)
         return;
     native_vblank_polling = 1u;
@@ -3215,18 +3510,29 @@ static void psx_native_vblank_poll(void)
     native_vblank_fraction += elapsed % 1000000u * FIELD_RATE;
     fields += native_vblank_fraction / 1000000u;
     native_vblank_fraction %= 1000000u;
+    present_field = fields != 0u;
     while (fields && !vblank_wait_failed)
     {
         --fields;
         psx_vblank_signal();
     }
+    if (present_field && !vblank_wait_failed)
+        gpu_present();
     native_vblank_polling = 0u;
+}
+
+void psx_native_poll_events(void)
+{
+    bios_native_irq_dispatch();
+    psx_root_counter_poll();
+    psx_native_vblank_poll();
 }
 
 sint32 VSync(sint32 mode)
 {
     uint32 frame;
     uint32 frames;
+    bios_native_irq_dispatch();
     psx_root_counter_poll();
     if (vblank_wait_failed)
         return -1;
@@ -3289,8 +3595,6 @@ int psx_state_io(FILE *f, int load)
     return pad_state_io(f, load);
 }
 
-#endif
-
 /* Pad services */
 #include <string.h>
 static uint8 *pad_packets[2];
@@ -3298,6 +3602,8 @@ static uint8 pad_actuators[2][6];
 static uint8 pad_alignment[2][6];
 static sint32 pad_active;
 static sint32 pad_main_mode[2];
+static uint8 pad_current_id[2];
+static uint32 native_pad_packet_owners[2];
 static uint32 pad_buttons;
 static sint32 pad_replay_bound;
 static sint32 pad_replay_failure;
@@ -3344,6 +3650,7 @@ sint32 pad_publish_replay(sint32 controller, const uint8 *report, uint32 length)
     if (report[0] != 0u || !((report[1] == 0x41u && length == 4u) || (report[1] == 0x73u && length == 8u)))
         goto failed;
     memmove(pad_packets[controller], report, length);
+    pad_current_id[controller] = report[1] >> 4;
     return 1;
 failed:
     pad_replay_failure = 1;
@@ -3382,6 +3689,7 @@ sint32 pad_lockstep_apply(sint32 controller, uint32 type, uint32 buttons, uint32
         report[7] = (uint8)(analog >> 24);
     }
     memmove(pad_packets[controller], report, type == 2u ? 8u : 4u);
+    pad_current_id[controller] = report[1] >> 4;
     return 1;
 }
 
@@ -3405,6 +3713,7 @@ void pad_publish(sint32 controller, sint32 connected, uint16 buttons)
         return;
     packet[0] = 0;
     packet[1] = 0x41;
+    pad_current_id[controller] = 4u;
     packet[2] = (uint8)buttons;
     packet[3] = (uint8)(buttons >> 8);
 }
@@ -3443,9 +3752,18 @@ void PadInitDirect(uint8 *pad1, uint8 *pad2)
     }
     pad_packets[0] = pad1;
     pad_packets[1] = pad2;
+    memset(pad_current_id, 0, sizeof(pad_current_id));
     bios_pad_initialized = 1u;
-    pad_publish(0, 0, 0xffff);
-    pad_publish(1, 0, 0xffff);
+    if (pad1)
+    {
+        pad1[0] = 0xFFu;
+        pad1[1] = 0u;
+    }
+    if (pad2)
+    {
+        pad2[0] = 0xFFu;
+        pad2[1] = 0u;
+    }
 }
 
 typedef struct
@@ -3554,8 +3872,6 @@ sint32 psx_pad_serial_transfer(uint32 owner, sint32 value, uint32 port, uint32 s
     return (sint32)previous;
 }
 
-static uint32 native_pad_packet_owners[2];
-
 void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1)
 {
     if ((owner0 && !psx_addr(owner0, 240u)) || (owner1 && !psx_addr(owner1, 240u)))
@@ -3624,12 +3940,45 @@ sint32 PadGetState(sint32 port)
 
 sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset)
 {
-    (void)term;
-    (void)offset;
-    return pad_main_mode[pad_index(port)];
+    uint32 index = ((uint32)port & 0xF0u) != 0u;
+    uint32 owner = native_pad_packet_owners[index];
+    if (owner)
+    {
+        switch (term)
+        {
+            case 1:
+                return (sint32)r_u8(owner + 0xE8u);
+            case 2:
+                return (sint32)r_u16(owner + 0xE6u);
+            case 3:
+                return (sint32)r_u8(owner + 0xE4u);
+            case 4:
+            {
+                uint32 count = r_u8(owner + 0xE3u);
+                if (offset < 0)
+                    return (sint32)count;
+                if ((uint32)offset >= count)
+                    return 0;
+                return (sint32)r_u16(r_u32(owner) + (uint32)offset * 2u);
+            }
+            case 100:
+                return (sint32)r_u32(owner + 0x4Cu);
+            default:
+                return 0;
+        }
+    }
+    switch (term)
+    {
+        case 1:
+            return (sint32)pad_current_id[index];
+        case 3:
+            return pad_main_mode[index];
+        default:
+            return 0;
+    }
 }
 
-void PadSetAct(sint32 port, const void *actuator, sint32 length)
+void PadSetAct(sint32 port, uint8 *actuator, sint32 length)
 {
     sint32 index = pad_index(port);
     if (actuator == 0 || length <= 0)
@@ -3639,24 +3988,86 @@ void PadSetAct(sint32 port, const void *actuator, sint32 length)
     memcpy(pad_actuators[index], actuator, (size_t)length);
 }
 
-sint32 PadSetActAlign(sint32 port, const void *alignment)
+sint32 PadSetActAlign(sint32 port, uint8 *alignment)
 {
     sint32 index = pad_index(port);
-    const uint8 *bytes = (const uint8 *)alignment;
     if (PadGetState(port) == 0 || (pad_packets[index][1] >> 4) == 4u)
         return 0;
     if (alignment == 0)
         return 0;
-    memset(pad_alignment[index], 0, sizeof(pad_alignment[index]));
-    if (bytes[0] != 0)
-        memcpy(pad_alignment[index], alignment, sizeof(pad_alignment[index]));
+    memcpy(pad_alignment[index], alignment, sizeof(pad_alignment[index]));
     return 1;
 }
 
-void PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
+static uint32 pad_main_mode_send_target;
+static uint32 pad_main_mode_receive_target;
+
+void psx_pad_bind_main_mode_commands(uint32 send_target, uint32 receive_target)
 {
-    (void)lock;
-    pad_main_mode[pad_index(port)] = mode;
+    if ((send_target & 3u) || (receive_target & 3u) || (!send_target != !receive_target))
+        abort();
+    pad_main_mode_send_target = send_target;
+    pad_main_mode_receive_target = receive_target;
+}
+
+static uint32 native_pad_main_mode_send(uint32 owner)
+{
+    uint8 phase = r_u8(owner + 0x46u);
+    if (phase == 2u)
+    {
+        w_u8(owner + 0x36u, 0x44u);
+        w_u32(owner + 0x2Cu, owner + 0x51u);
+        w_u8(owner + 0x35u, phase);
+        return owner + 0x51u;
+    }
+    if (phase == 3u)
+    {
+        w_u8(owner + 0x36u, 0x4Du);
+        w_u32(owner + 0x2Cu, owner + 0x5Du);
+        w_u8(owner + 0x35u, 6u);
+        return 6u;
+    }
+    return 0x4Du;
+}
+
+static uint32 native_pad_main_mode_receive(uint32 owner)
+{
+    if (r_u8(owner + 0x53u))
+    {
+        if (r_u8(owner + 0x46u) == 2u)
+            return 1u;
+        w_u8(owner + 0x46u, 0xFEu);
+    }
+    else
+        (void)psx_pad_owner_cleanup(owner);
+    return 0u;
+}
+
+sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
+{
+    uint32 index = ((uint32)port & 0xF0u) != 0u;
+    uint32 owner = native_pad_packet_owners[index];
+    uint8 current_offset;
+    uint8 requested_mode = (uint8)mode;
+    uint8 requested_lock = (uint8)lock;
+    /* Native digital input has no extended-mode command engine */
+    if (!owner)
+        return 0;
+    if (!r_u16(owner + 0xE6u) || r_u8(owner + 0x46u) != 0xFFu)
+        return 0;
+    if (!pad_main_mode_send_target || !pad_main_mode_receive_target)
+    {
+        fprintf(stderr, "Unbound native PAD main-mode commands owner=%08X\n", owner);
+        abort();
+    }
+    current_offset = r_u8(owner + 0xE4u);
+    w_u8(owner + 0x46u, 1u);
+    w_u32(owner + 0x14u, pad_main_mode_send_target);
+    w_u32(owner + 0x18u, pad_main_mode_receive_target);
+    w_u8(owner + 0x51u, requested_mode);
+    w_u8(owner + 0x52u, requested_lock);
+    w_u8(owner + 0x53u, requested_mode == current_offset);
+    return 1;
 }
 
 int pad_state_io(FILE *file, int load)
@@ -3755,30 +4166,46 @@ sint32 xport_cd_file_read(uint32 guest_path, const char *root, uint32 destinatio
     return ok;
 }
 
-sint32 GetRCnt(sint32 counter)
+sint32 GetRCnt(uint32 counter)
 {
-    (void)counter;
-    abort();
+    uint32 index = (uint32)counter & 0xFFFFu;
+    if (index >= 3u)
+        return 0;
+    psx_root_counter_poll();
+    return (sint32)timers.counter[index];
 }
 
-sint32 OpenEvent(uint32 event_class, uint32 specification, uint32 mode, uint32 guest_callback)
+sint32 OpenEventGuest(uint32 event_class, uint32 specification, uint32 mode, uint32 guest_callback)
 {
-    uint32 handle = bios_native_next_event++;
-
-    if (handle >= 1u && handle <= 8u)
+    uint32 index;
+    for (index = 0; index < 32u; ++index)
     {
-        BiosNativeEvent *event = &bios_native_events[handle - 1u];
+        BiosNativeEvent *event = &bios_native_events[index];
+        if (event->allocated)
+            continue;
+        memset(event, 0, sizeof(*event));
+        event->allocated = 1u;
         event->event_class = event_class;
         event->specification = specification;
         event->mode = mode;
         event->callback = guest_callback;
+        return (sint32)(index + 1u);
     }
-    return (sint32)handle;
+    return -1;
 }
 
-sint32 EnableEvent(uint32 handle)
+sint32 OpenEvent(uint32 event_class, sint32 specification, sint32 mode, PsxEventCallback callback)
 {
-    if (handle >= 1u && handle <= 8u)
+    sint32 handle = OpenEventGuest(event_class, (uint32)specification, (uint32)mode, 0u);
+    if (handle > 0)
+        bios_native_events[handle - 1].native_callback = callback;
+    return handle;
+}
+
+sint32 EnableEvent(sint32 event_handle)
+{
+    uint32 handle = (uint32)event_handle;
+    if (handle >= 1u && handle <= 32u && bios_native_events[handle - 1u].allocated)
     {
         bios_native_events[handle - 1u].enabled = 1u;
         return 1;
@@ -3786,9 +4213,10 @@ sint32 EnableEvent(uint32 handle)
     return 0;
 }
 
-sint32 DisableEvent(uint32 handle)
+sint32 DisableEvent(sint32 event_handle)
 {
-    if (handle >= 1u && handle <= 8u)
+    uint32 handle = (uint32)event_handle;
+    if (handle >= 1u && handle <= 32u && bios_native_events[handle - 1u].allocated)
     {
         bios_native_events[handle - 1u].enabled = 0u;
         return 1;
@@ -3799,12 +4227,6 @@ sint32 DisableEvent(uint32 handle)
 /* Native instruction caches need no guest flush */
 void FlushCache(void)
 {
-}
-
-/* CD status remains an unimplemented native service */
-sint32 CdStatus(void)
-{
-    return 0;
 }
 
 /* No native memory-card medium is mounted */
@@ -4042,12 +4464,12 @@ sint32 StartTAP(void)
     abort();
 }
 
-sint32 MemCardInit(void)
+sint32 MemCardInitPSX(void)
 {
     abort();
 }
 
-sint32 MemCardStart(void)
+sint32 MemCardStartPSX(void)
 {
     abort();
 }
@@ -4091,11 +4513,6 @@ uint32 ChangeClearPAD(uint32 mode)
     bios_pad_clear_mode = mode;
     w_u32(0x8914u, mode);
     return previous;
-}
-
-uint32 SpuInitMalloc(uint32 count, uint32 table)
-{
-    return spu_init_malloc_guest(count, table);
 }
 
 uint32 _SpuInit(uint32 mode)
@@ -4226,6 +4643,8 @@ uint32 xport_bios_init_card(uint32 mode)
     w_u32(0x7548u, 0x4F90u);
     w_u32(0x7540u, 0u);
     w_u32(0x754Cu, 0u);
+    if (bios_card_irq_initializer != NULL)
+        bios_card_irq_initializer();
     w_u32(0x756Cu, 1u);
     w_u32(0x74B8u, mode);
     return previous;
@@ -4251,6 +4670,7 @@ sint32 xport_bios_enter_critical(void)
 void xport_bios_exit_critical(void)
 {
     bios_interrupts_enabled = 1u;
+    bios_native_irq_dispatch();
     if (bios_vblank_pending)
     {
         bios_vblank_pending = 0u;
@@ -4261,6 +4681,67 @@ void xport_bios_exit_critical(void)
 uint32 xport_psyq_crt_initialize(void)
 {
     abort();
+}
+
+static MATRIX *gte_gs_light_directions;
+static MATRIX *gte_gs_light_colors;
+
+void gte_bind_gs_light_matrices(MATRIX *directions, MATRIX *colors)
+{
+    gte_gs_light_directions = directions;
+    gte_gs_light_colors = colors;
+}
+
+sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light)
+{
+    MATRIX directions, colors;
+    uint32 squared, length, component, channel;
+    sint32 vector[3];
+    uint8 rgb[3];
+    if (!light || !gte_gs_light_directions || !gte_gs_light_colors)
+    {
+        fprintf(stderr, "GsSetFlatLight requires a descriptor and bound LIBGS matrices\n");
+        abort();
+    }
+    rgb[0] = light->r;
+    rgb[1] = light->g;
+    rgb[2] = light->b;
+    directions = *gte_gs_light_directions;
+    colors = *gte_gs_light_colors;
+    vector[0] = light->vx;
+    vector[1] = light->vy;
+    vector[2] = light->vz;
+    squared = (uint32)vector[0] * (uint32)vector[0];
+    squared += (uint32)vector[1] * (uint32)vector[1];
+    squared += (uint32)vector[2] * (uint32)vector[2];
+    xport_gte_write_data(30u, squared);
+    length = SquareRoot0((sint32)squared);
+    if (!length)
+        return -1;
+    if (index >= 0 && index < 3)
+    {
+        for (component = 0; component < 3u; ++component)
+        {
+            sint32 numerator = (sint32)((0u - (uint32)vector[component]) << 12u);
+            sint32 denominator = (sint32)length;
+            if (denominator == -1 && numerator == (-2147483647 - 1))
+            {
+                fprintf(stderr, "GsSetFlatLight signed division overflow\n");
+                abort();
+            }
+            directions.m[index][component] = (sint16)(numerator / denominator);
+        }
+        for (channel = 0; channel < 3u; ++channel)
+        {
+            sint32 scaled = (sint32)((uint32)rgb[channel] << 12u);
+            sint32 high = (sint32)(((sint64)scaled * (sint32)0x80808081u) >> 32u);
+            colors.m[channel][index] = (sint16)((sint32)((uint32)high + (uint32)scaled) >> 7u);
+        }
+    }
+    *gte_gs_light_directions = directions;
+    *gte_gs_light_colors = colors;
+    SetColorMatrix(&colors);
+    return 0;
 }
 
 sint32 GsInit3D(void)
@@ -4332,23 +4813,39 @@ void xport_mips_overflow_exception(uint32 pc)
 
 uint32 PadInitDirectPSX(uint32 first_packet, uint32 second_packet)
 {
-    (void)first_packet;
-    (void)second_packet;
-    abort();
+    if (pad_replay_bound)
+    {
+        pad_replay_failure = 1;
+        return 0u;
+    }
+    if (!bios_card_address(first_packet, 0x22u, 1u) || !bios_card_address(second_packet, 0x22u, 1u))
+        return 0u;
+    PadInitDirect((uint8 *)psx_addr(first_packet, 0x22u), (uint8 *)psx_addr(second_packet, 0x22u));
+    if (!xport_input_init())
+        return 0u;
+    return 1u;
 }
 
 uint32 PadStartComPSX(void)
 {
-    abort();
+    if (pad_replay_bound)
+    {
+        pad_replay_failure = 1;
+        return 0u;
+    }
+    if (!bios_pad_initialized)
+        return 0u;
+    PadStartCom();
+    return 1u;
 }
 
-uint32 MemCardExist(uint32 channel)
+uint32 MemCardExistPSX(uint32 channel)
 {
     (void)channel;
     abort();
 }
 
-uint32 MemCardSync(uint32 mode, uint32 command, uint32 result)
+uint32 MemCardSyncPSX(uint32 mode, uint32 command, uint32 result)
 {
     (void)mode;
     (void)command;
@@ -4356,7 +4853,7 @@ uint32 MemCardSync(uint32 mode, uint32 command, uint32 result)
     abort();
 }
 
-uint32 MemCardOpen(uint32 channel, uint32 filename, uint32 mode)
+uint32 MemCardOpenPSX(uint32 channel, uint32 filename, uint32 mode)
 {
     (void)channel;
     (void)filename;
@@ -4364,7 +4861,7 @@ uint32 MemCardOpen(uint32 channel, uint32 filename, uint32 mode)
     abort();
 }
 
-uint32 MemCardReadFile(uint32 channel, uint32 filename, uint32 destination, uint32 offset, uint32 length)
+uint32 MemCardReadFilePSX(uint32 channel, uint32 filename, uint32 destination, uint32 offset, uint32 length)
 {
     (void)channel;
     (void)filename;
@@ -4374,7 +4871,7 @@ uint32 MemCardReadFile(uint32 channel, uint32 filename, uint32 destination, uint
     abort();
 }
 
-uint32 MemCardClose(void)
+uint32 MemCardClosePSX(void)
 {
     abort();
 }
@@ -4414,14 +4911,14 @@ uint32 PadGetStatePSX(uint32 port)
 
 void PadSetActPSX(uint32 port, uint32 actuator, uint32 length)
 {
-    PadSetAct((sint32)port, actuator && length ? psx_addr(actuator, length) : NULL, (sint32)length);
+    PadSetAct((sint32)port, actuator && length ? (uint8 *)psx_addr(actuator, length) : NULL, (sint32)length);
 }
 
 uint32 PadSetActAlignPSX(uint32 port, uint32 alignment)
 {
     if (PadGetState((sint32)port) == 0 || (pad_packets[pad_index((sint32)port)][1] >> 4) == 4u)
         return 0u;
-    return (uint32)PadSetActAlign((sint32)port, alignment ? psx_addr(alignment, 6u) : NULL);
+    return (uint32)PadSetActAlign((sint32)port, alignment ? (uint8 *)psx_addr(alignment, 6u) : NULL);
 }
 
 uint32 setRC2wait(uint32 wait)
@@ -4446,7 +4943,7 @@ void xport_mips_break(uint32 code)
     abort();
 }
 
-uint32 CdSearchFile(uint32 destination, uint32 filename)
+uint32 CdSearchFileGuest(uint32 destination, uint32 filename)
 {
     char path[256];
     uint32 index;
@@ -4456,7 +4953,7 @@ uint32 CdSearchFile(uint32 destination, uint32 filename)
     {
         path[index] = (char)r_u8(filename + index);
         if (!path[index])
-            return CdSearchFilePSX(psx_addr(destination, 24u), path) ? destination : 0;
+            return CdSearchFile((CdlFILE *)psx_addr(destination, sizeof(CdlFILE)), path) ? destination : 0;
     }
     return 0;
 }
@@ -4499,6 +4996,22 @@ void xport_gte_write_data(uint32 register_index, uint32 value)
         gte.mac0 = (sint32)value;
     else if (register_index >= 25u && register_index <= 27u)
         gte.mac[register_index - 25u] = (sint32)value;
+    else if (register_index == 30u)
+    {
+        uint32 bits = (value & 0x80000000u) != 0u ? ~value : value;
+        uint32 count = 0u;
+        gte_lzcs = value;
+        while (count < 32u && (bits & 0x80000000u) == 0u)
+        {
+            ++count;
+            bits <<= 1;
+        }
+        gte_lzcr = count;
+    }
+    else if (register_index == 31u)
+    {
+        /* LZCR is read only */
+    }
     else
         abort();
 }
@@ -4532,6 +5045,10 @@ uint32 xport_gte_read_data(uint32 register_index)
         return (uint32)gte.mac0;
     if (register_index >= 25u && register_index <= 27u)
         return (uint32)gte.mac[register_index - 25u];
+    if (register_index == 30u)
+        return gte_lzcs;
+    if (register_index == 31u)
+        return gte_lzcr;
     abort();
 }
 
@@ -4541,9 +5058,9 @@ uint32 _SpuDataCallback(uint32 guest_callback)
     abort();
 }
 
-void *CdSearchFilePSX(void *result, const char *path)
+CdlFILE *CdSearchFile(CdlFILE *result, const char *path)
 {
-    return cd_search_file_native(result, path);
+    return (CdlFILE *)cd_search_file_native(result, path);
 }
 
 sint32 CdReset(sint32 mode)
@@ -4591,11 +5108,20 @@ sint32 Exec(uint32 guest_header, uint32 argc, uint32 argv)
     return bios_native_exec(bios_native_exec_context, entry, argc, argv);
 }
 
-uint32 randPSX(void)
+// Shared recurrence for PsyQ LIBC2 and BIOS, with separate seed owners
+sint32 psyq_rand_next(uint32 *seed)
 {
-    uint32 state = r_u32(0xA0009010u) * 0x41C64E6Du + 0x3039u;
-    w_u32(0xA0009010u, state);
-    return (state >> 16) & 0x7FFFu;
+    *seed = *seed * 0x41C64E6Du + 0x3039u;
+    return (sint32)((*seed >> 16) & 0x7FFFu);
+}
+
+sint32 randPSX(void)
+{
+    uint32 seed = r_u32(0xA0009010u);
+    sint32 value = psyq_rand_next(&seed);
+
+    w_u32(0xA0009010u, seed);
+    return value;
 }
 
 sint32 OpenEventPSX(uint32 event_class, uint32 specification, uint32 mode, uint32 guest_callback)
@@ -4694,6 +5220,7 @@ void psx_root_counter_bind(uint32 control_slot, uint32 mask_table)
     native_root_control_slot = control_slot;
     native_root_mask_table = mask_table;
     native_root_last_us = xport_timer_get();
+    native_root_clock_started = 1u;
     native_root_tick_fraction = 0u;
     xport_memory_bind_mmio(0x1F801070u, 8u, native_root_irq_read, native_root_irq_write, NULL);
 }
@@ -4701,8 +5228,13 @@ void psx_root_counter_bind(uint32 control_slot, uint32 mask_table)
 void psx_root_counter_poll(void)
 {
     uint64 now, elapsed, ticks;
-    if (!native_root_control_slot || native_root_polling)
+    if (native_root_polling)
         return;
+    if (!native_root_clock_started)
+    {
+        native_root_last_us = xport_timer_get();
+        native_root_clock_started = 1u;
+    }
     native_root_polling = 1u;
     now = xport_timer_get();
     elapsed = now - native_root_last_us;
@@ -4711,6 +5243,18 @@ void psx_root_counter_poll(void)
     native_root_tick_fraction += elapsed % 1000000u * 33868800u;
     ticks += native_root_tick_fraction / 1000000u;
     native_root_tick_fraction %= 1000000u;
+    {
+        uint64 remaining = ticks;
+        while (remaining)
+        {
+            uint32 step = remaining > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32)remaining;
+            if (!(timers.mode[0] & 0x100u))
+                psx_timer_add(0u, step);
+            if (!(timers.mode[1] & 0x100u))
+                psx_timer_add(1u, step);
+            remaining -= step;
+        }
+    }
     if (timers.mode[2] & 0x81u)
     {
         fprintf(stderr, "Unsupported native timer2 gate/toggle mode %04X\n", timers.mode[2]);
@@ -4738,8 +5282,10 @@ sint32 StartRCnt(uint32 counter)
     counter &= 0xFFFFu;
     if (!native_root_control_slot || !native_root_mask_table)
     {
-        fprintf(stderr, "Unbound original SDK root counter tables\n");
-        abort();
+        if (counter > 3u)
+            return 0;
+        native_root_irq.mask |= counter == 3u ? 1u : 1u << (counter + 4u);
+        return counter < 3u;
     }
     control = r_u32(native_root_control_slot) + 4u;
     mask = r_u32(native_root_mask_table + counter * 4u);
@@ -4747,22 +5293,15 @@ sint32 StartRCnt(uint32 counter)
     return counter < 3u;
 }
 
-uint32 CdSetDebug(uint32 level)
-{
-    /* User-authorized unimplemented BIOS or SDK boundary */
-    (void)level;
-    abort();
-}
-
 void srandPSX(uint32 seed)
 {
     w_u32(0xA0009010u, seed);
 }
 
-CdlCB DMACallback(uint32 channel, CdlCB callback)
+PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback)
 {
-    static CdlCB callbacks[7];
-    CdlCB previous;
+    static PsxInterruptCallback callbacks[7];
+    PsxInterruptCallback previous;
 
     if (channel >= sizeof(callbacks) / sizeof(callbacks[0]))
         return NULL;
@@ -4775,7 +5314,6 @@ CdlCB DMACallback(uint32 channel, CdlCB callback)
 
 uint32 CdReadyCallbackPSX(uint32 callback)
 {
-    extern const uint32 xport_cd_ready_callback_address;
     uint32 previous;
     previous = r_u32(xport_cd_ready_callback_address);
     w_u32(xport_cd_ready_callback_address, callback);
@@ -4784,7 +5322,6 @@ uint32 CdReadyCallbackPSX(uint32 callback)
 
 uint32 CdSyncCallbackPSX(uint32 callback)
 {
-    extern const uint32 xport_cd_sync_callback_address;
     uint32 previous;
     previous = r_u32(xport_cd_sync_callback_address);
     w_u32(xport_cd_sync_callback_address, callback);
@@ -4801,7 +5338,7 @@ uint32 xport_guest_nonlocal_transfer(uint32 owner_entry, uint32 source_pc, uint3
     abort();
 }
 
-uint32 bzero(uint32 destination, uint32 length)
+uint32 bzeroPSX(uint32 destination, uint32 length)
 {
     if (destination == 0u || (sint32)length <= 0)
         return 0u;
@@ -4956,6 +5493,10 @@ void xport_missing_guest_sprintf_format(char *destination, uint32 format_address
 uint32 xport_missing_pad_owner_callback(uint32 target, uint32 owner)
 {
     uint32 i;
+    if (target && target == pad_main_mode_send_target)
+        return native_pad_main_mode_send(owner);
+    if (target && target == pad_main_mode_receive_target)
+        return native_pad_main_mode_receive(owner);
     for (i = 0u; i < native_pad_callback_count; ++i)
         if (native_pad_callbacks[i].target == target)
             return native_pad_callbacks[i].callback(owner);
@@ -4965,17 +5506,78 @@ uint32 xport_missing_pad_owner_callback(uint32 target, uint32 owner)
 
 uint32 VectorNormalSS(SVECTOR *source, SVECTOR *destination)
 {
-    (void)source;
-    (void)destination;
-    abort();
+    VECTOR input;
+    VECTOR squares;
+    VECTOR product;
+    SVECTOR loaded;
+    sint64 sum_wide;
+    uint32 sum;
+    uint32 leading;
+    uint32 normalized;
+    uint32 shift;
+    sint16 coefficient;
+
+    if (!source || !destination)
+        abort();
+    loaded.vx = source->vx;
+    loaded.vy = source->vy;
+    loaded.vz = source->vz;
+    loaded.pad = 0;
+    input.vx = loaded.vx;
+    input.vy = loaded.vy;
+    input.vz = loaded.vz;
+    input.pad = 0;
+    Square0(&input, &squares);
+    sum_wide = (sint64)squares.vx + squares.vy + squares.vz;
+    // Original signed ADD traps on squared-norm overflow
+    if (sum_wide > 2147483647)
+    {
+        fprintf(stderr, "VectorNormalSS squared-norm overflow\n");
+        abort();
+    }
+    sum = (uint32)sum_wide;
+    leading = (uint32)Lzc((sint32)sum) & ~1u;
+    normalized = leading < 24u ? sum >> (24u - leading) : sum << (leading - 24u);
+    // Original zero lookup is the halfword 128 bytes before its table
+    coefficient = sum ? psyq_rsqrt_table[normalized - 64u] : 7276;
+    shift = (uint32)((31 - (sint32)leading) >> 1) & 31u;
+    gte_gpf0(&loaded, coefficient, &product);
+    destination->vx = (sint16)(product.vx >> shift);
+    destination->vy = (sint16)(product.vy >> shift);
+    destination->vz = (sint16)(product.vz >> shift);
+    return sum;
 }
 
 uint32 SetFogNearFar(sint32 near_distance, sint32 far_distance, sint32 projection)
 {
-    (void)near_distance;
-    (void)far_distance;
-    (void)projection;
-    abort();
+    sint32 separation = (sint32)((uint32)far_distance - (uint32)near_distance);
+    sint32 product;
+    sint32 near_quotient;
+    sint32 far_quotient;
+    sint32 numerator;
+    sint32 dqa;
+    uint32 result;
+
+    if (separation < 100)
+        return 1u;
+    product = (sint32)((0u - (uint32)near_distance) * (uint32)far_distance);
+    near_quotient = product / separation;
+    far_quotient = (sint32)((uint32)far_distance << 12u) / separation;
+    numerator = (sint32)((uint32)near_quotient << 8u);
+    if (!projection || (numerator == INT32_MIN && projection == -1))
+    {
+        fprintf(stderr, "SetFogNearFar original DIV exception\n");
+        abort();
+    }
+    dqa = numerator / projection;
+    if (dqa < -32768)
+        dqa = -32768;
+    result = dqa > 32767 ? 1u : 0u;
+    if (result)
+        dqa = 32767;
+    xport_gte_write_control(27u, (uint32)dqa);
+    xport_gte_write_control(28u, (uint32)far_quotient << 12u);
+    return result;
 }
 
 static sint64 native_gte_wrap44(sint64 value, uint32 row)
@@ -5051,26 +5653,90 @@ static void native_gte_normal_color(const SVECTOR *normal, uint32 depth)
     push_rgb_from_mac();
 }
 
+static uint32 native_gte_screen_offset_raw(uint32 axis)
+{
+    if (axis == 0u)
+        return ((uint32)gte.ofx << 16) | native_gte_ofx_fraction;
+    if (axis == 1u)
+        return ((uint32)gte.ofy << 16) | native_gte_ofy_fraction;
+    abort();
+}
+
+static sint64 native_gte_floor_shift(sint64 value, uint32 shift)
+{
+    sint64 divisor = (sint64)(1ULL << shift);
+    if (value >= 0)
+        return value / divisor;
+    return -1 - ((-1 - value) / divisor);
+}
+
 static void native_gte_project(const SVECTOR *v, uint32 last)
 {
-    uint32 quotient, depth;
-    (void)gte_project_depth_step(v, NULL);
-    if (!last)
-        return;
-    depth = gte.sz[3];
-    quotient = (!depth || (uint32)gte.h >= depth * 2u) ? 0x1FFFFu : gte_unr_divide((uint32)gte.h, depth);
-    gte.mac0 = truncate_mac0((sint64)quotient * gte.dqa + gte.dqb);
-    gte.ir0 = gte.mac0 >> 12;
-    if (gte.ir0 < 0)
+    sint32 input[3] = {v->vx, v->vy, v->vz};
+    sint32 sx, sy, depth_cue;
+    uint32 row, column, depth, quotient;
+    sint64 accumulated, screen_x, screen_y, cue;
+
+    for (row = 0u; row < 3u; ++row)
     {
-        gte.ir0 = 0;
-        gte.flag |= 1u << 12;
+        accumulated = (sint64)gte.translation[row] * 4096;
+        for (column = 0u; column < 3u; ++column)
+            accumulated = native_gte_wrap44(accumulated + (sint64)gte.rotation.m[row][column] * input[column], row);
+        gte.mac[row] = (sint32)native_gte_floor_shift(accumulated, 12u);
+        gte.ir[row] = clamp_ir(gte.mac[row], 1u << (24u - row));
     }
-    if (gte.ir0 > 4096)
+    depth = clamp_sz(gte.mac[2]);
+    gte.sz[0] = gte.sz[1];
+    gte.sz[1] = gte.sz[2];
+    gte.sz[2] = gte.sz[3];
+    gte.sz[3] = depth;
+    if (depth == 0u || (uint32)gte.h >= depth * 2u)
     {
-        gte.ir0 = 4096;
-        gte.flag |= 1u << 12;
+        quotient = 0x1FFFFu;
+        gte.flag |= 1u << 17;
     }
+    else
+        quotient = gte_unr_divide((uint32)gte.h, depth);
+    screen_x = (sint64)(sint32)native_gte_screen_offset_raw(0u) + (sint64)gte.ir[0] * quotient;
+    screen_y = (sint64)(sint32)native_gte_screen_offset_raw(1u) + (sint64)gte.ir[1] * quotient;
+    (void)truncate_mac0(screen_x);
+    (void)truncate_mac0(screen_y);
+    sx = clamp_sxy((sint32)native_gte_floor_shift(screen_x, 16u), 1u << 14);
+    sy = clamp_sxy((sint32)native_gte_floor_shift(screen_y, 16u), 1u << 13);
+    gte.sxy[0] = gte.sxy[1];
+    gte.sxy[1] = gte.sxy[2];
+    gte.sxy[2] = (sint32)((uint16)sx | ((uint32)(uint16)sy << 16));
+    if (last != 0u)
+    {
+        cue = (sint64)quotient * gte.dqa + gte.dqb;
+        gte.mac0 = truncate_mac0(cue);
+        depth_cue = (sint32)native_gte_floor_shift(cue, 12u);
+        if (depth_cue < 0)
+        {
+            depth_cue = 0;
+            gte.flag |= 1u << 12;
+        }
+        else if (depth_cue > 4096)
+        {
+            depth_cue = 4096;
+            gte.flag |= 1u << 12;
+        }
+        gte.ir0 = depth_cue;
+    }
+}
+
+static void native_gte_depth_color(uint32 color, uint32 shift, uint32 lm)
+{
+    uint32 row;
+    for (row = 0; row < 3u; ++row)
+    {
+        sint64 base = (sint64)((color >> (row * 8u)) & 255u) * 65536;
+        sint32 delta;
+        native_gte_mac_ir(row, (sint64)gte.far_color[row] * 4096 - base, shift, 0u);
+        delta = gte.ir[row];
+        native_gte_mac_ir(row, base + (sint64)gte.ir0 * delta, shift, lm);
+    }
+    push_rgb_from_mac();
 }
 
 void xport_gte_execute(uint32 command)
@@ -5127,6 +5793,33 @@ void xport_gte_execute(uint32 command)
             finish_flag();
             return;
         }
+        case 0x14u:
+        {
+            sint32 input[3] = {gte.ir[0], gte.ir[1], gte.ir[2]};
+            sint32 base[3];
+            native_gte_matrix(&gte.color, input, gte.back_color, shift, lm);
+            for (row = 0u; row < 3u; ++row)
+                base[row] = (sint32)((gte.rgbc >> (row * 8u)) & 255u) * gte.ir[row] * 16;
+            for (row = 0u; row < 3u; ++row)
+            {
+                sint32 delta;
+                native_gte_mac_ir(row, (sint64)gte.far_color[row] * 4096 - base[row], shift, 0u);
+                delta = gte.ir[row];
+                native_gte_mac_ir(row, (sint64)base[row] + (sint64)gte.ir0 * delta, shift, lm);
+            }
+            push_rgb_from_mac();
+            finish_flag();
+            return;
+        }
+        case 0x10u:
+            native_gte_depth_color(gte.rgbc, shift, lm);
+            finish_flag();
+            return;
+        case 0x2Au:
+            for (index = 0; index < 3u; ++index)
+                native_gte_depth_color(gte.rgb[0], shift, lm);
+            finish_flag();
+            return;
         case 0x13u:
         case 0x1Bu:
         case 0x16u:
@@ -5138,6 +5831,11 @@ void xport_gte_execute(uint32 command)
                 v = native_gte_vertex(index);
                 native_gte_normal_color(&v, opcode == 0x13u || opcode == 0x16u);
             }
+            finish_flag();
+            return;
+        case 0x28u:
+            for (row = 0u; row < 3u; ++row)
+                native_gte_mac_ir(row, (sint64)gte.ir[row] * gte.ir[row], shift, lm);
             finish_flag();
             return;
         case 0x0Cu:
@@ -5157,6 +5855,20 @@ void xport_gte_execute(uint32 command)
     }
     fprintf(stderr, "Unsupported GTE command %08X\n", command);
     abort();
+}
+
+uint32 xport_gte_read_screen_offset(uint32 axis)
+{
+    if (axis == 0u)
+        return ((uint32)gte.ofx << 16u) | native_gte_ofx_fraction;
+    if (axis == 1u)
+        return ((uint32)gte.ofy << 16u) | native_gte_ofy_fraction;
+    abort();
+}
+
+uint32 xport_gte_read_flag(void)
+{
+    return (uint32)gte.flag;
 }
 
 static uint32 bios_tap_interrupt_node;
@@ -5188,12 +5900,12 @@ uint32 StopTAP(void)
     return bios_interrupts_enabled;
 }
 
-sint32 MemCardEnd(void)
+sint32 MemCardEndPSX(void)
 {
     uint32 destination;
     if (!bios_card_end_table || !bios_card_end_saved_words || !bios_card_address(bios_card_end_table, 28u, 4u) || !bios_card_address(bios_card_end_saved_words, 12u, 4u))
     {
-        fprintf(stderr, "Unbound MemCardEnd kernel patch\n");
+        fprintf(stderr, "Unbound MemCardEndPSX kernel patch\n");
         abort();
     }
     /* BIOS _stop_card removes the card interrupt routine */
@@ -5204,7 +5916,7 @@ sint32 MemCardEnd(void)
     destination = r_u32(bios_card_end_table + 24u) + 112u;
     if (!bios_card_address(destination, 12u, 4u))
     {
-        fprintf(stderr, "Invalid MemCardEnd kernel patch destination\n");
+        fprintf(stderr, "Invalid MemCardEndPSX kernel patch destination\n");
         abort();
     }
     for (uint32 i = 0; i < 3u; ++i)
@@ -5216,10 +5928,80 @@ sint32 MemCardEnd(void)
 
 MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
 {
-    (void)left;
-    (void)right;
-    (void)destination;
-    abort();
+    const uint8 *left_bytes = (const uint8 *)left;
+    const uint8 *right_bytes = (const uint8 *)right;
+    uint8 *output = (uint8 *)destination;
+    uint32 words[5], column1[3], column2[3];
+    uint32 first, second, third;
+    uint32 low[3], high[3], high_mac[3], result[3];
+    uint32 component;
+    words[0] = xport_load_le32(left_bytes + 0u);
+    words[1] = xport_load_le32(left_bytes + 4u);
+    words[2] = xport_load_le32(left_bytes + 8u);
+    words[3] = xport_load_le32(left_bytes + 12u);
+    words[4] = xport_load_le32(left_bytes + 16u);
+    xport_gte_write_control(0u, words[0]);
+    xport_gte_write_control(1u, words[1]);
+    xport_gte_write_control(2u, words[2]);
+    xport_gte_write_control(3u, words[3]);
+    xport_gte_write_control(4u, words[4]);
+    first = xport_load_le16(right_bytes);
+    second = xport_load_le32(right_bytes + 4u);
+    third = xport_load_le32(right_bytes + 12u);
+    first |= second & 0xFFFF0000u;
+    xport_gte_write_data(0u, first);
+    xport_gte_write_data(1u, third);
+    xport_gte_execute(0x486012u);
+    first = xport_load_le16(right_bytes + 2u);
+    second = xport_load_le32(right_bytes + 8u);
+    third = (uint32)(sint32)(sint16)xport_load_le16(right_bytes + 14u);
+    first |= second << 16;
+    column1[0] = xport_gte_read_data(9u);
+    column1[1] = xport_gte_read_data(10u);
+    column1[2] = xport_gte_read_data(11u);
+    xport_gte_write_data(0u, first);
+    xport_gte_write_data(1u, third);
+    xport_gte_execute(0x486012u);
+    first = xport_load_le16(right_bytes + 4u);
+    second = xport_load_le32(right_bytes + 8u);
+    third = xport_load_le32(right_bytes + 16u);
+    first |= second & 0xFFFF0000u;
+    column2[0] = xport_gte_read_data(9u);
+    column2[1] = xport_gte_read_data(10u);
+    column2[2] = xport_gte_read_data(11u);
+    xport_gte_write_data(0u, first);
+    xport_gte_write_data(1u, third);
+    xport_gte_execute(0x486012u);
+    xport_store_le32(output, (column1[0] & 0xFFFFu) | (column2[0] << 16));
+    xport_store_le32(output + 12u, (column1[2] & 0xFFFFu) | (column2[2] << 16));
+    first = xport_gte_read_data(9u);
+    second = xport_gte_read_data(10u);
+    xport_store_le32(output + 16u, xport_gte_read_data(11u));
+    xport_store_le32(output + 4u, (first & 0xFFFFu) | (column1[1] << 16));
+    xport_store_le32(output + 8u, (column2[1] & 0xFFFFu) | (second << 16));
+    for (component = 0u; component < 3u; ++component)
+    {
+        uint32 value = xport_load_le32(right_bytes + 20u + component * 4u);
+        uint32 magnitude = (sint32)value < 0 ? 0u - value : value;
+        uint32 shifted = (magnitude >> 15u) | ((magnitude & 0x80000000u) ? 0xFFFF0000u : 0u);
+        high[component] = (sint32)value < 0 ? 0u - shifted : shifted;
+        low[component] = (sint32)value < 0 ? 0u - (magnitude & 0x7FFFu) : magnitude & 0x7FFFu;
+    }
+    for (component = 0u; component < 3u; ++component)
+        xport_gte_write_data(9u + component, high[component]);
+    xport_gte_execute(0x41E012u);
+    for (component = 0u; component < 3u; ++component)
+        high_mac[component] = xport_gte_read_data(25u + component);
+    for (component = 0u; component < 3u; ++component)
+        xport_gte_write_data(9u + component, low[component]);
+    xport_gte_execute(0x49E012u);
+    for (component = 0u; component < 3u; ++component)
+        result[component] = xport_gte_read_data(25u + component) + (high_mac[component] << 3u);
+    for (component = 0u; component < 3u; ++component)
+        result[component] += xport_load_le32(left_bytes + 20u + component * 4u);
+    for (component = 0u; component < 3u; ++component)
+        xport_store_le32(output + 20u + component * 4u, result[component]);
+    return destination;
 }
 
 void xport_gte_write_unavailable_data(uint32 register_index, uint32 value)
@@ -5258,5 +6040,1101 @@ uint32 xport_guest_call3(uint32 target, uint32 argument0, uint32 argument1, uint
 
 void xport_gpu_clear_otag_r_guest_driver(uint32 guest_ot, uint32 count)
 {
+    abort();
+}
+
+void SetFogNear(sint32 distance, sint32 projection)
+{
+    uint32 product = (uint32)distance * 320u;
+    sint32 numerator = (sint32)(0u - product);
+    if (!projection || (numerator == INT32_MIN && projection == -1))
+        abort();
+    xport_gte_write_control(27u, (uint32)(numerator / projection));
+    xport_gte_write_control(28u, 0x01400000u);
+}
+
+sint32 EnterCriticalSectionPSX(void)
+{
+    return xport_bios_enter_critical();
+}
+
+void ExitCriticalSection(void)
+{
+    xport_bios_exit_critical();
+}
+
+sint32 SetVideoMode(sint32 mode)
+{
+    sint32 previous = native_video_mode;
+    native_video_mode = mode;
+    return previous;
+}
+
+sint32 GetVideoMode(void)
+{
+    return native_video_mode;
+}
+
+/* Native PsyQ PC file-server handles */
+static FILE *pc_files[64];
+static uint8 pc_modes[64];
+static char pc_root[512];
+static sint32 pc_uppercase;
+
+sint32 psx_pc_set_root(const char *root, sint32 uppercase)
+{
+    size_t length = root ? strlen(root) : 0u;
+    if (length >= sizeof(pc_root))
+        return 0;
+    if (length)
+        memcpy(pc_root, root, length);
+    pc_root[length] = 0;
+    pc_uppercase = uppercase != 0;
+    return 1;
+}
+
+static sint32 pc_path(const char *name, char path[1024])
+{
+    size_t root_length = strlen(pc_root), length = 0u;
+    if (!name)
+        return 0;
+    if (root_length)
+    {
+        memcpy(path, pc_root, root_length);
+        length = root_length;
+        path[length++] = '/';
+        while (*name == '/' || *name == '\\')
+            ++name;
+    }
+    while (*name && *name != ';')
+    {
+        char value = *name++;
+        if (length >= 1023u)
+            return 0;
+        if (value == '\\')
+            value = '/';
+        if (pc_uppercase && value >= 'a' && value <= 'z')
+            value -= 'a' - 'A';
+        path[length++] = value;
+    }
+    path[length] = 0;
+    return length != 0u;
+}
+
+sint32 PCinit(void)
+{
+    sint32 index, result = 0;
+    for (index = 0; index < 64; ++index)
+        if (pc_files[index])
+        {
+            if (fclose(pc_files[index]) != 0)
+                result = -1;
+            pc_files[index] = NULL;
+        }
+    return result;
+}
+
+static sint32 pc_open(char *name, const char *mode, uint8 access)
+{
+    char path[1024];
+    sint32 index;
+    if (!pc_path(name, path))
+        return -1;
+    for (index = 0; index < 64; ++index)
+        if (!pc_files[index])
+        {
+            pc_files[index] = xport_fopen(path, mode);
+            if (!pc_files[index])
+                return -1;
+            pc_modes[index] = access;
+            return index;
+        }
+    return -1;
+}
+
+sint32 PCopen(char *name, sint32 flags, sint32 permissions)
+{
+    if (flags < 0 || flags > 2)
+        return -1;
+    return pc_open(name, flags ? "r+b" : "rb", (uint8)flags);
+}
+
+sint32 PCcreat(char *name, sint32 permissions)
+{
+    return pc_open(name, "w+b", 2u);
+}
+
+sint32 PCclose(sint32 handle)
+{
+    sint32 result;
+    if (handle < 0 || handle >= 64 || !pc_files[handle])
+        return -1;
+    result = fclose(pc_files[handle]);
+    pc_files[handle] = NULL;
+    return result;
+}
+
+sint32 PClseek(sint32 handle, sint32 offset, sint32 origin)
+{
+    long position;
+    if (handle < 0 || handle >= 64 || !pc_files[handle] || origin < 0 || origin > 2)
+        return -1;
+    if (fseek(pc_files[handle], (long)offset, origin) != 0)
+        return -1;
+    position = ftell(pc_files[handle]);
+    return position < 0 || (uint64)position > 0x7FFFFFFFu ? -1 : (sint32)position;
+}
+
+sint32 PCread(sint32 handle, char *buffer, sint32 count)
+{
+    size_t bytes;
+    if (handle < 0 || handle >= 64 || !pc_files[handle] || pc_modes[handle] == 1u || count < 0 || (!buffer && count))
+        return -1;
+    bytes = fread(buffer, 1u, (size_t)count, pc_files[handle]);
+    return ferror(pc_files[handle]) ? -1 : (sint32)bytes;
+}
+
+sint32 PCwrite(sint32 handle, char *buffer, sint32 count)
+{
+    size_t bytes;
+    if (handle < 0 || handle >= 64 || !pc_files[handle] || pc_modes[handle] == 0u || count < 0 || (!buffer && count))
+        return -1;
+    bytes = fwrite(buffer, 1u, (size_t)count, pc_files[handle]);
+    if (fflush(pc_files[handle]) != 0 || ferror(pc_files[handle]))
+        return -1;
+    return (sint32)bytes;
+}
+
+/* Native libmcrd uses the raw 128 KiB card filesystem */
+static uint8 *mc_media[2];
+
+static sint32 bios_native_card_medium_present(uint32 port)
+{
+    return port < 2u && mc_media[port] != NULL;
+}
+
+static uint8 mc_new[2];
+static sint32 mc_running;
+static sint32 mc_command, mc_channel, mc_completed_command, mc_result, mc_ready;
+static sint32 mc_offset, mc_bytes;
+static uint32 *mc_buffer;
+static char mc_name[21];
+static MemCB mc_callback;
+
+static sint32 mc_socket(sint32 channel)
+{
+    return channel == 0 ? 0 : channel == 0x10 ? 1 : -1;
+}
+
+sint32 psx_memcard_mount(sint32 channel, uint8 *image, size_t bytes)
+{
+    sint32 socket = mc_socket(channel);
+    if (socket < 0 || (image && bytes != 0x20000u) || mc_command)
+        return 0;
+    mc_media[socket] = image;
+    mc_new[socket] = image != NULL;
+    return 1;
+}
+
+static uint8 mc_checksum(const uint8 *frame)
+{
+    uint8 value = 0;
+    uint32 index;
+    for (index = 0u; index < 127u; ++index)
+        value ^= frame[index];
+    return value;
+}
+
+static sint32 mc_status(sint32 channel, uint8 **image)
+{
+    sint32 socket = mc_socket(channel);
+    if (socket < 0 || !mc_media[socket])
+        return 1;
+    *image = mc_media[socket];
+    if ((*image)[0] != 'M' || (*image)[1] != 'C')
+        return 4;
+    if ((*image)[127] != mc_checksum(*image))
+        return 2;
+    return 0;
+}
+
+static sint32 mc_find(const uint8 *image, const char *name)
+{
+    uint32 block;
+    if (!name || !*name || strlen(name) > 20u)
+        return -1;
+    for (block = 1u; block <= 15u; ++block)
+    {
+        const uint8 *entry = image + block * 128u;
+        if (xport_load_le32(entry) == 0x51u && memchr(entry + 10u, 0, 21u) && strcmp((const char *)entry + 10u, name) == 0)
+            return (sint32)block;
+    }
+    return -1;
+}
+
+static sint32 mc_chain(const uint8 *image, sint32 first, uint8 blocks[15])
+{
+    uint32 visited = 0u, next, count = 0u;
+    while (first >= 1 && first <= 15 && count < 15u)
+    {
+        const uint8 *entry = image + (uint32)first * 128u;
+        uint32 state = xport_load_le32(entry);
+        if (visited & (1u << first) || entry[127] != mc_checksum(entry) || (!count && state != 0x51u) || (count && state != 0x52u && state != 0x53u))
+            return -1;
+        blocks[count++] = (uint8)first;
+        visited |= 1u << first;
+        next = xport_load_le16(entry + 8u);
+        if (next == 0xFFFFu)
+            return (sint32)count;
+        if (state == 0x53u || next >= 15u)
+            return -1;
+        first = (sint32)next + 1;
+    }
+    return -1;
+}
+
+static sint32 mc_transfer(uint8 *image)
+{
+    uint8 blocks[15];
+    sint32 first = mc_find(image, mc_name), count;
+    uint32 length, offset, remaining;
+    uint8 *buffer = (uint8 *)mc_buffer;
+    if (first < 0)
+        return 5;
+    count = mc_chain(image, first, blocks);
+    length = xport_load_le32(image + (uint32)first * 128u + 4u);
+    if (count < 1 || length != (uint32)count * 8192u)
+        return 2;
+    if (mc_offset < 0 || mc_bytes < 0 || (uint32)mc_offset > length || (uint32)mc_bytes > length - (uint32)mc_offset)
+        return 2;
+    offset = (uint32)mc_offset;
+    remaining = (uint32)mc_bytes;
+    while (remaining)
+    {
+        uint32 part = 8192u - (offset & 8191u);
+        uint8 *data = image + (uint32)blocks[offset / 8192u] * 8192u + (offset & 8191u);
+        if (part > remaining)
+            part = remaining;
+        if (mc_command == 4)
+            memcpy(data, buffer, part);
+        else
+            memcpy(buffer, data, part);
+        offset += part;
+        buffer += part;
+        remaining -= part;
+    }
+    return 0;
+}
+
+static void mc_poll(void)
+{
+    uint8 *image = NULL;
+    sint32 socket, result;
+    MemCB callback;
+    if (!mc_command || !mc_running)
+        return;
+    socket = mc_socket(mc_channel);
+    if (socket < 0 || !mc_media[socket])
+        result = 1;
+    else if (mc_command == 1)
+        result = mc_new[socket] ? 3 : 0;
+    else
+    {
+        result = mc_status(mc_channel, &image);
+        if (mc_command == 2)
+        {
+            if (!result && mc_new[socket])
+                result = 3;
+            mc_new[socket] = 0u;
+        }
+        else if (mc_new[socket])
+            result = 3;
+        else if (!result)
+            result = mc_transfer(image);
+    }
+    mc_completed_command = mc_command;
+    mc_result = result;
+    mc_command = 0;
+    mc_ready = 1;
+    callback = mc_callback;
+    if (callback)
+        callback(mc_completed_command, result);
+}
+
+void MemCardInit(sint32 mode)
+{
+    mc_running = 0;
+    mc_command = mc_completed_command = mc_result = mc_ready = 0;
+    mc_callback = NULL;
+}
+
+void MemCardStart(void)
+{
+    mc_command = mc_completed_command = mc_result = mc_ready = 0;
+    mc_running = 1;
+}
+
+void MemCardStop(void)
+{
+    mc_poll();
+    mc_running = 0;
+}
+
+void MemCardEnd(void)
+{
+    mc_running = 0;
+}
+
+static sint32 mc_queue(sint32 command, sint32 channel)
+{
+    if (mc_command || !mc_running)
+        return 0;
+    mc_command = command;
+    mc_channel = channel;
+    mc_ready = 0;
+    mc_result = 0;
+    return 1;
+}
+
+sint32 MemCardExist(sint32 channel)
+{
+    return mc_queue(1, channel);
+}
+
+sint32 MemCardAccept(sint32 channel)
+{
+    return mc_queue(2, channel);
+}
+
+static sint32 mc_queue_file(sint32 command, sint32 channel, char *name, uint32 *buffer, sint32 offset, sint32 bytes)
+{
+    size_t length;
+    if (!name || !buffer || ((uint32)offset & 127u) || ((uint32)bytes & 127u))
+        return 0;
+    length = strlen(name);
+    if (!length || length > 20u || !mc_queue(command, channel))
+        return 0;
+    memcpy(mc_name, name, length + 1u);
+    mc_buffer = buffer;
+    mc_offset = offset;
+    mc_bytes = bytes;
+    return 1;
+}
+
+sint32 MemCardReadFile(sint32 channel, char *name, uint32 *buffer, sint32 offset, sint32 bytes)
+{
+    return mc_queue_file(3, channel, name, buffer, offset, bytes);
+}
+
+sint32 MemCardWriteFile(sint32 channel, char *name, uint32 *buffer, sint32 offset, sint32 bytes)
+{
+    return mc_queue_file(4, channel, name, buffer, offset, bytes);
+}
+
+sint32 MemCardSync(sint32 mode, sint32 *command, sint32 *result)
+{
+    if (!mc_command && !mc_ready)
+        return -1;
+    if (!mode)
+        mc_poll();
+    if (result)
+        *result = mc_ready ? mc_result : 0;
+    if (command)
+        *command = mc_ready ? mc_completed_command : mc_command;
+    if (!mc_ready)
+        return 0;
+    mc_ready = 0;
+    return 1;
+}
+
+MemCB MemCardCallback(MemCB callback)
+{
+    MemCB previous = mc_callback;
+    mc_callback = callback;
+    return previous;
+}
+
+sint32 MemCardFormat(sint32 channel)
+{
+    sint32 socket = mc_socket(channel);
+    uint8 *image;
+    uint32 frame;
+    if (mc_command)
+        return -1;
+    if (socket < 0 || !(image = mc_media[socket]))
+        return 1;
+    memset(image, 0xFF, 0x20000u);
+    memset(image, 0, 8192u);
+    image[0] = 'M';
+    image[1] = 'C';
+    image[127] = mc_checksum(image);
+    for (frame = 1u; frame < 36u; ++frame)
+    {
+        uint8 *entry = image + frame * 128u;
+        if (frame < 16u)
+            entry[0] = 0xA0u;
+        else
+            xport_store_le32(entry, 0xFFFFFFFFu);
+        xport_store_le16(entry + 8u, 0xFFFFu);
+        entry[127] = mc_checksum(entry);
+    }
+    memcpy(image + 63u * 128u, image, 128u);
+    mc_new[socket] = 0u;
+    return 0;
+}
+
+sint32 MemCardCreateFile(sint32 channel, char *name, sint32 count)
+{
+    uint8 *image = NULL, free_blocks[15];
+    sint32 status, found = 0;
+    uint32 block;
+    size_t length;
+    if (mc_command)
+        return -1;
+    status = mc_status(channel, &image);
+    if (status)
+        return status;
+    if (!name || !(length = strlen(name)) || length > 20u || count < 1 || count > 15)
+        return 5;
+    if (mc_find(image, name) >= 0)
+        return 6;
+    for (block = 1u; block <= 15u && found < count; ++block)
+    {
+        uint8 *entry = image + block * 128u;
+        uint32 state = xport_load_le32(entry);
+        if (entry[127] != mc_checksum(entry))
+            return 2;
+        if (state >= 0xA0u && state <= 0xA3u)
+            free_blocks[found++] = (uint8)block;
+    }
+    if (found < count)
+        return 7;
+    for (found = 0; found < count; ++found)
+    {
+        uint8 *entry = image + (uint32)free_blocks[found] * 128u;
+        memset(entry, 0, 128u);
+        entry[0] = found == 0 ? 0x51u : found + 1 == count ? 0x53u : 0x52u;
+        xport_store_le16(entry + 8u, found + 1 == count ? 0xFFFFu : (uint16)(free_blocks[found + 1] - 1u));
+        if (!found)
+        {
+            xport_store_le32(entry + 4u, (uint32)count * 8192u);
+            memcpy(entry + 10u, name, length + 1u);
+        }
+        entry[127] = mc_checksum(entry);
+    }
+    return 0;
+}
+
+sint32 MemCardDeleteFile(sint32 channel, char *name)
+{
+    uint8 *image = NULL, blocks[15];
+    sint32 status, first, count, index;
+    if (mc_command)
+        return -1;
+    status = mc_status(channel, &image);
+    if (status)
+        return status;
+    first = mc_find(image, name);
+    if (first < 0)
+        return 5;
+    count = mc_chain(image, first, blocks);
+    if (count < 1)
+        return 2;
+    for (index = 0; index < count; ++index)
+    {
+        uint8 *entry = image + (uint32)blocks[index] * 128u;
+        entry[0] = (uint8)(entry[0] + 0x50u);
+        entry[127] = mc_checksum(entry);
+    }
+    return 0;
+}
+
+static sint32 mc_matches(const char *pattern, const char *name)
+{
+    const char *star = NULL, *retry = NULL;
+    while (*name)
+    {
+        if (*pattern == '?' || *pattern == *name)
+        {
+            ++pattern;
+            ++name;
+        }
+        else if (*pattern == '*')
+        {
+            star = ++pattern;
+            retry = name;
+        }
+        else if (star)
+        {
+            pattern = star;
+            name = ++retry;
+        }
+        else
+            return 0;
+    }
+    while (*pattern == '*')
+        ++pattern;
+    return *pattern == 0;
+}
+
+sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, sint32 *files, sint32 offset, sint32 maximum)
+{
+    uint8 *image = NULL;
+    sint32 status, skipped = 0, copied = 0;
+    uint32 block;
+    if (mc_command)
+        return -1;
+    status = mc_status(channel, &image);
+    if (status)
+        return status;
+    if (!pattern || offset < 0 || maximum < 0)
+        return 2;
+    for (block = 1u; block <= 15u && copied < maximum; ++block)
+    {
+        uint8 *entry = image + block * 128u;
+        if (xport_load_le32(entry) != 0x51u)
+            continue;
+        if (entry[127] != mc_checksum(entry) || !memchr(entry + 10u, 0, 21u))
+            return 2;
+        if (!mc_matches(pattern, (char *)entry + 10u))
+            continue;
+        if (skipped++ < offset || !directory)
+            continue;
+        memset(&directory[copied], 0, sizeof(DIRENTRY));
+        memcpy(directory[copied].name, entry + 10u, 20u);
+        directory[copied].attr = 0x51;
+        directory[copied].size = (sint32)xport_load_le32(entry + 4u);
+        directory[copied].head = (sint32)block;
+        ++copied;
+    }
+    if (files)
+        *files = copied;
+    return 0;
+}
+
+static void libc_qsort_swap(unsigned char *left, unsigned char *right, size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+    {
+        unsigned char value = left[i];
+        left[i] = right[i];
+        right[i] = value;
+    }
+}
+
+/* PsyQ libc qsortPSX Pivot selection and strict-less-than
+ * partitioning are observable when the comparator reports equal keys. */
+void qsortPSX(void *base, size_t count, size_t size, int (*compare)(const void *, const void *))
+{
+    unsigned char *bytes = (unsigned char *)base;
+    if (count < 2)
+        return;
+    if (count == 2)
+    {
+        if (compare(bytes, bytes + size) > 0)
+            libc_qsort_swap(bytes, bytes + size, size);
+        return;
+    }
+
+    libc_qsort_swap(bytes, bytes + (count >> 1) * size, size);
+    unsigned char *boundary = bytes;
+    unsigned char *element = bytes + size;
+    size_t lower_count = 0;
+    for (size_t i = 1; i < count; ++i, element += size)
+    {
+        if (compare(element, bytes) < 0)
+        {
+            boundary += size;
+            ++lower_count;
+            if (element != boundary)
+                libc_qsort_swap(element, boundary, size);
+        }
+    }
+    if (boundary != bytes)
+        libc_qsort_swap(bytes, boundary, size);
+
+    qsortPSX(bytes, lower_count, size, compare);
+    qsortPSX(boundary + size, count - lower_count - 1, size, compare);
+}
+
+/* PsyQ soft-float comparison orders encoded magnitudes, including NaNs */
+sint32 __ltdf2(double left, double right)
+{
+    uint64 left_bits, right_bits;
+    memcpy(&left_bits, &left, sizeof(left_bits));
+    memcpy(&right_bits, &right, sizeof(right_bits));
+    const uint64 sign = (uint64)1 << 63;
+    const uint64 left_magnitude = left_bits & ~sign;
+    const uint64 right_magnitude = right_bits & ~sign;
+    if (left_bits == right_bits || !(left_magnitude | right_magnitude))
+        return 0;
+    if ((left_bits ^ right_bits) & sign)
+        return (left_bits & sign) ? -1 : 0;
+    const int magnitude_less = left_magnitude < right_magnitude;
+    return (left_bits & sign) ? (magnitude_less ? 0 : -1) : (magnitude_less ? -1 : 0);
+}
+
+sint32 math_errno, math_err_point;
+
+sint32 _err_math(sint32 error, sint32 point)
+{
+    math_errno = error;
+    math_err_point = point;
+    if (error == 0x21 || error == 0x22)
+        DeliverEvent(0xF4000002u, error == 0x21 ? 0x301u : 0x302u);
+    return 0;
+}
+
+uint32 psx_float_bits(float value)
+{
+    uint32 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float psx_float_value(uint32 bits)
+{
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint32 math_signed_shift(uint32 value, uint32 shift)
+{
+    shift &= 31u;
+    if (!shift)
+        return value;
+    return (value >> shift) | ((value & 0x80000000u) ? (~(uint32)0 << (32u - shift)) : 0u);
+}
+
+/* PsyQ rounds integer conversion halfway values away from zero */
+float __floatsisf(sint32 value)
+{
+    uint32 magnitude = (uint32)value;
+    uint32 sign = value < 0 ? 0x80000000u : 0u;
+    uint32 exponent = 157u;
+    if (!magnitude)
+        return psx_float_value(0u);
+    if (sign)
+        magnitude = 0u - magnitude;
+    if ((sint32)magnitude <= 0x00FFFFFF)
+    {
+        do
+        {
+            magnitude <<= 4;
+            exponent -= 4u;
+        } while ((sint32)magnitude <= 0x00FFFFFF);
+    }
+    if ((sint32)magnitude <= 0x3FFFFFFF)
+    {
+        do
+        {
+            magnitude <<= 1;
+            --exponent;
+        } while ((sint32)magnitude <= 0x3FFFFFFF);
+    }
+    magnitude += 0x40u;
+    if (magnitude & 0x80000000u)
+    {
+        ++exponent;
+        magnitude >>= 8;
+    }
+    else
+        magnitude >>= 7;
+    return psx_float_value(sign | (exponent << 23) | (magnitude & 0xFF7FFFFFu));
+}
+
+sint32 __fixsfsi(float value)
+{
+    uint32 bits = psx_float_bits(value);
+    uint32 sign = bits & 0x80000000u;
+    uint32 exponent = (bits >> 23) & 0xFFu;
+    if (!(bits & 0x7FFFFFFFu))
+        return (sint32)sign;
+    if (exponent > 157u)
+    {
+        if (sign)
+            return (sint32)0x80000000u;
+        _err_math(0x22, 0x12);
+        return 0x7FFFFFFF;
+    }
+    if (exponent < 126u)
+        return 0;
+    uint32 magnitude = ((bits & 0x7FFFFFu) | 0x800000u) << 7;
+    magnitude >>= 157u - exponent;
+    return (sint32)(sign ? 0u - magnitude : magnitude);
+}
+
+float __divsf3(float numerator, float denominator)
+{
+    uint32 left = psx_float_bits(numerator);
+    uint32 right = psx_float_bits(denominator);
+    uint32 sign = (left ^ right) & 0x80000000u;
+    sint32 exponent = (sint32)((left >> 23) & 0xFFu) - (sint32)((right >> 23) & 0xFFu) + 126;
+    if (!(right & 0x7FFFFFFFu))
+        return psx_float_value(sign ? 0x4F800000u : 0x4F000000u);
+    if (!(left & 0x7FFFFFFFu))
+        return psx_float_value(sign);
+    uint32 dividend = (left & 0x7FFFFFu) | 0x800000u;
+    uint32 divisor = (right & 0x7FFFFFu) | 0x800000u;
+    if (dividend < divisor)
+    {
+        dividend <<= 1;
+        --exponent;
+    }
+    uint32 quotient = (uint32)(((uint64)dividend << 24) / divisor);
+    if (exponent >= 0)
+    {
+        quotient = (quotient + 1u) >> 1;
+        ++exponent;
+    }
+    else
+    {
+        uint32 shift = (0u - (uint32)exponent) & 31u;
+        quotient += (uint32)1 << shift;
+        quotient = math_signed_shift(quotient, shift + 1u);
+        exponent = 0;
+    }
+    quotient &= 0xFF7FFFFFu;
+    if (exponent >= 255)
+    {
+        _err_math(0x22, 0x0E);
+        return psx_float_value(sign | 0x7F800000u);
+    }
+    return psx_float_value(sign | ((uint32)exponent << 23) | quotient);
+}
+
+double psx_double_value(uint64 bits)
+{
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+uint64 psx_double_bits(double value)
+{
+    uint64 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static uint64 math_mantissa64(uint64 bits)
+{
+    return (bits & (((uint64)1 << 52) - 1u)) | ((uint64)1 << 52);
+}
+
+static uint64 math_arithmetic_right64(uint64 value, uint32 count)
+{
+    if (!count)
+        return value;
+    uint64 fill = (value & ((uint64)1 << 63)) ? ~(uint64)0 : 0;
+    if (count >= 64u)
+        return fill;
+    return (value >> count) | (fill << (64u - count));
+}
+
+static uint64 math_pack64(uint64 sign, sint32 exponent, uint64 mantissa, sint32 point)
+{
+    mantissa &= ~((uint64)1 << 52);
+    if (exponent >= 2047)
+    {
+        _err_math(0x22, point);
+        return sign | ((uint64)0x7FF00000u << 32);
+    }
+    /* Preserve the original 32-bit exponent shift even below zero */
+    return sign | ((uint64)((uint32)exponent << 20) << 32) | mantissa;
+}
+
+uint64 __adddf3PSX(uint64 left, uint64 right)
+{
+    uint64 sign_mask = (uint64)1 << 63;
+    if (!(left & ~sign_mask))
+        return right;
+    if (!(right & ~sign_mask))
+        return left;
+    sint32 left_exp = (sint32)((left >> 52) & 0x7FFu);
+    sint32 right_exp = (sint32)((right >> 52) & 0x7FFu);
+    if (left_exp > right_exp + 54)
+        return left;
+    if (right_exp > left_exp + 54)
+        return right;
+    uint64 a = math_mantissa64(left);
+    uint64 b = math_mantissa64(right);
+    if (left & sign_mask)
+        a = 0u - a;
+    if (right & sign_mask)
+        b = 0u - b;
+    a <<= 9;
+    b <<= 9;
+    sint32 exponent;
+    if (left_exp > right_exp)
+    {
+        b = math_arithmetic_right64(b, (uint32)(left_exp - right_exp));
+        exponent = left_exp;
+    }
+    else
+    {
+        a = math_arithmetic_right64(a, (uint32)(right_exp - left_exp));
+        exponent = right_exp;
+    }
+    uint64 sum = a + b;
+    if (!sum)
+        return 0;
+    uint64 sign = sum & sign_mask;
+    if (sign)
+        sum = 0u - sum;
+    while (!(sum & ((uint64)0xE0000000u << 32)))
+    {
+        sum <<= 1;
+        --exponent;
+    }
+    if (sum & ((uint64)1 << 62))
+    {
+        sum >>= 1;
+        ++exponent;
+    }
+    sum += (sum & 0x200u) ? 0x100u : 0xFFu;
+    if (sum & ((uint64)1 << 62))
+    {
+        sum >>= 1;
+        ++exponent;
+    }
+    return math_pack64(sign, exponent, sum >> 9, 0x0B);
+}
+
+uint64 __muldf3PSX(uint64 left, uint64 right)
+{
+    uint64 sign_mask = (uint64)1 << 63;
+    uint64 sign = (left ^ right) & sign_mask;
+    if (!(left & ~sign_mask) || !(right & ~sign_mask))
+        return sign;
+    uint64 a = math_mantissa64(left);
+    uint64 b = math_mantissa64(right);
+    uint64 high_a = a >> 21;
+    uint64 high_b = b >> 21;
+    uint64 product = high_a * high_b;
+    product += ((a & 0x1FFFFFu) * high_b) >> 21;
+    product += ((b & 0x1FFFFFu) * high_a) >> 21;
+    sint32 exponent = (sint32)((left >> 52) & 0x7FFu) + (sint32)((right >> 52) & 0x7FFu) - 1022;
+    if (product & sign_mask)
+        product = (product + 0x400u) >> 11;
+    else
+    {
+        product += 0x200u;
+        if (product & sign_mask)
+            product >>= 11;
+        else
+        {
+            product >>= 10;
+            --exponent;
+        }
+    }
+    return math_pack64(sign, exponent, product, 0x0D);
+}
+
+uint64 __divdf3PSX(uint64 left, uint64 right)
+{
+    uint64 sign_mask = (uint64)1 << 63;
+    uint64 sign = (left ^ right) & sign_mask;
+    if (!(right & ~sign_mask))
+        return sign | ~sign_mask;
+    if (!(left & ~sign_mask))
+        return sign;
+    uint64 dividend = math_mantissa64(left);
+    uint64 divisor = math_mantissa64(right);
+    sint32 exponent = (sint32)((left >> 52) & 0x7FFu) - (sint32)((right >> 52) & 0x7FFu) + 1022;
+    if (dividend < divisor)
+    {
+        dividend <<= 1;
+        --exponent;
+    }
+    uint64 quotient = 0;
+    uint64 bit;
+    for (bit = (uint64)1 << 53; bit; bit >>= 1)
+    {
+        if (dividend >= divisor)
+        {
+            quotient |= bit;
+            dividend -= divisor;
+        }
+        dividend <<= 1;
+    }
+    uint32 shift;
+    if (exponent >= 0)
+    {
+        quotient += 1u;
+        ++exponent;
+        shift = 1;
+    }
+    else
+    {
+        shift = 0u - (uint32)exponent;
+        uint32 increment = (uint32)1 << (shift & 31u);
+        quotient += increment;
+        ++shift;
+        exponent = 0;
+    }
+    quotient = shift >= 64u ? 0 : quotient >> shift;
+    return math_pack64(sign, exponent, quotient, 0x0F);
+}
+
+double __extendsfdf2(float value)
+{
+    uint32 bits = psx_float_bits(value);
+    uint64 sign = (uint64)(bits & 0x80000000u) << 32;
+    uint32 fraction = bits & 0x7FFFFFu;
+    uint32 exponent = (bits >> 23) & 0xFFu;
+    if (!(bits & 0x7FFFFFFFu))
+        return psx_double_value(sign);
+    uint64 mantissa;
+    if (exponent)
+    {
+        exponent += 0x380u;
+        mantissa = (uint64)fraction << 29;
+    }
+    else
+    {
+        exponent = 0x37Eu;
+        mantissa = (uint64)fraction << 32;
+        while (mantissa >= ((uint64)1 << 53))
+        {
+            mantissa >>= 1;
+            ++exponent;
+        }
+        while (!(mantissa & ((uint64)1 << 52)))
+        {
+            mantissa <<= 1;
+            --exponent;
+        }
+        mantissa &= ~((uint64)1 << 52);
+    }
+    return psx_double_value(sign | ((uint64)exponent << 52) | mantissa);
+}
+
+sint32 __fixdfsi(double value)
+{
+    uint64 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint64 sign = bits & ((uint64)1 << 63);
+    uint32 exponent = (uint32)(bits >> 52) & 0x7FFu;
+    if (!(bits & ~((uint64)1 << 63)))
+        return sign ? (sint32)0x80000000u : 0;
+    if (exponent > 1053u)
+    {
+        _err_math(0x22, 0x11);
+        return sign ? (sint32)0x80000000u : 0x7FFFFFFF;
+    }
+    if (exponent < 1022u)
+        return 0;
+    uint64 mantissa = (bits & (((uint64)1 << 52) - 1u)) | ((uint64)1 << 52);
+    uint32 magnitude = (uint32)(mantissa >> 22);
+    magnitude >>= 1053u - exponent;
+    return (sint32)(sign ? 0u - magnitude : magnitude);
+}
+
+double __floatsidf(sint32 value)
+{
+    uint32 magnitude = (uint32)value;
+    uint64 sign = value < 0 ? (uint64)1 << 63 : 0u;
+    uint32 exponent = 1053u;
+    if (!magnitude)
+        return psx_double_value(0u);
+    if (sign)
+        magnitude = 0u - magnitude;
+    if ((sint32)magnitude <= 0x00FFFFFF)
+    {
+        do
+        {
+            magnitude <<= 4;
+            exponent -= 4u;
+        } while ((sint32)magnitude <= 0x00FFFFFF);
+    }
+    if ((sint32)magnitude <= 0x3FFFFFFF)
+    {
+        do
+        {
+            magnitude <<= 1;
+            --exponent;
+        } while ((sint32)magnitude <= 0x3FFFFFFF);
+    }
+    uint64 mantissa = ((uint64)magnitude << 22) & ~((uint64)1 << 52);
+    return psx_double_value(sign | ((uint64)exponent << 52) | mantissa);
+}
+
+/* PsyQ omits the low-byte product and truncates each cross product separately */
+uint32 __mulsf3PSX(uint32 left, uint32 right)
+{
+    uint32 sign = (left ^ right) & 0x80000000u;
+    if (!(left & 0x7FFFFFFFu) || !(right & 0x7FFFFFFFu))
+        return sign;
+    uint32 left_mantissa = (left & 0x7FFFFFu) | 0x800000u;
+    uint32 right_mantissa = (right & 0x7FFFFFu) | 0x800000u;
+    uint32 left_high = left_mantissa >> 8;
+    uint32 right_high = right_mantissa >> 8;
+    uint32 product = left_high * right_high;
+    product += ((left_mantissa & 0xFFu) * right_high) >> 8;
+    product += ((right_mantissa & 0xFFu) * left_high) >> 8;
+    sint32 exponent = (sint32)((left >> 23) & 0xFFu) + (sint32)((right >> 23) & 0xFFu) - 126;
+    if (product & 0x80000000u)
+        product = (product + 0x80u) >> 8;
+    else
+    {
+        product += 0x40u;
+        if (product & 0x80000000u)
+            product >>= 8;
+        else
+        {
+            product >>= 7;
+            --exponent;
+        }
+    }
+    product &= 0xFF7FFFFFu;
+    if (exponent >= 255)
+    {
+        _err_math(0x22, 0x0C);
+        return sign | 0x7F800000u;
+    }
+    return sign | ((uint32)exponent << 23) | product;
+}
+
+float __truncdfsf2(double value)
+{
+    uint64 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint32 sign = (uint32)(bits >> 32) & 0x80000000u;
+    if (!(bits & ~((uint64)1 << 63)))
+        return psx_float_value(sign);
+    sint32 exponent = (sint32)((bits >> 52) & 0x7FFu) - 0x380;
+    uint64 mantissa = (bits & (((uint64)1 << 52) - 1u)) | ((uint64)1 << 52);
+    uint32 rounded = (uint32)(mantissa >> 28);
+    if (exponent > 0)
+    {
+        rounded = (rounded + 1u) >> 1;
+        if (rounded & 0xFF000000u)
+        {
+            rounded >>= 1;
+            ++exponent;
+        }
+    }
+    else
+    {
+        uint32 shift = 0u - (uint32)exponent;
+        rounded += (uint32)1 << ((shift + 1u) & 31u);
+        rounded >>= (shift + 2u) & 31u;
+        exponent = 0;
+    }
+    rounded &= 0xFF7FFFFFu;
+    if (exponent >= 255)
+    {
+        _err_math(0x22, 0x10);
+        return psx_float_value(sign | 0x7F800000u);
+    }
+    return psx_float_value(sign | ((uint32)exponent << 23) | rounded);
+}
+
+void xport_memory_control_write32_missing(uint32 address, uint32 value)
+{
+    (void)address;
+    (void)value;
     abort();
 }

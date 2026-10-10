@@ -124,20 +124,16 @@ extern "C"
     /* Required link-time services implemented by every game */
     void xport_main(void);
     extern const uint32 xport_gpu_graph_type_address;
+    extern const uint32 xport_cd_sync_callback_address;
+    extern const uint32 xport_cd_ready_callback_address;
+    extern const uint32 xport_cd_status_address;
+    extern const uint32 xport_cd_setloc_table_address;
+    uint32 xport_libsnd_sequence_call(uint32 target, uint32 argc, const uint32 *arguments);
     void xport_function_marker(const char *image, uint32 address, const char *function, const char *file, uint32 line, uintptr_t host_return_address, uint32 channels);
 
 #if defined(__cplusplus)
 }
 #endif
-/* Access guest memory with a fixed width */
-#define r_u8(address) ((uint8)xport_memory_read((uint32)(address), 1u))
-#define r_u16(address) ((uint16)xport_memory_read((uint32)(address), 2u))
-#define r_u32(address) xport_memory_read((uint32)(address), 4u)
-#define w_u8(address, value) xport_memory_write((uint32)(address), 1u, (uint32)(value), 1u)
-#define w_u16(address, value) xport_memory_write((uint32)(address), 2u, (uint32)(value), 3u)
-#define w_u32(address, value) xport_memory_write((uint32)(address), 4u, (uint32)(value), 15u)
-#define w_masked_u32(address, value, mask) xport_memory_write((uint32)(address), 4u, (uint32)(value), (uint32)(mask))
-
 /* Raw guest-memory lvalues for direct IDA pseudocode translation */
 #define byte_(address) (*(uint8 *)psx_addr((uint32)(address), sizeof(uint8)))
 #define word_(address) (*(uint16 *)psx_addr((uint32)(address), sizeof(uint16)))

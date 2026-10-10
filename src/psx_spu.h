@@ -22,8 +22,10 @@ extern "C"
 {
 #endif
 
+    void cd_dispatch_ready_event(void);
     sint32 CdInit(void);
     sint32 cd_mount_cue(const char *cue_path);
+    sint32 cd_mount_stream_file(const char *path);
     void *cd_search_file_native(void *result, const char *path);
     CdlLOC *CdIntToPos(sint32 sector, CdlLOC *position);
     void cd_unmount_image(void);
@@ -62,6 +64,32 @@ extern "C"
 
     sint32 spu_bind_malloc_guest(const SpuMallocGuestBinding *binding);
     uint32 spu_init_malloc_guest(uint32 count, uint32 table);
+    uint32 spu_sequence_mark_table(void);
+
+    typedef struct SpuVmGuestBinding
+    {
+        uint32 context;
+        uint32 voices;
+        uint32 program_pointer;
+        uint32 header_pointer;
+        uint32 tone_pointer;
+        uint32 bank_flags;
+        uint32 program_limit;
+        uint32 header_table;
+        uint32 program_table;
+        uint32 tone_table;
+        uint32 voice_count;
+        uint32 protection;
+        uint32 channel_masks;
+        uint32 release_offset;
+        uint32 mono_mode;
+        uint32 voice_masks;
+        uint32 pending_keyoff;
+    } SpuVmGuestBinding;
+
+    sint32 spu_bind_vm_guest(const SpuVmGuestBinding *binding);
+    void spu_vm_guest_binding(SpuVmGuestBinding *binding);
+    void spu_voice_cache_binding(uint32 *values, uint32 *flags);
 
     typedef struct SpuHeapBinding
     {
@@ -76,6 +104,7 @@ extern "C"
 
     sint32 spu_bind_heap(const SpuHeapBinding *binding);
     sint32 spu_heap_failed(void);
+    sint32 SpuInitMalloc(sint32 count, char *records);
     sint32 SpuMalloc(sint32 bytes);
     void SpuFree(uint32 address);
 
@@ -122,6 +151,7 @@ extern "C"
     sint32 SpuSetTransferMode(sint32 mode);
     uint32 SpuSetTransferStartAddr(uint32 address);
     uint32 SpuWrite(const void *source, uint32 byte_count);
+    uint32 spu_write_host(const void *source, uint32 byte_count);
     sint32 SpuIsTransferCompleted(sint32 mode);
 
     /* Exposed for deterministic block vectors. `history1` is the immediately
@@ -155,6 +185,9 @@ extern "C"
     int spu_lockstep_portable_selftest(void);
 #endif
     /* END GENERATED MODULE API */
+
+    sint32 cd_stream_pop_sector_native(uint8 output[2352]);
+    void cd_stream_consumer_native(sint32 enabled);
 
 #if defined(__cplusplus)
 }

@@ -155,6 +155,7 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     void gpu_put_draw_env(uint32 env, sint32 surface_x, sint32 surface_y);
     void gpu_packet(void *packet);
     void gpu_register_dma_range(void *begin, uint32 size);
+    sint32 gpu_register_packet_range(void *begin, uint32 size);
     sint32 gpu_present(void);
     void gpu_display_offset(sint32 x, sint32 y);
     void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height);
