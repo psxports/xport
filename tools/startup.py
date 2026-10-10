@@ -32,6 +32,7 @@ WINDOWS_RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range
                           *(f'LPT{i}' for i in range(1, 10))}
 TERMINAL = {'attention', 'complete', 'failed', 'cancelled'}
 NATIVE_TEMPLATE_DIR = XPORT_ROOT/'src/platform/win'
+PROJECT_GITIGNORE_TEMPLATE = TOOLS/'templates/project/.gitignore'
 NATIVE_TEMPLATE_TOKENS = ('@@PROJECT_GUID@@', '@@SHORT_NAME@@', '@@FULL_NAME@@', '@@SHARED_SOURCE@@')
 NATIVE_TEMPLATE_REQUIREMENTS = {
     'xport.sln': {'@@PROJECT_GUID@@', '@@SHORT_NAME@@'},
@@ -230,7 +231,7 @@ def initialize_project(root, name, short_name, first_port=2400):
         raise ValueError('STARTUP_ALREADY_INITIALIZED: '+str(root/CONFIG_NAME))
     validate_names(name, short_name)
     platform = root/'src/platform/win'
-    targets = [root/CONFIG_NAME, root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
+    targets = [root/CONFIG_NAME, root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
                platform/(short_name+'.vcxproj'), root/'status/translation-ledger.json']
     existing = [str(path) for path in targets if path.exists()]
     if existing:
@@ -305,6 +306,7 @@ void xport_main(void)
 }
 '''
             (root/'src/game_main.c').write_text(main_text, encoding='utf-8', newline='')
+            shutil.copyfile(PROJECT_GITIGNORE_TEMPLATE, root/'.gitignore')
             (root/'AGENTS.md').write_text(agents_text(name, short_name), encoding='utf-8', newline='')
             (root/'status/translation-ledger.json').write_text(json.dumps({'version': 1, 'entries': []}, indent=2)+'\n', encoding='utf-8')
             with (root/CONFIG_NAME).open('x', encoding='utf-8') as stream:

@@ -133,6 +133,135 @@ static sint32 sync_failed, sync_running;
 static GpuPsyqTimeout sync_timeout;
 static sint32 sync_timeout_bound;
 
+static GpuScanoutState native_scanout = {0, 0, 16, 256, 0, 0, 0, 0};
+static uint64 scanout_last_us;
+static uint32 scanout_fraction, scanout_clock_started;
+static DISPENV native_disp_cache;
+static uint32 native_disp_cached;
+
+void gpu_scanout_reset(GpuScanoutState *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->start_y = 16u;
+    state->end_y = 256u;
+}
+
+sint32 gpu_scanout_validate(const GpuScanoutState *state)
+{
+    uint32 pal;
+    if (!state)
+        return 0;
+    pal = (state->mode >> 3) & 1u;
+    return state->mode <= 255u && state->disp_y <= 1023u && state->start_y <= 1023u && state->end_y <= 1023u && state->line < (pal ? 314u : 263u) && state->tick < (pal ? 3406u : 3413u) && state->field <= 1u && state->disp_field <= 1u;
+}
+
+void gpu_scanout_command(GpuScanoutState *state, uint32 command)
+{
+    switch (command >> 24)
+    {
+    case 0u:
+        gpu_scanout_reset(state);
+        break;
+    case 5u:
+        state->disp_y = (command >> 10) & 1023u;
+        break;
+    case 7u:
+        state->start_y = command & 1023u;
+        state->end_y = (command >> 10) & 1023u;
+        break;
+    case 8u:
+        state->mode = command & 255u;
+        state->line %= (state->mode & 8u) ? 314u : 263u;
+        state->tick %= (state->mode & 8u) ? 3406u : 3413u;
+        break;
+    default:
+        break;
+    }
+}
+
+sint32 gpu_scanout_advance(GpuScanoutState *state, uint64 ticks)
+{
+    uint32 total_lines, line_ticks, end_y, start_y, count, edge;
+    uint64 lines;
+    if (!gpu_scanout_validate(state))
+        return 0;
+    total_lines = (state->mode & 8u) ? 314u : 263u;
+    line_ticks = (state->mode & 8u) ? 3406u : 3413u;
+    // Visit two fields before skipping complete parity cycles
+    if (ticks >= (uint64)2u * total_lines * line_ticks)
+        ticks = ticks % ((uint64)2u * total_lines * line_ticks) + (uint64)2u * total_lines * line_ticks;
+    ticks += state->tick;
+    lines = ticks / line_ticks;
+    state->tick = (uint32)(ticks % line_ticks);
+    start_y = state->start_y < total_lines ? state->start_y : total_lines;
+    end_y = state->end_y < total_lines ? state->end_y : total_lines;
+    while (lines)
+    {
+        edge = total_lines;
+        if (start_y < end_y && state->line < end_y)
+            edge = end_y;
+        count = edge - state->line;
+        if (lines < count)
+            count = (uint32)lines;
+        state->line += count;
+        lines -= count;
+        if (state->line == end_y && start_y < end_y)
+            state->disp_field = (state->mode & 0x24u) == 0x24u ? state->field ^ 1u : 0u;
+        if (state->line == total_lines)
+        {
+            state->line = 0u;
+            state->field = (state->mode & 32u) ? state->field ^ 1u : 0u;
+        }
+    }
+    return 1;
+}
+
+sint32 gpu_scanout_ode(const GpuScanoutState *state)
+{
+    uint32 active;
+    if (!gpu_scanout_validate(state))
+        return -1;
+    if ((state->mode & 0x24u) != 0x24u)
+        return (sint32)((state->disp_y + state->line) & 1u);
+    active = state->line >= state->start_y && state->line < state->end_y;
+    return (sint32)((state->disp_y + (active ? state->disp_field : 0u)) & 1u);
+}
+
+static void gpu_scanout_poll(void)
+{
+    uint64 now = xport_timer_get(), elapsed, ticks, scaled;
+    uint32 freq = (native_scanout.mode & 8u) ? 53203425u : 53693175u;
+    uint32 period = (native_scanout.mode & 8u) ? 2u * 314u * 3406u : 2u * 263u * 3413u;
+    if (!scanout_clock_started)
+    {
+        scanout_last_us = now;
+        scanout_clock_started = 1u;
+        return;
+    }
+    elapsed = now >= scanout_last_us ? now - scanout_last_us : 0u;
+    scanout_last_us = now;
+    scaled = elapsed % 1000000u * freq + scanout_fraction;
+    ticks = (elapsed / 1000000u % period) * freq + scaled / 1000000u;
+    if (elapsed / 1000000u >= period)
+        ticks += period;
+    scanout_fraction = (uint32)(scaled % 1000000u);
+    if (!gpu_scanout_advance(&native_scanout, ticks))
+        abort();
+}
+
+sint32 GetODE(void)
+{
+    uint32 dma, status;
+    if (sync_sample)
+    {
+        if (sync_sample(sync_context, &dma, &status) != 1)
+            abort();
+        return (sint32)(status >> 31);
+    }
+    gpu_scanout_poll();
+    return gpu_scanout_ode(&native_scanout);
+}
+
 sint32 gpu_bind_sync(uint32 queue_head, uint32 queue_tail, GpuSyncSample sample, GpuSyncStep pump, GpuSyncStep wait, void *context, uint32 budget)
 {
     uint32 addresses[2] = {queue_head, queue_tail}, i;
@@ -2506,6 +2635,10 @@ void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height)
 
 void gpu_init_empty(void)
 {
+    gpu_scanout_reset(&native_scanout);
+    scanout_last_us = xport_timer_get();
+    scanout_clock_started = 1u;
+    scanout_fraction = native_disp_cached = 0u;
     display_state = 0;
     memset(VRAM, 0, sizeof(VRAM));
     active_tpage = 0;
@@ -2543,6 +2676,10 @@ sint32 gpu_save_frame(const char *path)
 /* Reset only host GPU state; PsyQ environment calls provide game dimensions */
 void gpu_reset_graph_state(void)
 {
+    gpu_scanout_reset(&native_scanout);
+    scanout_last_us = xport_timer_get();
+    scanout_clock_started = 1u;
+    scanout_fraction = native_disp_cached = 0u;
     display_state = 0;
     active_tpage = 0;
     active_draw_flags = 0;
@@ -2705,6 +2842,10 @@ DRAWENV *PutDrawEnv(DRAWENV *environment)
 
 static void gpu_psyq_gp1(uint32 command)
 {
+    gpu_scanout_poll();
+    gpu_scanout_command(&native_scanout, command);
+    if (!(command >> 24))
+        scanout_fraction = 0u;
     if (transfer_observer)
         transfer_observer(transfer_observer_context, 1u, 4u, &command, 1u);
     if (psyq_binding.gp1_shadow)
@@ -2724,18 +2865,25 @@ static void gpu_psyq_disp_env(DISPENV *environment)
     if (!psyq_bound)
     {
         if (transfer_observer)
+        {
             transfer_observation_failed = 1;
-        return;
+            return;
+        }
+        video = (uint32)GetVideoMode();
+        cache = &native_disp_cache;
     }
-    video = *(uint32 *)psx_addr(psyq_binding.video_mode, 4u);
-    if (*(uint8 *)psx_addr(psyq_binding.graph_type, 1u) != 0u || video > 1u)
+    else
+    {
+        video = *(uint32 *)psx_addr(psyq_binding.video_mode, 4u);
+        cache = (DISPENV *)psx_addr(psyq_binding.display_cache, 20u);
+    }
+    if ((psyq_bound && *(uint8 *)psx_addr(psyq_binding.graph_type, 1u) != 0u) || video > 1u)
     {
         transfer_observation_failed = 1;
         return;
     }
-    cache = (DISPENV *)psx_addr(psyq_binding.display_cache, 20u);
     gpu_psyq_gp1(0x05000000u | ((uint32)environment->disp.x & 0x3ffu) | (((uint32)environment->disp.y & 0x3ffu) << 10));
-    if (memcmp(&cache->screen, &environment->screen, 8u))
+    if ((!psyq_bound && !native_disp_cached) || memcmp(&cache->screen, &environment->screen, 8u))
     {
         environment->pad0 = (uint8)video;
         x0 = 10 * environment->screen.x + 608;
@@ -2749,11 +2897,11 @@ static void gpu_psyq_disp_env(DISPENV *environment)
         gpu_psyq_gp1(0x06000000u | ((uint32)x0 & 0xfffu) | (((uint32)x1 & 0xfffu) << 12));
         gpu_psyq_gp1(0x07000000u | ((uint32)y0 & 0x3ffu) | (((uint32)y1 & 0x3ffu) << 10));
     }
-    if (memcmp(&cache->disp, &environment->disp, 8u) || memcmp(&cache->isinter, &environment->isinter, 4u))
+    if ((!psyq_bound && !native_disp_cached) || memcmp(&cache->disp, &environment->disp, 8u) || memcmp(&cache->isinter, &environment->isinter, 4u))
     {
         environment->pad0 = (uint8)video;
         mode = 0x08000000u | (video ? 8u : 0u) | (environment->isrgb24 ? 16u : 0u) | (environment->isinter ? 32u : 0u);
-        if (*(uint8 *)psx_addr(psyq_binding.reverse_flag, 1u))
+        if (psyq_bound && *(uint8 *)psx_addr(psyq_binding.reverse_flag, 1u))
             mode |= 128u;
         width = environment->disp.w;
         height = environment->disp.h;
@@ -2763,6 +2911,8 @@ static void gpu_psyq_disp_env(DISPENV *environment)
         gpu_psyq_gp1(mode);
     }
     memcpy(cache, environment, 20u);
+    if (!psyq_bound)
+        native_disp_cached = 1u;
 }
 
 DISPENV *PutDispEnv(DISPENV *environment)
@@ -2792,6 +2942,10 @@ static int gpu_state_block(FILE *file, void *data, size_t size, int load)
 
 typedef struct GPU_PORTABLE_SCALARS
 {
+    GpuScanoutState scanout;
+    uint32 scanout_fraction;
+    DISPENV native_disp_cache;
+    uint32 native_disp_cached;
     uint32 move_image_packet;
     uint32 clear_image_packet;
     uint32 clear_image_dimensions;
@@ -2815,13 +2969,20 @@ typedef struct GPU_PORTABLE_SCALARS
 int gpu_state_io(FILE *f, int load)
 {
     GPU_PORTABLE_SCALARS scalars = {0};
+    if (!load)
+        gpu_scanout_poll();
     if (!(gpu_state_block(f, &VRAM, sizeof(VRAM), load) && gpu_state_block(f, &active_tpage, sizeof(active_tpage), load) && gpu_state_block(f, &texture_window, sizeof(texture_window), load) && gpu_state_block(f, &display_state, sizeof(display_state), load) && gpu_state_block(f, &display_x, sizeof(display_x), load) && gpu_state_block(f, &display_y, sizeof(display_y), load) && gpu_state_block(f, &display_width, sizeof(display_width), load) && gpu_state_block(f, &display_height, sizeof(display_height), load) && gpu_state_block(f, &display_offset_x, sizeof(display_offset_x), load) && gpu_state_block(f, &display_offset_y, sizeof(display_offset_y), load) && gpu_state_block(f, &raster_clip_x0, sizeof(raster_clip_x0), load) && gpu_state_block(f, &raster_clip_y0, sizeof(raster_clip_y0), load) && gpu_state_block(f, &raster_clip_x1, sizeof(raster_clip_x1), load) && gpu_state_block(f, &raster_clip_y1, sizeof(raster_clip_y1), load) &&
           gpu_state_block(f, &raster_offset_x, sizeof(raster_offset_x), load) && gpu_state_block(f, &raster_offset_y, sizeof(raster_offset_y), load) && gpu_state_block(f, &raster_surface_x, sizeof(raster_surface_x), load) && gpu_state_block(f, &raster_surface_y, sizeof(raster_surface_y), load)))
         return 0;
     if (load)
     {
-        if (!gpu_state_block(f, &scalars, sizeof(scalars), 1) || scalars.sync_running || scalars.psyq_bound != psyq_bound || scalars.psyq_queue_bound != psyq_queue_bound || (psyq_bound && memcmp(&scalars.psyq_binding, &psyq_binding, sizeof(psyq_binding))) || (psyq_queue_bound && memcmp(&scalars.psyq_queue_binding, &psyq_queue_binding, sizeof(psyq_queue_binding))))
+        if (!gpu_state_block(f, &scalars, sizeof(scalars), 1) || !gpu_scanout_validate(&scalars.scanout) || scalars.scanout_fraction >= 1000000u || scalars.native_disp_cached > 1u || scalars.sync_running || scalars.psyq_bound != psyq_bound || scalars.psyq_queue_bound != psyq_queue_bound || (psyq_bound && memcmp(&scalars.psyq_binding, &psyq_binding, sizeof(psyq_binding))) || (psyq_queue_bound && memcmp(&scalars.psyq_queue_binding, &psyq_queue_binding, sizeof(psyq_queue_binding))))
             return 0;
+        native_scanout = scalars.scanout;
+        scanout_fraction = scalars.scanout_fraction;
+        native_disp_cache = scalars.native_disp_cache;
+        native_disp_cached = scalars.native_disp_cached;
+        scanout_clock_started = 0u;
         move_image_packet = scalars.move_image_packet;
         clear_image_packet = scalars.clear_image_packet;
         clear_image_dimensions = scalars.clear_image_dimensions;
@@ -2839,6 +3000,10 @@ int gpu_state_io(FILE *f, int load)
     }
     if (native_dma_range_count || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)
         return 0;
+    scalars.scanout = native_scanout;
+    scalars.scanout_fraction = scanout_fraction;
+    scalars.native_disp_cache = native_disp_cache;
+    scalars.native_disp_cached = native_disp_cached;
     scalars.move_image_packet = move_image_packet;
     scalars.clear_image_packet = clear_image_packet;
     scalars.clear_image_dimensions = clear_image_dimensions;

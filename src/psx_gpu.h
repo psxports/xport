@@ -37,6 +37,18 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     sint32 gpu_bind_sync(uint32 queue_head, uint32 queue_tail, GpuSyncSample sample, GpuSyncStep pump, GpuSyncStep wait, void *context, uint32 budget);
     sint32 gpu_sync_failed(void);
 
+    typedef struct GpuScanoutState
+    {
+        uint32 mode, disp_y, start_y, end_y;
+        uint32 line, tick, field, disp_field;
+    } GpuScanoutState;
+
+    void gpu_scanout_reset(GpuScanoutState *state);
+    void gpu_scanout_command(GpuScanoutState *state, uint32 command);
+    sint32 gpu_scanout_validate(const GpuScanoutState *state);
+    sint32 gpu_scanout_advance(GpuScanoutState *state, uint64 ticks);
+    sint32 gpu_scanout_ode(const GpuScanoutState *state);
+
     typedef struct GpuPsyqTimeout
     {
         uint32 vblank_counter;

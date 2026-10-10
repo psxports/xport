@@ -5366,6 +5366,25 @@ sint32 readPSX(sint32 descriptor, void *destination, uint32 length)
     return -1;
 }
 
+sint32 writePSX(sint32 fd, const void *src, uint32 length)
+{
+    (void)fd;
+    (void)src;
+    (void)length;
+    // No BIOS file descriptor is available without a card medium
+    return -1;
+}
+
+sint32 erase(const char *path)
+{
+    if (!path)
+        return 0;
+    if (strncmp(path, "bu00:", 5u) == 0 || strncmp(path, "bu10:", 5u) == 0)
+        return 0;
+    fprintf(stderr, "Unsupported native BIOS file device: %s\n", path);
+    abort();
+}
+
 sint32 closePSX(sint32 descriptor)
 {
     (void)descriptor;

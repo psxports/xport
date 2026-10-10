@@ -7,6 +7,13 @@
 #include "xport.h"
 #include "psx_press.h"
 
+/* Represent recovered MIPS BREAK instructions without a callable SDK symbol */
+#if defined(_MSC_VER)
+    #define trap(code) ((void)(code), __debugbreak())
+#else
+    #define trap(code) ((void)(code), __builtin_trap())
+#endif
+
 #if defined(__cplusplus)
 extern "C"
 {
@@ -48,7 +55,9 @@ extern "C"
     void psx_pad_bind_main_mode_commands(uint32 send_target, uint32 receive_target);
     sint32 openPSX(const char *path, uint32 mode);
     sint32 readPSX(sint32 descriptor, void *destination, uint32 length);
+    sint32 writePSX(sint32 fd, const void *src, uint32 length);
     sint32 closePSX(sint32 descriptor);
+    sint32 erase(const char *path);
 
     void gte_write_h(uint16 h);
     uint16 gte_read_h(void);
@@ -1580,6 +1589,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 GetRCnt(uint32 counter);
         uint16 GetTPage(sint32 depth, sint32 abr, sint32 x, sint32 y);
         sint32 GetGraphType(void);
+        sint32 GetODE(void);
         void InitGeom(void);
         sint32 Lzc(sint32 value);
         void xport_gte_write_data(uint32 register_index, uint32 value);
