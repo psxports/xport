@@ -12,7 +12,12 @@ extern "C"
         sint16 dct[64];
     } DECDCTENV;
 
+#ifndef MDEC_CUSTOM
+    #define MDEC_CUSTOM 0
+#endif
+#if MDEC_CUSTOM
     typedef uint16 DECDCTTAB[34816];
+#endif
     typedef void (*DecDCTCallback)(void);
     void DecDCTReset(sint32 mode);
     DECDCTENV *DecDCTGetEnv(DECDCTENV *env);
@@ -27,10 +32,14 @@ extern "C"
     /* Advance native decoder clocks and deliver completed DMA callbacks */
     void mdec_psyq_pump(uint32 ticks);
     sint32 DecDCTvlc(uint32 *bs, uint32 *buf);
+#if MDEC_CUSTOM
     sint32 DecDCTvlc2(uint32 *bs, uint32 *buf, DECDCTTAB table);
+#endif
     sint32 DecDCTvlcSize(sint32 size);
+#if MDEC_CUSTOM
     sint32 DecDCTvlcSize2(sint32 size);
     void DecDCTvlcBuild(uint16 *table);
+#endif
 #ifdef __cplusplus
 }
 #endif

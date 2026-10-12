@@ -347,6 +347,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 psx_irq_pending(const PsxIrqState *state);
         sint32 psx_irq_line(PsxIrqState *state, uint32 irq, uint32 high);
         sint32 psx_irq_write(PsxIrqState *state, uint32 offset, uint32 value);
+        uint16 psx_irq_native_mask_exchange(uint16 mask);
+        sint32 psx_irq_native_acknowledge(uint32 sources);
         sint32 psx_dma_validate(const PsxDmaState *state, const PsxIrqState *irq);
         sint32 psx_dma_write_interrupt(PsxDmaState *state, PsxIrqState *irq, uint32 value);
         sint32 psx_dma_complete(PsxDmaState *state, PsxIrqState *irq, uint32 channel);
@@ -630,784 +632,188 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint8 pad1;
     } DISPENV;
 
+    typedef union
+    {
+        uint32 rgbc;
+
+        struct
+        {
+            uint8 r, g, b, code;
+        };
+    } RGBC;
+
     typedef struct
     {
         uint32 addr : 24;
         uint32 len : 8;
-        uint8 r0;
-        uint8 g0;
-        uint8 b0;
-        uint8 code;
+        RGBC rgbc;
     } P_TAG;
+
+    // Packed GPU coordinate word
+    typedef union
+    {
+        uint32 xy;
+
+        struct
+        {
+            sint16 x, y;
+        };
+    } XY;
+
+    typedef struct
+    {
+        RGBC rgbc;
+        XY xy;
+    } POINT_C;
+
+    typedef union
+    {
+        uint16 uv;
+
+        struct
+        {
+            uint8 u, v;
+        };
+    } UV;
+
+    typedef struct
+    {
+        XY xy;
+        UV uv;
+        uint16 attr;
+    } POINT_T;
+
+    typedef struct
+    {
+        RGBC rgbc;
+        XY xy;
+        UV uv;
+        uint16 attr;
+    } POINT_CT;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
+        RGBC rgbc;
+        XY p[3];
     } POLY_F3;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x3, y3;
-            };
-
-            uint32 xy3;
-        };
+        RGBC rgbc;
+        XY p[4];
     } POLY_F4;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u0, v0;
-            };
-
-            uint16 uv0;
-        };
-
-        uint16 clut;
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u1, v1;
-            };
-
-            uint16 uv1;
-        };
-
-        uint16 tpage;
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u2, v2;
-            };
-
-            uint16 uv2;
-        };
-
-        uint16 pad1;
+        RGBC rgbc;
+        POINT_T p[3];
     } POLY_FT3;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u0, v0;
-            };
-
-            uint16 uv0;
-        };
-
-        uint16 clut;
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u1, v1;
-            };
-
-            uint16 uv1;
-        };
-
-        uint16 tpage;
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u2, v2;
-            };
-
-            uint16 uv2;
-        };
-
-        uint16 pad1;
-
-        union
-        {
-            struct
-            {
-                sint16 x3, y3;
-            };
-
-            uint32 xy3;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u3, v3;
-            };
-
-            uint16 uv3;
-        };
-
-        uint16 pad2;
+        RGBC rgbc;
+        POINT_T p[4];
     } POLY_FT4;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 r1, g1, b1, pad1;
-            };
-
-            uint32 color1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 r2, g2, b2, pad2;
-            };
-
-            uint32 color2;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
+        POINT_C p[3];
     } POLY_G3;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 r1, g1, b1, pad1;
-            };
-
-            uint32 color1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 r2, g2, b2, pad2;
-            };
-
-            uint32 color2;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 r3, g3, b3, pad3;
-            };
-
-            uint32 color3;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x3, y3;
-            };
-
-            uint32 xy3;
-        };
+        POINT_C p[4];
     } POLY_G4;
 
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0;
-        uint8 r1, g1, b1, pad1;
-        sint16 x1, y1;
+        RGBC rgbc;
+        XY p[2];
+    } LINE_F2;
+
+    typedef struct
+    {
+        uint32 tag;
+        POINT_C p[2];
     } LINE_G2;
 
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0, x1, y1;
-    } LINE_F2;
-
-    // PsyQ three-vertex flat polyline with a DMA terminator
-    typedef struct
-    {
-        uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0, x1, y1, x2, y2;
+        RGBC rgbc;
+        XY p[3];
         uint32 pad;
     } LINE_F3;
 
-    // PsyQ four-vertex flat polyline with a DMA terminator
     typedef struct
     {
         uint32 tag;
+        POINT_C p[3];
+        uint32 pad;
+    } LINE_G3;
 
-        union
-        {
-            uint32 color0;
-
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-        };
-
-        union
-        {
-            uint32 xy0;
-
-            struct
-            {
-                sint16 x0, y0;
-            };
-        };
-
-        union
-        {
-            uint32 xy1;
-
-            struct
-            {
-                sint16 x1, y1;
-            };
-        };
-
-        union
-        {
-            uint32 xy2;
-
-            struct
-            {
-                sint16 x2, y2;
-            };
-        };
-
-        union
-        {
-            uint32 xy3;
-
-            struct
-            {
-                sint16 x3, y3;
-            };
-        };
-
+    typedef struct
+    {
+        uint32 tag;
+        RGBC rgbc;
+        XY p[4];
         uint32 pad;
     } LINE_F4;
 
     typedef struct
     {
         uint32 tag;
+        POINT_C p[4];
+        uint32 pad;
+    } LINE_G4;
 
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
+    typedef struct
+    {
+        uint32 tag;
+        RGBC rgbc;
+        XY p[5];
+        uint32 pad;
+    } LINE_F5;
 
-            uint32 color0;
-        };
+    typedef struct
+    {
+        uint32 tag;
+        POINT_C p[5];
+        uint32 pad;
+    } LINE_G5;
 
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u0, v0;
-            };
-
-            uint16 uv0;
-        };
-
-        uint16 clut;
-
-        union
-        {
-            struct
-            {
-                uint8 r1, g1, b1, p1;
-            };
-
-            uint32 color1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u1, v1;
-            };
-
-            uint16 uv1;
-        };
-
-        uint16 tpage;
-
-        union
-        {
-            struct
-            {
-                uint8 r2, g2, b2, p2;
-            };
-
-            uint32 color2;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u2, v2;
-            };
-
-            uint16 uv2;
-        };
-
-        uint16 pad2;
+    typedef struct
+    {
+        uint32 tag;
+        POINT_CT p[3];
     } POLY_GT3;
 
     typedef struct
     {
         uint32 tag;
-
-        union
-        {
-            struct
-            {
-                uint8 r0, g0, b0, code;
-            };
-
-            uint32 color0;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x0, y0;
-            };
-
-            uint32 xy0;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u0, v0;
-            };
-
-            uint16 uv0;
-        };
-
-        uint16 clut;
-
-        union
-        {
-            struct
-            {
-                uint8 r1, g1, b1, p1;
-            };
-
-            uint32 color1;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x1, y1;
-            };
-
-            uint32 xy1;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u1, v1;
-            };
-
-            uint16 uv1;
-        };
-
-        uint16 tpage;
-
-        union
-        {
-            struct
-            {
-                uint8 r2, g2, b2, p2;
-            };
-
-            uint32 color2;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x2, y2;
-            };
-
-            uint32 xy2;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u2, v2;
-            };
-
-            uint16 uv2;
-        };
-
-        uint16 pad2;
-
-        union
-        {
-            struct
-            {
-                uint8 r3, g3, b3, p3;
-            };
-
-            uint32 color3;
-        };
-
-        union
-        {
-            struct
-            {
-                sint16 x3, y3;
-            };
-
-            uint32 xy3;
-        };
-
-        union
-        {
-            struct
-            {
-                uint8 u3, v3;
-            };
-
-            uint16 uv3;
-        };
-
-        uint16 pad3;
+        POINT_CT p[4];
     } POLY_GT4;
 
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0;
-        uint8 u0, v0;
-        uint16 clut;
+        RGBC rgbc;
+        POINT_T p[1];
         sint16 w, h;
     } SPRT;
 
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0;
-        uint8 u0, v0;
-        uint16 clut;
+        RGBC rgbc;
+        POINT_T p[1];
     } SPRT_16;
 
     typedef SPRT_16 SPRT_8;
@@ -1415,16 +821,16 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0;
+        RGBC rgbc;
+        XY p[1];
         sint16 w, h;
     } TILE;
 
     typedef struct
     {
         uint32 tag;
-        uint8 r0, g0, b0, code;
-        sint16 x0, y0;
+        RGBC rgbc;
+        XY p[1];
     } TILE_16;
 
     typedef TILE_16 TILE_8;
@@ -1463,24 +869,24 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
 #define setVector(vector, _x, _y, _z) (xport_store_le16(&(vector)->vx, (uint16)(_x)), xport_store_le16(&(vector)->vy, (uint16)(_y)), xport_store_le16(&(vector)->vz, (uint16)(_z)))
 #define setRECT(rect, _x, _y, width, height) (xport_store_le16(&(rect)->x, (uint16)(_x)), xport_store_le16(&(rect)->y, (uint16)(_y)), xport_store_le16(&(rect)->w, (uint16)(width)), xport_store_le16(&(rect)->h, (uint16)(height)))
-#define setRGB0(packet, red, green, blue) (xport_store_u8(&(packet)->r0, (red)), xport_store_u8(&(packet)->g0, (green)), xport_store_u8(&(packet)->b0, (blue)))
-#define setRGB1(packet, red, green, blue) (xport_store_u8(&(packet)->r1, (red)), xport_store_u8(&(packet)->g1, (green)), xport_store_u8(&(packet)->b1, (blue)))
-#define setRGB2(packet, red, green, blue) (xport_store_u8(&(packet)->r2, (red)), xport_store_u8(&(packet)->g2, (green)), xport_store_u8(&(packet)->b2, (blue)))
-#define setRGB3(packet, red, green, blue) (xport_store_u8(&(packet)->r3, (red)), xport_store_u8(&(packet)->g3, (green)), xport_store_u8(&(packet)->b3, (blue)))
-#define setXY0(packet, _x, _y) (xport_store_le16(&(packet)->x0, (uint16)(_x)), xport_store_le16(&(packet)->y0, (uint16)(_y)))
-#define setXY2(packet, _x0, _y0, _x1, _y1) (setXY0(packet, _x0, _y0), xport_store_le16(&(packet)->x1, (uint16)(_x1)), xport_store_le16(&(packet)->y1, (uint16)(_y1)))
-#define setXY3(packet, _x0, _y0, _x1, _y1, _x2, _y2) (setXY2(packet, _x0, _y0, _x1, _y1), xport_store_le16(&(packet)->x2, (uint16)(_x2)), xport_store_le16(&(packet)->y2, (uint16)(_y2)))
-#define setXY4(packet, _x0, _y0, _x1, _y1, _x2, _y2, _x3, _y3) (setXY3(packet, _x0, _y0, _x1, _y1, _x2, _y2), xport_store_le16(&(packet)->x3, (uint16)(_x3)), xport_store_le16(&(packet)->y3, (uint16)(_y3)))
+#define setRGB0(packet, red, green, blue) (xport_store_u8((uint8 *)(packet) + 4u, (red)), xport_store_u8((uint8 *)(packet) + 4u + 1u, (green)), xport_store_u8((uint8 *)(packet) + 4u + 2u, (blue)))
+#define setRGB1(packet, red, green, blue) (xport_store_u8(&(packet)->p[1].rgbc.r, (red)), xport_store_u8(&(packet)->p[1].rgbc.g, (green)), xport_store_u8(&(packet)->p[1].rgbc.b, (blue)))
+#define setRGB2(packet, red, green, blue) (xport_store_u8(&(packet)->p[2].rgbc.r, (red)), xport_store_u8(&(packet)->p[2].rgbc.g, (green)), xport_store_u8(&(packet)->p[2].rgbc.b, (blue)))
+#define setRGB3(packet, red, green, blue) (xport_store_u8(&(packet)->p[3].rgbc.r, (red)), xport_store_u8(&(packet)->p[3].rgbc.g, (green)), xport_store_u8(&(packet)->p[3].rgbc.b, (blue)))
+#define setXY0(packet, _x0, _y0) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)))
+#define setXY2(packet, _x0, _y0, _x1, _y1) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)))
+#define setXY3(packet, _x0, _y0, _x1, _y1, _x2, _y2) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])), (uint16)(_x2)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])) + 2u, (uint16)(_y2)))
+#define setXY4(packet, _x0, _y0, _x1, _y1, _x2, _y2, _x3, _y3) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])), (uint16)(_x2)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])) + 2u, (uint16)(_y2)), xport_store_le16((uint8 *)(packet) + (8u + 3u * sizeof((packet)->p[0])), (uint16)(_x3)), xport_store_le16((uint8 *)(packet) + (8u + 3u * sizeof((packet)->p[0])) + 2u, (uint16)(_y3)))
 #define setWH(packet, width, height) (xport_store_le16(&(packet)->w, (uint16)(width)), xport_store_le16(&(packet)->h, (uint16)(height)))
-#define setUV0(packet, _u, _v) (xport_store_u8(&(packet)->u0, (_u)), xport_store_u8(&(packet)->v0, (_v)))
-#define setUV3(packet, _u0, _v0, _u1, _v1, _u2, _v2) (setUV0(packet, _u0, _v0), xport_store_u8(&(packet)->u1, (_u1)), xport_store_u8(&(packet)->v1, (_v1)), xport_store_u8(&(packet)->u2, (_u2)), xport_store_u8(&(packet)->v2, (_v2)))
-#define setUV4(packet, _u0, _v0, _u1, _v1, _u2, _v2, _u3, _v3) (setUV3(packet, _u0, _v0, _u1, _v1, _u2, _v2), xport_store_u8(&(packet)->u3, (_u3)), xport_store_u8(&(packet)->v3, (_v3)))
+#define setUV0(packet, _u0, _v0) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)))
+#define setUV3(packet, _u0, _v0, _u1, _v1, _u2, _v2) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)))
+#define setUV4(packet, _u0, _v0, _u1, _v1, _u2, _v2, _u3, _v3) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)), xport_store_u8(&(packet)->p[3].uv.u, (_u3)), xport_store_u8(&(packet)->p[3].uv.v, (_v3)))
 #define setlen(packet, length) xport_store_u8((uint8 *)(packet) + 3u, (length))
 #define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | ((uint32)(intptr)(address) & 0x00ffffffu))
-#define setcode(packet, command) xport_store_u8(&((P_TAG *)(packet))->code, (command))
+#define setcode(packet, command) xport_store_u8(&((P_TAG *)(packet))->rgbc.code, (command))
 #define getlen(packet) xport_load_u8((const uint8 *)(packet) + 3u)
 #define getaddr(packet) (xport_load_le32(packet) & 0x00ffffffu)
-#define getcode(packet) xport_load_u8(&((P_TAG *)(packet))->code)
+#define getcode(packet) xport_load_u8(&((P_TAG *)(packet))->rgbc.code)
 #define nextPrim(packet) ((void *)(intptr)(getaddr(packet) | 0x80000000UL))
 #define isendprim(packet) (getaddr(packet) == 0xffffffUL)
 #define addPrim(ot, packet) (setaddr(packet, getaddr(ot)), setaddr(ot, packet))
@@ -1490,13 +896,22 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #define setShadeTex(packet, raw_texture) ((raw_texture) ? setcode(packet, getcode(packet) | 1) : setcode(packet, getcode(packet) & ~1))
 #define getTPage(depth, abr, x, y) ((((depth) & 3) << 7) | (((abr) & 3) << 5) | (((y) & 0x100) >> 4) | (((x) & 0x3ff) >> 6) | (((y) & 0x200) << 2))
 #define getClut(x, y) (((y) << 6) | (((x) >> 4) & 0x3f))
-#define setTPage(packet, depth, abr, x, y) xport_store_le16(&(packet)->tpage, getTPage(depth, abr, x, y))
-#define setClut(packet, x, y) xport_store_le16(&(packet)->clut, getClut(x, y))
+#define setTPage(packet, depth, abr, x, y) xport_store_le16(&(packet)->p[1].attr, getTPage(depth, abr, x, y))
+#define setClut(packet, x, y) xport_store_le16(&(packet)->p[0].attr, getClut(x, y))
 #define psx_draw_mode(dfe, dtd, tpage) (0xe1000000UL | ((dtd) ? 0x0200UL : 0) | ((dfe) ? 0x0400UL : 0) | ((tpage) & 0x9ff))
 #define psx_texture_window(texture_window) ((texture_window) ? (0xe2000000UL | (((texture_window)->y & 0xff) >> 3 << 15) | (((texture_window)->x & 0xff) >> 3 << 10) | ((~((texture_window)->h - 1) & 0xff) >> 3 << 5) | ((~((texture_window)->w - 1) & 0xff) >> 3)) : 0)
 #define setDrawMode1(packet, dfe, dtd, tpage) (setlen(packet, 1), xport_store_le32((uint32 *)(packet) + 1, psx_draw_mode(dfe, dtd, tpage)))
 #define setDrawMode(packet, dfe, dtd, tpage, texture_window) (setlen(packet, 2), xport_store_le32((uint32 *)(packet) + 1, psx_draw_mode(dfe, dtd, tpage)), xport_store_le32((uint32 *)(packet) + 2, psx_texture_window((PSX_RECT *)(texture_window))))
 #define setTexWindow(packet, texture_window) (setlen(packet, 2), xport_store_le32((uint32 *)(packet) + 1, psx_texture_window((PSX_RECT *)(texture_window))), xport_store_le32((uint32 *)(packet) + 2, 0))
+#define setLineF2(line) (setlen(line, 3), setcode(line, 0x40))
+#define setLineG2(line) (setlen(line, 4), setcode(line, 0x50))
+#define setLineF3(line) (setlen(line, 5), setcode(line, 0x48), (line)->pad = 0x55555555u)
+#define setLineG3(line) (setlen(line, 7), setcode(line, 0x58), (line)->pad = 0x55555555u, (line)->p[2].rgbc.code = 0)
+#define setLineF4(line) (setlen(line, 6), setcode(line, 0x4c), (line)->pad = 0x55555555u)
+#define setLineG4(line) (setlen(line, 9), setcode(line, 0x5c), (line)->pad = 0x55555555u, (line)->p[2].rgbc.code = 0, (line)->p[3].rgbc.code = 0)
+#define setLineF5(line) (setlen(line, 7), setcode(line, 0x4c), (line)->pad = 0x55555555u)
+#define setLineG5(line) (setlen(line, 11), setcode(line, 0x5c), (line)->pad = 0x55555555u, (line)->p[2].rgbc.code = 0, (line)->p[3].rgbc.code = 0, (line)->p[4].rgbc.code = 0)
+
 #define setPolyF3(packet) (setlen(packet, 4), setcode(packet, 0x20))
 #define setPolyFT3(packet) (setlen(packet, 7), setcode(packet, 0x24))
 #define setPolyG3(packet) (setlen(packet, 6), setcode(packet, 0x30))
@@ -1556,12 +971,14 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 SetDrawMovePSX(uint32 destination, uint32 rectangle, uint32 x, uint32 y);
         void SetDrawMove(DR_MOVE *packet, PSX_RECT *rectangle, sint32 x, sint32 y);
         uint32 xport_guest_call3(uint32 target, uint32 argument0, uint32 argument1, uint32 argument2);
+        uint32 xport_guest_call_known_registers(uint32 target, uint32 *registers, uint32 known_register_mask);
         uint32 *ClearOTagR(uint32 *ot, sint32 count);
         sint32 ccos(sint32 a);
         sint32 csin(sint32 a);
         sint32 rcos(sint32 a);
         sint32 rsin(sint32 a);
         uint32 SquareRoot0(sint32 input);
+        uint32 SquareRoot0PSX(uint32 input, uint32 table_address);
 
         typedef struct
         {
@@ -1571,6 +988,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
         void gte_bind_gs_light_matrices(MATRIX *directions, MATRIX *colors);
         sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light);
+        uint32 GsSortOtPSX(uint32 source_ot, uint32 destination_ot);
         void rsincos(sint32 angle, sint32 *sine, sint32 *cosine);
         sint32 ratan2(sint32 y, sint32 x);
         sint32 DrawSync(sint32 mode);
@@ -1579,6 +997,20 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 *ClearOTagRNativePSX(uint32 *ot, sint32 count, uint32 header_address, uint32 header_target);
         uint32 *ClearOTagRPSX(uint32 *ot, sint32 count, uint32 header_address, uint32 header_target, uint32 guest_ot);
         uint32 DrawOTagPSX(uint32 guest_ot);
+        uint32 DrawPrimPSX(uint32 primitive, uint32 driver_slot, uint32 guest_gp, uint32 guest_entry);
+        uint32 xport_gpu_guest_dispatch(uint32 target, uint32 *registers, uint32 known_register_mask);
+        uint32 SYS_OBJ_172CPSX(uint32 x, uint32 y, uint32 extent);
+        uint32 SYS_OBJ_17C4PSX(uint32 x, uint32 y, uint32 extent);
+        uint32 SYS_OBJ_185CPSX(uint32 x, uint32 y);
+        uint32 SYS_OBJ_170CPSX(uint32 dfe, uint32 dtd, uint32 tpage);
+        uint32 SYS_OBJ_1878PSX(uint32 rectangle);
+        uint32 SYS_OBJ_149CPSX(uint32 packet, uint32 environment, uint32 extent);
+        uint32 PutDrawEnvPSX(uint32 environment, uint32 state, uint32 debug_format, uint32 guest_gp, uint32 guest_entry, uint32 (*copy_guest)(uint32 destination, uint32 source, uint32 bytes));
+        uint32 xport_sdk_texture_frame_acquire(size_t bytes);
+        void xport_sdk_texture_frame_release(uint32 address, size_t bytes);
+        uint32 xport_sdk_draw_env_frame_acquire(size_t bytes);
+        void xport_sdk_draw_env_frame_release(uint32 address, size_t bytes);
+
         MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination);
         uint32 xport_gpu_draw_otag_guest_result(uint32 guest_ot);
         void xport_gpu_clear_otag_r_guest_driver(uint32 guest_ot, uint32 count);
@@ -1589,6 +1021,11 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 GetRCnt(uint32 counter);
         uint16 GetTPage(sint32 depth, sint32 abr, sint32 x, sint32 y);
         sint32 GetGraphType(void);
+        void FntLoad(sint32 x, sint32 y);
+        sint32 FntOpen(sint32 x, sint32 y, sint32 w, sint32 h, sint32 bg, sint32 n);
+        void SetDumpFnt(sint32 id);
+        sint32 FntPrint(const char *fmt, ...);
+        uint32 *FntFlush(sint32 id);
         sint32 GetODE(void);
         void InitGeom(void);
         sint32 Lzc(sint32 value);
@@ -1602,6 +1039,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void xport_gte_execute(uint32 command);
         void xport_gte_write_unavailable_data(uint32 register_index, uint32 value);
         void xport_gte_complete_rtpt(void);
+        uint32 xport_guest_call_known_registers_post_sdk(uint32 target, uint32 *registers, uint32 known_register_mask);
         uint32 xport_guest_nonlocal_transfer(uint32 owner_entry, uint32 source_pc, uint32 target, uint32 known_gpr_mask, const uint32 *known_gpr_values);
         sint32 LoadImagePSX(PSX_RECT *rectangle, uint32 *pixels);
         uint16 LoadClut(uint32 *pixels, sint32 x, sint32 y);
@@ -1721,9 +1159,28 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 StoreImage(PSX_RECT *rectangle, uint32 *pixels);
         MATRIX *TransposeMatrix(MATRIX *source, MATRIX *destination);
         DISPENV *PutDispEnv(DISPENV *environment);
+        uint32 PutDispEnvPSX(uint32 environment, uint32 debug_level_address, uint32 debug_callback_address, uint32 debug_format_address, uint32 driver_table_address, uint32 cache_address, uint32 reverse_flag_address, uint32 divisors_address, uint32 ranges_address, uint32 guest_gp, uint32 guest_entry, sint32 (*get_video_mode)(void), uint32 (*copy_bytes)(uint32 destination, uint32 source, uint32 bytes));
         PsxInterruptCallback DrawSyncCallback(PsxInterruptCallback callback);
         DRAWENV *PutDrawEnv(DRAWENV *environment);
         void SsEnd(void);
+
+        typedef struct SndVolume2
+        {
+            sint16 left;
+            sint16 right;
+        } SndVolume2;
+
+        typedef struct SndRegisterAttr
+        {
+            SndVolume2 volume;
+            sint16 pitch;
+            sint16 mask;
+            sint16 addr;
+            sint16 adsr1;
+            sint16 adsr2;
+        } SndRegisterAttr;
+
+        void SsQueueRegisters(sint32 voice, SndRegisterAttr *attributes);
         void SsInit(void);
         void SsQuit(void);
         void SsSetMVol(sint16 left, sint16 right);
@@ -1735,6 +1192,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void xport_libsnd_bind_voice_volume(uint32 volume_address, uint32 flags_address);
         void xport_libsnd_bind_sequence_table(uint32 table_address);
         uint32 _SsSeqPlay(sint16 sequence, sint16 separation);
+        uint32 SsChannelMute(sint16 sequence, sint16 separation, uint16 mask);
         void xport_libsnd_bind_sequence_handlers(uint32 table_address);
         void spu_sequence_tables(uint32 *sequences, uint32 *handlers);
         uint32 _SsGetSeqData(sint16 sequence, sint16 separation);
@@ -1745,6 +1203,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 _SsNoteOn(sint16 sequence, sint16 separation, uint8 note, uint8 velocity);
         uint32 _SsVmKeyOn(sint16 identity, sint16 bank, sint16 program, uint16 note, uint16 velocity, uint16 volume);
         uint32 _SsVmKeyOff(sint16 identity, sint16 bank, sint16 program, uint16 note);
+        uint32 SsVoKeyOff(uint32 voice_program, uint32 note_volume);
         sint32 _SsVmVSetUp(uint16 bank, sint16 program);
         uint32 _SsVmSelectToneAndVag(uint8 *tones, uint8 *vags);
         uint32 _SsVmAlloc(void);
@@ -1758,6 +1217,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 _SsReadDeltaValue(sint16 sequence, sint16 separation);
         uint32 _SsSeqGetEof(sint16 sequence, sint16 separation, uint32 event);
         sint32 SsUtSetDetVVol(uint16 voice, sint16 left, sint16 right);
+        sint32 SsVoiceCheck(uint32 voice, sint32 bank_program, sint16 note);
         uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 right);
         sint16 SsUtKeyOnV(sint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right);
         sint16 SsVabOpenHead(uint8 *header, sint16 requested_bank);
@@ -1779,6 +1239,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void srandPSX(uint32 seed);
         sint32 CdGetToc2(sint32 mode, CdlLOC *toc);
         PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback);
+        PsxInterruptCallback psx_dma_callback_native(uint32 channel);
         sint32 CD_cw(uint8 command, const uint8 *parameter, uint8 *result, uint32 asynchronous);
         sint32 CD_sync(sint32 mode, uint8 *result);
         sint32 CdSync(sint32 mode, uint8 *result);
@@ -1876,6 +1337,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #endif
         sint32 xport_psx_exe_load(const PSX_EXE *executable);
         sint32 xport_cd_file_size(uint32 guest_path, const char *root, size_t *size);
+        sint32 xport_cd_file_size_native(const char *src, const char *root, size_t *size);
+        sint32 xport_cd_file_read_native(const char *src, const char *root, void *dst, size_t cap, size_t *size);
         sint32 xport_cd_file_read(uint32 guest_path, const char *root, uint32 destination, size_t capacity, size_t *size);
 #if defined(__cplusplus)
     }

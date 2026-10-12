@@ -236,7 +236,7 @@ def validate_delegated_sources(root, packet, proposal, shared_root, changes):
             validate_stub_body(bridge_body, entry)
             lines = bridge_source.splitlines()
             if row["source_line"] > len(lines) or _code(lines[row["source_line"] - 1]).strip() != "abort();":
-                raise ValueError("SDK delegated mapping must identify its unconditional abort line")
+                raise ValueError("SDK delegated mapping must identify its unconditional abort line: " + row["symbol"] + " at " + str(row["source_line"]) + " actual " + repr(lines[row["source_line"] - 1] if row["source_line"] <= len(lines) else "<outside source>"))
             groups = [g for g in audit.get("machine_coverage") or [] if set(g.get("check_ids") or []) & set(row["check_ids"])]
             mapped = [c for g in groups for c in g.get("check_ids") or [] if c in row["check_ids"]]
             if len(mapped) != len(row["check_ids"]) or set(mapped) != set(row["check_ids"]):

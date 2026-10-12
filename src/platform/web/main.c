@@ -15,7 +15,7 @@ enum
 
 static sint32 platform_headless;
 static sint32 platform_quit;
-static uint32 platform_pad_buttons;
+static uint32 platform_pad_buttons[2];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
@@ -23,8 +23,6 @@ static uint64 platform_frame_deadline;
 static sint32 audio_active;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
-static sint32 platform_argc;
-static char *platform_argv[64];
 static uint32 audio_output_accumulator;
 static sint16 audio_input[XPORT_AUDIO_INPUT_FRAMES * 2];
 static float audio_output[XPORT_AUDIO_OUTPUT_FRAMES * 2];
@@ -46,13 +44,16 @@ extern "C"
 }
 
 // clang-format off
-EM_JS(uint32, xport_gamepad_buttons, (), {
+EM_JS(uint32, xport_gamepad_buttons, (sint32 player), {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const pressed = (pad, index) => index < pad.buttons.length && (pad.buttons[index].pressed || pad.buttons[index].value > 0.5);
     let buttons = 0;
+    let controller = 0;
     for (const pad of pads)
     {
         if (!pad || !pad.connected)
+            continue;
+        if (controller++ !== player)
             continue;
         if (pad.axes.length > 1)
         {
@@ -137,15 +138,49 @@ EM_JS(void, xport_error, (const char *title, const char *message), {
     console.error(text);
 });
 
-static uint32 key_to_pad(const char *code)
+static uint32 key_to_pad(sint32 controller, const char *code)
 {
-    if (!strcmp(code, "ArrowUp") || !strcmp(code, "KeyW"))
+    if (controller == 1)
+    {
+        if (!strcmp(code, "ArrowUp"))
+            return PADLup;
+        if (!strcmp(code, "ArrowDown"))
+            return PADLdown;
+        if (!strcmp(code, "ArrowLeft"))
+            return PADLleft;
+        if (!strcmp(code, "ArrowRight"))
+            return PADLright;
+        if (!strcmp(code, "Numpad5"))
+            return PADRup;
+        if (!strcmp(code, "Numpad1"))
+            return PADRleft;
+        if (!strcmp(code, "Numpad2"))
+            return PADRdown;
+        if (!strcmp(code, "Numpad3"))
+            return PADRright;
+        if (!strcmp(code, "Numpad7"))
+            return PADL2;
+        if (!strcmp(code, "Numpad4"))
+            return PADL1;
+        if (!strcmp(code, "Numpad9"))
+            return PADR2;
+        if (!strcmp(code, "Numpad6"))
+            return PADR1;
+        if (!strcmp(code, "NumpadEnter"))
+            return PADstart;
+        if (!strcmp(code, "NumpadAdd"))
+            return PADselect;
+        return 0;
+    }
+    if (controller != 0)
+        return 0;
+    if (!strcmp(code, "KeyW"))
         return PADLup;
-    if (!strcmp(code, "ArrowDown") || !strcmp(code, "KeyS"))
+    if (!strcmp(code, "KeyS"))
         return PADLdown;
-    if (!strcmp(code, "ArrowLeft") || !strcmp(code, "KeyA"))
+    if (!strcmp(code, "KeyA"))
         return PADLleft;
-    if (!strcmp(code, "ArrowRight") || !strcmp(code, "KeyD"))
+    if (!strcmp(code, "KeyD"))
         return PADLright;
     if (!strcmp(code, "KeyI"))
         return PADRup;
@@ -172,15 +207,20 @@ static uint32 key_to_pad(const char *code)
 
 static EM_BOOL key_event(sint32 type, const EmscriptenKeyboardEvent *event, void *user)
 {
-    uint32 button = key_to_pad(event->code);
+    EM_BOOL handled = EM_FALSE;
     (void)user;
-    if (!button)
-        return EM_FALSE;
-    if (type == EMSCRIPTEN_EVENT_KEYDOWN)
-        platform_pad_buttons |= button;
-    else
-        platform_pad_buttons &= ~button;
-    return EM_TRUE;
+    for (sint32 controller = 0; controller < 2; ++controller)
+    {
+        uint32 button = key_to_pad(controller, event->code);
+        if (!button)
+            continue;
+        handled = EM_TRUE;
+        if (type == EMSCRIPTEN_EVENT_KEYDOWN)
+            platform_pad_buttons[controller] |= button;
+        else
+            platform_pad_buttons[controller] &= ~button;
+    }
+    return handled;
 }
 
 static EM_BOOL blur_event(sint32 type, const EmscriptenFocusEvent *event, void *user)
@@ -188,7 +228,7 @@ static EM_BOOL blur_event(sint32 type, const EmscriptenFocusEvent *event, void *
     (void)type;
     (void)event;
     (void)user;
-    platform_pad_buttons = 0;
+    memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     return EM_FALSE;
 }
 
@@ -213,7 +253,7 @@ void xport_timer_wait_frame(uint32 refresh_rate)
 
 sint32 xport_input_init(void)
 {
-    platform_pad_buttons = 0;
+    memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
@@ -231,11 +271,11 @@ sint32 xport_poll(void)
 
 EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
 {
-    if (controller != 0)
+    if (controller < 0 || controller >= 2)
         return 0;
-    if (platform_pad_override)
+    if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    return platform_pad_buttons | platform_touch_buttons | xport_gamepad_buttons();
+    return platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0) | xport_gamepad_buttons(controller);
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)
@@ -276,16 +316,6 @@ void xport_set_headless(sint32 headless)
 RUN_MODE xport_run_mode(void)
 {
     return platform_run_mode;
-}
-
-sint32 xport_arg_count(void)
-{
-    return platform_argc;
-}
-
-char **xport_arg_values(void)
-{
-    return platform_argv;
 }
 
 void xport_set_exit_code(sint32 code)
@@ -332,12 +362,14 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     uint32 output_rate;
     uint32 index;
     uint32 peak = 0;
+    spu_dispatch_pending_irq();
     if (!audio_active || !rate)
         return;
     input_frames = (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate);
     if (!input_frames || input_frames > XPORT_AUDIO_INPUT_FRAMES)
         return;
     spu_render(audio_input, input_frames);
+    spu_dispatch_pending_irq();
     output_rate = xport_audio_rate();
     audio_output_accumulator += output_rate;
     output_frames = audio_output_accumulator / rate;
@@ -437,20 +469,10 @@ void xport_shutdown(void)
 int main(int argc, char **argv)
 {
     int result;
-    int index;
+    (void)argc;
+    (void)argv;
 
     platform_run_mode = RUN_MODE_GAME;
-    platform_argc = 1;
-    platform_argv[0] = argv[0];
-    for (index = 1; index < argc; ++index)
-    {
-        if (!strcmp(argv[index], "--collect"))
-            continue;
-        if (platform_argc + 1 >= (sint32)(sizeof(platform_argv) / sizeof(platform_argv[0])))
-            return 64;
-        platform_argv[platform_argc++] = argv[index];
-    }
-    platform_argv[platform_argc] = NULL;
     platform_exit_code = 0;
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
     xport_input_init();

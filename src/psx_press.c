@@ -1,4 +1,5 @@
 #include "psx_press.h"
+#include "psx.h"
 #include "psx_mdec.h"
 #include <string.h>
 #include <stdlib.h>
@@ -13,7 +14,6 @@ static uint32 input_snapshot[65535];
 static uint32 input_pos, input_left;
 static uint32 *output;
 static uint32 output_left;
-static DecDCTCallback input_callback, output_callback;
 static uint32 initialized, input_busy, output_busy, input_pending, output_pending;
 static uint32 input_masked, output_masked;
 
@@ -141,7 +141,7 @@ void mdec_psyq_pump(uint32 ticks)
         /* Mask only the matching completion callback while allowing the opposite DMA to progress */
         if (input_pending && !input_masked)
         {
-            DecDCTCallback callback = input_callback;
+            DecDCTCallback callback = psx_dma_callback_native(0u);
             input_pending = 0;
             if (callback)
             {
@@ -153,7 +153,7 @@ void mdec_psyq_pump(uint32 ticks)
         }
         if (output_pending && !output_masked)
         {
-            DecDCTCallback callback = output_callback;
+            DecDCTCallback callback = psx_dma_callback_native(1u);
             output_pending = 0;
             if (callback)
             {
@@ -235,14 +235,10 @@ void DecDCTout(uint32 *buf, sint32 size)
 
 DecDCTCallback DecDCTinCallback(DecDCTCallback callback)
 {
-    DecDCTCallback prior = input_callback;
-    input_callback = callback;
-    return prior;
+    return DMACallback(0u, callback);
 }
 
 DecDCTCallback DecDCToutCallback(DecDCTCallback callback)
 {
-    DecDCTCallback prior = output_callback;
-    output_callback = callback;
-    return prior;
+    return DMACallback(1u, callback);
 }

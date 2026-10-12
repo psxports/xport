@@ -13,6 +13,7 @@ XPORT_SOURCES := \
 	$(XPORT_WEB_DIR)/main.c \
 	$(XPORT_ROOT)/src/psx.c \
 	$(XPORT_ROOT)/src/psx_gpu.c \
+	$(XPORT_ROOT)/src/psx_font.c \
 	$(XPORT_ROOT)/src/psx_spu.c \
 	$(XPORT_ROOT)/src/psx_xa.c \
 	$(XPORT_ROOT)/src/psx_mdec.c \

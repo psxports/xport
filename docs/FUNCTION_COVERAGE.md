@@ -37,6 +37,6 @@ Use the low-level `function_coverage start --image IMAGE --name NAME [--role ROL
 
 ## Explicit status-limited recording
 
-Only when the user requests a partial recording, add `--status TODO` (or `WIP`, `DONE`, `SKIP`) to the start command. The default still registers every image function. The filter reads the configured analysis database in read-only mode, binds statuses to the exact image/address/original SHA-256 and rejects stale or missing identities. It does not modify accepted exports or implementation statuses. The 2048 registered-target limit remains unchanged; selected counts outside 1..2048 fail before launch.
+Only when the user requests a partial recording, add `--status TODO` (or `WIP`, `DONE`, `SKIP`) to the start command. The default still registers every image function. The filter reads the configured analysis database in read-only mode, binds statuses to the exact image/address/original SHA-256 and rejects stale or missing identities. It does not modify accepted exports or implementation statuses. The registered-target limit is 8192; selected counts outside 1..8192 fail before launch. Function coverage has independent capacity; the call-tracker boundary-target limit is unchanged.
 
 The receipt records `target_filter.status`, the database path/hash and `full_image_coverage: false`. Such a recording proves execution only within the selected status snapshot and cannot establish full-image or full-game coverage. Stop preserves the selected run's first-entry order and receipt metadata.

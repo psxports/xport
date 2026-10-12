@@ -4,7 +4,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 
 ## Mandatory rules
 
-- Never create, edit, move, delete or regenerate any file named `README.md` in xport or a consuming project
+- Startup may create a new consuming project `README.md` once from `tools/templates/project/README.md.in`; refuse an existing README before initialization. Otherwise never create, edit, move, delete or regenerate any file named `README.md` in xport or a consuming project
 - Keep xport-owned Markdown documentation in `[XPORT_ROOT]/docs`; `AGENTS.md`, `CHANGELOG.md` and the immutable root `README.md` are the only root exceptions
 - Write documentation for agents: use explicit commands, inputs, outputs, invariants, failure conditions and terminal conditions; remove narrative, duplication, optional wording and contradictory rules
 - Put reusable tools in `tools`, the shared PSX/PsyQ host runtime in `src`, and game facts, adapters, generated artifacts and evidence in the consuming project
@@ -13,6 +13,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - Preserve unrelated work, original inputs, third-party licenses, upstream identities and source hashes
 - Treat original MIPS bytes as semantic authority. Use IDA pseudocode as a structural baseline only when it exists and is complete. Missing or partial pseudocode is normal: record `pseudocode_complete: false` and `pseudocode_used_as_baseline: false`, then audit the complete MIPS
 - During converge, reject hacks: no frame, time, address, input, value or observed-case compensation; no difference masking, event suppression or reproducer special case; edit only required audited functions whose complete original evidence proves the replacement
+- Start native refactoring only on explicit user request after explicit user confirmation of full main-functionality coverage; refactored code is outside converge acceptance. Follow [docs/REFACTORING.md](docs/REFACTORING.md); never initiate this transition during translation, coverage or converge
 - Write brief code comments, start them with a capital letter and omit the final period
 
 ## Task router
@@ -24,6 +25,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - `coverage NAME`: read [docs/COVERAGE.md](docs/COVERAGE.md); default to native-first saved C, integration and a bounded playable scenario; preserve existing translations and proof history, use three workers, and separate draft progress from proof counts. Use strict audit gates only for an explicitly requested strict deliverable
 - `converge NAME`: create an active goal, then read [docs/CONVERGENCE.md](docs/CONVERGENCE.md); keep the same supervisor alive and under event-driven observation until full-record `MATCH`, required user input or an explicit user stop; mark the goal complete only after verified `MATCH`
 - Manual translation or repair of decompiled C: read [docs/DECOMPILATION.md](docs/DECOMPILATION.md)
+- User-initiated native/readability refactoring after confirmed full main-functionality coverage: read [docs/REFACTORING.md](docs/REFACTORING.md); verify its entry gate before planning or changing the state model
 - Lockstep protocols and repair artifacts: read [docs/LOCKSTEP.md](docs/LOCKSTEP.md)
 - Device evidence: read [docs/DEVICE_PROVENANCE.md](docs/DEVICE_PROVENANCE.md)
 - DuckStation deployment and provenance: read [docs/DUCKSTATION.md](docs/DUCKSTATION.md) and [docs/DUCKSTATION_SOURCES.md](docs/DUCKSTATION_SOURCES.md)
@@ -31,3 +33,8 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - Web builds and packaging: read [docs/WEB.md](docs/WEB.md)
 
 Read only the documents routed by the current task. Do not preload old chats, complete logs, unrelated evidence or the whole documentation tree.
+# Build policy for coverage and converge
+
+- Run Debug builds only while `coverage` or `converge` is in progress
+- Do not run Release builds for batches, retries, or intermediate corrections
+- Run one Release build after the task is complete as its final verification, or when the user explicitly requests Release

@@ -110,8 +110,7 @@ extern "C"
     sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byte_mask);
     void xport_message_error(const char *title, const char *message);
     RUN_MODE xport_run_mode(void);
-    sint32 xport_arg_count(void);
-    char **xport_arg_values(void);
+
     void xport_set_exit_code(sint32 code);
 
     extern GDB_DATA volatile uint32 g_xport_audio_submitted_buffers;
@@ -123,11 +122,22 @@ extern "C"
 
     /* Required link-time services implemented by every game */
     void xport_main(void);
-    extern const uint32 xport_gpu_graph_type_address;
-    extern const uint32 xport_cd_sync_callback_address;
-    extern const uint32 xport_cd_ready_callback_address;
-    extern const uint32 xport_cd_status_address;
-    extern const uint32 xport_cd_setloc_table_address;
+    // Native builds need no guest GPU/CD address bindings
+#if defined(XPORT_NATIVE_GPU_CD)
+    #define xport_gpu_graph_type_address 0u
+    #define xport_cd_sync_callback_address 0u
+    #define xport_cd_ready_callback_address 0u
+    #define xport_cd_status_address 0u
+    #define xport_cd_setloc_table_address 0u
+#else
+// Zero selects the native standard GPU, nonzero selects a guest PsyQ byte
+extern const uint32 xport_gpu_graph_type_address;
+// Native CD consumers define all four bindings as zero and use typed callbacks
+extern const uint32 xport_cd_sync_callback_address;
+extern const uint32 xport_cd_ready_callback_address;
+extern const uint32 xport_cd_status_address;
+extern const uint32 xport_cd_setloc_table_address;
+#endif
     uint32 xport_libsnd_sequence_call(uint32 target, uint32 argc, const uint32 *arguments);
     void xport_function_marker(const char *image, uint32 address, const char *function, const char *file, uint32 line, uintptr_t host_return_address, uint32 channels);
 
@@ -157,6 +167,10 @@ extern "C"
 #else
     #define XPORT_FUNCTION_LOCKSTEP_CHANNEL 0u
 #endif
-#define FUNCTION_MARKER(address, image) xport_function_marker((image), (uint32)(address), __func__, __FILE__, __LINE__, XPORT_FUNCTION_RETURN_ADDRESS(), XPORT_FUNCTION_AUDIT_CHANNEL | XPORT_FUNCTION_LOCKSTEP_CHANNEL)
+#if defined(XPORT_DISABLE_FUNCTION_MARKERS)
+    #define FUNCTION_MARKER(address, image) ((void)0)
+#else
+    #define FUNCTION_MARKER(address, image) xport_function_marker((image), (uint32)(address), __func__, __FILE__, __LINE__, XPORT_FUNCTION_RETURN_ADDRESS(), XPORT_FUNCTION_AUDIT_CHANNEL | XPORT_FUNCTION_LOCKSTEP_CHANNEL)
+#endif
 
 #endif

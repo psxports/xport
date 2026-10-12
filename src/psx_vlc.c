@@ -1,5 +1,4 @@
 #include "psx_press.h"
-#include <string.h>
 #include "psx_vlc_table.inc"
 
 typedef struct VlcState
@@ -16,8 +15,54 @@ typedef struct VlcDecoder
     uint32 limit;
 } VlcDecoder;
 
-static VlcDecoder default_decoder = {{0}, NULL, 0xFFFFFFFFu};
-static VlcDecoder table_decoder = {{0}, NULL, 0xFFFFFFFFu};
+static VlcDecoder default_decoder = {{NULL, NULL, 0, 0, 0, 0, {0, 0, 0}}, NULL, 0xFFFFFFFFu};
+#if MDEC_CUSTOM
+static VlcDecoder table_decoder = {{NULL, NULL, 0, 0, 0, 0, {0, 0, 0}}, NULL, 0xFFFFFFFFu};
+#endif
+
+static uint32 vlc_ac_token(uint32 bits)
+{
+    uint32 zeros = 0, shift, index, coefficient, length;
+    if (bits & 0x80000000u)
+        return bits & 0x40000000u ? ((bits & 0x20000000u ? 0x03FFu : 1u) << 16) | 3u : 0xFE000002u;
+    while (zeros < 17u && !(bits & (0x80000000u >> zeros)))
+        ++zeros;
+    if (zeros == 5u)
+        return 0x7C1F0006u;
+    if (zeros > 11u)
+        return 0u;
+    shift = zeros < 6u ? 1u : zeros < 9u ? 6u : 9u;
+    index = vlc_ac_lookup[(shift == 1u ? 0u : shift == 6u ? 256u : 512u) + ((bits >> (24u - shift)) & 255u)];
+    if (index == 255u)
+        return 0u;
+    coefficient = vlc_ac[index].coefficient;
+    length = vlc_ac[index].length;
+    if (bits & (1u << (32u - length)))
+        coefficient = (coefficient & 0xFC00u) | ((0u - coefficient) & 0x03FFu);
+    return (coefficient << 16) | length;
+}
+
+/* Preserve the SDK batching and bit consumption at continuation boundaries */
+static uint32 vlc_ac_entry(uint32 bits, uint32 *additional)
+{
+    uint32 first = 0, used = 0, token, coefficient, i;
+    *additional = 0;
+    for (i = 0; i < 3u; ++i)
+    {
+        token = vlc_ac_token(bits << used);
+        if (!token || used + (token & 255u) > 13u)
+            break;
+        used += token & 255u;
+        coefficient = token >> 16;
+        if (!i)
+            first = token & 0xFFFF0000u;
+        else
+            *additional |= coefficient << ((i - 1u) * 16u);
+        if (coefficient == 0xFE00u || coefficient == 0x7C1Fu)
+            break;
+    }
+    return first | used;
+}
 
 static uint16 vlc_read16(const void *pointer)
 {
@@ -65,9 +110,13 @@ static int vlc_decode(VlcDecoder *decoder, const uint32 *source, uint32 *destina
 {
     VlcState state;
     uint16 *chunk_limit;
-    const uint16 *table_base = table + 1024u;
-    uint32 first_code, additional, coefficient, count, index;
+#if MDEC_CUSTOM
+    const uint16 *table_base = table ? table + 1024u : NULL;
     const uint16 *dc_table;
+#else
+    (void)table;
+#endif
+    uint32 first_code, additional, coefficient, count, index;
     uint32 dc_prefix, dc_width, delta, leading, header;
     if (source)
     {
@@ -90,15 +139,32 @@ static int vlc_decode(VlcDecoder *decoder, const uint32 *source, uint32 *destina
     chunk_limit = decoder->limit == 0xFFFFFFFFu ? NULL : state.output + decoder->limit;
 
 decode_ac:
-    index = 4u * (state.bits >> 19);
-    first_code = vlc_read32(table_base + index);
-    if (first_code)
-        additional = vlc_read32(table_base + index + 2u);
-    else
+#if MDEC_CUSTOM
+    if (table)
     {
-        vlc_consume(&state, 8u);
-        first_code = vlc_read32(table_base + 32768u + 2u * (state.bits >> 23));
-        additional = 0u;
+        index = 4u * (state.bits >> 19);
+        first_code = vlc_read32(table_base + index);
+        if (first_code)
+            additional = vlc_read32(table_base + index + 2u);
+        else
+        {
+            vlc_consume(&state, 8u);
+            first_code = vlc_read32(table_base + 32768u + 2u * (state.bits >> 23));
+            additional = 0u;
+        }
+    }
+    else
+#endif
+    {
+        first_code = vlc_ac_entry(state.bits, &additional);
+        if (!first_code)
+        {
+            first_code = vlc_ac_token(state.bits);
+            vlc_consume(&state, 8u);
+            if (first_code)
+                first_code -= 8u;
+            additional = 0u;
+        }
     }
     vlc_consume(&state, first_code & 255u);
     coefficient = first_code >> 16;
@@ -144,10 +210,21 @@ decode_dc:
         goto finished;
     if (state.block)
     {
-        dc_table = table_base - (state.block >= 3u ? 1024u : 512u);
-        index = 2u * (state.bits >> 24);
-        dc_prefix = vlc_read16(dc_table + index);
-        dc_width = vlc_read16(dc_table + index + 1u);
+#if MDEC_CUSTOM
+        if (table)
+        {
+            dc_table = table_base - (state.block >= 3u ? 1024u : 512u);
+            index = 2u * (state.bits >> 24);
+            dc_prefix = vlc_read16(dc_table + index);
+            dc_width = vlc_read16(dc_table + index + 1u);
+        }
+        else
+#endif
+        {
+            index = (state.block >= 3u ? 0u : 256u) + (state.bits >> 24);
+            dc_prefix = vlc_dc[index] >> 4;
+            dc_width = vlc_dc[index] & 15u;
+        }
         state.bits <<= dc_prefix & 31u;
         delta = 0u;
         count = state.consumed;
@@ -202,13 +279,15 @@ finished:
 
 int DecDCTvlc(uint32 *bs, uint32 *buf)
 {
-    return vlc_decode(&default_decoder, bs, buf, psyq_vlc_table);
+    return vlc_decode(&default_decoder, bs, buf, NULL);
 }
 
+#if MDEC_CUSTOM
 int DecDCTvlc2(uint32 *bs, uint32 *buf, DECDCTTAB table)
 {
     return vlc_decode(&table_decoder, bs, buf, table);
 }
+#endif
 
 static int vlc_set_size(VlcDecoder *decoder, int size)
 {
@@ -222,6 +301,7 @@ int DecDCTvlcSize(int size)
     return vlc_set_size(&default_decoder, size);
 }
 
+#if MDEC_CUSTOM
 int DecDCTvlcSize2(int size)
 {
     return vlc_set_size(&table_decoder, size);
@@ -229,5 +309,24 @@ int DecDCTvlcSize2(int size)
 
 void DecDCTvlcBuild(uint16 *table)
 {
-    memcpy(table, psyq_vlc_table, sizeof(psyq_vlc_table));
+    uint32 index, first, additional;
+    for (index = 0; index < 512u; ++index)
+    {
+        vlc_write16(table + index * 2u, vlc_dc[index] >> 4);
+        vlc_write16(table + index * 2u + 1u, vlc_dc[index] & 15u);
+    }
+    for (index = 0; index < 8192u; ++index)
+    {
+        first = vlc_ac_entry(index << 19, &additional);
+        vlc_write32(table + 1024u + index * 4u, first);
+        vlc_write32(table + 1026u + index * 4u, additional);
+    }
+    for (index = 0; index < 512u; ++index)
+    {
+        first = vlc_ac_token(index << 15);
+        if (first)
+            first -= 8u;
+        vlc_write32(table + 33792u + index * 2u, first);
+    }
 }
+#endif

@@ -11,7 +11,10 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-source-index-v7'
+PARSER_VERSION='c-cpp-source-index-v9'
+CODE_EXTENSIONS=('.c','.cpp')
+HEADER_EXTENSIONS=('.h','.hpp')
+SOURCE_EXTENSIONS=CODE_EXTENSIONS+HEADER_EXTENSIONS
 IDENT=re.compile(r'\b[A-Za-z_]\w*\b')
 CONTROL={'if','for','while','switch','sizeof','return'}
 KEYWORDS={'auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','restrict','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','_Bool','_Atomic','_Complex'}
@@ -28,7 +31,7 @@ def source_inventory(root):
     shared=Path(__file__).resolve().parents[1]/'src'
     roots=[root/'src']
     if shared.resolve()!=(root/'src').resolve():roots.append(shared)
-    paths={path.resolve() for source_root in roots for path in source_root.rglob('*') if path.is_file() and path.suffix.lower() in ('.c','.h')}
+    paths={path.resolve() for source_root in roots for path in source_root.rglob('*') if path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS}
     return sorted(paths,key=lambda path:source_relative(root,path))
 
 
@@ -62,6 +65,16 @@ def mask_c(text):
             for j,ch in enumerate(line):
                 if ch not in '\r\n':out[offset+j]=' '
         offset+=len(line)
+    masked=''.join(out)
+    # Linkage blocks are transparent to free-function and declaration indexing
+    for match in re.finditer(r'\bextern\s+"C"\s*\{',text):
+        if masked[match.start():match.start()+6]!='extern':continue
+        opening=match.end()-1
+        closing=matching(masked,opening)
+        if closing is None:continue
+        for offset in range(match.start(),match.end()):
+            if out[offset]!='\n':out[offset]=' '
+        out[closing]=' '
     return ''.join(out)
 
 
@@ -98,11 +111,23 @@ def functions(text,path):
             open_paren=backward_paren(masked,close_paren) if trim and masked[close_paren]==')' else None
             name_match=re.search(r'([A-Za-z_]\w*)\s*$',masked[statement:open_paren] if open_paren is not None else '')
             is_function=bool(name_match and name_match.group(1) not in CONTROL and '=' not in masked[statement:open_paren])
+            # Qualified out-of-class methods include constructors with initializer lists
+            qualified=list(re.finditer(r'((?:[A-Za-z_]\w*::)+~?[A-Za-z_]\w*)\s*\(',prefix))
+            qualified_name=None
+            for candidate in qualified:
+                opening=statement+candidate.end()-1
+                closing=matching(masked,opening,'(',')')
+                suffix=masked[closing+1:i].strip()
+                if not suffix or suffix in ('const','noexcept','const noexcept') or suffix.startswith(':'):
+                    qualified_name=candidate.group(1)
+                    break
+            if qualified_name:
+                is_function=True
             end=matching(masked,i)
             if is_function:
                 start=statement
                 while start<i and masked[start].isspace():start+=1
-                name=name_match.group(1);body=text[start:end+1]
+                name=qualified_name or name_match.group(1);body=text[start:end+1]
                 markers=[(int(a,16),image) for a,image in re.findall(r'\b(?:FF_)?FUNCTION_MARKER(?:_ARGS)?\b\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
                 prefix=text[max(0,start-512):start]
                 original_match=re.search(r'/\*\s*Original:\s*([A-Za-z_]\w*?_([0-9A-Fa-f]{8}))\.\s*\*/\s*$',prefix,re.S)
@@ -198,6 +223,9 @@ def include_closure(root,relative,texts):
 def select_implementation(entry,candidates):
     address=entry['address'];image=entry['image']
     exact=[f for f in candidates if (address,image) in f['markers']];basis='marker';multiple=False
+    if len(exact)>1 and entry.get('semantic_name'):
+        named=[f for f in exact if f['name']==entry['semantic_name'] and f['markers']==[(address,image)]]
+        if len(named)==1:return named[0],'mapped','ledger_semantic_name_and_marker'
     if not exact and entry.get('original_name'):
         exact=[f for f in candidates if (entry['original_name'],address) in f.get('originals',[])];basis='original_comment'
     if not exact and entry.get('semantic_name'):
@@ -235,8 +263,8 @@ def populate(db,root,ledger):
     for source in paths:
         rel=source_relative(root,source);raw=source.read_bytes();text=raw.decode('utf-8-sig')
         texts[rel]=text;db.execute('INSERT INTO source_files VALUES(?,?,?,?)',(rel,sha(raw),len(raw),PARSER_VERSION))
-        parsed[rel]=functions(text,rel) if source.suffix.lower()=='.c' else []
-        decls.extend(declarations(text,rel,source.suffix.lower()=='.h'))
+        parsed[rel]=functions(text,rel) if source.suffix.lower() in CODE_EXTENSIONS else []
+        decls.extend(declarations(text,rel,source.suffix.lower() in HEADER_EXTENSIONS))
     declaration_ids=defaultdict(list)
     for item in decls:
         cur=db.execute('INSERT INTO source_declarations(path,name,kind,start_offset,end_offset,start_line,end_line,sha256) VALUES(?,?,?,?,?,?,?,?)',
@@ -291,7 +319,7 @@ def incremental_source_refresh(db,root,ledger,changed):
     texts={source_relative(root,p):p.read_text(encoding='utf-8-sig') for p in source_inventory(root)}
     affected=set();changed_headers=set()
     for relative in changed:
-        path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower()=='.h'
+        path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower() in HEADER_EXTENSIONS
         parsed=[] if is_header else functions(text,relative)
         if is_header:changed_headers.add(relative)
         declaration_ids=[r[0] for r in db.execute('SELECT id FROM source_declarations WHERE path=?',(relative,))]
@@ -408,7 +436,7 @@ def find_formatter():
 
 
 def format_sources(root,relative_paths):
-    paths=sorted(set(path for path in relative_paths if path.lower().endswith(('.c','.h')) and (root/path).is_file()))
+    paths=sorted(set(path for path in relative_paths if path.lower().endswith(SOURCE_EXTENSIONS) and (root/path).is_file()))
     style=Path(__file__).resolve().parents[1]/'src/.clang-format'
     if not style.is_file():raise ValueError('Shared clang-format style is missing: '+str(style))
     if not paths:return dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha(style.read_bytes()))
@@ -450,7 +478,7 @@ def rebuild(format_changed=True):
         mapping_changes=set(indexed_mappings)^set(ledger_mappings)
         mapping_changes.update(key for key in set(indexed_mappings)&set(ledger_mappings) if indexed_mappings[key]!=ledger_mappings[key])
         changed=sorted(set(changed)|{ledger_mappings[key] for key in mapping_changes if key in ledger_mappings}) if isinstance(changed,list) else changed
-        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and set(indexed_mappings)==set(ledger_mappings) and all(path.lower().endswith(('.c','.h')) for path in changed)
+        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and set(indexed_mappings)==set(ledger_mappings) and all(path.lower().endswith(SOURCE_EXTENSIONS) for path in changed)
         if can_increment:
             removed=set(indexed_mappings)-set(ledger_mappings)
             for image,address in removed:

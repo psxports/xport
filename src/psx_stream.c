@@ -101,7 +101,7 @@ void StSetStream(uint32 mode, uint32 start_frame, uint32 end_frame, void (*func1
     stream.mode = mode & 1u;
     stream.start = start_frame;
     stream.end = end_frame;
-    stream.mask = start_frame != 0;
+    stream.mask = 1;
     stream.channel = stream.next_channel = 0;
     stream.complete = func1;
     stream.limit = func2;
@@ -140,7 +140,7 @@ void StUnSetRing(void)
 void StSetMask(uint32 mask, uint32 start, uint32 end)
 {
     stream_drop_partial();
-    stream.mask = mask != 0;
+    stream.mask = mask;
     stream.start = start;
     stream.end = end;
     stream.ended = 0;
@@ -176,9 +176,9 @@ sint32 stream_feed_sector(const uint8 sector[2048], const CdlLOC *location)
     frame = stream_u32(sector + 8);
     if (!chunks || part >= chunks || chunks >= stream.count)
         return -1;
-    if (stream.mask)
+    if (stream.mask == 1u && stream.start)
     {
-        if (!stream.start || frame != stream.start)
+        if (stream_u16(sector + 8) != stream.start)
             return 0;
         stream.mask = 0;
     }
@@ -271,7 +271,7 @@ sint32 stream_pump(void)
     uint8 raw[2352];
     CdlLOC location;
     sint32 result;
-    if (stream.pumping || !stream.configured || !stream.count || stream.ended || (stream.mask && !stream.start))
+    if (stream.pumping || !stream.configured || !stream.count || stream.ended)
         return 0;
     stream.pumping = 1;
     if (stream.emulate)

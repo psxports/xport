@@ -1,6 +1,6 @@
 #ifndef XPORT_PSX_GPU_H
 #define XPORT_PSX_GPU_H
-#include "xport.h"
+#include "psx.h"
 #define GPU_VRAM_WIDTH 1024
 #define GPU_VRAM_HEIGHT 512
 
@@ -14,6 +14,18 @@ extern "C"
 #else
 extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
 #endif
+    typedef struct GpuTimImage
+    {
+        uint32 mode;
+        PSX_RECT pixels;
+        const uint8 *pixel_data;
+        PSX_RECT clut;
+        const uint8 *clut_data;
+    } GpuTimImage;
+
+    // Decode the TIM body starting at its mode word
+    sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image);
+
     typedef void (*GpuTransferObserver)(void *context, uint32 operation, uint32 guest_address, const uint32 *words, uint32 count);
     void gpu_set_transfer_observer(GpuTransferObserver observer, void *context);
     sint32 gpu_transfer_observation_failed(void);

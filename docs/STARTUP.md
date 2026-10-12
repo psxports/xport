@@ -80,19 +80,38 @@ The remaining sections define startup evidence and project layout. Read `DECOMPI
 
 Before running any initializer, require both the human-readable project name and an explicit short native name from the user. Never derive, abbreviate or silently normalize the short name. It must start with an ASCII letter, contain only ASCII letters, digits or underscores and be at most 16 characters. The exact value names `[SHORT].sln`, `[SHORT].vcxproj` and `[SHORT].exe`.
 
+Project README template:
+
+- `[XPORT_ROOT]/tools/templates/project/README.md.in` -> `[PROJECT_ROOT]/README.md`
+- Render the current template layout without project-specific markup changes: centered linked `cover.png`, project title, description, Play Game link and the `decomp`, `refactor`, `enhance`, `remaster` status rows
+- The public project/repository name is exactly `[FULL_NAME]-xport`; do not derive it from the root directory or append `(xport)`
+- Play Game is exactly `https://psxports.to/[SHORT_NAME]/`, preserving the supplied short name
+- Use `@@FULL_NAME@@`, `@@PROJECT_NAME@@`, `@@REPOSITORY@@` and `@@SHORT_NAME@@`; HTML-escape displayed names and URL-encode repository/path values
+- Refuse missing templates, missing/unknown tokens and an existing root `README.md` before writing scaffold files; never regenerate an existing README on retry or completion refresh
+- The cover link expects a project-owned root `cover.png`; startup does not fabricate or copy another game's cover
+- Progress images use `https://psxports.pages.dev/progress?repo=[FULL_NAME]-xport&label=STAGE`; labels are `decomp`, `refactor`, `enhance`, `remaster`
+
+Mandatory Windows templates:
+
+- `[XPORT_ROOT]/src/platform/win/xport.vcxproj` -> `[PROJECT_ROOT]/src/platform/win/[SHORT].vcxproj`
+- `[XPORT_ROOT]/src/platform/win/xport.sln` -> `[PROJECT_ROOT]/src/platform/win/[SHORT].sln`
+
+The agent must use both canonical templates through `startup.py`; it renders them with `@@PROJECT_GUID@@`, `@@SHORT_NAME@@`, `@@FULL_NAME@@` and `@@SHARED_SOURCE@@`. Use one new project GUID in both files, the exact user-supplied short name, an XML-escaped full name and the relative shared-source path. Never author these files from scratch or copy another game's project/solution. Preserve template Debug/Release compiler, linker and runtime settings, including Release `/O1`, `/Gw` and switchable xcrt. Fail startup if either template is missing or tokens remain unresolved; do not invent a substitute. After generation, verify that the solution refers to `[SHORT].vcxproj` with the same GUID and maps Debug/Release `x86` to project `Win32`.
+
 Run the single startup supervisor from the shared toolset. It allocates sibling-aware ports, creates the scaffold, runs diagnosis/build, and continues through all startup gates:
 
 ```powershell
 python -B [XPORT_ROOT]/tools/startup.py start --project [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
 ```
 
-Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 `Debug|Win32` C console skeleton. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=768` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`, creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
+Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 `Debug|Win32` and `Release|Win32` Windows GUI C skeleton. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=768` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`, creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
 
 Standard layout:
 
+- `README.md`: One-time render of the canonical project README template; preserve it after initialization
 - `.gitignore`: Exact copy of `[XPORT_ROOT]/tools/templates/project/.gitignore`; keep generated build, runtime, analysis, original-image and agent-state trees out of project history
 - `src/`: Platform-neutral C game implementation and `.h` declarations; preserve guest widths/addresses. The initializer creates `src/game_main.c` with the required game entry/bindings; game code includes the shared `[XPORT_ROOT]/src/xport.h` for the complete Xport contract, fixed-width types and `FUNCTION_MARKER` and must not create a project copy or auxiliary `xport_*.h` contract header.
-- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`; VS2022 v143 Debug x86, compiled as C. The solution platform is `x86` and maps to the vcxproj `Win32` platform; configured solution builds must pass `x86`. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
+- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`, rendered from the mandatory canonical templates above; VS2022 v143 Debug/Release x86, compiled as C. The solution platform is `x86` and maps to the vcxproj `Win32` platform; configured solution builds must pass `x86`. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
 - `bin/`: Native Working Directory. Debug x86 outputs exactly `bin/[SHORT]_debug.exe`. Release x86 outputs exactly `bin/[SHORT].exe`. Both files remain directly under `bin`; one configuration never overwrites the other.
   - `bin/DATA/`: Runtime game data extracted from the first, data track of the CD image.
   - `bin/MUSIC/`: Decimal-name IMA ADPCM WAV tracks generated from the CD audio tracks by `X convert_music`; never place them under `bin/DATA`.
@@ -248,3 +267,7 @@ TODO means no accepted implementation. Move to WIP only after the exact `(image,
 The public marker forwards the caller's image, address, function, file, line, host return address and enabled channel flags to `xport_function_marker` in shared `xport_trace.c`. Channel bits 1 and 2 preserve the caller translation unit's `XPORT_ENABLE_AUDIT` and `LOCKSTEP_DEBUG` choices even when shared source has different audit flags. The service emits those enabled events with the original caller identity; LockstepDebug requires the shared source to be built for that channel. The host return address is captured at the macro callsite, never inside the forwarding service. Both ordinary game translation units and trace-enabled units use the same public macro.
 
 Gate before recording: every configured executable entrypoint is WIP, DONE or reviewed SKIP; all other TODO functions and unresolved edges remain inventoried; the entrypoint implementation and evidence are reviewable; no semantics were invented; the source index, ledger and `status/progress.html` reflect reality. A successful native link and global TODO zero are later coverage milestones. Before every intermediate report run `X render_progress`; after changing importer inputs run `X build_database` first. Preserve legacy log encoding (ASCII additions if required).
+
+## Windows runtime template
+
+Keep `src/platform/win/xport.vcxproj` custom runtime configuration when generating projects. Debug|Win32 uses the normal CRT; Release|Win32 includes shared `platform/win/xcrt.c` by default. `/p:UseXcrt=false` restores the standard CRT in the same Release configuration. Runtime/file/format limits and Release linker settings: [LIBRARY.md](LIBRARY.md#windows-release-crt). Do not introduce local CRT replacements or new runtime configurations.

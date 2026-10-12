@@ -6,6 +6,26 @@ The shared `RotMatrix` implementation follows the packed PsyQ `rcossin_tbl` quad
 
 Perspective projection uses the PSX GTE UNR reciprocal approximation, including normalization, lookup quantization, two refinement steps and final saturation. Exact host integer division is not equivalent and can move projected coordinates even when matrices and vertices match.
 
+## Target language and naming
+
+Record the target language in the project's `AGENTS.md` before translation. Follow the language-specific [naming and structure rules](REFACTORING.md#naming-and-structure): C uses `lower_snake_case` functions and `UPPER_SNAKE_CASE` structure types; C++ uses `PascalCase` classes, structures, type aliases, free functions and methods, including `Effect10d::Effect10d()` and `Effect10d::ReadMasked()`. Variables, parameters and fields use `lower_snake_case` in both languages. C++ implementation files must use `.cpp`. Preserve required SDK/ABI names and linkage at mixed-language boundaries. Translate established object operations as owner methods; a `.cpp` rename alone does not fulfill object-oriented translation. These naming rules do not authorize changing the guest memory/observation contract or bypassing the refactoring entry gate.
+
+Record the selected C++ standard in the project's `AGENTS.md` and honor it throughout decompilation. A C++98 project uses classic `virtual` declarations, unscoped enums, `0` null pointers and explicit destructor bodies; do not introduce `override`, `enum class`, `nullptr`, defaulted functions or other later-language features. Preserve required SDK/ABI types and document necessary compiler extensions instead of silently upgrading the target standard.
+
+Use C++98 for game decompilation unless the user explicitly selects another standard. Do not silently raise the dialect for host convenience or modern formatting.
+
+C++ function and method signatures must occupy one physical line in declarations and definitions, including the complete parameter list. Do not wrap a signature to satisfy a line-length preference. Constructor initializer lists and function bodies may use separate lines.
+
+Default arguments are forbidden in decompiled C++ declarations and definitions. Pass every required argument explicitly at each callsite. When removing existing defaults, supply the same values explicitly and preserve overload selection and argument order. A pure virtual declaration ending in `= 0` is permitted: it is not a default argument.
+
+Before representing an original function as an instance method, record its receiver classification from complete original caller setup, object construction and table provenance. On MIPS, an object-like pointer in `$a0` alone does not establish an implicit `this`: an ordinary function uses the same first-argument register. Validate adjusted virtual-call receiver and target pairs when present; for nonvirtual candidates, establish independent owner/receiver evidence. If the distinction remains unresolved, emit a free function in the relevant module with an explicit pointer argument. Do not claim that absence from a virtual table proves an original free or static function. Identify newly written native view/adapter helpers separately from recovered original methods.
+
+## Numeric literal suffixes
+
+Do not use `u`, `l`, `ll`, their uppercase or combined forms, floating-point suffixes or other numeric literal suffixes without an explicit semantic need. Do not add them mechanically because an argument, field or result has a fixed-width type. Prefer `1`, `64` and `0x80010000` over redundant `1u`, `64u` and `0x80010000u`.
+
+A suffix is allowed only when omitting it changes the required literal range, expression type, wrapping arithmetic, shift width, precision, overload selection or SDK/ABI contract. For example, `1u << 31` requires unsigned arithmetic to avoid a signed left-shift overflow. Establish the need from the complete expression and the original MIPS, not just the destination type; record a non-obvious reason in a brief comment or the function audit. Respect the selected language standard when choosing suffixes. Before removing an existing suffix, audit integer promotions and intermediate operations; never trade faithful arithmetic for formatting.
+
 ## Mandatory function translation audit
 
 When complete IDA pseudocode exists, read it from its first through last line and use it as the structural baseline. A bounded excerpt, function prologue, inferred purpose, neighboring implementation or model summary is not a complete baseline. Missing, partial or unreadable pseudocode is a normal input state: set `pseudocode_complete: false` and `pseudocode_used_as_baseline: false`, then translate and audit from the complete MIPS listing. Pseudocode availability alone never accepts or rejects a function.

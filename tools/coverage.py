@@ -483,6 +483,8 @@ def load_state(name: str) -> tuple[Path, dict, dict, dict[str, Path]]:
     validate_indirect_state(root, project, state)
     from coverage_native_abi_frame import validate_native_abi_state
     validate_native_abi_state(root, state)
+    from coverage_v8_batch12_scopes import validate_state as validate_v8_scope_state
+    validate_v8_scope_state(root, state)
     return root, project, state, selected
 
 
@@ -573,6 +575,8 @@ def status(name: str) -> dict:
             "game_frame_delegation_count": state.get("game_frame_delegation_count", 0),
             "game_frame_delegations": state.get("game_frame_delegations", []),
             "native_abi_frame_count": state.get('native_abi_frame_count', 0),
+            "v8_batch12_scope_count": state.get('v8_batch12_scope_count', 0),
+            "v8_batch12_scopes": state.get('v8_batch12_scopes', []),
             "native_abi_frames": state.get('native_abi_frames', []),
             "absent_device_count": state.get("absent_device_count", 0),
             "absent_devices": state.get("absent_devices", []),
@@ -794,6 +798,10 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
         frame_delegation = authorized_frame_delegation(after.get("root"), packet, receipt, binding, audit)
         from coverage_native_abi_frame import authorized_native_abi_frame
         native_abi = authorized_native_abi_frame(after.get("root"), packet, receipt, binding, audit)
+        from coverage_v8_batch12_scopes import authorized_scope
+        v8_scope = authorized_scope(after.get("root"), packet, receipt, binding, audit)
+        if v8_scope is not None and key in sdk_keys:
+            raise ValueError("V8 game scope cannot waive an SDK dependency")
         if native_abi is not None and key in sdk_keys:
             raise ValueError("Native ABI scope cannot waive an SDK audit")
         if frame_delegation is not None and key in sdk_keys:
@@ -846,7 +854,7 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
         if (audit.get("complete_mips_audit") is not True or
                 audit.get("pseudocode_used_as_baseline") is not
                 binding.get("pseudocode_complete") or
-                (audit.get("unresolved_semantics") != [] and waiver is None and absent_waiver is None and delegation is None and frame_delegation is None and native_abi is None)):
+                (audit.get("unresolved_semantics") != [] and waiver is None and absent_waiver is None and delegation is None and frame_delegation is None and native_abi is None and v8_scope is None)):
             raise ValueError("Coverage audit is incomplete")
         expected = [item["id"] for item in context["machine_audit"]["checks"]]
         if native_abi is not None:
@@ -915,6 +923,11 @@ def validate_audit(packet_path: Path, after: dict, changed: set[str] | None) -> 
     if receipt.get('native_abi_frame_admissions', []) != native_admissions or type(receipt.get('native_abi_frame_count', 0)) is not int or receipt.get('native_abi_frame_count', 0) != len(native_admissions):
         raise ValueError('Native ABI receipt inventory or count differs from explicit scope')
     validate_native_abi_sources(after['root'], packet, receipt, {}, required)
+    from coverage_v8_batch12_scopes import validate_sources as validate_v8_sources, summary as v8_scope_summary
+    v8_admissions = v8_scope_summary(receipt)
+    if receipt.get('v8_batch12_scope_admissions', []) != v8_admissions or type(receipt.get('v8_batch12_scope_count', 0)) is not int or receipt.get('v8_batch12_scope_count', 0) != len(v8_admissions):
+        raise ValueError('V8 batch12 receipt scope inventory changed')
+    validate_v8_sources(after['root'], packet, receipt, {}, required)
     from coverage_game_frame_delegation import validate_frame_delegated_sources, frame_delegation_summary
     if receipt.get("game_frame_delegation_admissions", []) != frame_delegation_summary(receipt):
         raise ValueError("Guest-frame receipt inventory differs from its explicit scope")
@@ -999,6 +1012,26 @@ def release_build(root: Path) -> dict:
     return value
 
 
+def ledger_owner_candidates(root: Path, packet: dict, binding: dict) -> list:
+    context = packet.get('source_context') or {}
+    contexts = [context, *(context.get('audit_cluster') or [])]
+    owners = [c for c in contexts if (c.get('function', {}).get('image'), c.get('function', {}).get('address')) == (binding['image'], binding['address'])]
+    implementation = owners[0].get('implementation') or {} if len(owners) == 1 else {}
+    if implementation.get('complete') is True:
+        relative = Path(implementation.get('path') or '')
+        source = (root / relative).resolve()
+        if relative.parts[:1] != ('src',) or relative.suffix != '.c' or '..' in relative.parts or not source.is_relative_to((root / 'src').resolve()) or not source.is_file():
+            raise ValueError('Coverage ledger mapped owner escapes source scope')
+        return [f for f in indexed_functions(source.read_text(encoding='utf-8-sig'), relative.as_posix()) if f['name'] == implementation.get('symbol') and f['markers'] == [(binding['address'], binding['image'])]]
+    matches = []
+    for source in sorted((root / 'src').glob('*.c')):
+        relative = source.relative_to(root).as_posix()
+        for function in indexed_functions(source.read_text(encoding='utf-8-sig'), relative):
+            if (binding['address'], binding['image']) in function['markers']:
+                matches.append(function)
+    return matches
+
+
 def update_ledger(root: Path, packet_path: Path, packet: dict,
                   proposal: dict) -> bytes:
     ledger_path = root / "status" / "translation-ledger.json"
@@ -1017,13 +1050,7 @@ def update_ledger(root: Path, packet_path: Path, packet: dict,
         key = (binding["image"], binding["address"])
         entry = entries.get(key)
         if entry is None:
-            matches = []
-            for source in sorted((root / "src").glob("*.c")):
-                relative = source.relative_to(root).as_posix()
-                for function in indexed_functions(
-                        source.read_text(encoding="utf-8-sig"), relative):
-                    if (binding["address"], binding["image"]) in function["markers"]:
-                        matches.append(function)
+            matches = ledger_owner_candidates(root, packet, binding)
             if len(matches) != 1:
                 raise ValueError(
                     f"Coverage needs one source mapping for {key[0]}:{key[1]:08X}")
@@ -1042,13 +1069,7 @@ def update_ledger(root: Path, packet_path: Path, packet: dict,
         if entry.get("sha256") != binding["function_sha256"]:
             raise ValueError("Coverage ledger entry has stale original identity")
         if entry.get("link_only_stub") is True:
-            matches = []
-            for source in sorted((root / "src").glob("*.c")):
-                relative = source.relative_to(root).as_posix()
-                for function in indexed_functions(
-                        source.read_text(encoding="utf-8-sig"), relative):
-                    if (binding["address"], binding["image"]) in function["markers"]:
-                        matches.append(function)
+            matches = ledger_owner_candidates(root, packet, binding)
             if len(matches) != 1:
                 raise ValueError("Coverage did not replace the link-only stub exactly once")
             entry["source"] = matches[0]["path"]
@@ -1063,6 +1084,10 @@ def update_ledger(root: Path, packet_path: Path, packet: dict,
         entry["static_evidence"] = evidence
         audit = next((a for a in proposal.get("function_audits") or []
                       if (a.get("image"), a.get("address")) == key), {})
+        if audit.get('replacement_kind') == 'user_authorized_v8_batch12_scope':
+            entry['status'] = 'WIP'
+            for field in ('replacement_kind', 'original_equivalence', 'game_scope_authorization', 'game_scope_review', 'waived_original_effects', 'unresolved_semantics'):
+                entry[field] = audit[field]
         if audit.get('replacement_kind') == 'user_authorized_native_abi_frame':
             entry['status'] = 'WIP'
             for field in ('replacement_kind', 'original_equivalence', 'native_abi_authorization', 'waived_original_effects', 'unresolved_semantics'):
@@ -1209,9 +1234,22 @@ def apply(name: str, proposal_path: Path) -> dict:
                 finalize_and_accept,
                 root / _project["paths"]["native_solution"], **shared_options)
         else:
-            result = apply_proposal(root, SOURCE_ROOTS, packet_path, before, proposal,
+            from coverage_mapped_return_abi import validate_return_updates
+            return_shared = shared_source_root() if proposal.get('game_return_prototype_updates') or proposal.get('game_return_abi_audits') else None
+            return_updates = validate_return_updates(root, packet, proposal, return_shared)
+            from coverage_v8_incoming_v0 import validate_v0_updates
+            v0_updates = validate_v0_updates(root, packet, proposal)
+            from coverage_v8_batch12_scopes import validate_updates as validate_sp_ra_updates
+            sp_ra_updates = validate_sp_ra_updates(root, packet, proposal)
+            transaction_proposal = copy.deepcopy(proposal)
+            transaction_proposal['edits'].extend(return_updates)
+            transaction_proposal['edits'].extend(v0_updates)
+            transaction_proposal['edits'].extend(sp_ra_updates)
+            result = apply_proposal(root, SOURCE_ROOTS, packet_path, before, transaction_proposal,
                                     audit_validator=validator, **shared_options,
-                                    post_apply=finalize_and_accept)
+                                    post_apply=finalize_and_accept,
+                                    declaration_validator=lambda edit: edit in return_updates or edit in v0_updates or edit in sp_ra_updates,
+                                    sdk_solution=root / _project["paths"]["native_solution"])
     except BaseException as failure:
         receipt_path = packet_path.with_suffix(".audit.json")
         committed_source = bool(committed) and not getattr(failure, "_coverage_source_rollback_complete", False)
@@ -1252,7 +1290,7 @@ def prove(name: str, proposal_path: Path) -> dict:
         raise ValueError("Absent-device admission requires coverage apply and its supervisor transaction")
     if proposal.get("missing_stub_authorization"):
         raise ValueError("Missing stub admission requires coverage apply and its supervisor transaction")
-    if proposal.get("game_prototype_updates") or proposal.get("runtime_constant_updates"):
+    if proposal.get("game_prototype_updates") or proposal.get("runtime_constant_updates") or proposal.get('game_return_prototype_updates') or proposal.get('game_return_abi_audits') or proposal.get('game_v0_carrier_review') or proposal.get('game_sp_ra_prototype_updates'):
         raise ValueError("Bound game declaration updates require coverage apply")
     if proposal.get("edits") not in ([], None):
         raise ValueError("Use coverage apply when the proposal contains edits")
@@ -1318,6 +1356,12 @@ def accept_proof(state: dict, selected: dict[str, Path], packet: dict,
             delegated.append(admission)
     state["sdk_system_delegation_count"] = len(delegated)
     frame_admissions = receipt.get("game_frame_delegation_admissions") or []
+    v8_admissions = receipt.get('v8_batch12_scope_admissions') or []
+    v8_retained = state.setdefault('v8_batch12_scopes', [])
+    for admission in v8_admissions:
+        if admission not in v8_retained:
+            v8_retained.append(admission)
+    state['v8_batch12_scope_count'] = len(v8_retained)
     native_admissions = receipt.get('native_abi_frame_admissions') or []
     native_retained = state.setdefault('native_abi_frames', [])
     for admission in native_admissions:
@@ -1336,6 +1380,9 @@ def accept_proof(state: dict, selected: dict[str, Path], packet: dict,
             item["c_status"] = "decompiled"
             item["proof_status"] = "proved"
             item["proof_basis"] = "coverage_audit"
+            if any(s['image'] == image_of(state, item) and s['address'] == item['address'] for s in v8_admissions):
+                item['proof_basis'] = 'user_authorized_v8_batch12_scoped_audit'
+                item['original_equivalence'] = False
             if any(s['image'] == image_of(state, item) and s['address'] == item['address'] for s in native_admissions):
                 item['proof_basis'] = 'user_authorized_native_abi_frame_scoped_audit'
                 item['original_equivalence'] = False

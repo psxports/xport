@@ -9,7 +9,9 @@ static SpuVmGuestBinding spu_vm_binding(void)
     spu_vm_guest_binding(&binding);
     if (!binding.context)
     {
+#ifndef NDEBUG
         fprintf(stderr, "PsyQ voice manager requires the guest VM binding\n");
+#endif
         abort();
     }
     return binding;
@@ -154,7 +156,9 @@ uint32 _SsVmDoAllocate(void)
     spu_voice_cache_binding(&values, &flags);
     if (!values || !flags)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsVmDoAllocate requires the libsnd voice cache binding\n");
+#endif
         abort();
     }
     voice = r_u16(binding.context + 24u);
@@ -192,7 +196,9 @@ uint32 _SsVmDoAllocate(void)
 
 static void vmNoiseOn(uint8 voice)
 {
+#ifndef NDEBUG
     fprintf(stderr, "Unimplemented PsyQ vmNoiseOn voice %u\n", voice);
+#endif
     abort();
 }
 
@@ -216,7 +222,9 @@ uint32 _SsVmKeyOnNow(uint16 pitch)
     spu_sequence_tables(&table, NULL);
     if (!values || !flags_address || !table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsVmKeyOnNow requires libsnd cache and sequence bindings\n");
+#endif
         abort();
     }
     header = r_u32(binding.header_pointer);
@@ -334,7 +342,9 @@ uint32 _SsVmKeyOn(sint16 identity, sint16 bank, sint16 program, uint16 note, uin
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsVmKeyOn requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * ((uint16)identity & 0xFFu)) + 176u * (((uint16)identity & 0xFF00u) >> 8);
@@ -428,6 +438,14 @@ uint32 _SsVmKeyOn(sint16 identity, sint16 bank, sint16 program, uint16 note, uin
     return result;
 }
 
+uint32 SsVoKeyOff(uint32 voice_program, uint32 note_volume)
+{
+    sint16 bank = (sint16)(voice_program >> 8);
+    sint16 program = (uint8)voice_program;
+    uint16 note = (uint16)(note_volume >> 8);
+    return _SsVmKeyOff(33, bank, program, note);
+}
+
 uint32 _SsVmKeyOff(sint16 identity, sint16 bank, sint16 program, uint16 note)
 {
     SpuVmGuestBinding binding = spu_vm_binding();
@@ -502,6 +520,23 @@ uint32 _SsVmKeyOffNow(void)
     return result;
 }
 
+uint32 SsChannelMute(sint16 sequence, sint16 separation, uint16 mask)
+{
+    uint32 table, offset, record;
+    spu_sequence_tables(&table, NULL);
+    if (!table)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "SsChannelMute requires the libsnd sequence table binding\n");
+#endif
+        abort();
+    }
+    offset = 176u * (uint32)(sint32)separation;
+    record = r_u32(table + 4u * (uint32)(sint32)sequence);
+    w_u16(record + offset + 128u, mask);
+    return offset;
+}
+
 uint32 _SsNoteOn(sint16 sequence, sint16 separation, uint8 note, uint8 velocity)
 {
     uint32 table, record, channel, volume, muted;
@@ -510,7 +545,9 @@ uint32 _SsNoteOn(sint16 sequence, sint16 separation, uint8 note, uint8 velocity)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsNoteOn requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -536,7 +573,9 @@ uint32 _SsSetProgramChange(sint16 sequence, sint16 separation, uint8 program)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsSetProgramChange requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -554,7 +593,9 @@ uint32 _SsContNrpn1(sint16 sequence, sint16 separation, uint8 value)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsContNrpn1 requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -564,7 +605,9 @@ uint32 _SsContNrpn1(sint16 sequence, sint16 separation, uint8 value)
         marks = spu_sequence_mark_table();
         if (!marks)
         {
+#ifndef NDEBUG
             fprintf(stderr, "_SsContNrpn1 requires the libsnd mark table binding\n");
+#endif
             abort();
         }
         target = r_u32(marks + 64u * (uint32)(sint32)sequence + 4u * (uint32)(sint32)separation);
@@ -595,7 +638,9 @@ uint32 _SsContNrpn2(sint16 sequence, sint16 separation, uint8 value)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsContNrpn2 requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -657,7 +702,9 @@ uint32 _SsSetControlChange(sint16 sequence, sint16 separation, uint8 control)
     spu_sequence_tables(&table, &handlers);
     if (!table || !handlers)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsSetControlChange requires sequence and handler table bindings\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -714,7 +761,9 @@ uint32 _SsSetControlChange(sint16 sequence, sint16 separation, uint8 control)
 
 uint32 _SsSeqGetEof(sint16 sequence, sint16 separation, uint32 event)
 {
+#ifndef NDEBUG
     fprintf(stderr, "Unimplemented PsyQ _SsSeqGetEof sequence %d separation %d event %u\n", sequence, separation, event);
+#endif
     abort();
 }
 
@@ -724,7 +773,9 @@ uint32 _SsReadDeltaValue(sint16 sequence, sint16 separation)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsReadDeltaValue requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;
@@ -758,7 +809,9 @@ uint32 _SsGetSeqData(sint16 sequence, sint16 separation)
     spu_sequence_tables(&table, &handlers);
     if (!table || !handlers)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsGetSeqData requires sequence and handler table bindings\n");
+#endif
         abort();
     }
     row = table + 4u * (uint32)(sint32)sequence;
@@ -870,7 +923,9 @@ uint32 _SsSeqPlay(sint16 sequence, sint16 separation)
     spu_sequence_tables(&table, NULL);
     if (!table)
     {
+#ifndef NDEBUG
         fprintf(stderr, "_SsSeqPlay requires the libsnd sequence table binding\n");
+#endif
         abort();
     }
     record = r_u32(table + 4u * (uint32)(sint32)sequence) + 176u * (uint32)(sint32)separation;

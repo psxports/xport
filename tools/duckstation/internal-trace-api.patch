@@ -1472,7 +1472,7 @@ index 3c93cec..0f99ff5 100644
  bool AreGlobalSaveStatesEnabled();
 diff --git a/src/core/xport_lockstep_mips.h b/src/core/xport_lockstep_mips.h
 new file mode 100644
-index 0000000..2aa6fac
+index 0000000..0bc171c
 --- /dev/null
 +++ b/src/core/xport_lockstep_mips.h
 @@ -0,0 +1,581 @@
@@ -1625,7 +1625,7 @@ index 0000000..2aa6fac
 +class MipsFunctionCoverage final
 +{
 +public:
-+  static constexpr u32 MAX_FUNCTIONS = MipsCallTracker::MAX_BOUNDARY_TARGETS;
++  static constexpr u32 MAX_FUNCTIONS = 8192;
 +  static constexpr u32 HASH_CAPACITY = MAX_FUNCTIONS * 2;
 +  static_assert((HASH_CAPACITY & (HASH_CAPACITY - 1)) == 0);
 +

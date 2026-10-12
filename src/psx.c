@@ -10,6 +10,34 @@
     #undef w_masked_u32
 #endif
 
+uint32 GsSortOtPSX(uint32 source_ot, uint32 destination_ot)
+{
+    uint32 current = r_u32(source_ot + 4u);
+    uint32 source_offset = r_u32(source_ot + 12u);
+    uint32 destination_offset = r_u32(destination_ot + 8u);
+    uint32 destination_base = r_u32(destination_ot + 4u);
+    uint32 previous = current;
+    uint32 tail_link = current;
+    uint32 link = r_u32(tail_link) & 0xFFFFFFu;
+    uint32 slot = destination_base + 4u * (source_offset - destination_offset);
+    while (link != 0xFFFFFFu)
+    {
+        tail_link = previous;
+        link = r_u32(current);
+        previous = current;
+        current = link & 0xFFFFFFu;
+        link = r_u32(current) & 0xFFFFFFu;
+    }
+    /* Preserve packet lengths and reload aliases after each write */
+    link = r_u32(tail_link) & 0xFF000000u;
+    link |= r_u32(slot) & 0xFFFFFFu;
+    w_u32(tail_link, link);
+    link = r_u32(slot) & 0xFF000000u;
+    link |= r_u32(source_ot + 16u) & 0xFFFFFFu;
+    w_u32(slot, link);
+    return destination_ot;
+}
+
 GDB_CALL uint8 r_u8(uint32 address)
 {
     return (uint8)xport_memory_read(address, 1u);
@@ -411,7 +439,9 @@ static void bios_native_card_complete(void)
             continue;
         if (bios_native_card_medium_present(port))
         {
+#ifndef NDEBUG
             fprintf(stderr, "PSX: pending mounted-card BIOS sector completion and event transport\n");
+#endif
             abort();
         }
         requested = r_u32(0xA0009F20u + 4u * port);
@@ -1040,7 +1070,9 @@ void psx_vblank_signal(void)
     {
         if (!bios_native_dispatch || !bios_native_dispatch(bios_native_dispatch_context, bios_vsync_callback))
         {
+#ifndef NDEBUG
             fprintf(stderr, "Unsupported native VBlank callback %08X\n", bios_vsync_callback);
+#endif
             abort();
         }
     }
@@ -1446,18 +1478,42 @@ void *psx_addr(uint32 address, size_t count)
     }
     else
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unmapped PSX address %08X\n", address);
+#endif
         abort();
     }
     if (count > capacity - physical)
     {
+#ifndef NDEBUG
         fprintf(stderr, "PSX address range exceeds memory: %08X + %zu\n", address, count);
+#endif
         abort();
     }
     return base + physical;
 }
 
 static PsxInterruptCallback native_irq_callbacks[11];
+
+uint16 psx_irq_native_mask_exchange(uint16 mask)
+{
+    uint16 previous = (uint16)native_root_irq.mask;
+    if (!psx_irq_write(&native_root_irq, 4u, mask))
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Invalid native IRQ mask state\n");
+#endif
+        abort();
+    }
+    return previous;
+}
+
+sint32 psx_irq_native_acknowledge(uint32 sources)
+{
+    if (sources & ~0x7FFu)
+        return 0;
+    return psx_irq_write(&native_root_irq, 0u, ~sources);
+}
 
 PsxInterruptCallback InterruptCallback(sint32 interrupt, PsxInterruptCallback callback)
 {
@@ -1523,8 +1579,12 @@ void psx_interrupt_raise(uint32 interrupt)
 
 sint32 ResetCallback(void)
 {
+    static uint32 initialized;
+    if (initialized)
+        return 0;
     vsync_callback = NULL;
     memset(native_irq_callbacks, 0, sizeof(native_irq_callbacks));
+    initialized = 1u;
     return 0;
 }
 
@@ -2447,8 +2507,19 @@ sint32 ReadGeomScreen(void)
 
 void SetRotMatrix(MATRIX *m)
 {
-    if (m)
-        memcpy(&gte.rotation, m, sizeof(MATRIX));
+    const uint8 *input = (const uint8 *)m;
+    uint32 words[5];
+
+    words[0] = xport_load_le32(input);
+    words[1] = xport_load_le32(input + 4u);
+    words[2] = xport_load_le32(input + 8u);
+    words[3] = xport_load_le32(input + 12u);
+    words[4] = xport_load_le32(input + 16u);
+    xport_gte_write_control(0u, words[0]);
+    xport_gte_write_control(1u, words[1]);
+    xport_gte_write_control(2u, words[2]);
+    xport_gte_write_control(3u, words[3]);
+    xport_gte_write_control(4u, words[4]);
 }
 
 void SetLightMatrix(MATRIX *m)
@@ -2459,8 +2530,19 @@ void SetLightMatrix(MATRIX *m)
 
 void SetColorMatrix(MATRIX *m)
 {
-    if (m)
-        memcpy(gte.color.m, m->m, sizeof(gte.color.m));
+    const uint8 *input = (const uint8 *)m;
+    uint32 words[5];
+
+    words[0] = xport_load_le32(input);
+    words[1] = xport_load_le32(input + 4u);
+    words[2] = xport_load_le32(input + 8u);
+    words[3] = xport_load_le32(input + 12u);
+    words[4] = xport_load_le32(input + 16u);
+    xport_gte_write_control(16u, words[0]);
+    xport_gte_write_control(17u, words[1]);
+    xport_gte_write_control(18u, words[2]);
+    xport_gte_write_control(19u, words[3]);
+    xport_gte_write_control(20u, words[4]);
 }
 
 void SetBackColor(sint32 red, sint32 green, sint32 blue)
@@ -2525,12 +2607,14 @@ void gte_intpl12(const SVECTOR *input, const SVECTOR *far_color, sint32 factor, 
 
 void SetTransMatrix(MATRIX *m)
 {
-    if (m)
-    {
-        gte.translation[0] = m->t[0];
-        gte.translation[1] = m->t[1];
-        gte.translation[2] = m->t[2];
-    }
+    const uint8 *input = (const uint8 *)m;
+    uint32 x = xport_load_le32(input + 20u);
+    uint32 y = xport_load_le32(input + 24u);
+    uint32 z = xport_load_le32(input + 28u);
+
+    xport_gte_write_control(5u, x);
+    xport_gte_write_control(6u, y);
+    xport_gte_write_control(7u, z);
 }
 
 void ReadRotMatrix(MATRIX *m)
@@ -3598,7 +3682,8 @@ int psx_state_io(FILE *f, int load)
 /* Pad services */
 #include <string.h>
 static uint8 *pad_packets[2];
-static uint8 pad_actuators[2][6];
+static uint8 *pad_actuators[2];
+static uint8 pad_actuator_lengths[2];
 static uint8 pad_alignment[2][6];
 static sint32 pad_active;
 static sint32 pad_main_mode[2];
@@ -3805,8 +3890,6 @@ static void native_pad_serial_send(uint32 port, uint8 command)
     serial->received = 0xFFu;
     serial->ready = 1u;
     serial->acknowledged = 0u;
-    if (port != 0u)
-        return;
     switch (serial->phase)
     {
         case 0:
@@ -3884,37 +3967,23 @@ static void bios_native_pad_poll(void)
 {
     if (!pad_replay_bound && pad_active)
     {
-        /* Convert the PsyQ mask to the little-endian serial word */
-        uint16 buttons = (uint16)~xport_input_read(0);
-        uint16 serial_buttons = (uint16)((buttons >> 8) | (buttons << 8));
-        pad_publish(0, 1, serial_buttons);
-        pad_publish(1, 0, 0xFFFFu);
+        uint32 port;
+        for (port = 0u; port < 2u; ++port)
         {
-            uint32 port;
-            for (port = 0u; port < 2u; ++port)
-            {
-                uint32 owner = native_pad_packet_owners[port];
-                uint32 packet;
-                uint16 owner_buttons;
-                if (!owner)
-                    continue;
-                packet = r_u32(owner + 48u);
-                if (!packet)
-                    continue;
-                owner_buttons = (uint16)~xport_input_read((sint32)port);
-                if (port == 0u)
-                {
-                    w_u8(packet, 0u);
-                    w_u8(packet + 1u, 0x41u);
-                    w_u8(packet + 2u, (uint8)(owner_buttons >> 8));
-                    w_u8(packet + 3u, (uint8)owner_buttons);
-                }
-                else
-                {
-                    w_u8(packet, 0xFFu);
-                    w_u8(packet + 1u, 0u);
-                }
-            }
+            uint32 owner = native_pad_packet_owners[port];
+            uint32 packet;
+            uint16 owner_buttons = (uint16)~xport_input_read((sint32)port);
+            // Both keyboard layouts are connected digital controllers
+            pad_publish((sint32)port, 1, (uint16)((owner_buttons >> 8) | (owner_buttons << 8)));
+            if (!owner)
+                continue;
+            packet = r_u32(owner + 48u);
+            if (!packet)
+                continue;
+            w_u8(packet, 0u);
+            w_u8(packet + 1u, 0x41u);
+            w_u8(packet + 2u, (uint8)(owner_buttons >> 8));
+            w_u8(packet + 3u, (uint8)owner_buttons);
         }
     }
 }
@@ -3931,7 +4000,26 @@ void PadStopCom(void)
 
 sint32 PadGetState(sint32 port)
 {
+    uint32 owner = native_pad_packet_owners[((uint32)port & 0xF0u) != 0u];
     sint32 index;
+    if (owner)
+    {
+        uint32 error = r_u32(owner + 0x34u) & 0xFFFF0000u;
+        uint32 state;
+        if (!error && r_u32(owner + 0x10u) != owner)
+            error = r_u8(owner + 0x38u);
+        if (!error)
+            error = r_u8(r_u32(owner + 0x30u));
+        state = r_u8(owner + 0x49u);
+        if (error)
+        {
+            if (state == 2u || state == 3u)
+                return 1;
+            if (state == 6u)
+                return 4;
+        }
+        return (sint32)state;
+    }
     if (port != 0 && port != 0x10)
         return 0;
     index = pad_index(port);
@@ -3980,12 +4068,9 @@ sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset)
 
 void PadSetAct(sint32 port, uint8 *actuator, sint32 length)
 {
-    sint32 index = pad_index(port);
-    if (actuator == 0 || length <= 0)
-        return;
-    if (length > (sint32)sizeof(pad_actuators[index]))
-        length = (sint32)sizeof(pad_actuators[index]);
-    memcpy(pad_actuators[index], actuator, (size_t)length);
+    uint32 index = ((uint32)port & 0xF0u) != 0u;
+    pad_actuators[index] = actuator;
+    pad_actuator_lengths[index] = (uint8)length;
 }
 
 sint32 PadSetActAlign(sint32 port, uint8 *alignment)
@@ -4057,7 +4142,9 @@ sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
         return 0;
     if (!pad_main_mode_send_target || !pad_main_mode_receive_target)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound native PAD main-mode commands owner=%08X\n", owner);
+#endif
         abort();
     }
     current_offset = r_u8(owner + 0xE4u);
@@ -4100,6 +4187,36 @@ static sint32 resolve_cd_path(uint32 guest_path, const char *root, char *host_pa
     while (r_u8(guest_path) != 0u && r_u8(guest_path) != ';')
     {
         uint8 character = r_u8(guest_path++);
+
+        if (cursor + 1u >= capacity || character == ':')
+            return 0;
+        host_path[cursor++] = character == '\\' ? '/' : (char)character;
+    }
+    host_path[cursor] = '\0';
+    for (index = 0u; index + 1u < cursor; ++index)
+        if (host_path[index] == '.' && host_path[index + 1u] == '.')
+            return 0;
+    return 1;
+}
+
+static sint32 resolve_cd_path_native(const char *src, const char *root, char *host_path, size_t capacity)
+{
+    size_t cursor;
+    size_t index;
+
+    if (!src || !root || !host_path || !capacity)
+        return 0;
+    cursor = strlen(root);
+    if (!cursor || cursor + 2u > capacity)
+        return 0;
+    memcpy(host_path, root, cursor);
+    if (host_path[cursor - 1u] != '/' && host_path[cursor - 1u] != '\\')
+        host_path[cursor++] = '/';
+    while ((uint8)*src == '\\' || (uint8)*src == '/')
+        ++src;
+    while ((uint8)*src != 0u && (uint8)*src != ';')
+    {
+        uint8 character = (uint8)*src++;
 
         if (cursor + 1u >= capacity || character == ':')
             return 0;
@@ -4164,6 +4281,24 @@ sint32 xport_cd_file_read(uint32 guest_path, const char *root, uint32 destinatio
     ok = xport_file_read(path, buffer, capacity, size) && (!*size || xport_guest_copy(xport_guest_ref(destination), xport_host_ref(buffer), *size));
     free(buffer);
     return ok;
+}
+
+sint32 xport_cd_file_size_native(const char *src, const char *root, size_t *size)
+{
+    char path[260];
+
+    if (!size || !resolve_cd_path_native(src, root, path, sizeof(path)))
+        return 0;
+    return xport_file_size(path, size);
+}
+
+sint32 xport_cd_file_read_native(const char *src, const char *root, void *dst, size_t cap, size_t *size)
+{
+    char path[260];
+
+    if (!size || (!dst && cap) || !resolve_cd_path_native(src, root, path, sizeof(path)))
+        return 0;
+    return xport_file_read(path, dst, cap, size);
 }
 
 sint32 GetRCnt(uint32 counter)
@@ -4237,7 +4372,9 @@ void *firstfile(const char *pattern, void *record)
         return NULL;
     if (strncmp(pattern, "bu00:", 5u) == 0 || strncmp(pattern, "bu10:", 5u) == 0)
         return NULL;
+#ifndef NDEBUG
     fprintf(stderr, "Unsupported BIOS directory device: %s\n", pattern);
+#endif
     abort();
 }
 
@@ -4519,7 +4656,9 @@ uint32 _SpuInit(uint32 mode)
 {
     if (mode != 0u)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unsupported native SPU warm initialization mode %u\n", mode);
+#endif
         abort();
     }
     SpuInit();
@@ -4583,7 +4722,9 @@ uint32 _patch_card(void)
 {
     if (!bios_card_patches_bound)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound BIOS card patch sources\n");
+#endif
         abort();
     }
     memmove(psx_addr(bios_card_first_destination, 20u), psx_addr(bios_card_first_source, 20u), 20u);
@@ -4596,7 +4737,9 @@ uint32 _patch_card2(void)
 {
     if (!bios_card_patches_bound)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound BIOS card patch sources\n");
+#endif
         abort();
     }
     uint32 original = r_u32(bios_card_second_destination);
@@ -4609,7 +4752,9 @@ uint32 _copy_memcard_patch(void)
 {
     if (!bios_card_patches_bound)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound BIOS card patch sources\n");
+#endif
         abort();
     }
     memmove(psx_addr(0xDF80u, 112u), psx_addr(bios_card_copy_source, 112u), 112u);
@@ -4700,7 +4845,9 @@ sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light)
     uint8 rgb[3];
     if (!light || !gte_gs_light_directions || !gte_gs_light_colors)
     {
+#ifndef NDEBUG
         fprintf(stderr, "GsSetFlatLight requires a descriptor and bound LIBGS matrices\n");
+#endif
         abort();
     }
     rgb[0] = light->r;
@@ -4726,7 +4873,9 @@ sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light)
             sint32 denominator = (sint32)length;
             if (denominator == -1 && numerator == (-2147483647 - 1))
             {
+#ifndef NDEBUG
                 fprintf(stderr, "GsSetFlatLight signed division overflow\n");
+#endif
                 abort();
             }
             directions.m[index][component] = (sint16)(numerator / denominator);
@@ -4911,7 +5060,13 @@ uint32 PadGetStatePSX(uint32 port)
 
 void PadSetActPSX(uint32 port, uint32 actuator, uint32 length)
 {
-    PadSetAct((sint32)port, actuator && length ? (uint8 *)psx_addr(actuator, length) : NULL, (sint32)length);
+    uint32 owner = native_pad_packet_owners[(port & 0xF0u) != 0u];
+    PadSetAct((sint32)port, actuator ? (uint8 *)psx_addr(actuator, 0u) : NULL, (sint32)length);
+    if (owner)
+    {
+        w_u32(owner + 0x28u, actuator);
+        w_u8(owner + 0x34u, (uint8)length);
+    }
 }
 
 uint32 PadSetActAlignPSX(uint32 port, uint32 alignment)
@@ -5101,7 +5256,9 @@ sint32 Exec(uint32 guest_header, uint32 argc, uint32 argv)
         memset(psx_addr(bss, bss_bytes), 0, bss_bytes);
     if (!bios_native_exec)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unsupported native PS-X EXE entry %08X (header %08X)\n", entry, guest_header);
+#endif
         abort();
     }
     /* The dispatcher must reject unregistered entries; zero is a valid program result */
@@ -5189,7 +5346,9 @@ uint32 _spu_Fw(uint32 source, uint32 length)
     transferred = SpuWrite(psx_addr(source, length), length);
     if (spu_transfer_failed())
     {
+#ifndef NDEBUG
         fprintf(stderr, "SPU upload failed: source %08X bytes %u\n", source, length);
+#endif
         abort();
     }
     return transferred;
@@ -5257,7 +5416,9 @@ void psx_root_counter_poll(void)
     }
     if (timers.mode[2] & 0x81u)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unsupported native timer2 gate/toggle mode %04X\n", timers.mode[2]);
+#endif
         abort();
     }
     if (timers.mode[2] & 0x200u)
@@ -5298,16 +5459,28 @@ void srandPSX(uint32 seed)
     w_u32(0xA0009010u, seed);
 }
 
-PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback)
-{
-    static PsxInterruptCallback callbacks[7];
-    PsxInterruptCallback previous;
+static PsxInterruptCallback native_dma_callbacks[7];
 
-    if (channel >= sizeof(callbacks) / sizeof(callbacks[0]))
+PsxInterruptCallback psx_dma_callback_native(uint32 channel)
+{
+    PsxInterruptCallback callback;
+    if (channel >= sizeof(native_dma_callbacks) / sizeof(native_dma_callbacks[0]))
         return NULL;
     xport_audio_lock();
-    previous = callbacks[channel];
-    callbacks[channel] = callback;
+    callback = native_dma_callbacks[channel];
+    xport_audio_unlock();
+    return callback;
+}
+
+PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous;
+
+    if (channel >= sizeof(native_dma_callbacks) / sizeof(native_dma_callbacks[0]))
+        return NULL;
+    xport_audio_lock();
+    previous = native_dma_callbacks[channel];
+    native_dma_callbacks[channel] = callback;
     xport_audio_unlock();
     return previous;
 }
@@ -5353,7 +5526,9 @@ sint32 openPSX(const char *path, uint32 mode)
         return -1;
     if (strncmp(path, "bu00:", 5u) == 0 || strncmp(path, "bu10:", 5u) == 0)
         return -1;
+#ifndef NDEBUG
     fprintf(stderr, "Unsupported native BIOS file device: %s\n", path);
+#endif
     abort();
 }
 
@@ -5381,7 +5556,9 @@ sint32 erase(const char *path)
         return 0;
     if (strncmp(path, "bu00:", 5u) == 0 || strncmp(path, "bu10:", 5u) == 0)
         return 0;
+#ifndef NDEBUG
     fprintf(stderr, "Unsupported native BIOS file device: %s\n", path);
+#endif
     abort();
 }
 
@@ -5519,7 +5696,9 @@ uint32 xport_missing_pad_owner_callback(uint32 target, uint32 owner)
     for (i = 0u; i < native_pad_callback_count; ++i)
         if (native_pad_callbacks[i].target == target)
             return native_pad_callbacks[i].callback(owner);
+#ifndef NDEBUG
     fprintf(stderr, "Unbound native PAD callback target=%08X owner=%08X\n", target, owner);
+#endif
     abort();
 }
 
@@ -5551,7 +5730,9 @@ uint32 VectorNormalSS(SVECTOR *source, SVECTOR *destination)
     // Original signed ADD traps on squared-norm overflow
     if (sum_wide > 2147483647)
     {
+#ifndef NDEBUG
         fprintf(stderr, "VectorNormalSS squared-norm overflow\n");
+#endif
         abort();
     }
     sum = (uint32)sum_wide;
@@ -5585,7 +5766,9 @@ uint32 SetFogNearFar(sint32 near_distance, sint32 far_distance, sint32 projectio
     numerator = (sint32)((uint32)near_quotient << 8u);
     if (!projection || (numerator == INT32_MIN && projection == -1))
     {
+#ifndef NDEBUG
         fprintf(stderr, "SetFogNearFar original DIV exception\n");
+#endif
         abort();
     }
     dqa = numerator / projection;
@@ -5872,7 +6055,9 @@ void xport_gte_execute(uint32 command)
         default:
             break;
     }
+#ifndef NDEBUG
     fprintf(stderr, "Unsupported GTE command %08X\n", command);
+#endif
     abort();
 }
 
@@ -5908,7 +6093,9 @@ uint32 StopTAP(void)
 {
     if (!bios_tap_interrupt_node || !bios_card_address(bios_tap_interrupt_node, 12u, 4u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound StopTAP interrupt node\n");
+#endif
         abort();
     }
     xport_bios_enter_critical();
@@ -5924,7 +6111,9 @@ sint32 MemCardEndPSX(void)
     uint32 destination;
     if (!bios_card_end_table || !bios_card_end_saved_words || !bios_card_address(bios_card_end_table, 28u, 4u) || !bios_card_address(bios_card_end_saved_words, 12u, 4u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unbound MemCardEndPSX kernel patch\n");
+#endif
         abort();
     }
     /* BIOS _stop_card removes the card interrupt routine */
@@ -5935,7 +6124,9 @@ sint32 MemCardEndPSX(void)
     destination = r_u32(bios_card_end_table + 24u) + 112u;
     if (!bios_card_address(destination, 12u, 4u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid MemCardEndPSX kernel patch destination\n");
+#endif
         abort();
     }
     for (uint32 i = 0; i < 3u; ++i)
@@ -6210,7 +6401,11 @@ sint32 PCread(sint32 handle, char *buffer, sint32 count)
     if (handle < 0 || handle >= 64 || !pc_files[handle] || pc_modes[handle] == 1u || count < 0 || (!buffer && count))
         return -1;
     bytes = fread(buffer, 1u, (size_t)count, pc_files[handle]);
+#ifndef NDEBUG
     return ferror(pc_files[handle]) ? -1 : (sint32)bytes;
+#else
+    return (sint32)bytes;
+#endif
 }
 
 sint32 PCwrite(sint32 handle, char *buffer, sint32 count)
@@ -6219,8 +6414,10 @@ sint32 PCwrite(sint32 handle, char *buffer, sint32 count)
     if (handle < 0 || handle >= 64 || !pc_files[handle] || pc_modes[handle] == 0u || count < 0 || (!buffer && count))
         return -1;
     bytes = fwrite(buffer, 1u, (size_t)count, pc_files[handle]);
+#ifndef NDEBUG
     if (fflush(pc_files[handle]) != 0 || ferror(pc_files[handle]))
         return -1;
+#endif
     return (sint32)bytes;
 }
 
@@ -7154,6 +7351,76 @@ float __truncdfsf2(double value)
 void xport_memory_control_write32_missing(uint32 address, uint32 value)
 {
     (void)address;
+    (void)value;
+    abort();
+}
+
+uint32 SquareRoot0PSX(uint32 input, uint32 table_address)
+{
+    uint32 leading, even, normalized, value, shift;
+    xport_gte_write_data(30u, input);
+    leading = xport_gte_read_data(31u);
+    uint32 result = 0u;
+    if (leading != 32u)
+    {
+        even = leading & 0xFFFFFFFEu;
+        shift = (uint32)((sint32)(31u - even) >> 1);
+        if ((sint32)(even - 24u) < 0)
+            normalized = (uint32)((sint32)input >> ((24u - even) & 31u));
+        else
+            normalized = input << ((even - 24u) & 31u);
+        value = r_s16(table_address + 2u * (normalized - 64u));
+        result = (value << (shift & 31u)) >> 12;
+    }
+    return result;
+}
+
+uint32 xport_sdk_texture_frame_acquire(size_t bytes)
+{
+    (void)bytes;
+    abort();
+}
+
+void xport_sdk_texture_frame_release(uint32 address, size_t bytes)
+{
+    (void)address;
+    (void)bytes;
+    abort();
+}
+
+uint32 xport_sdk_draw_env_frame_acquire(size_t bytes)
+{
+    (void)bytes;
+    abort();
+}
+
+void xport_sdk_draw_env_frame_release(uint32 address, size_t bytes)
+{
+    (void)address;
+    (void)bytes;
+    abort();
+}
+
+uint32 xport_guest_call_known_registers_post_sdk(uint32 target, uint32 *registers, uint32 known_register_mask)
+{
+    (void)target;
+    (void)registers;
+    (void)known_register_mask;
+    abort();
+}
+
+uint32 xport_guest_call_known_registers(uint32 target, uint32 *registers, uint32 known_register_mask)
+{
+    (void)target;
+    (void)registers;
+    (void)known_register_mask;
+    abort();
+}
+
+uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
+{
+    (void)destination;
+    (void)format;
     (void)value;
     abort();
 }

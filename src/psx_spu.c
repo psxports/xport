@@ -68,6 +68,7 @@ static uint32 transfer_byte_address;
 static uint64 transfer_deadline;
 static sint32 transfer_pending;
 static XportDeviceOperation transfer_operation;
+static void spu_irq_check_range(uint32 address, uint32 bytes);
 
 static void spu_trace_internal_gap(XportDevicePrimitive primitive, uint32 reason)
 {
@@ -193,8 +194,11 @@ uint32 SpuSetTransferStartAddr(uint32 address)
     if (transfer.address_rounding_enabled && address % transfer.address_rounding_unit)
         aligned = (address + transfer.address_rounding_unit) & ~transfer.address_alignment_mask;
     units = aligned >> transfer.address_shift;
+    xport_audio_lock();
     *transfer.address_units = (uint16)units;
     transfer_byte_address = (uint32)(uint16)units << transfer.address_shift;
+    spu_irq_check_range(transfer_byte_address, 2);
+    xport_audio_unlock();
     return (uint32)(uint16)units << transfer.address_shift;
 }
 
@@ -585,7 +589,9 @@ static sint32 spu_reverb_work_occupied(uint32 units)
         if (base >= boundary || boundary < base + heap.entries[2u * i + 1u])
             return 1;
     }
+#ifndef NDEBUG
     fprintf(stderr, "Invalid SPU heap while checking reverb work area\n");
+#endif
     abort();
 }
 
@@ -626,55 +632,6 @@ static inline sint16 audio_sample_clamp(sint32 value)
     if (value > 32767)
         return 32767;
     return (sint16)value;
-}
-
-static FILE *audio_stem_capture;
-static sint32 audio_stem_capture_initialized;
-static FILE *audio_voice_profile;
-static uint32 audio_voice_profile_frames;
-
-static void audio_stem_capture_initialize(void)
-{
-    const char *path;
-
-    if (audio_stem_capture_initialized)
-        return;
-    audio_stem_capture_initialized = 1;
-    path = getenv("XPORT_AUDIO_STEM_CAPTURE");
-    if (!path || !*path)
-        return;
-    audio_stem_capture = fopen(path, "wb");
-    if (!audio_stem_capture)
-        fprintf(stderr, "Cannot open audio stem capture: %s\n", path);
-    else
-        setvbuf(audio_stem_capture, NULL, _IOFBF, 1024u * 1024u);
-    path = getenv("XPORT_AUDIO_VOICE_PROFILE");
-    if (!path || !*path)
-        return;
-    audio_voice_profile = fopen(path, "wb");
-    if (!audio_voice_profile)
-        fprintf(stderr, "Cannot open audio voice profile: %s\n", path);
-    else
-    {
-        setvbuf(audio_voice_profile, NULL, _IOFBF, 1024u * 1024u);
-        fprintf(audio_voice_profile, "frame,voice,phase,envelope,pitch,volume_left,volume_right,sample_note,start_address,current_address,repeat_address,block_flags,keyed\n");
-    }
-}
-
-static void audio_stem_capture_shutdown(void)
-{
-    if (audio_stem_capture)
-    {
-        fclose(audio_stem_capture);
-        audio_stem_capture = NULL;
-    }
-    if (audio_voice_profile)
-    {
-        fclose(audio_voice_profile);
-        audio_voice_profile = NULL;
-    }
-    audio_voice_profile_frames = 0u;
-    audio_stem_capture_initialized = 0;
 }
 
 static const sint16 spu_gaussian[512] = {
@@ -729,6 +686,9 @@ typedef struct SPU_STATE
     uint32 key_status;
     uint32 key_on_pending;
     uint32 key_off_pending;
+    uint16 irq_address;
+    uint8 irq_flag;
+    uint8 irq_pending;
     uint64 lockstep_ticks;
     uint32 lockstep_clock_valid;
     uint32 lockstep_vblank_render;
@@ -753,6 +713,41 @@ typedef struct SPU_STATE
 } SPU_STATE;
 
 static SPU_STATE spu;
+
+static void update_adsr(SPU_VOICE *voice);
+
+/* Latch RAM IRQs without entering game code on the mixer thread */
+static void spu_irq_check_range(uint32 address, uint32 bytes)
+{
+    uint32 target = (uint32)spu.irq_address << 3;
+    if ((reverb_control.control & 0x40) && !spu.irq_flag &&
+        ((target - address) & (SPU_RAM_SIZE - 1)) < bytes)
+    {
+        spu.irq_flag = 1;
+        spu.irq_pending = 1;
+    }
+}
+
+static void spu_irq_check_late(void)
+{
+    uint32 index;
+    spu_irq_check_range(transfer_byte_address, 2);
+    for (index = 0; index < SPU_VOICE_COUNT && !spu.irq_flag; ++index)
+        if (spu.voices[index].decoded_valid)
+            spu_irq_check_range(spu.voices[index].current_address, 16);
+}
+
+/* Call only from the game thread after releasing the mixer lock */
+void spu_dispatch_pending_irq(void)
+{
+    uint32 pending;
+    xport_audio_lock();
+    pending = spu.irq_pending && spu.irq_flag && (reverb_control.control & 0x40);
+    spu.irq_pending = 0;
+    xport_audio_unlock();
+    if (pending)
+        psx_interrupt_raise(9);
+}
 
 static void spu_reverb_reset_cursor(void)
 {
@@ -931,27 +926,6 @@ typedef struct LIBSND_STATE
 
 /* Variables. */
 static LIBSND_STATE libsnd;
-
-static void audio_voice_profile_record(uint32 frames)
-{
-    sint32 voice;
-
-    if (!audio_voice_profile)
-        return;
-    audio_voice_profile_frames += frames;
-    if (audio_voice_profile_frames < SPU_SAMPLE_RATE / 10u)
-        return;
-    audio_voice_profile_frames -= SPU_SAMPLE_RATE / 10u;
-    for (voice = 0; voice < SPU_VOICE_COUNT; ++voice)
-    {
-        const SPU_VOICE *state = spu.voices + voice;
-
-        if (state->adsr_phase == SPU_ADSR_OFF)
-            continue;
-        fprintf(audio_voice_profile, "%llu,%d,%u,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u\n", (unsigned long long)libsnd.cd.stream.decoded_frames, voice, (unsigned)state->adsr_phase, (unsigned)state->envelope, (unsigned)state->registers.pitch, (int)state->registers.volume_left, (int)state->registers.volume_right, (unsigned)state->sample_note, (unsigned)state->registers.start_address * 8u, (unsigned)state->current_address, (unsigned)state->repeat_address, (unsigned)state->block_flags, (unsigned)((spu.key_status >> voice) & 1u));
-    }
-    fflush(audio_voice_profile);
-}
 
 static CdlLOC cd_toc[100];
 
@@ -1165,7 +1139,6 @@ static void spu_init(void)
 
 static void spu_shutdown(void)
 {
-    audio_stem_capture_shutdown();
     memset(&spu, 0, sizeof(spu));
 }
 
@@ -1185,7 +1158,10 @@ sint32 spu_upload(uint32 byte_address, const void *source, uint32 byte_count)
             return 0;
         xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, source_region, source_offset, XPORT_DEVICE_REGION_SPU_RAM, byte_address, byte_count, 0xffffffffu);
     }
+    xport_audio_lock();
     memcpy(spu.ram + byte_address, source, byte_count);
+    spu_irq_check_range(byte_address, byte_count);
+    xport_audio_unlock();
     if (operation.active)
     {
         xport_device_trace_stage(&operation, XPORT_DEVICE_WRITE, XPORT_DEVICE_EVIDENCE_EXACT, source_region, source_offset, XPORT_DEVICE_REGION_SPU_RAM, byte_address, byte_count, 0xffffffffu);
@@ -1198,7 +1174,10 @@ sint32 spu_download(uint32 byte_address, void *destination, uint32 byte_count)
 {
     if (!spu.initialized || destination == 0 || byte_address >= SPU_RAM_SIZE || byte_count > SPU_RAM_SIZE - byte_address)
         return 0;
+    xport_audio_lock();
     memcpy(destination, spu.ram + byte_address, byte_count);
+    spu_irq_check_range(byte_address, byte_count);
+    xport_audio_unlock();
     return 1;
 }
 
@@ -1215,7 +1194,11 @@ sint32 spu_load_ram_file(const char *path)
     xport_audio_lock();
     size = fread(spu.ram, 1, sizeof(spu.ram), file);
     xport_audio_unlock();
-    if (size != sizeof(spu.ram) || fgetc(file) != EOF)
+    if (size != sizeof(spu.ram)
+#ifndef NDEBUG
+        || fgetc(file) != EOF
+#endif
+    )
     {
         fclose(file);
         return 0;
@@ -1280,6 +1263,9 @@ static sint32 spu_mmio_read16(uint32 physical_address, uint16 *value)
         case 0x1F801DAAu:
             *value = (uint16)reverb_control.control;
             return 1;
+        case 0x1F801DA4u:
+            *value = spu.irq_address;
+            return 1;
         case 0x1F801DB0u:
             *value = (uint16)spu.cd_left;
             return 1;
@@ -1316,7 +1302,9 @@ static sint32 spu_synchronize_to_ticks(uint64 target)
     }
     if (target < spu.lockstep_ticks)
     {
+    #ifndef NDEBUG
         fprintf(stderr, "xport_spu_clock backward current=%llu target=%llu\n", (unsigned long long)spu.lockstep_ticks, (unsigned long long)target);
+    #endif
         return 0;
     }
     frames = target - spu.lockstep_ticks;
@@ -1382,7 +1370,9 @@ static sint32 spu_mmio_timed_read16(uint32 physical_address, uint16 *value)
 #if defined(LOCKSTEP_DEBUG)
     if (synchronized && *value != (uint16)expected)
     {
+    #ifndef NDEBUG
         fprintf(stderr, "xport_spu_read mismatch address=%08X expected=%04X actual=%04X\n", physical_address, (uint16)expected, *value);
+    #endif
         exit(84);
     }
 #endif
@@ -1431,11 +1421,14 @@ sint32 spu_mmio_read(void *user, uint32 physical_address, uint32 width, uint32 *
 
 static sint32 spu_mmio_common_writable(uint32 address)
 {
+    if (address >= 0x1F801C00 && address < 0x1F801D80 && !(address & 1))
+        return 1;
     switch (address)
     {
         case 0x1F801D80u:
         case 0x1F801D82u:
         case 0x1F801DAAu:
+        case 0x1F801DA4u:
         case 0x1F801DB0u:
         case 0x1F801DB2u:
         case 0x1F801DB4u:
@@ -1485,9 +1478,12 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
     for (index = 0u; index < count; ++index)
     {
         uint32 changed = values[index] ^ previous[index];
-        if ((addresses[index] == 0x1F801D80u || addresses[index] == 0x1F801D82u) && (values[index] & 0x8000u))
+        if ((addresses[index] == 0x1F801D80u || addresses[index] == 0x1F801D82u ||
+             (addresses[index] < 0x1F801D80 && (addresses[index] & 15) < 4)) && (values[index] & 0x8000u))
         {
+#ifndef NDEBUG
             fprintf(stderr, "xport_spu_write unsupported volume sweep address=%08X value=%04X\n", addresses[index], values[index]);
+#endif
             goto finish;
         }
         if (addresses[index] == 0x1F801DAAu)
@@ -1495,15 +1491,36 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
             /* Bits 0 and 1 enable dry CD and external input mixing
                Bits 2 and 3 route those inputs to the reverb processor
                This host has no external analog input, so that bus is silent */
-            if (changed & ~0x8Fu)
+            if (changed & ~0xCFu)
             {
+#ifndef NDEBUG
                 fprintf(stderr, "xport_spu_write unsupported control routing value=%04X changed=%04X\n", values[index], changed);
+#endif
                 goto finish;
             }
         }
     }
     for (index = 0u; index < count; ++index)
     {
+        if (addresses[index] < 0x1F801D80)
+        {
+            SPU_VOICE *voice = spu.voices + (addresses[index] - 0x1F801C00) / 16;
+            switch ((addresses[index] & 15) >> 1)
+            {
+            case 0: voice->registers.volume_left = (sint16)values[index]; break;
+            case 1: voice->registers.volume_right = (sint16)values[index]; break;
+            case 2: voice->registers.pitch = values[index]; break;
+            case 3: voice->registers.start_address = values[index]; break;
+            case 4: voice->registers.adsr1 = values[index]; update_adsr(voice); break;
+            case 5: voice->registers.adsr2 = values[index]; update_adsr(voice); break;
+            case 6: voice->envelope = values[index] & 0x7FFF; break;
+            case 7:
+                voice->registers.repeat_address = values[index];
+                voice->repeat_address = (uint32)values[index] << 3;
+                break;
+            }
+            continue;
+        }
         switch (addresses[index])
         {
             case 0x1F801D80u:
@@ -1528,6 +1545,14 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
                 reverb_control.control = values[index];
                 reverb_control.enabled = (values[index] >> 7) & 1u;
                 spu.cd_mix_controlled = 1u;
+                if (!(values[index] & 0x40))
+                    spu.irq_flag = spu.irq_pending = 0;
+                else
+                    spu_irq_check_late();
+                break;
+            case 0x1F801DA4u:
+                spu.irq_address = values[index];
+                spu_irq_check_late();
                 break;
         }
     }
@@ -2087,7 +2112,9 @@ void xport_libsnd_bind_sequence_table(uint32 table_address)
 {
     if (!table_address || !psx_addr(table_address, 4u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid libsnd sequence table binding %08X\n", table_address);
+#endif
         abort();
     }
     xport_audio_lock();
@@ -2099,7 +2126,9 @@ void xport_libsnd_bind_sequence_handlers(uint32 table_address)
 {
     if (!table_address || !psx_addr(table_address, 68u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid libsnd sequence handler binding %08X\n", table_address);
+#endif
         abort();
     }
     xport_audio_lock();
@@ -2111,7 +2140,9 @@ void xport_libsnd_bind_sequence_mark_table(uint32 table_address)
 {
     if (!table_address || !psx_addr(table_address, 4u))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid libsnd sequence mark table binding %08X\n", table_address);
+#endif
         abort();
     }
     xport_audio_lock();
@@ -2170,7 +2201,9 @@ void xport_libsnd_bind_voice_volume(uint32 volume_address, uint32 flags_address)
 {
     if (!volume_address || !flags_address || !psx_addr(volume_address, 16u * (SPU_VOICE_COUNT - 1u) + 4u) || !psx_addr(flags_address, SPU_VOICE_COUNT))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid libsnd voice volume binding %08X/%08X\n", volume_address, flags_address);
+#endif
         abort();
     }
     xport_audio_lock();
@@ -2189,6 +2222,94 @@ void spu_voice_cache_binding(uint32 *values, uint32 *flags)
     xport_audio_unlock();
 }
 
+static uint16 spu_register_half(const SndRegisterAttr *attributes, uint32 index)
+{
+    uint16 value;
+    memcpy(&value, (const uint8 *)attributes + 2u * index, sizeof(value));
+    return value;
+}
+
+void SsQueueRegisters(sint32 voice, SndRegisterAttr *attributes)
+{
+    uint32 base, dirty_address;
+    uint16 value, dirty;
+    uint32 all;
+    if ((uint32)voice >= SPU_VOICE_COUNT || !attributes)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Invalid SsQueueRegisters voice/attributes\n");
+#endif
+        abort();
+    }
+    xport_audio_lock();
+    if (!libsnd.voice_volume_address || !libsnd.voice_update_flags_address || !psx_addr(libsnd.voice_volume_address, 16u * (SPU_VOICE_COUNT - 1u) + 12u))
+    {
+        xport_audio_unlock();
+#ifndef NDEBUG
+        fprintf(stderr, "SsQueueRegisters requires the deferred voice cache binding\n");
+#endif
+        abort();
+    }
+    base = libsnd.voice_volume_address + 16u * (uint32)voice;
+    dirty_address = libsnd.voice_update_flags_address + (uint32)voice;
+    all = spu_register_half(attributes, 3u) == 0u;
+    if ((spu_register_half(attributes, 3u) & 1u) || all)
+    {
+        value = spu_register_half(attributes, 0u) & 0x7FFFu;
+        dirty = r_u8(dirty_address) | 1u;
+        w_u16(base, value);
+        w_u8(dirty_address, dirty);
+    }
+    if ((spu_register_half(attributes, 3u) & 2u) || all)
+    {
+        w_u16(base + 2u, spu_register_half(attributes, 1u) & 0x7FFFu);
+        w_u8(dirty_address, r_u8(dirty_address) | 2u);
+    }
+    if ((spu_register_half(attributes, 3u) & 4u) || all)
+    {
+        w_u16(base + 8u, spu_register_half(attributes, 5u));
+        w_u8(dirty_address, r_u8(dirty_address) | 0x10u);
+    }
+    if ((spu_register_half(attributes, 3u) & 8u) || all)
+    {
+        w_u16(base + 10u, spu_register_half(attributes, 6u));
+        w_u8(dirty_address, r_u8(dirty_address) | 0x20u);
+    }
+    if ((spu_register_half(attributes, 3u) & 0x20u) || all)
+    {
+        w_u16(base + 4u, spu_register_half(attributes, 2u));
+        w_u8(dirty_address, r_u8(dirty_address) | 4u);
+    }
+    if ((spu_register_half(attributes, 3u) & 0x10u) || all)
+    {
+        w_u16(base + 6u, spu_register_half(attributes, 4u));
+        w_u8(dirty_address, r_u8(dirty_address) | 8u);
+    }
+    xport_audio_unlock();
+}
+
+sint32 SsVoiceCheck(uint32 voice, sint32 bank_program, sint16 note)
+{
+    uint32 record;
+    sint32 result = -1;
+    if (voice >= SPU_VOICE_COUNT)
+        return -1;
+    xport_audio_lock();
+    if (!libsnd.vm_guest.voices)
+    {
+        xport_audio_unlock();
+#ifndef NDEBUG
+        fprintf(stderr, "SsVoiceCheck requires the voice record binding\n");
+#endif
+        abort();
+    }
+    record = libsnd.vm_guest.voices + 54u * voice;
+    if (r_s16(record + 24u) == (bank_program >> 8) && r_s16(record + 20u) == (uint8)bank_program && r_s16(record + 14u) == note)
+        result = 0;
+    xport_audio_unlock();
+    return result;
+}
+
 sint32 SsUtSetDetVVol(uint16 voice, sint16 left, sint16 right)
 {
     uint32 values, flags_address;
@@ -2199,7 +2320,9 @@ sint32 SsUtSetDetVVol(uint16 voice, sint16 left, sint16 right)
     if (!libsnd.voice_volume_address || !libsnd.voice_update_flags_address)
     {
         xport_audio_unlock();
+#ifndef NDEBUG
         fprintf(stderr, "SsUtSetDetVVol requires the deferred voice volume binding\n");
+#endif
         abort();
     }
     values = libsnd.voice_volume_address + 16u * voice;
@@ -2216,7 +2339,9 @@ void xport_libsnd_bind_voice_limits(uint32 protection_address, uint32 count_addr
 {
     if ((protection_address && !psx_addr(protection_address, 4u)) || (count_address && !psx_addr(count_address, 1u)))
     {
+#ifndef NDEBUG
         fprintf(stderr, "Invalid libsnd voice limit binding %08X/%08X\n", protection_address, count_address);
+#endif
         abort();
     }
     xport_audio_lock();
@@ -2235,7 +2360,9 @@ static sint16 libsnd_voice_count(void)
     sint16 count = libsnd.voice_count_address ? (sint8)r_u8(libsnd.voice_count_address) : SPU_VOICE_COUNT;
     if (count > SPU_VOICE_COUNT)
     {
+#ifndef NDEBUG
         fprintf(stderr, "Unsupported libsnd voice count %d\n", count);
+#endif
         abort();
     }
     return count > 0 ? count : 0;
@@ -2279,7 +2406,9 @@ uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 righ
     if (left > 127u || right > 127u)
     {
         xport_audio_unlock();
+#ifndef NDEBUG
         fprintf(stderr, "SsVoKeyOn volume above127 is not implemented\n");
+#endif
         abort();
     }
     for (tone_index = 0; tone_index < program_entry->tone_count; ++tone_index)
@@ -2295,7 +2424,9 @@ uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 righ
         if (tone->sample == 255)
         {
             xport_audio_unlock();
+#ifndef NDEBUG
             fprintf(stderr, "SsVoKeyOn noise tone is not implemented\n");
+#endif
             abort();
         }
         protection = libsnd_voice_protection();
@@ -2533,7 +2664,9 @@ void SpuGetVoiceAttr(SpuVoiceAttr *attr)
 #if defined(LOCKSTEP_DEBUG)
     if (synchronized && (uint16)expected_envelope != (uint16)result.envx)
     {
+    #ifndef NDEBUG
         fprintf(stderr, "xport_spu_env mismatch voice=%d expected=%04X actual=%04X\n", voice, (uint16)expected_envelope, (uint16)result.envx);
+    #endif
         exit(85);
     }
 #endif
@@ -2547,7 +2680,11 @@ void SpuSetKey(sint32 on_off, uint32 voice_bit)
     if (on_off == SPU_ON)
         spu_key_on(voice_bit & SPU_ALLCH);
     else
+    {
         spu_key_off(voice_bit & SPU_ALLCH);
+        /* A later SDK stop cancels an unrendered SDK start */
+        spu.key_on_pending &= ~(voice_bit & SPU_ALLCH);
+    }
     xport_audio_unlock();
 }
 
@@ -3142,6 +3279,7 @@ static void decode_voice_block(SPU_VOICE *voice)
 {
     uint8 block[16];
     uint32 index;
+    spu_irq_check_range(voice->current_address, 16);
     for (index = 0; index < 16; ++index)
         block[index] = spu.ram[(voice->current_address + index) & (SPU_RAM_SIZE - 1)];
     voice->decoded[0] = voice->decoded[28];
@@ -3670,9 +3808,18 @@ sint32 CdSetDebug(sint32 level)
     return previous;
 }
 
+static uint8 cd_native_status_locked(void);
+
 sint32 CdStatus(void)
 {
-    return r_u8(xport_cd_status_address);
+    uint8 status;
+
+    if (xport_cd_status_address != 0u)
+        return r_u8(xport_cd_status_address);
+    xport_audio_lock();
+    status = cd_native_status_locked();
+    xport_audio_unlock();
+    return status;
 }
 
 sint32 CdControl(uint8 command, uint8 *parameter, uint8 *result)
@@ -3711,12 +3858,45 @@ sint32 CD_sync(sint32 mode, uint8 *result)
     return completion;
 }
 
+// PsyQ LIBCD SYS command flags for implicit Setloc
+static const uint8 cd_setloc_commands[32] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+
+static sint32 cd_control_b_native(uint8 command, uint8 *parameter, uint8 *result)
+{
+    CdlCB prev;
+    uint32 attempts = 3u;
+
+    if (command >= sizeof(cd_setloc_commands) / sizeof(cd_setloc_commands[0]))
+        return 0;
+    prev = CdSyncCallback(NULL);
+    for (;;)
+    {
+        CdSyncCallback(NULL);
+        if (command != 1u && (CdStatus() & 0x10u) != 0u)
+            CD_cw(1u, NULL, NULL, 0u);
+        if (!parameter || !cd_setloc_commands[command] || CD_cw(2u, parameter, result, 0u) == 0)
+        {
+            CdSyncCallback(prev);
+            if (CD_cw(command, parameter, result, 0u) == 0)
+                break;
+        }
+        if (attempts-- == 0u)
+        {
+            CdSyncCallback(prev);
+            return 0;
+        }
+    }
+    return CD_sync(0, result) == CdlComplete;
+}
+
 sint32 CdControlB(uint8 command, uint8 *parameter, uint8 *result)
 {
     uint32 attempts;
     uint32 previous_callback;
     uint32 setloc_entry;
     sint32 dispatch_result;
+    if (xport_cd_setloc_table_address == 0u)
+        return cd_control_b_native(command, parameter, result);
     attempts = 3u;
     previous_callback = r_u32(xport_cd_sync_callback_address);
     setloc_entry = xport_cd_setloc_table_address + 4u * command;
@@ -3829,6 +4009,7 @@ static uint32 spu_reverb_address(sint32 offset)
 static sint32 spu_reverb_read(sint32 offset)
 {
     uint32 address = spu_reverb_address(offset);
+    spu_irq_check_range(address, 2);
     return (sint16)((uint16)spu.ram[address] | ((uint16)spu.ram[address + 1u] << 8));
 }
 
@@ -3842,6 +4023,7 @@ static void spu_reverb_write(sint32 offset, sint32 value)
     sample = (uint16)audio_sample_clamp(value);
     spu.ram[address] = (uint8)sample;
     spu.ram[address + 1u] = (uint8)(sample >> 8);
+    spu_irq_check_range(address, 2);
 }
 
 static sint32 spu_reverb_q15(sint64 value)
@@ -3972,7 +4154,7 @@ static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 fra
             sint32 sample;
             sint32 amplitude;
             uint32 step;
-            if (voice->adsr_phase == SPU_ADSR_OFF)
+            if (voice->adsr_phase == SPU_ADSR_OFF && !(reverb_control.control & 0x40))
                 continue;
             if (!voice->decoded_valid)
                 decode_voice_block(voice);
@@ -4086,28 +4268,26 @@ void spu_render(sint16 *interleaved_stereo, uint32 frame_count)
         xport_audio_unlock();
         return;
     }
-    audio_stem_capture_initialize();
     spu_synchronize_device_clock();
     while (offset < frame_count)
     {
-        sint32 mixed[SPU_MIX_CHUNK_FRAMES * 2];
-        sint32 voices[SPU_MIX_CHUNK_FRAMES * 2];
-        sint32 sends[SPU_MIX_CHUNK_FRAMES * 2] = {0};
-        sint16 decoded[SPU_MIX_CHUNK_FRAMES * 2];
+        /* Transient workspaces are protected by the audio lock */
+        static sint32 mixed[SPU_MIX_CHUNK_FRAMES * 2];
+        static sint32 sends[SPU_MIX_CHUNK_FRAMES * 2];
+        static sint16 decoded[SPU_MIX_CHUNK_FRAMES * 2];
         uint32 count = frame_count - offset;
         uint32 synchronized = 0u;
         uint32 sample;
         if (count > SPU_MIX_CHUNK_FRAMES)
             count = SPU_MIX_CHUNK_FRAMES;
         memset(mixed, 0, count * 2u * sizeof(*mixed));
+        memset(sends, 0, count * 2u * sizeof(*sends));
 #if defined(LOCKSTEP_DEBUG)
         if (spu.lockstep_clock_valid && !spu.lockstep_vblank_render)
             synchronized = count;
 #endif
         if (synchronized < count)
             spu_mix_voices(mixed + synchronized * 2u, sends + synchronized * 2u, count - synchronized);
-        if (audio_stem_capture)
-            memcpy(voices, mixed, count * 2u * sizeof(*voices));
         if (cd_xa_active_locked() || (libsnd.cd.active && !libsnd.cd.paused && !libsnd.cd.muted))
         {
             sint32 xa_source = cd_xa_active_locked();
@@ -4155,18 +4335,6 @@ void spu_render(sint16 *interleaved_stereo, uint32 frame_count)
                 mixed[sample * 2] += wet_left;
                 mixed[sample * 2 + 1] += wet_right;
             }
-            if (audio_stem_capture)
-            {
-                sint32 stems[6];
-
-                stems[0] = voices[sample * 2];
-                stems[1] = voices[sample * 2 + 1];
-                stems[2] = mixed[sample * 2] - stems[0];
-                stems[3] = mixed[sample * 2 + 1] - stems[1];
-                stems[4] = mixed[sample * 2];
-                stems[5] = mixed[sample * 2 + 1];
-                fwrite(stems, sizeof(stems), 1, audio_stem_capture);
-            }
             sint16 left = audio_sample_clamp(mixed[sample * 2]);
             sint16 right = audio_sample_clamp(mixed[sample * 2 + 1]);
             if (spu.native_muted)
@@ -4175,10 +4343,7 @@ void spu_render(sint16 *interleaved_stereo, uint32 frame_count)
             interleaved_stereo[(offset + sample) * 2 + 1] = audio_sample_clamp(apply_volume(right, fixed_volume((uint16)spu.master_right)));
         }
         offset += count;
-        audio_voice_profile_record(count);
     }
-    if (audio_stem_capture)
-        fflush(audio_stem_capture);
     if (libsnd.ticks_running)
     {
         libsnd.tick_accumulator += frame_count;
@@ -4559,49 +4724,117 @@ void cd_unmount_image(void)
     xport_audio_unlock();
 }
 
+static char *cd_cue_field(char *line, const char *field)
+{
+    size_t size = strlen(field);
+    while (*line == ' ' || *line == '\t')
+        ++line;
+    if (strncmp(line, field, size) || (line[size] != ' ' && line[size] != '\t'))
+        return NULL;
+    line += size;
+    while (*line == ' ' || *line == '\t')
+        ++line;
+    return line;
+}
+
+static int cd_cue_number(char **cursor, uint32 *value)
+{
+    char *end;
+    *value = strtoul(*cursor, &end, 10);
+    if (end == *cursor)
+        return 0;
+    *cursor = end;
+    return 1;
+}
+
 static sint32 cd_mount_cue_locked(const char *cue_path)
 {
-    FILE *cue, *image;
-    char line[1024], filename[768], image_path[1024];
+    FILE *image;
+    char filename[768] = {0}, current_file[768] = {0}, image_path[1024];
+    char *data, *line, *next, *field;
     const char *slash, *backslash;
-    size_t directory;
-    sint32 tracks = 0, mode2 = 0, minute = 0, second = 0, frame = 0;
+    size_t directory, size, read_size;
+    sint32 tracks = 0, mode2 = 0;
+    uint32 minute = 0, second = 0, frame = 0, current_track = 0;
     sint64 bytes;
-    if (!cue_path || !(cue = xport_fopen(cue_path, "rb")))
+    if (!cue_path || !xport_file_size(cue_path, &size) || size == SIZE_MAX)
         return 0;
-    filename[0] = 0;
-    char current_file[768] = {0};
-    sint32 current_track = 0;
-    while (fgets(line, sizeof(line), cue))
+    data = malloc(size + 1u);
+    if (!data)
+        return 0;
+    if (!xport_file_read(cue_path, data, size, &read_size) || read_size != size)
     {
-        char found[768], mode[64];
-        sint32 track;
-        if (sscanf(line, " FILE \"%767[^\"]\" BINARY", found) == 1)
+        free(data);
+        return 0;
+    }
+    data[size] = 0;
+    for (line = data; line; line = next)
+    {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        field = strchr(line, '\r');
+        if (field)
+            *field = 0;
+        if ((field = cd_cue_field(line, "FILE")) != NULL && *field == '"')
         {
-            strcpy(current_file, found);
+            char *end = strchr(++field, '"');
+            size_t length = end ? (size_t)(end - field) : 0;
+            if (!end || length >= sizeof(current_file))
+            {
+                free(data);
+                return 0;
+            }
+            memcpy(current_file, field, length);
+            current_file[length] = 0;
         }
-        if (sscanf(line, " TRACK %d %63s", &track, mode) == 2)
+        if ((field = cd_cue_field(line, "TRACK")) != NULL)
         {
+            uint32 track;
+            char *end;
+            if (!cd_cue_number(&field, &track))
+            {
+                free(data);
+                return 0;
+            }
+            while (*field == ' ' || *field == '\t')
+                ++field;
+            end = field;
+            while (*end && *end != ' ' && *end != '\t')
+                ++end;
+            *end = 0;
             current_track = track;
-            if (track == 1 && strcmp(mode, "MODE2/2352") == 0)
+            if (track == 1 && !strcmp(field, "MODE2/2352"))
             {
                 ++tracks;
                 mode2 = 1;
                 strcpy(filename, current_file);
             }
-            else if (strcmp(mode, "AUDIO") != 0)
+            else if (strcmp(field, "AUDIO"))
             {
-                fclose(cue);
+                free(data);
                 return 0;
             }
         }
-        if (current_track == 1 && sscanf(line, " INDEX 01 %d:%d:%d", &minute, &second, &frame) == 3 && (minute < 0 || minute >= 100 || second < 0 || second >= 60 || frame < 0 || frame >= 75))
+        if (current_track == 1 && (field = cd_cue_field(line, "INDEX")) != NULL)
         {
-            fclose(cue);
-            return 0;
+            uint32 index;
+            if (!cd_cue_number(&field, &index))
+            {
+                free(data);
+                return 0;
+            }
+            if (index == 1)
+            {
+                if (!cd_cue_number(&field, &minute) || *field++ != ':' || !cd_cue_number(&field, &second) || *field++ != ':' || !cd_cue_number(&field, &frame) || minute >= 100 || second >= 60 || frame >= 75)
+                {
+                    free(data);
+                    return 0;
+                }
+            }
         }
     }
-    fclose(cue);
+    free(data);
     if (!filename[0] || tracks != 1 || !mode2)
         return 0;
     slash = strrchr(cue_path, '/');
@@ -4616,21 +4849,13 @@ static sint32 cd_mount_cue_locked(const char *cue_path)
     image = xport_fopen(image_path, "rb");
     if (!image)
         return 0;
-#if defined(_WIN32)
-    if (_fseeki64(image, 0, SEEK_END) != 0)
-    {
-        fclose(image);
-        return 0;
-    }
-    bytes = _ftelli64(image);
-#else
     if (fseek(image, 0, SEEK_END) != 0)
     {
         fclose(image);
         return 0;
     }
     bytes = ftell(image);
-#endif
+
     if (bytes <= 0 || bytes % 2352 != 0 || (uint64)bytes / 2352u > UINT32_MAX)
     {
         fclose(image);
@@ -4668,15 +4893,10 @@ sint32 cd_mount_stream_file(const char *path)
 
     if (!path || !(file = fopen(path, "rb")))
         return 0;
-#if defined(_WIN32)
-    if (_fseeki64(file, 0, SEEK_END) != 0)
-        goto fail;
-    bytes = _ftelli64(file);
-#else
     if (fseek(file, 0, SEEK_END) != 0)
         goto fail;
     bytes = ftell(file);
-#endif
+
     if (bytes <= 0 || bytes > UINT32_MAX || fseek(file, 0, SEEK_SET) != 0 || fread(header, 1u, sizeof(header), file) != sizeof(header))
         goto fail;
     if (memcmp(header, "RIFF", 4u) == 0 && memcmp(header + 8, "CDXA", 4u) == 0)
@@ -4735,13 +4955,9 @@ static sint32 cd_fetch_sector(uint32 sector)
     uint64 offset = cd_image_byte_offset + ((uint64)sector + cd_sector_offset) * cd_image_sector_bytes;
     if (!cd_image || (uint64)sector + cd_sector_offset >= cd_image_sectors)
         return 0;
-#if defined(_WIN32)
-    if (_fseeki64(cd_image, (sint64)offset, SEEK_SET) != 0)
-        return 0;
-#else
     if (offset > 0x7fffffffu || fseek(cd_image, (long)offset, SEEK_SET) != 0)
         return 0;
-#endif
+
     if (cd_image_sector_bytes == 2048u)
     {
         CdlLOC pos;
@@ -4941,7 +5157,8 @@ static sint32 cd_xa_active_locked(void)
 
 static sint32 cd_xa_sector_locked(void)
 {
-    sint16 decoded[XA_MAX_SECTOR_FRAMES * 2u];
+    /* Transient workspace is protected by the audio lock */
+    static sint16 decoded[XA_MAX_SECTOR_FRAMES * 2u];
     uint32 frames, i;
     sint32 audio;
     if (CD_XA_PCM_FRAMES - cd_xa.pcm_count < XA_MAX_SECTOR_FRAMES)
@@ -4984,7 +5201,9 @@ static sint32 cd_xa_sector_locked(void)
         cd_xa.identity_channel = cd_sector_buffer[17];
         if (xa_decode_sector(&cd_xa.decoder, cd_sector_buffer, decoded, XA_MAX_SECTOR_FRAMES, &frames) != XA_OK)
         {
+#ifndef NDEBUG
             fprintf(stderr, "Unsupported or malformed XA sector at LBA %u, coding %02X\n", cd_sector_cursor - 1u, cd_sector_buffer[19]);
+#endif
             abort();
         }
         for (i = 0; i < frames; ++i)
@@ -5335,6 +5554,12 @@ sint32 CD_vol(CdlATV *volume)
     return CdMix(volume);
 }
 
+// Status byte already published by the native controller Nop response
+static uint8 cd_native_status_locked(void)
+{
+    return (uint8)((cd_image ? 2u : 0u) | (cd_xa.reading ? 0x20u : 0u) | (cd_xa.error ? 1u : 0u));
+}
+
 sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
 {
     sint32 ok = 0;
@@ -5345,7 +5570,7 @@ sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
     {
         ok = cd_image != NULL;
         if (result)
-            result[0] = (uint8)((ok ? 2u : 0u) | (cd_xa.reading ? 0x20u : 0u) | (cd_xa.error ? 1u : 0u));
+            result[0] = cd_native_status_locked();
     }
     else if (command == 16u)
     {

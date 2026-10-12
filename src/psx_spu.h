@@ -165,6 +165,7 @@ extern "C"
     sint32 spu_load_ram_file(const char *path);
     sint32 spu_mmio_read(void *user, uint32 physical_address, uint32 width, uint32 *value);
     sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 value, uint32 byte_mask);
+    void spu_dispatch_pending_irq(void);
     const uint8 *spu_ram_data(void);
     sint32 spu_native_vab_address(sint16 bank);
     void spu_native_set_mute(sint32 muted);

@@ -1125,18 +1125,19 @@ static void release_mapping(HANDLE *handle, void **view)
 
 static sint32 publish_mapping(const char *name, DWORD size, sint32 reuse_existing, HANDLE *handle, void **view)
 {
-    SetLastError(ERROR_SUCCESS);
-    *handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0u, size, name);
-    if (!*handle)
-    {
-        memory_error = XPORT_LOCKSTEP_MEMORY_CREATE_FAILED;
-        return 0;
-    }
-    if (GetLastError() == ERROR_ALREADY_EXISTS && !reuse_existing)
+    *handle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+    if (*handle && !reuse_existing)
     {
         CloseHandle(*handle);
         *handle = NULL;
         memory_error = XPORT_LOCKSTEP_MEMORY_MAPPING_COLLISION;
+        return 0;
+    }
+    if (!*handle)
+        *handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0u, size, name);
+    if (!*handle)
+    {
+        memory_error = XPORT_LOCKSTEP_MEMORY_CREATE_FAILED;
         return 0;
     }
     *view = MapViewOfFile(*handle, FILE_MAP_ALL_ACCESS, 0u, 0u, size);
@@ -1374,7 +1375,9 @@ sint32 xport_lockstep_spu_event_consume(XportLockstepSpuEventKind kind, uint32 a
             _ReadWriteBarrier();
             if (event.kind != (uint32)kind || event.address != address || (validate_value && event.value != *value))
             {
+    #ifndef NDEBUG
                 fprintf(stderr, "xport_spu_timeline mismatch read=%u write=%u expected=%u:%08X:%08X validate=%d actual=%u:%08X:%08X ticks=%08X%08X\n", read, write, (uint32)kind, address, *value, validate_value, event.kind, event.address, event.value, event.ticks_high, event.ticks_low);
+    #endif
                 InterlockedCompareExchange((volatile LONG *)&deferred_state->spu_timeline_error, 2, 0);
                 return -1;
             }
@@ -1385,7 +1388,9 @@ sint32 xport_lockstep_spu_event_consume(XportLockstepSpuEventKind kind, uint32 a
         }
         if (GetTickCount() - started >= 10000u)
         {
+    #ifndef NDEBUG
             fprintf(stderr, "xport_spu_timeline timeout read=%u write=%u expected=%u:%08X:%08X validate=%d\n", deferred_state->spu_timeline_read, deferred_state->spu_timeline_write, (uint32)kind, address, *value, validate_value);
+    #endif
             InterlockedCompareExchange((volatile LONG *)&deferred_state->spu_timeline_error, 3, 0);
             return -1;
         }
@@ -2759,7 +2764,10 @@ sint32 xport_memory_snapshot_finish(XportMemorySnapshotWriter *writer)
     xport_snapshot_u64(payload + 8u, implementation->last_frame);
     xport_snapshot_u64(payload + 16u, implementation->last_clock);
     memcpy(payload + 24u, file_digest, sizeof(file_digest));
-    result = xport_snapshot_record(implementation, 3u, payload, sizeof(payload), 0) && fflush(implementation->stream) == 0;
+    result = xport_snapshot_record(implementation, 3u, payload, sizeof(payload), 0);
+#ifndef NDEBUG
+    result = result && fflush(implementation->stream) == 0;
+#endif
     if (fclose(implementation->stream) != 0)
         result = 0;
     implementation->stream = NULL;
@@ -2783,6 +2791,7 @@ sint32 xport_memory_snapshot_capture_psx(XportMemorySnapshotWriter *writer, Xpor
     return token && xport_memory_snapshot_region(writer, token, 1u) && xport_memory_snapshot_region(writer, token, 2u) && xport_memory_snapshot_region(writer, token, 3u) && xport_memory_snapshot_region(writer, token, 4u) && xport_memory_snapshot_commit(writer, token);
 }
 
+#ifndef NDEBUG
 int xport_journal_file_sha256(const char *path, char output[65])
 {
     XportSha256 hash;
@@ -2799,7 +2808,11 @@ int xport_journal_file_sha256(const char *path, char output[65])
     xport_sha256_init(&hash);
     while ((count = fread(data, 1, sizeof(data), stream)) != 0)
         xport_sha256_update(&hash, data, count);
+    #ifndef NDEBUG
     failed = ferror(stream);
+    #else
+    failed = 0;
+    #endif
     if (fclose(stream))
         failed = 1;
     if (failed)
@@ -2896,7 +2909,11 @@ int xport_journal_hex_bytes(XportJournal *journal, const char *name, uint32_t ad
 
 int xport_journal_end(XportJournal *journal)
 {
-    if (!journal || !journal->stream || journal->failed || fputs("}\n", journal->stream) < 0 || fflush(journal->stream) || ferror(journal->stream))
+    if (!journal || !journal->stream || journal->failed || fputs("}\n", journal->stream) < 0
+    #ifndef NDEBUG
+        || fflush(journal->stream) || ferror(journal->stream)
+    #endif
+    )
     {
         if (journal)
             journal->failed = 1;
@@ -3041,3 +3058,5 @@ int xport_trace_write_progress(const char *path, uint32_t sequence, const uint32
         remove(temporary);
     return ok;
 }
+
+#endif

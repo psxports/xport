@@ -159,23 +159,23 @@ void gpu_scanout_command(GpuScanoutState *state, uint32 command)
 {
     switch (command >> 24)
     {
-    case 0u:
-        gpu_scanout_reset(state);
-        break;
-    case 5u:
-        state->disp_y = (command >> 10) & 1023u;
-        break;
-    case 7u:
-        state->start_y = command & 1023u;
-        state->end_y = (command >> 10) & 1023u;
-        break;
-    case 8u:
-        state->mode = command & 255u;
-        state->line %= (state->mode & 8u) ? 314u : 263u;
-        state->tick %= (state->mode & 8u) ? 3406u : 3413u;
-        break;
-    default:
-        break;
+        case 0u:
+            gpu_scanout_reset(state);
+            break;
+        case 5u:
+            state->disp_y = (command >> 10) & 1023u;
+            break;
+        case 7u:
+            state->start_y = command & 1023u;
+            state->end_y = (command >> 10) & 1023u;
+            break;
+        case 8u:
+            state->mode = command & 255u;
+            state->line %= (state->mode & 8u) ? 314u : 263u;
+            state->tick %= (state->mode & 8u) ? 3406u : 3413u;
+            break;
+        default:
+            break;
     }
 }
 
@@ -577,6 +577,52 @@ static void gpu_observe_image(const PSX_RECT *rectangle, const uint32 *pixels, s
     return;
 unsupported:
     gpu_unobserved_transfer();
+}
+
+static sint32 gpu_decode_tim_block(const uint8 *src, size_t size, PSX_RECT *rect, const uint8 **pixels, size_t *block_size)
+{
+    size_t payload_size;
+
+    if (size < 12u)
+        return 0;
+    *block_size = xport_load_le32(src);
+    setRECT(rect, (sint16)xport_load_le16(src + 4u), (sint16)xport_load_le16(src + 6u), (sint16)xport_load_le16(src + 8u), (sint16)xport_load_le16(src + 10u));
+    if (rect->w < 0 || rect->h < 0)
+        return 0;
+    payload_size = (size_t)rect->w * (size_t)rect->h * 2u;
+    if (payload_size > size - 12u)
+        return 0;
+    *pixels = src + 12u;
+    return 1;
+}
+
+sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image)
+{
+    const uint8 *bytes = (const uint8 *)src;
+    GpuTimImage decoded = {0};
+    size_t off = 4u;
+    size_t block_size;
+
+    if (!bytes || !image || size < 4u)
+        return 0;
+    decoded.mode = xport_load_le32(bytes);
+    if (decoded.mode & ~0x0Bu)
+        return 0;
+    if (decoded.mode & 8u)
+    {
+        size_t clut_size;
+
+        if (!gpu_decode_tim_block(bytes + off, size - off, &decoded.clut, &decoded.clut_data, &block_size))
+            return 0;
+        clut_size = (size_t)decoded.clut.w * (size_t)decoded.clut.h * 2u;
+        if (block_size < 12u || block_size > size - off || clut_size > block_size - 12u || (block_size & 3u))
+            return 0;
+        off += block_size;
+    }
+    if (!gpu_decode_tim_block(bytes + off, size - off, &decoded.pixels, &decoded.pixel_data, &block_size))
+        return 0;
+    *image = decoded;
+    return 1;
 }
 
 sint32 LoadImagePSX(PSX_RECT *rectangle, uint32 *pixels)
@@ -1317,7 +1363,7 @@ static sint32 raster_enabled(void)
 #if defined(LOCKSTEP_DEBUG)
     // Lockstep must preserve GPU readback semantics
     return 1;
-#else
+#elif defined(_DEBUG)
     static sint32 force = -1;
     if (!xport_is_headless())
         return 1;
@@ -1325,9 +1371,13 @@ static sint32 raster_enabled(void)
     {
         const char *r = getenv("XPORT_RASTERIZE"), *v = getenv("XPORT_VERIFY_VRAM");
         force = (r && !strcmp(r, "1")) || (v && !strcmp(v, "1"));
+    #ifndef NDEBUG
         printf("headless_rasterization %s\n", force ? "enabled" : "disabled");
+    #endif
     }
     return force;
+#else
+    return !xport_is_headless();
 #endif
 }
 
@@ -1789,7 +1839,9 @@ static void draw_prim(void *raw)
             length = 3u;
         if (length > remaining)
         {
+#ifndef NDEBUG
             fprintf(stderr, "Truncated GPU command %02X: %u of %u words\n", command, remaining, length);
+#endif
             abort();
         }
         packet[0] = length << 24;
@@ -2008,7 +2060,9 @@ static void gpu_draw_command(void *raw)
         if (!reported[p[7]])
         {
             reported[p[7]] = 1u;
+    #ifndef NDEBUG
             fprintf(stderr, "gpu_unsupported_primitive address=%08x tag=%08x code=%02x words=%u\n", gpu_debug_packet_address, gpu_debug_packet_tag, p[7], gpu_debug_packet_tag >> 24);
+    #endif
         }
     }
 #endif
@@ -2050,6 +2104,17 @@ sint32 ResetGraph(sint32 mode)
         transfer_observer(transfer_observer_context, 1u, 4u, &command, 1u);
         return 0;
     }
+    if (mode == 1 && !transfer_observer && !linked_submit && !sync_sample && soft_reset_head && soft_reset_tail)
+    {
+        /* Native packets complete synchronously, with no active DMA or partial FIFO */
+        *(uint32 *)psx_addr(soft_reset_tail, 4u) = 0u;
+        *(uint32 *)psx_addr(soft_reset_head, 4u) = 0u;
+        if (!psx_irq_native_acknowledge(1u << 3))
+            return -1;
+        gpu_psyq_gp1(0x02000000u);
+        gpu_psyq_gp1(0x01000000u);
+        return 0;
+    }
     gpu_unobserved_transfer();
     if (mode != 0)
         return -1;
@@ -2068,6 +2133,9 @@ sint32 SetGraphDebug(sint32 level)
 
 sint32 GetGraphType(void)
 {
+    // Native rasterizer models the standard PS1 GPU
+    if (xport_gpu_graph_type_address == 0u)
+        return 0;
     return (sint32)r_u8(xport_gpu_graph_type_address);
 }
 
@@ -2350,7 +2418,9 @@ static void gpu_draw_linked_dma(uint32 *ot)
         if ((address & 3u) || count++ >= 65536)
         {
 #if !defined(NDEBUG)
+    #ifndef NDEBUG
             fprintf(stderr, "gpu_link_failure reason=head address=%08x head=%08x count=%u native=%d\n", address, head, count, native);
+    #endif
 #endif
             if (transfer_observer)
                 transfer_observation_failed = 1;
@@ -2377,7 +2447,9 @@ static void gpu_draw_linked_dma(uint32 *ot)
                 if (!gpu_native_dma_pointer(link, &packet))
                 {
 #if !defined(NDEBUG)
+    #ifndef NDEBUG
                     fprintf(stderr, "gpu_link_failure reason=resolve address=%08x head=%08x link=%08x count=%u native=%d\n", address, head, link, count, native);
+    #endif
 #endif
                     if (transfer_observer)
                         transfer_observation_failed = 1;
@@ -2404,10 +2476,14 @@ static void gpu_draw_linked_dma(uint32 *ot)
         if (registered_bytes && registered_bytes < 4u + 4u * (tag >> 24))
             return;
 #if !defined(NDEBUG)
+    #ifndef NDEBUG
         if ((tag & 0x00ffffffu) == 0u)
             fprintf(stderr, "gpu_link_failure zero_link predecessor=%08x tag=%08x words=%u count=%u\n", address, tag, tag >> 24, count);
+    #endif
+    #ifndef NDEBUG
         if ((tag & 0x00ffffffu) != 0x00ffffffu && (tag & 3u))
             fprintf(stderr, "gpu_link_failure predecessor=%08x tag=%08x words=%u count=%u\n", address, tag, tag >> 24, count);
+    #endif
 #endif
         if (linked_trace_operation && linked_trace_operation->active)
             xport_device_trace_stage(linked_trace_operation, XPORT_DEVICE_FETCH, XPORT_DEVICE_EVIDENCE_EXACT, packet_native ? XPORT_DEVICE_REGION_NONE : address < PSX_DRAM_SIZE ? XPORT_DEVICE_REGION_RAM : XPORT_DEVICE_REGION_SCRATCHPAD, packet_native ? 0u : address < PSX_DRAM_SIZE ? address : address - 0x1f800000u, XPORT_DEVICE_REGION_NONE, 0u, 4u + 4u * (tag >> 24), 0xffffffffu);
@@ -2815,8 +2891,7 @@ void SetDrawEnv(DR_ENV *packet, DRAWENV *environment)
         y = environment->clip.y - environment->ofs[1];
         words[7] = 0x60000000u | (uint32)environment->r0 | ((uint32)environment->g0 << 8) | ((uint32)environment->b0 << 16);
         words[8] = (uint16)x | ((uint32)(uint16)y << 16);
-        words[9] = (uint32)gpu_env_clamp((sint16)environment->clip.w, VRAM_W)
-            | ((uint32)gpu_env_clamp((sint16)environment->clip.h, VRAM_H) << 16);
+        words[9] = (uint32)gpu_env_clamp((sint16)environment->clip.w, VRAM_W) | ((uint32)gpu_env_clamp((sint16)environment->clip.h, VRAM_H) << 16);
         count = 9;
     }
     words[0] = (words[0] & 0x00ffffffu) | ((uint32)count << 24);
@@ -3187,3 +3262,462 @@ uint32 xport_gpu_status_read_missing(uint32 address)
     (void)address;
     abort();
 }
+
+uint32 DrawPrimPSX(uint32 primitive, uint32 driver_slot, uint32 guest_gp, uint32 guest_entry)
+{
+    uint32 driver, target, count, registers[32];
+    driver = r_u32(driver_slot);
+    target = r_u32(driver + 60u);
+    count = r_u8(primitive + 3u);
+    registers[0] = 0u;
+    registers[2] = target;
+    registers[4] = 0u;
+    registers[16] = primitive;
+    registers[17] = count;
+    registers[28] = guest_gp;
+    registers[31] = guest_entry + 0x2Cu;
+    (void)xport_gpu_guest_dispatch(target, registers, 0x90030015u);
+    driver = r_u32(driver_slot);
+    target = r_u32(driver + 20u);
+    registers[2] = target;
+    registers[4] = primitive + 4u;
+    registers[5] = count;
+    registers[31] = guest_entry + 0x48u;
+    return xport_gpu_guest_dispatch(target, registers, 0x90030035u);
+}
+
+uint32 SYS_OBJ_172CPSX(uint32 x, uint32 y, uint32 extent)
+{
+    uint32 value, maximum;
+    if ((sint16)x < 0)
+        x = 0u;
+    else
+    {
+        value = (uint32)(sint32)r_s16(extent) - 1u;
+        maximum = r_u16(extent) - 1u;
+        if ((sint32)value < (sint16)x)
+            x = maximum;
+    }
+    if ((sint16)y < 0)
+        y = 0u;
+    else
+    {
+        value = (uint32)(sint32)r_s16(extent + 2u) - 1u;
+        maximum = r_u16(extent + 2u) - 1u;
+        if ((sint32)value < (sint16)y)
+            y = maximum;
+    }
+    return 0xE3000000u | (x & 1023u) | ((y & 1023u) << 10u);
+}
+
+uint32 SYS_OBJ_17C4PSX(uint32 x, uint32 y, uint32 extent)
+{
+    uint32 value, maximum;
+    if ((sint16)x < 0)
+        x = 0u;
+    else
+    {
+        value = (uint32)(sint32)r_s16(extent) - 1u;
+        maximum = r_u16(extent) - 1u;
+        if ((sint32)value < (sint16)x)
+            x = maximum;
+    }
+    if ((sint16)y < 0)
+        y = 0u;
+    else
+    {
+        value = (uint32)(sint32)r_s16(extent + 2u) - 1u;
+        maximum = r_u16(extent + 2u) - 1u;
+        if ((sint32)value < (sint16)y)
+            y = maximum;
+    }
+    return 0xE4000000u | (x & 1023u) | ((y & 1023u) << 10u);
+}
+
+uint32 SYS_OBJ_185CPSX(uint32 x, uint32 y)
+{
+    return 0xE5000000u | (x & 2047u) | ((y & 2047u) << 11u);
+}
+
+uint32 SYS_OBJ_170CPSX(uint32 dfe, uint32 dtd, uint32 tpage)
+{
+    uint32 command = 0xE1000000u;
+    if (dtd != 0u)
+        command |= 0x200u;
+    tpage &= 0x9FFu;
+    if (dfe != 0u)
+        tpage |= 0x400u;
+    return command | tpage;
+}
+
+uint32 SYS_OBJ_1878PSX(uint32 rectangle)
+{
+    uint32 frame = xport_sdk_texture_frame_acquire(16u);
+    uint32 width, offset_x, height, offset_y, result = 0u;
+    if (rectangle != 0u)
+    {
+        width = r_u8(rectangle) >> 3u;
+        w_u32(frame, width);
+        offset_x = ((0u - (uint32)(sint32)r_s16(rectangle + 4u)) & 255u) >> 3u;
+        w_u32(frame + 8u, offset_x);
+        height = r_u8(rectangle + 2u) >> 3u;
+        w_u32(frame + 4u, height);
+        offset_y = ((0u - (uint32)(sint32)r_s16(rectangle + 6u)) & 255u) >> 3u;
+        result = 0xE2000000u | (width << 10u) | (height << 15u) | offset_x | (offset_y << 5u);
+        w_u32(frame + 12u, offset_y);
+    }
+    xport_sdk_texture_frame_release(frame, 16u);
+    return result;
+}
+
+uint32 SYS_OBJ_149CPSX(uint32 packet, uint32 environment, uint32 extent)
+{
+    uint32 frame = xport_sdk_draw_env_frame_acquire(40u);
+    uint32 x, y, width, height, value, count = 7u;
+    sint32 height_signed;
+    x = (uint32)(sint32)r_s16(environment);
+    y = (uint32)(sint32)r_s16(environment + 2u);
+    w_u32(packet + 4u, SYS_OBJ_172CPSX(x, y, extent));
+    width = r_u16(environment + 4u);
+    x = r_u16(environment);
+    y = r_u16(environment + 2u);
+    x = (uint32)(sint32)(sint16)(width + x - 1u);
+    height = r_u16(environment + 6u);
+    y = (uint32)(sint32)(sint16)(y + height - 1u);
+    w_u32(packet + 8u, SYS_OBJ_17C4PSX(x, y, extent));
+    x = (uint32)(sint32)r_s16(environment + 8u);
+    y = (uint32)(sint32)r_s16(environment + 10u);
+    w_u32(packet + 12u, SYS_OBJ_185CPSX(x, y));
+    x = r_u8(environment + 23u);
+    y = r_u8(environment + 22u);
+    value = r_u16(environment + 20u);
+    w_u32(packet + 16u, SYS_OBJ_170CPSX(x, y, value));
+    value = SYS_OBJ_1878PSX(environment + 12u);
+    w_u32(packet + 20u, value);
+    w_u32(packet + 24u, 0xE6000000u);
+    if (r_u8(environment + 24u) != 0u)
+    {
+        x = r_u16(environment);
+        w_u16(frame + 16u, x);
+        y = r_u16(environment + 2u);
+        w_u16(frame + 18u, y);
+        width = r_u16(environment + 4u);
+        w_u16(frame + 20u, width);
+        height = r_u16(environment + 6u);
+        w_u16(frame + 22u, height);
+        if ((sint16)width < 0)
+            width = 0u;
+        else
+        {
+            value = (uint32)(sint32)r_s16(extent) - 1u;
+            if ((sint32)value < (sint16)width)
+                width = r_u16(extent) - 1u;
+            else
+            {
+                (void)r_u16(extent);
+            }
+        }
+        height_signed = r_s16(frame + 22u);
+        height = r_u16(frame + 22u);
+        w_u16(frame + 20u, width);
+        if (height_signed < 0)
+            height = 0u;
+        else
+        {
+            value = (uint32)(sint32)r_s16(extent + 2u) - 1u;
+            if ((sint32)value < height_signed)
+                height = r_u16(extent + 2u) - 1u;
+            else
+            {
+                (void)r_u16(extent + 2u);
+            }
+        }
+        x = r_u16(frame + 16u);
+        w_u16(frame + 22u, height);
+        if ((x & 63u) != 0u || (r_u16(frame + 20u) & 63u) != 0u)
+        {
+            value = r_u16(environment + 8u);
+            w_u16(frame + 16u, x - value);
+            y = r_u16(frame + 18u);
+            value = r_u16(environment + 10u);
+            w_u16(frame + 18u, y - value);
+            value = r_u8(environment + 27u) << 16u;
+            value |= r_u8(environment + 26u) << 8u;
+            value |= 0x60000000u | r_u8(environment + 25u);
+        }
+        else
+        {
+            value = r_u8(environment + 27u) << 16u;
+            value |= r_u8(environment + 26u) << 8u;
+            value |= 0x02000000u | r_u8(environment + 25u);
+        }
+        w_u32(packet + 28u, value);
+        w_u32(packet + 32u, r_u32(frame + 16u));
+        w_u32(packet + 36u, r_u32(frame + 20u));
+        count = 10u;
+    }
+    w_u8(packet + 3u, (uint8)(count - 1u));
+    xport_sdk_draw_env_frame_release(frame, 40u);
+    return count - 1u;
+}
+
+uint32 PutDrawEnvPSX(uint32 environment, uint32 state, uint32 debug_format, uint32 guest_gp, uint32 guest_entry, uint32 (*copy_guest)(uint32 destination, uint32 source, uint32 bytes))
+{
+    uint32 driver, target, value, registers[32];
+    if (r_u8(state) >= 2u)
+    {
+        target = r_u32(state - 6u);
+        registers[0] = 0u;
+        registers[2] = target;
+        registers[4] = debug_format;
+        registers[5] = environment;
+        registers[17] = environment;
+        registers[18] = state;
+        registers[28] = guest_gp;
+        registers[31] = guest_entry + 0x4Cu;
+        (void)xport_gpu_guest_dispatch(target, registers, 0x90060035u);
+    }
+    (void)SYS_OBJ_149CPSX(environment + 28u, environment, state + 2u);
+    value = r_u32(environment + 28u);
+    driver = r_u32(state - 10u);
+    w_u32(environment + 28u, value | 0xFFFFFFu);
+    registers[0] = 0u;
+    registers[4] = r_u32(driver + 24u);
+    target = r_u32(driver + 8u);
+    registers[2] = target;
+    registers[3] = driver;
+    registers[5] = environment + 28u;
+    registers[6] = 64u;
+    registers[7] = 0u;
+    registers[16] = environment + 28u;
+    registers[17] = environment;
+    registers[18] = state;
+    registers[28] = guest_gp;
+    registers[31] = guest_entry + 0x94u;
+    (void)xport_gpu_guest_dispatch(target, registers, 0x900700FDu);
+    (void)copy_guest(state + 14u, environment, 92u);
+    return environment;
+}
+
+uint32 PutDispEnvPSX(uint32 environment, uint32 debug_level_address, uint32 debug_callback_address, uint32 debug_format_address, uint32 driver_table_address, uint32 cache_address, uint32 reverse_flag_address, uint32 divisors_address, uint32 ranges_address, uint32 guest_gp, uint32 guest_entry, sint32 (*get_video_mode)(void), uint32 (*copy_bytes)(uint32 destination, uint32 source, uint32 bytes))
+{
+    uint32 mode = 0x08000000u, registers[32], target, driver, packed, command, value, cached, current, index, video, divisor, selector, start, end, delta, x0, x1, y0, y1, minimum;
+    sint32 width, height, screen_x, screen_y, screen_w;
+    sint32 changed;
+    value = r_u8(debug_level_address);
+    if (value >= 2u)
+    {
+        target = r_u32(debug_callback_address);
+        registers[0] = 0u;
+        registers[2] = target;
+        registers[4] = debug_format_address;
+        registers[5] = environment;
+        registers[16] = mode;
+        registers[17] = environment;
+        registers[18] = debug_level_address;
+        registers[28] = guest_gp;
+        registers[31] = guest_entry + 0x50u;
+        xport_gpu_guest_dispatch(target, registers, 0x90070035u);
+    }
+    packed = (r_u16(environment + 2u) & 0x3FFu) << 10;
+    command = r_u16(environment) & 0x3FFu;
+    driver = r_u32(driver_table_address);
+    command |= 0x05000000u;
+    target = r_u32(driver + 16u);
+    command |= packed;
+    registers[0] = 0u;
+    registers[2] = target;
+    registers[3] = packed;
+    registers[4] = command;
+    registers[5] = driver;
+    registers[16] = mode;
+    registers[17] = environment;
+    registers[18] = debug_level_address;
+    registers[28] = guest_gp;
+    registers[31] = guest_entry + 0x84u;
+    xport_gpu_guest_dispatch(target, registers, 0x9007003Du);
+    cached = r_u32(cache_address + 16u);
+    current = r_u32(environment + 16u);
+    changed = cached != current;
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 0u);
+        current = (uint32)(sint32)r_s16(environment + 0u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 2u);
+        current = (uint32)(sint32)r_s16(environment + 2u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 4u);
+        current = (uint32)(sint32)r_s16(environment + 4u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 6u);
+        current = (uint32)(sint32)r_s16(environment + 6u);
+        changed = cached != current;
+    }
+    if (changed)
+    {
+        value = (uint32)get_video_mode();
+        w_u8(environment + 18u, (uint8)value);
+        if ((value & 0xFFu) == 1u)
+            mode |= 8u;
+        if (r_u8(environment + 17u))
+            mode |= 16u;
+        if (r_u8(environment + 16u))
+            mode |= 32u;
+        if (r_u8(reverse_flag_address))
+            mode |= 128u;
+        width = r_s16(environment + 4u);
+        if (width >= 281 && width < 353)
+            mode |= 1u;
+        else if (width >= 353 && width < 401)
+            mode |= 64u;
+        else if (width >= 401 && width < 561)
+            mode |= 2u;
+        else if (width >= 561)
+            mode |= 3u;
+        video = r_u8(environment + 18u);
+        height = r_s16(environment + 6u);
+        if (height >= (video ? 289 : 257))
+            mode |= 36u;
+        driver = r_u32(driver_table_address);
+        target = r_u32(driver + 16u);
+        registers[0] = 0u;
+        registers[2] = target;
+        registers[3] = (uint32)height;
+        registers[4] = mode;
+        registers[16] = mode;
+        registers[17] = environment;
+        registers[18] = debug_level_address;
+        registers[28] = guest_gp;
+        registers[31] = guest_entry + 0x1DCu;
+        xport_gpu_guest_dispatch(target, registers, 0x9007001Du);
+        w_u8(environment + 18u, 8u);
+    }
+    changed = 0;
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 8u);
+        current = (uint32)(sint32)r_s16(environment + 8u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 10u);
+        current = (uint32)(sint32)r_s16(environment + 10u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 12u);
+        current = (uint32)(sint32)r_s16(environment + 12u);
+        changed = cached != current;
+    }
+    if (!changed)
+    {
+        cached = (uint32)(sint32)(sint16)r_u16(cache_address + 14u);
+        current = (uint32)(sint32)r_s16(environment + 14u);
+        changed = cached != current;
+    }
+    if (!changed)
+        changed = r_u8(environment + 18u) == 8u;
+    if (changed)
+    {
+        value = (uint32)get_video_mode();
+        w_u8(environment + 18u, (uint8)value);
+        screen_y = r_s16(environment + 10u);
+        y0 = (uint32)screen_y + ((value & 0xFFu) ? 19u : 16u);
+        height = r_s16(environment + 14u);
+        y1 = y0 + (height ? (uint32)height : 240u);
+        width = r_s16(environment + 4u);
+        index = width < 281 ? 0u : width < 353 ? 1u : width < 401 ? 2u : width < 561 ? 3u : 4u;
+        screen_x = r_s16(environment + 8u);
+        divisor = r_u8(divisors_address + index);
+        video = r_u8(environment + 18u);
+        selector = (5u * video + index) * 4u;
+        start = r_u16(ranges_address + selector);
+        end = r_u16(ranges_address + selector + 2u);
+        screen_w = r_s16(environment + 12u);
+        delta = end - start;
+        x0 = start + (uint32)((sint64)screen_x * (sint64)divisor);
+        if (screen_w)
+        {
+            delta = (uint32)((sint32)(uint32)((sint64)(sint32)delta * (sint64)screen_w) >> 8);
+        }
+        x1 = x0 + delta;
+        video = r_u8(environment + 18u);
+        if (video)
+        {
+            x0 = (sint32)x0 < 540 ? 540u : (sint32)x0 < 3221 ? x0 : 3220u;
+            divisor = r_u8(divisors_address + index);
+            minimum = x0 + 4u * divisor;
+            x1 = (sint32)x1 < (sint32)minimum ? minimum : (sint32)x1 < 3261 ? x1 : 3260u;
+            y0 = (sint32)y0 < 19 ? 19u : (sint32)y0 < 304 ? y0 : 303u;
+            minimum = y0 + 2u;
+            value = 305u;
+        }
+        else
+        {
+            x0 = (sint32)x0 < 500 ? 500u : (sint32)x0 < 3251 ? x0 : 3250u;
+            divisor = r_u8(divisors_address + index);
+            minimum = x0 + 4u * divisor;
+            x1 = (sint32)x1 < (sint32)minimum ? minimum : (sint32)x1 < 3291 ? x1 : 3290u;
+            y0 = (sint32)y0 < 16 ? 16u : (sint32)y0 < 258 ? y0 : 257u;
+            minimum = y0 + 2u;
+            value = 258u;
+        }
+        y1 = (sint32)y1 < (sint32)minimum ? minimum : (sint32)y1 < (sint32)(value + 1u) ? y1 : value;
+        packed = (x1 & 0xFFFu) << 12;
+        command = 0x06000000u | (x0 & 0xFFFu);
+        driver = r_u32(driver_table_address);
+        target = r_u32(driver + 16u);
+        command |= packed;
+        registers[0] = 0u;
+        registers[2] = target;
+        registers[3] = packed;
+        registers[4] = command;
+        registers[5] = driver;
+        registers[16] = y0;
+        registers[17] = environment;
+        registers[18] = y1;
+        registers[28] = guest_gp;
+        registers[31] = guest_entry + 0x49Cu;
+        xport_gpu_guest_dispatch(target, registers, 0x9007003Du);
+        packed = (y1 & 0x3FFu) << 10;
+        command = 0x07000000u | (y0 & 0x3FFu);
+        driver = r_u32(driver_table_address);
+        target = r_u32(driver + 16u);
+        command |= packed;
+        registers[0] = 0u;
+        registers[2] = target;
+        registers[3] = packed;
+        registers[4] = command;
+        registers[5] = driver;
+        registers[16] = y0;
+        registers[17] = environment;
+        registers[18] = y1;
+        registers[28] = guest_gp;
+        registers[31] = guest_entry + 0x4C8u;
+        xport_gpu_guest_dispatch(target, registers, 0x9007003Du);
+    }
+    copy_bytes(cache_address, environment, 20u);
+    return environment;
+}
+
+#if !defined(XPORT_GAME_GPU_GUEST_DISPATCH) || !XPORT_GAME_GPU_GUEST_DISPATCH
+uint32 xport_gpu_guest_dispatch(uint32 target, uint32 *registers, uint32 known_register_mask)
+{
+    (void)target;
+    (void)registers;
+    (void)known_register_mask;
+    abort();
+}
+#endif

@@ -99,16 +99,9 @@ sint32 mdec_rle_decode(MdecRleBlock *block, const uint16 *input, uint32 count, u
     return 0;
 }
 
-static sint64 mdec_floor_power(sint64 value, uint32 bits)
-{
-    sint64 unit = (sint64)1 << bits;
-    return value >= 0 ? value / unit : -((-value + unit - 1) / unit);
-}
-
 static sint64 mdec_arithmetic_shift(sint64 value, uint32 bits)
 {
-    uint64 sign = value < 0 ? ~(uint64)0 << (64u - bits) : 0u;
-    return (sint64)(((uint64)value >> bits) | sign);
+    return value >> bits;
 }
 
 static sint32 mdec_signed_word(uint32 word)
@@ -128,7 +121,7 @@ static sint16 mdec_idct_value(const sint16 *values, const sint16 *scale, uint32 
         else
             second += (uint32)product;
     }
-    rounded = mdec_floor_power((sint64)mdec_signed_word(first) + mdec_signed_word(second) + 131072, 18u);
+    rounded = mdec_arithmetic_shift((sint64)mdec_signed_word(first) + mdec_signed_word(second) + 131072, 18u);
     return (sint16)rounded;
 }
 
@@ -143,7 +136,7 @@ static void mdec_idct_matrix_1d(const sint16 values[8], sint16 output[8], const 
 
 static sint16 mdec_idct_accumulated(uint32 first, uint32 second)
 {
-    return (sint16)mdec_floor_power((sint64)mdec_signed_word(first) + mdec_signed_word(second) + 131072, 18u);
+    return (sint16)mdec_arithmetic_shift((sint64)mdec_signed_word(first) + mdec_signed_word(second) + 131072, 18u);
 }
 
 static void mdec_idct_standard_1d(const sint16 values[8], sint16 output[8])
@@ -208,7 +201,7 @@ static void mdec_idct_aan_1d(const sint16 values[8], sint16 output[8])
         for (coordinate = 0u; coordinate < 8u; ++coordinate)
         {
             sint64 product = (sint64)values[nonzero_frequency] * mdec_standard_scale[nonzero_frequency * 8u + coordinate];
-            output[coordinate] = (sint16)mdec_floor_power(product + 131072, 18u);
+            output[coordinate] = (sint16)mdec_arithmetic_shift(product + 131072, 18u);
         }
         return;
     }
@@ -353,9 +346,9 @@ sint32 mdec_color(uint32 pixels[256], const sint16 blocks[384], uint32 signed_ou
             uint32 chroma = (y / 2u) * 8u + x / 2u;
             uint32 luminance = (2u + (y / 8u) * 2u + x / 8u) * 64u + (y & 7u) * 8u + (x & 7u);
             sint32 cr = blocks[chroma], cb = blocks[64u + chroma], brightness = blocks[luminance];
-            sint32 red = (sint32)mdec_floor_power(359 * cr + 128, 8u);
-            sint32 blue = (sint32)mdec_floor_power(454 * cb + 128, 8u);
-            sint32 green = (sint32)mdec_floor_power(mdec_floor_power(-88 * cb, 5u) * 32 + mdec_floor_power(-183 * cr, 3u) * 8 + 128, 8u);
+            sint32 red = (sint32)mdec_arithmetic_shift(359 * cr + 128, 8u);
+            sint32 blue = (sint32)mdec_arithmetic_shift(454 * cb + 128, 8u);
+            sint32 green = (sint32)mdec_arithmetic_shift(mdec_arithmetic_shift(-88 * cb, 5u) * 32 + mdec_arithmetic_shift(-183 * cr, 3u) * 8 + 128, 8u);
             uint32 bias = signed_output ? 0u : 128u;
             uint32 r = ((uint32)mdec_pixel_limit(mdec_signed_nine(brightness + red)) + bias) & 255u;
             uint32 g = ((uint32)mdec_pixel_limit(mdec_signed_nine(brightness + green)) + bias) & 255u;

@@ -30,6 +30,7 @@ FEATURES = (
     "qXportFunctionCoverageStop+",
     "qXportFunctionCoverageRead+",
 )
+MAX_FUNCTION_COVERAGE_TARGETS = 8192
 RUN_NAME = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -70,8 +71,8 @@ def load_functions(path: Path, *, status: str | None = None,
         by_address[address] = name
     result = [{"address": address, "name": by_address[address]} for address in sorted(by_address)
               if selected is None or address in selected]
-    if not result or len(result) > 2048:
-        raise ValueError(f"Function coverage requires 1..2048 targets, got {len(result)}")
+    if not result or len(result) > MAX_FUNCTION_COVERAGE_TARGETS:
+        raise ValueError(f"Function coverage requires 1..{MAX_FUNCTION_COVERAGE_TARGETS} targets, got {len(result)}")
     return result
 
 

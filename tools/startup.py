@@ -5,6 +5,7 @@ import configparser
 import contextlib
 import datetime
 import hashlib
+import html
 import importlib
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.parse import quote
 
 from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
 from xport_process import normalized_environment
@@ -33,6 +35,7 @@ WINDOWS_RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range
 TERMINAL = {'attention', 'complete', 'failed', 'cancelled'}
 NATIVE_TEMPLATE_DIR = XPORT_ROOT/'src/platform/win'
 PROJECT_GITIGNORE_TEMPLATE = TOOLS/'templates/project/.gitignore'
+PROJECT_README_TEMPLATE = TOOLS/'templates/project/README.md.in'
 NATIVE_TEMPLATE_TOKENS = ('@@PROJECT_GUID@@', '@@SHORT_NAME@@', '@@FULL_NAME@@', '@@SHARED_SOURCE@@')
 NATIVE_TEMPLATE_REQUIREMENTS = {
     'xport.sln': {'@@PROJECT_GUID@@', '@@SHORT_NAME@@'},
@@ -156,6 +159,23 @@ def render_native_template(template_name, replacements):
     return text
 
 
+
+def render_project_readme(name, short_name):
+    if not PROJECT_README_TEMPLATE.is_file():
+        raise ValueError('Missing project README template: '+str(PROJECT_README_TEMPLATE))
+    text = PROJECT_README_TEMPLATE.read_text(encoding='utf-8-sig')
+    replacements = {
+        '@@FULL_NAME@@': html.escape(name, quote=True),
+        '@@PROJECT_NAME@@': html.escape(name+'-xport', quote=True),
+        '@@REPOSITORY@@': quote(name+'-xport', safe=''),
+        '@@SHORT_NAME@@': quote(short_name, safe=''),
+    }
+    tokens = set(re.findall(r'@@[A-Z_]+@@', text))
+    if tokens != set(replacements):
+        raise ValueError('Invalid project README template tokens: '+', '.join(sorted(tokens ^ set(replacements))))
+    return re.sub(r'@@[A-Z_]+@@', lambda match: replacements[match.group()], text)
+
+
 def agents_text(name, short_name):
     return f'''# {name}
 
@@ -231,7 +251,7 @@ def initialize_project(root, name, short_name, first_port=2400):
         raise ValueError('STARTUP_ALREADY_INITIALIZED: '+str(root/CONFIG_NAME))
     validate_names(name, short_name)
     platform = root/'src/platform/win'
-    targets = [root/CONFIG_NAME, root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
+    targets = [root/CONFIG_NAME, root/'README.md', root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
                platform/(short_name+'.vcxproj'), root/'status/translation-ledger.json']
     existing = [str(path) for path in targets if path.exists()]
     if existing:
@@ -241,6 +261,7 @@ def initialize_project(root, name, short_name, first_port=2400):
     full_name = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     native_replacements = {'@@PROJECT_GUID@@': project_guid, '@@SHORT_NAME@@': short_name,
                            '@@FULL_NAME@@': full_name, '@@SHARED_SOURCE@@': shared_source}
+    readme = render_project_readme(name, short_name)
     solution = render_native_template('xport.sln', native_replacements)
     native_project = render_native_template('xport.vcxproj', native_replacements)
     with allocation_lock(root.parent):
@@ -306,6 +327,8 @@ void xport_main(void)
 }
 '''
             (root/'src/game_main.c').write_text(main_text, encoding='utf-8', newline='')
+            with (root/'README.md').open('x', encoding='utf-8', newline='') as stream:
+                stream.write(readme)
             shutil.copyfile(PROJECT_GITIGNORE_TEMPLATE, root/'.gitignore')
             (root/'AGENTS.md').write_text(agents_text(name, short_name), encoding='utf-8', newline='')
             (root/'status/translation-ledger.json').write_text(json.dumps({'version': 1, 'entries': []}, indent=2)+'\n', encoding='utf-8')

@@ -30,7 +30,7 @@ def apply_proposal(root: Path, source_roots: tuple[Path, ...], packet_path: Path
                    before: dict, proposal: dict, audit_validator=None,
                    shared_validator=None, build_validator=None,
                    shared_root: Path | None = None, shared_before: dict | None = None,
-                   post_apply=None, declaration_validator=None) -> dict:
+                   post_apply=None, declaration_validator=None, sdk_solution=None) -> dict:
     if not isinstance(proposal, dict):
         raise ValueError('Repair proposal must be an object')
     edits = proposal.get("edits")
@@ -89,12 +89,20 @@ def apply_proposal(root: Path, source_roots: tuple[Path, ...], packet_path: Path
                 if isinstance(row, dict)}
     if len(audits) != len(expected) or received != expected:
         raise ValueError("Repair audit does not cover every required function")
+    sdk_additions = bool(proposal.get("sdk_translations") or proposal.get("system_translations") or
+                         proposal.get("sdk_header_edits"))
+    sdk_view = proposal
+    if sdk_additions:
+        if sdk_solution is None or audit_validator is None or shared_root is None:
+            raise ValueError("Mapped SDK additions require the strict coverage supervisor")
+        from coverage_mapped_sdk import mapped_sdk_view
+        sdk_view = mapped_sdk_view(root, packet, proposal, replacements)
     sdk_bodies = []
     if packet.get("sdk_dependencies") or proposal.get("sdk_audits"):
         if audit_validator is None:
             raise ValueError("SDK edits require the complete coverage audit validator")
         from coverage_sdk_edits import authorized_sdk_bodies
-        sdk_bodies = authorized_sdk_bodies(packet, proposal, shared_root)
+        sdk_bodies = authorized_sdk_bodies(packet, sdk_view, shared_root, root)
     adapter_bodies = []
     for audit in adapter_audits:
         required_adapter_keys = {"path", "symbol", "function_before", "function_sha256",
@@ -191,6 +199,16 @@ def apply_proposal(root: Path, source_roots: tuple[Path, ...], packet_path: Path
                     raise ValueError('Repair audit conflicts with packet ' + key)
                 bound[key] = binding[key]
         bound_audits.append(bound)
+    if sdk_additions:
+        from coverage_mapped_sdk import prepare_mapped_sdk
+        additions = prepare_mapped_sdk(root, packet, proposal, sdk_view, replacements,
+                                       shared_root, shared_before, sdk_solution)
+        for path, data in additions.items():
+            if path.read_bytes() == data:
+                continue
+            original.setdefault(path, path.read_bytes())
+            replacements[path] = data
+            shared_paths.add(path)
     receipt_path = packet_path.with_suffix(".audit.json")
     previous_receipt = receipt_path.read_bytes() if receipt_path.is_file() else None
     post_result = None
@@ -217,10 +235,28 @@ def apply_proposal(root: Path, source_roots: tuple[Path, ...], packet_path: Path
             receipt['shared_source_identity'] = shared_after['identity']
             receipt['changed_shared_files'] = sorted(changed_shared)
         receipt["function_audits"] = bound_audits
+        if proposal.get('game_return_abi_audits'):
+            receipt['game_return_abi_audits'] = proposal['game_return_abi_audits']
+            receipt['game_return_prototype_updates'] = proposal['game_return_prototype_updates']
+        if proposal.get('game_v0_carrier_review'):
+            receipt['game_v0_carrier_review'] = proposal['game_v0_carrier_review']
+        if proposal.get('game_sp_ra_prototype_updates'):
+            receipt['game_sp_ra_prototype_updates'] = proposal['game_sp_ra_prototype_updates']
+        from coverage_v8_batch12_scopes import summary as v8_scope_summary
+        receipt['v8_batch12_scope_admissions'] = v8_scope_summary(proposal)
+        receipt['v8_batch12_scope_count'] = len(receipt['v8_batch12_scope_admissions'])
         from coverage_native_abi_frame import native_abi_summary
         receipt['native_abi_frame_admissions'] = native_abi_summary(proposal)
         receipt['native_abi_frame_count'] = len(receipt['native_abi_frame_admissions'])
+        from coverage_game_frame_delegation import frame_delegation_summary
+        frame_admissions = frame_delegation_summary(proposal)
+        if frame_admissions:
+            receipt['game_frame_delegation_admissions'] = frame_admissions
+            receipt['game_frame_delegation_count'] = len(frame_admissions)
         receipt["sdk_audits"] = proposal.get("sdk_audits") or []
+        if sdk_additions:
+            from coverage_mapped_sdk import mapped_sdk_receipt
+            receipt.update(mapped_sdk_receipt(proposal))
         receipt["adapter_audits"] = adapter_audits
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         if audit_validator is not None and not audit_validator(packet_path, after, changed):

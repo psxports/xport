@@ -13,6 +13,63 @@ import trace_workflow
 
 
 class StartupSupervisorTests(unittest.TestCase):
+    def test_generated_readme_uses_supplied_names_and_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Unrelated-directory'
+            startup.initialize_project(root, 'RapidRacer', 'RR', 45400)
+            text = (root/'README.md').read_text(encoding='utf-8')
+            self.assertEqual(text, startup.render_project_readme('RapidRacer', 'RR'))
+            self.assertIn('>RapidRacer-xport</h1>', text)
+            self.assertIn('https://psxports.to/RR/', text)
+            for label in ('decomp', 'refactor', 'enhance', 'remaster'):
+                self.assertIn('repo=RapidRacer-xport&amp;label='+label, text)
+            self.assertNotIn('@@', text)
+
+    def test_readme_escapes_display_names_and_encodes_repository(self):
+        text = startup.render_project_readme('Game & <Two>', 'G2')
+        self.assertIn('Game &amp; &lt;Two&gt;-xport', text)
+        self.assertIn('repo=Game%20%26%20%3CTwo%3E-xport', text)
+        self.assertIn('https://psxports.to/G2/', text)
+
+    def test_initializer_preserves_existing_readme_without_scaffold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            readme = root/'README.md'
+            readme.write_bytes(b'User README\n')
+            with self.assertRaisesRegex(ValueError, 'STARTUP_ROOT_NOT_EMPTY'):
+                startup.initialize_project(root, 'Example', 'EX', 45410)
+            self.assertEqual(readme.read_bytes(), b'User README\n')
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ['README.md'])
+
+    def test_initializer_rejects_missing_or_invalid_readme_template_before_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Project'
+            template = Path(directory)/'template.in'
+            with mock.patch.object(startup, 'PROJECT_README_TEMPLATE', template):
+                with self.assertRaisesRegex(ValueError, 'Missing project README template'):
+                    startup.initialize_project(root, 'Example', 'EX', 45420)
+                template.write_text('@@UNKNOWN@@', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'Invalid project README template tokens'):
+                    startup.initialize_project(root, 'Example', 'EX', 45420)
+            self.assertFalse(root.exists())
+
+    def test_generated_gitignore_matches_shared_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Ignored-xport'
+            startup.initialize_project(root, 'Ignored Game', 'IG', 45150)
+            self.assertEqual((root/'.gitignore').read_bytes(), startup.PROJECT_GITIGNORE_TEMPLATE.read_bytes())
+            self.assertEqual((root/'.gitignore').read_text(encoding='utf-8').splitlines(), [
+                '/_build/', '/bin/', '/status/', '/tools/', '/orig/', '/iso/', '/.cursor/',
+            ])
+
+    def test_initializer_refuses_existing_gitignore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'ExistingIgnore-xport'
+            root.mkdir()
+            (root/'.gitignore').write_text('/custom/\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'STARTUP_ROOT_NOT_EMPTY'):
+                startup.initialize_project(root, 'Existing Ignore', 'EI', 45160)
+
     def test_generated_pdb_files_use_intermediate_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'Symbols-xport'

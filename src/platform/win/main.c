@@ -61,7 +61,7 @@ static sint32 platform_headless;
 static sint32 platform_quit;
 static jmp_buf platform_game_exit;
 static sint32 platform_game_exit_active;
-static uint32 platform_pad_buttons;
+static uint32 platform_pad_buttons[2];
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static LARGE_INTEGER platform_timer_frequency;
@@ -70,14 +70,8 @@ static uint64 platform_frame_deadline;
 static sint32 platform_timer_initialized;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
-static sint32 platform_argc;
-static char *platform_argv[64];
 static HMODULE platform_xinput_module;
 static XInputGetStateProc _XInputGetState;
-
-static void xport_frame_profile_record(uint64 begin, uint64 end);
-static void xport_frame_profile_shutdown(void);
-static void xport_frame_profile_wait(uint64 begin, uint64 end);
 
 static void xport_timer_init(void)
 {
@@ -106,7 +100,6 @@ void xport_timer_wait_frame(uint32 refresh_rate)
     uint64 now;
     uint64 period;
     uint64 remaining;
-    uint64 wait_begin;
     xport_timer_init();
     if (!refresh_rate)
         refresh_rate = FIELD_RATE;
@@ -114,31 +107,97 @@ void xport_timer_wait_frame(uint32 refresh_rate)
     period = 1000000u / refresh_rate;
     if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
         platform_frame_deadline = now + period;
-    wait_begin = now;
     while (now < platform_frame_deadline)
     {
         remaining = platform_frame_deadline - now;
         Sleep(remaining > 2000 ? (DWORD)(remaining / 1000 - 1) : 0);
         now = xport_timer_get();
     }
-    xport_frame_profile_wait(wait_begin, now);
     platform_frame_deadline += period;
 }
 
-static uint32 key_to_pad(WPARAM key)
+static uint32 key_to_pad(sint32 controller, WPARAM key, LPARAM flags)
 {
+    if (controller == 1)
+    {
+        // Distinguish keypad navigation with Num Lock off from the arrow cluster
+        if (!(flags & (1L << 24)))
+        {
+            switch (key)
+            {
+                case VK_HOME:
+                    key = VK_NUMPAD7;
+                    break;
+                case VK_UP:
+                    key = VK_NUMPAD8;
+                    break;
+                case VK_PRIOR:
+                    key = VK_NUMPAD9;
+                    break;
+                case VK_LEFT:
+                    key = VK_NUMPAD4;
+                    break;
+                case VK_CLEAR:
+                    key = VK_NUMPAD5;
+                    break;
+                case VK_RIGHT:
+                    key = VK_NUMPAD6;
+                    break;
+                case VK_END:
+                    key = VK_NUMPAD1;
+                    break;
+                case VK_DOWN:
+                    key = VK_NUMPAD2;
+                    break;
+                case VK_NEXT:
+                    key = VK_NUMPAD3;
+                    break;
+            }
+        }
+        switch (key)
+        {
+            case VK_UP:
+                return PADLup;
+            case VK_DOWN:
+                return PADLdown;
+            case VK_LEFT:
+                return PADLleft;
+            case VK_RIGHT:
+                return PADLright;
+            case VK_NUMPAD5:
+                return PADRup;
+            case VK_NUMPAD1:
+                return PADRleft;
+            case VK_NUMPAD2:
+                return PADRdown;
+            case VK_NUMPAD3:
+                return PADRright;
+            case VK_NUMPAD7:
+                return PADL2;
+            case VK_NUMPAD4:
+                return PADL1;
+            case VK_NUMPAD9:
+                return PADR2;
+            case VK_NUMPAD6:
+                return PADR1;
+            case VK_ADD:
+                return PADselect;
+            case VK_RETURN:
+                return flags & (1L << 24) ? PADstart : 0;
+            default:
+                return 0;
+        }
+    }
+    if (controller != 0)
+        return 0;
     switch (key)
     {
-        case VK_UP:
         case 'W':
             return PADLup;
-        case VK_DOWN:
         case 'S':
             return PADLdown;
-        case VK_LEFT:
         case 'A':
             return PADLleft;
-        case VK_RIGHT:
         case 'D':
             return PADLright;
         case 'I':
@@ -158,7 +217,7 @@ static uint32 key_to_pad(WPARAM key)
         case '3':
             return PADR2;
         case VK_RETURN:
-            return PADstart;
+            return flags & (1L << 24) ? 0 : PADstart;
         case VK_BACK:
             return PADselect;
         default:
@@ -221,7 +280,7 @@ static uint32 xinput_to_pad(const XINPUT_GAMEPAD *gamepad)
     return buttons;
 }
 
-static uint32 xinput_read(void)
+static uint32 xinput_read(sint32 player)
 {
     DWORD controller;
     XINPUT_STATE state;
@@ -232,6 +291,8 @@ static uint32 xinput_read(void)
         memset(&state, 0, sizeof(state));
         if (_XInputGetState(controller, &state) == ERROR_SUCCESS)
         {
+            if (player-- != 0)
+                continue;
             /* TODO: Publish left and right sticks when live PsyQ analog packets are supported */
             return xinput_to_pad(&state.Gamepad);
         }
@@ -284,7 +345,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             platform_window_height = HIWORD(lparam);
             return 0;
         case WM_KILLFOCUS:
-            platform_pad_buttons = 0;
+            memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
             return 0;
         case WM_SYSKEYDOWN:
             if (wparam == VK_RETURN && (lparam & (1L << 29)))
@@ -300,11 +361,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KEYDOWN:
         case WM_KEYUP:
-            button = key_to_pad(wparam);
-            if (message == WM_KEYDOWN)
-                platform_pad_buttons |= button;
-            else
-                platform_pad_buttons &= ~button;
+            for (sint32 controller = 0; controller < 2; ++controller)
+            {
+                button = key_to_pad(controller, wparam, lparam);
+                if (message == WM_KEYDOWN)
+                    platform_pad_buttons[controller] |= button;
+                else
+                    platform_pad_buttons[controller] &= ~button;
+            }
             return 0;
         default:
             return DefWindowProc(window, message, wparam, lparam);
@@ -313,7 +377,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 
 sint32 xport_input_init(void)
 {
-    platform_pad_buttons = 0;
+    memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     platform_pad_override = 0;
     platform_override_buttons = 0;
     if (_XInputGetState == NULL)
@@ -339,9 +403,11 @@ sint32 xport_poll(void)
 
 uint32 xport_input_read(sint32 controller)
 {
-    if (controller != 0)
+    if (controller < 0 || controller >= 2)
         return 0;
-    return platform_pad_override ? platform_override_buttons : platform_pad_buttons | xinput_read();
+    if (controller == 0 && platform_pad_override)
+        return platform_override_buttons;
+    return platform_pad_buttons[controller] | xinput_read(controller);
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)
@@ -370,9 +436,11 @@ sint32 xport_window_init(void)
     window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
     window_class.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     window_class.lpszClassName = "XportWindow";
-    window_class.hIcon = LoadIcon(instance, IDI_APPLICATION);
+    window_class.hIcon = LoadIcon(instance, "MAINICON");
+    if (window_class.hIcon == NULL)
+        window_class.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     window_class.hIconSm = window_class.hIcon;
-    if (!RegisterClassEx(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    if (!RegisterClassEx(&window_class))
         return 0;
     rectangle.left = 0;
     rectangle.top = 0;
@@ -387,100 +455,10 @@ sint32 xport_window_init(void)
     if (platform_window == NULL)
         return 0;
     ShowWindow(platform_window, SW_SHOW);
-    UpdateWindow(platform_window);
     return 1;
 }
 
 /* Save bounded producer pixels without desktop readback */
-static void xport_capture_present(const uint32 *pixels, sint32 bw, sint32 bh, sint32 sx, sint32 sy, sint32 sw, sint32 sh, sint32 cw, sint32 ch, sint32 result)
-{
-    static uint32 attempted, saved, seen, configured, start, interval = 1u;
-    const char *directory = getenv("XPORT_FRAME_CAPTURE_DIR");
-    const char *setting;
-    char *end;
-    unsigned long parsed;
-    uint32 present_index;
-    char path[1024];
-    uint8 row[4096 * 3];
-    sint32 x, y, nonblack = 0, complete = 1;
-    FILE *file;
-    if (directory == NULL || directory[0] == 0 || saved >= 4u || attempted >= 256u)
-        return;
-    if (configured == 0u)
-    {
-        configured = 1u;
-        setting = getenv("XPORT_FRAME_CAPTURE_START");
-        if (setting != NULL && setting[0] >= '0' && setting[0] <= '9')
-        {
-            parsed = strtoul(setting, &end, 10);
-            if (*end == 0 && parsed <= 1000000ul)
-                start = (uint32)parsed;
-        }
-        setting = getenv("XPORT_FRAME_CAPTURE_INTERVAL");
-        if (setting != NULL && setting[0] >= '0' && setting[0] <= '9')
-        {
-            parsed = strtoul(setting, &end, 10);
-            if (*end == 0 && parsed >= 1ul && parsed <= 1000000ul)
-                interval = (uint32)parsed;
-        }
-    }
-    if (seen >= 1000000u)
-        return;
-    present_index = seen++;
-    if (present_index < start || (present_index - start) % interval != 0u)
-        return;
-    ++attempted;
-    if (bw > 4096 || bh > 4096 || sw > 4096 || sh > 4096)
-        return;
-    for (y = 0; y < sh && !nonblack; ++y)
-        for (x = 0; x < sw; ++x)
-            if (pixels[(size_t)(sy + y) * bw + sx + x] & 0xFFFFFFu)
-            {
-                nonblack = 1;
-                break;
-            }
-    if (!nonblack)
-        return;
-    if (snprintf(path, sizeof(path), "%s/present-%03u.ppm", directory, saved) < 0 || strlen(path) >= sizeof(path) - 1)
-        return;
-    file = fopen(path, "wb");
-    if (file == NULL)
-        return;
-    if (fprintf(file, "P6\n%d %d\n255\n", sw, sh) < 0)
-        complete = 0;
-    for (y = 0; y < sh && complete; ++y)
-    {
-        for (x = 0; x < sw; ++x)
-        {
-            uint32 pixel = pixels[(size_t)(sy + y) * bw + sx + x];
-            row[3 * x] = (uint8)(pixel >> 16);
-            row[3 * x + 1] = (uint8)(pixel >> 8);
-            row[3 * x + 2] = (uint8)pixel;
-        }
-        if (fwrite(row, 3u, (size_t)sw, file) != (size_t)sw)
-            complete = 0;
-    }
-    if (fclose(file) != 0)
-        complete = 0;
-    if (!complete)
-        return;
-    if (snprintf(path, sizeof(path), "%s/present-%03u.json", directory, saved) < 0 || strlen(path) >= sizeof(path) - 1)
-        return;
-    file = fopen(path, "wb");
-    if (file == NULL)
-        return;
-    complete = fprintf(file,
-                       "{\"present_index\":%u,\"sample_start\":%u,\"sample_interval\":%u,\"bitmap_width\":%d,\"bitmap_height\":%d,\"source_crop\":[%d,%d,%d,%d],"
-                       "\"client_width\":%d,\"client_height\":%d,\"stretch_dibits_result\":%d,"
-                       "\"presentation_api_success\":%s,\"visible_desktop_claim\":false,"
-                       "\"producer_format\":\"BI_RGB32 BGRX little endian\",\"nonblack\":true}\n",
-                       present_index, start, interval, bw, bh, sx, sy, sw, sh, cw, ch, result, result != 0 && result != GDI_ERROR ? "true" : "false") >= 0;
-    if (fclose(file) != 0)
-        complete = 0;
-    if (complete)
-        ++saved;
-}
-
 sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title)
 {
     RECT client;
@@ -489,8 +467,6 @@ sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_he
     sint32 client_height;
     sint32 client_width;
     sint32 result;
-    uint64 begin;
-    uint64 end;
     xport_poll();
     if (platform_headless)
         return 1;
@@ -502,7 +478,6 @@ sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_he
     client_height = client.bottom - client.top;
     if (client_width <= 0 || client_height <= 0)
         return 0;
-    begin = xport_timer_get();
     memset(&bitmap, 0, sizeof(bitmap));
     bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bitmap.bmiHeader.biWidth = bitmap_width;
@@ -516,9 +491,6 @@ sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_he
     SetStretchBltMode(device, COLORONCOLOR);
     result = StretchDIBits(device, 0, 0, client_width, client_height, source_x, source_y, source_width, source_height, pixels, &bitmap, DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(platform_window, device);
-    end = xport_timer_get();
-    xport_frame_profile_record(begin, end);
-    xport_capture_present(pixels, bitmap_width, bitmap_height, source_x, source_y, source_width, source_height, client_width, client_height, result);
     if (title != NULL)
         SetWindowText(platform_window, title);
     return result != 0 && result != GDI_ERROR;
@@ -539,16 +511,6 @@ RUN_MODE xport_run_mode(void)
     return platform_run_mode;
 }
 
-sint32 xport_arg_count(void)
-{
-    return platform_argc;
-}
-
-char **xport_arg_values(void)
-{
-    return platform_argv;
-}
-
 void xport_set_exit_code(sint32 code)
 {
     platform_exit_code = code;
@@ -563,7 +525,6 @@ sint32 xport_isquit(void)
 typedef struct WAVEOUT_state
 {
     HWAVEOUT device;
-    FILE *capture;
     WAVEHDR headers[XPORT_AUDIO_BUFFER_COUNT];
     sint16 samples[XPORT_AUDIO_BUFFER_COUNT][XPORT_AUDIO_BUFFER_FRAMES * 2];
     HANDLE semaphore;
@@ -592,128 +553,6 @@ volatile uint32 g_xport_audio_output_muted = 0;
 
 /* Functions. */
 volatile uint32 g_xport_audio_callback_overruns;
-
-static volatile uint32 audio_profile_output_samples;
-static volatile uint32 audio_profile_rail_samples;
-
-typedef struct XPORT_FRAME_PROFILE
-{
-    FILE *stream;
-    uint64 frame;
-    uint64 last_begin;
-    uint64 last_kernel;
-    uint64 last_user;
-    uint64 last_process_kernel;
-    uint64 last_process_user;
-    uint64 wait_us;
-    uint32 last_submitted;
-    uint32 last_overruns;
-    uint32 last_output_samples;
-    uint32 last_rail_samples;
-    sint32 initialized;
-} XPORT_FRAME_PROFILE;
-
-static XPORT_FRAME_PROFILE frame_profile;
-
-static void xport_frame_profile_initialize(void)
-{
-    const char *path;
-    if (frame_profile.initialized)
-        return;
-    frame_profile.initialized = 1;
-    path = getenv("XPORT_FRAME_PROFILE");
-    if (!path || !*path)
-        return;
-    frame_profile.stream = fopen(path, "wb");
-    if (!frame_profile.stream)
-    {
-        fprintf(stderr, "Cannot open frame profile: %s\n", path);
-        return;
-    }
-    setvbuf(frame_profile.stream, NULL, _IOFBF, 1024u * 1024u);
-    fprintf(frame_profile.stream, "frame,begin_us,interval_us,wait_us,useful_wall_us,present_us,process_cpu_us,main_cpu_us,main_user_cpu_us,main_kernel_cpu_us,audio_submitted,audio_submitted_delta,audio_overruns,audio_overruns_delta,audio_output_samples,audio_output_samples_delta,audio_rail_samples,audio_rail_samples_delta,audio_peak\n");
-}
-
-static void xport_frame_profile_wait(uint64 begin, uint64 end)
-{
-    xport_frame_profile_initialize();
-    if (frame_profile.stream && end >= begin)
-        frame_profile.wait_us += end - begin;
-}
-
-static uint64 xport_filetime_value(FILETIME value)
-{
-    ULARGE_INTEGER ticks;
-    ticks.LowPart = value.dwLowDateTime;
-    ticks.HighPart = value.dwHighDateTime;
-    return ticks.QuadPart;
-}
-
-static void xport_frame_profile_record(uint64 begin, uint64 end)
-{
-    FILETIME created;
-    FILETIME exited;
-    FILETIME kernel_time;
-    FILETIME user_time;
-    uint64 kernel;
-    uint64 user;
-    uint64 interval = 0u;
-    uint64 kernel_delta = 0u;
-    uint64 user_delta = 0u;
-    uint64 process_kernel;
-    uint64 process_user;
-    uint64 process_cpu = 0u;
-    uint64 useful_wall;
-    uint32 submitted;
-    uint32 overruns;
-    uint32 output_samples;
-    uint32 rail_samples;
-
-    xport_frame_profile_initialize();
-    if (!frame_profile.stream)
-        return;
-    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel_time, &user_time))
-        return;
-    kernel = xport_filetime_value(kernel_time);
-    user = xport_filetime_value(user_time);
-    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel_time, &user_time))
-        return;
-    process_kernel = xport_filetime_value(kernel_time);
-    process_user = xport_filetime_value(user_time);
-    submitted = g_xport_audio_submitted_buffers;
-    overruns = g_xport_audio_callback_overruns;
-    output_samples = audio_profile_output_samples;
-    rail_samples = audio_profile_rail_samples;
-    if (frame_profile.last_begin)
-    {
-        interval = begin - frame_profile.last_begin;
-        kernel_delta = kernel - frame_profile.last_kernel;
-        user_delta = user - frame_profile.last_user;
-        process_cpu = process_kernel + process_user - frame_profile.last_process_kernel - frame_profile.last_process_user;
-    }
-    useful_wall = interval > frame_profile.wait_us ? interval - frame_profile.wait_us : 0u;
-    fprintf(frame_profile.stream, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", (unsigned long long)frame_profile.frame, (unsigned long long)begin, (unsigned long long)interval, (unsigned long long)frame_profile.wait_us, (unsigned long long)useful_wall, (unsigned long long)(end - begin), (unsigned long long)(process_cpu / 10u), (unsigned long long)((kernel_delta + user_delta) / 10u), (unsigned long long)(user_delta / 10u), (unsigned long long)(kernel_delta / 10u), (unsigned)submitted, (unsigned)(submitted - frame_profile.last_submitted), (unsigned)overruns, (unsigned)(overruns - frame_profile.last_overruns), (unsigned)output_samples, (unsigned)(output_samples - frame_profile.last_output_samples), (unsigned)rail_samples, (unsigned)(rail_samples - frame_profile.last_rail_samples), (unsigned)g_xport_audio_peak);
-    frame_profile.last_begin = begin;
-    frame_profile.last_kernel = kernel;
-    frame_profile.last_user = user;
-    frame_profile.last_process_kernel = process_kernel;
-    frame_profile.last_process_user = process_user;
-    frame_profile.wait_us = 0u;
-    frame_profile.last_submitted = submitted;
-    frame_profile.last_overruns = overruns;
-    frame_profile.last_output_samples = output_samples;
-    frame_profile.last_rail_samples = rail_samples;
-    ++frame_profile.frame;
-}
-
-static void xport_frame_profile_shutdown(void)
-{
-    if (frame_profile.stream)
-    {
-        fclose(frame_profile.stream);
-        frame_profile.stream = NULL;
-    }
-}
 
 static void CALLBACK wave_callback(HWAVEOUT device, UINT message, DWORD_PTR instance, DWORD_PTR parameter1, DWORD_PTR parameter2)
 {
@@ -744,8 +583,6 @@ static DWORD WINAPI wave_thread(void *argument)
                 state->prepared[index] = 0;
             }
             spu_render(state->samples[index], XPORT_AUDIO_BUFFER_FRAMES);
-            if (state->capture)
-                fwrite(state->samples[index], sizeof(state->samples[index]), 1, state->capture);
             {
                 sint32 sample_index;
                 uint32 peak = 0;
@@ -753,9 +590,6 @@ static DWORD WINAPI wave_thread(void *argument)
                 {
                     sint32 value = state->samples[index][sample_index];
                     uint32 magnitude = (uint32)(value < 0 ? -value : value);
-                    ++audio_profile_output_samples;
-                    if (value == 32767 || value == -32768)
-                        ++audio_profile_rail_samples;
                     if (magnitude > peak)
                         peak = magnitude;
                 }
@@ -801,7 +635,9 @@ void xport_audio_shutdown(void)
     HANDLE thread;
     if (null_active)
     {
+#ifndef NDEBUG
         printf("headless_audio backend=null frames=%llu submitted=0 nonzero=%u peak=%u\n", (unsigned long long)null_frames, (unsigned)g_xport_audio_nonzero_buffers, (unsigned)g_xport_audio_peak);
+#endif
         null_active = 0;
         InterlockedExchange(&output.running, 0);
         return;
@@ -838,11 +674,6 @@ void xport_audio_shutdown(void)
         CloseHandle(output.semaphore);
         output.semaphore = 0;
     }
-    if (output.capture)
-    {
-        fclose(output.capture);
-        output.capture = NULL;
-    }
 }
 
 sint32 xport_audio_init(void)
@@ -850,34 +681,35 @@ sint32 xport_audio_init(void)
     WAVEFORMATEX format;
     MMRESULT result;
     sint32 index;
+#ifdef _DEBUG
     const char *audible = getenv("XPORT_AUDIO_OUTPUT");
     const char *backend = getenv("XPORT_AUDIO_BACKEND");
-    const char *capture = getenv("XPORT_AUDIO_CAPTURE");
+#endif
     if (InterlockedCompareExchange(&output.running, 1, 1) != 0)
         return 1;
+#ifdef _DEBUG
     g_xport_audio_output_muted = audible != 0 && strcmp(audible, "0") == 0;
+#else
+    g_xport_audio_output_muted = 0;
+#endif
     memset(&output, 0, sizeof(output));
-    if (capture && *capture)
-    {
-        output.capture = fopen(capture, "wb");
-        if (!output.capture)
-            fprintf(stderr, "Cannot open audio capture: %s\n", capture);
-        else
-            setvbuf(output.capture, NULL, _IOFBF, 1024u * 1024u);
-    }
     g_xport_audio_submitted_buffers = 0;
     g_xport_audio_nonzero_buffers = 0;
     g_xport_audio_peak = 0;
     g_xport_audio_callback_overruns = 0;
-    audio_profile_output_samples = 0;
-    audio_profile_rail_samples = 0;
-    if (xport_is_headless() && (backend == NULL || strcmp(backend, "waveout") != 0))
+    if (xport_is_headless()
+#ifdef _DEBUG
+        && (backend == NULL || strcmp(backend, "waveout") != 0)
+#endif
+    )
     {
         null_active = 1;
         null_frames = 0;
         g_xport_audio_backend_active = 0;
         InterlockedExchange(&output.running, 1);
+#ifndef NDEBUG
         printf("headless_audio backend=null\n");
+#endif
         return 1;
     }
     memset(&format, 0, sizeof(format));
@@ -891,19 +723,12 @@ sint32 xport_audio_init(void)
     output.semaphore = CreateSemaphore(0, 0, XPORT_AUDIO_BUFFER_COUNT, 0);
     if (output.semaphore == 0)
     {
-        if (output.capture)
-        {
-            fclose(output.capture);
-            output.capture = NULL;
-        }
         return 0;
     }
     result = waveOutOpen(&output.device, WAVE_MAPPER, &format, (DWORD_PTR)wave_callback, (DWORD_PTR)&output, CALLBACK_FUNCTION);
     if (result != MMSYSERR_NOERROR)
     {
         CloseHandle(output.semaphore);
-        if (output.capture)
-            fclose(output.capture);
         memset(&output, 0, sizeof(output));
         return 0;
     }
@@ -947,7 +772,10 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     sint16 samples[2048];
     uint32 remaining, count;
     if (!null_active || !rate)
+    {
+        spu_dispatch_pending_irq();
         return;
+    }
     remaining = (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate);
     while (remaining)
     {
@@ -969,6 +797,7 @@ void xport_audio_vblank(uint32 before, uint32 rate)
         null_frames += count;
         remaining -= count;
     }
+    spu_dispatch_pending_irq();
 }
 
 static FILE *collect_log;
@@ -988,10 +817,12 @@ FILE *xport_fopen(const char *path, const char *mode)
             }
         if (resource)
         {
-            for (; *resource && *resource != ';'; ++resource)
-                fputc(*resource == '\\' ? '/' : *resource, collect_log);
-            fputc('\n', collect_log);
-            fflush(collect_log);
+            char buffer[MAX_PATH + 1];
+            size_t length = 0;
+            for (; *resource && *resource != ';' && length < MAX_PATH; ++resource)
+                buffer[length++] = *resource == '\\' ? '/' : *resource;
+            buffer[length++] = '\n';
+            fwrite(buffer, 1, length, collect_log);
         }
     }
     return file;
@@ -1032,27 +863,21 @@ sint32 xport_file_read(const char *path, void *data, size_t capacity, size_t *si
     read_size = fread(data, 1, capacity, file);
     if (size != NULL)
         *size = read_size;
+#ifndef NDEBUG
     if (ferror(file))
     {
         fclose(file);
         return 0;
     }
+#endif
     fclose(file);
     return 1;
 }
 
 sint32 xport_memory_readable(const void *address, size_t size)
 {
-    MEMORY_BASIC_INFORMATION information;
-    uintptr_t begin;
-    uintptr_t end;
-    uintptr_t region_end;
-    if (address == NULL || size == 0 || VirtualQuery(address, &information, sizeof(information)) == 0)
-        return 0;
-    begin = (uintptr_t)address;
-    end = begin + size;
-    region_end = (uintptr_t)information.BaseAddress + information.RegionSize;
-    return end >= begin && end <= region_end && information.State == MEM_COMMIT && (information.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    uintptr_t begin = (uintptr_t)address;
+    return begin >= 0x00200000u && size && size <= UINTPTR_MAX - begin;
 }
 
 void xport_message_error(const char *title, const char *message)
@@ -1062,7 +887,6 @@ void xport_message_error(const char *title, const char *message)
 
 void xport_shutdown(void)
 {
-    xport_frame_profile_shutdown();
     xport_audio_shutdown();
     _XInputGetState = NULL;
     if (platform_xinput_module != NULL)
@@ -1090,68 +914,35 @@ void xport_shutdown(void)
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR command_line, int show_command)
 {
     int result;
-    int index;
+    int collect = strstr(command_line, "--collect") != NULL;
 #if defined(LOCKSTEP_DEBUG)
     if (!xport_lockstep_memory_init())
     {
+    #ifndef NDEBUG
         fprintf(stderr, "lockstep_memory_error=%s\n", xport_lockstep_memory_error_name(xport_lockstep_memory_error()));
+    #endif
         return 2;
     }
     xport_lockstep_memory_ready();
 #endif
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
-    for (index = 1; index < __argc; ++index)
+    if (collect)
     {
-        if (!strcmp(__argv[index], "--collect"))
+        const char *path = "../src/platform/web/collect.log";
+        collect_log = fopen(path, "a");
+        if (!collect_log)
         {
-            char path[MAX_PATH];
-            char *slash;
-            DWORD length = GetModuleFileNameA(NULL, path, sizeof(path));
-            if (!length || length >= sizeof(path))
-                return 1;
-            slash = strrchr(path, '\\');
-            if (!slash)
-                return 1;
-            *slash = 0;
-            if (strlen(path) + sizeof("/../src/platform/web/collect.log") > sizeof(path))
-                return 1;
-            strcat(path, "/../src/platform/web/collect.log");
-            collect_log = fopen(path, "a");
-            if (!collect_log)
-            {
-                MessageBoxA(NULL, path, "Cannot open collect.log", MB_OK | MB_ICONERROR);
-                return 1;
-            }
-            break;
+            MessageBoxA(NULL, path, "Cannot open collect.log", MB_OK | MB_ICONERROR);
+            return 1;
         }
     }
     platform_run_mode = RUN_MODE_GAME;
-    platform_argc = 1;
-    platform_argv[0] = __argv[0];
-    for (index = 1; index < __argc; ++index)
-    {
-        if (!strcmp(__argv[index], "--collect"))
-            continue;
 #if defined(LOCKSTEP_DEBUG)
-        if (!strcmp(__argv[index], "--lockstep-replay") && platform_run_mode == RUN_MODE_GAME)
-            platform_run_mode = RUN_MODE_LOCKSTEP_REPLAY;
-        else if (!strcmp(__argv[index], "--lockstep-boundary-selftest") && platform_run_mode == RUN_MODE_GAME)
-            platform_run_mode = RUN_MODE_LOCKSTEP_SELFTEST;
-        else
-        {
-            if (platform_argc + 1 >= (sint32)(sizeof(platform_argv) / sizeof(platform_argv[0])))
-                return 64;
-            platform_argv[platform_argc++] = __argv[index];
-        }
-#else
-        if (!strcmp(__argv[index], "--lockstep-replay") || !strcmp(__argv[index], "--lockstep-boundary-selftest"))
-            return 64;
-        if (platform_argc + 1 >= (sint32)(sizeof(platform_argv) / sizeof(platform_argv[0])))
-            return 64;
-        platform_argv[platform_argc++] = __argv[index];
+    if (strstr(command_line, "--lockstep-replay"))
+        platform_run_mode = RUN_MODE_LOCKSTEP_REPLAY;
+    else if (strstr(command_line, "--lockstep-boundary-selftest"))
+        platform_run_mode = RUN_MODE_LOCKSTEP_SELFTEST;
 #endif
-    }
-    platform_argv[platform_argc] = NULL;
     if (platform_run_mode != RUN_MODE_GAME)
         platform_headless = 1;
     InitializeCriticalSection(&audio_lock);
