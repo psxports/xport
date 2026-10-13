@@ -350,10 +350,23 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             platform_window_width = LOWORD(lparam);
             platform_window_height = HIWORD(lparam);
             return 0;
+        case WM_SETCURSOR:
+            if (!((DWORD)GetWindowLongA(window, GWL_STYLE) & WS_OVERLAPPEDWINDOW))
+            {
+                SetCursor(NULL);
+                return TRUE;
+            }
+            return DefWindowProc(window, message, wparam, lparam);
         case WM_KILLFOCUS:
             memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
             return 0;
+        case WM_SYSCOMMAND:
+            if ((wparam & 0xfff0) == SC_KEYMENU)
+                return 0;
+            return DefWindowProc(window, message, wparam, lparam);
         case WM_SYSKEYDOWN:
+            if (wparam == VK_MENU)
+                return 0;
             if (wparam == VK_RETURN && (lparam & (1L << 29)))
             {
                 if (!(lparam & (1L << 30)))
@@ -362,7 +375,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             }
             return DefWindowProc(window, message, wparam, lparam);
         case WM_SYSKEYUP:
-            if (wparam == VK_RETURN)
+            if (wparam == VK_RETURN || wparam == VK_MENU)
                 return 0;
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KEYDOWN:
