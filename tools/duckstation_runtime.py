@@ -141,7 +141,7 @@ def validate_settings(directory, port):
 
 
 def recording_settings(hidden=False):
-    """Return the complete speed contract for one recording mode"""
+    """Return recording speed overrides without changing the CPU clock"""
     speed = '0' if hidden else '1'
     return {
         'mode': 'hidden' if hidden else 'interactive',
@@ -157,11 +157,6 @@ def recording_settings(hidden=False):
                 'SaveStateOnExit': 'false'
             },
             'BIOS': {'PatchFastBoot': 'true'},
-            'CPU': {
-                'OverclockEnable': 'false',
-                'OverclockNumerator': '1',
-                'OverclockDenominator': '1'
-            },
             'Display': {'VSync': 'false'}
         },
         # StartPaused is a launch instruction and is not part of the captured effective settings
@@ -173,11 +168,6 @@ def recording_settings(hidden=False):
                 'SyncToHostRefreshRate': 'false',
                 'RewindEnable': 'false',
                 'RunaheadFrameCount': '0'
-            },
-            'CPU': {
-                'OverclockEnable': 'false',
-                'OverclockNumerator': '1',
-                'OverclockDenominator': '1'
             },
             'Display': {'VSync': 'false'}
         }
@@ -199,6 +189,13 @@ def configure_recording_settings(directory, port, hidden=False):
     ini = configparser.ConfigParser(interpolation=None)
     ini.optionxform = str
     ini.read(directory/'settings.ini', encoding='utf-8-sig')
+    # Capture the configured CPU clock without overriding user settings
+    plan['effective']['CPU'] = {
+        key: ini.get('CPU', key, fallback=default)
+        for key, default in (('OverclockEnable', 'false'),
+                             ('OverclockNumerator', '1'),
+                             ('OverclockDenominator', '1'))
+    }
     for section, values in plan['startup'].items():
         if section not in ini:
             ini.add_section(section)

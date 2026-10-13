@@ -34,8 +34,11 @@ class DuckStationLockstep:
     def _bind_event_image(self, event: dict) -> dict:
         runtime = self.runtime_identity
         # Protocol 23 emits a fixed transport label rather than an executable identity
-        if not runtime or runtime.get("patch_sha256") != (
-                "25a99c8a66cd7af93bd052414b1e96f8d5ef9b75be0d3176a347b3f0d234ba2b"):
+        if not runtime or runtime.get("patch_sha256") not in {
+                "25a99c8a66cd7af93bd052414b1e96f8d5ef9b75be0d3176a347b3f0d234ba2b",
+                "0c3155d5f8ad2854e87d9e2393b45f67cf2785b88a949f76b941561b4cddb069",
+                "1c625bb0b3e7016945eb9f9f1ed72439ca3cce1d80abf4cb55bb3b21abd28207",
+                "e53eb603936c6cf69505c85dceb65660992e798cdb7f5f48a991bff184c72c29"}:
             return event
         if runtime.get("lockstep_protocol_version") != 23:
             raise LockstepGdbError("Fixed image label has an incompatible protocol")
@@ -83,6 +86,49 @@ class DuckStationLockstep:
         if state["timer1"] > 0xffff or state["field_lines"] not in (263, 314):
             raise LockstepGdbError("DuckStation handoff device state is unsupported")
         return state
+
+    def timer_state(self) -> dict:
+        if self.mode != "replay" or not self.remote.stopped:
+            raise LockstepGdbError("DuckStation must be paused in replay for timer state")
+        reply = self.remote.packet("qXportLockstepTimerState")
+        fields = reply.split(":")
+        if (len(fields) != 5 or fields[0] != "TIMERSTATE" or
+                not all(re.fullmatch(r"[0-9a-fA-F]+", value) for value in fields[1:]) or
+                len(fields[4]) != 118):
+            raise LockstepGdbError(f"Malformed DuckStation timer state: {reply}")
+        version, clock, pending = (int(value, 16) for value in fields[1:4])
+        if version != 85 or clock > 0xffffffffffffffff or pending > 0x7fffffff:
+            raise LockstepGdbError("Unsupported DuckStation timer state header")
+        from duckstation_state85 import Reader, timers
+        reader = Reader(bytes.fromhex(fields[4]))
+        try:
+            state = timers(reader)
+            reader.end()
+        except ValueError as error:
+            raise LockstepGdbError("Malformed DuckStation timer serializer") from error
+        if (state["sysclk_div8_carry"] >= 8 or
+                any(row["mode"] > 0x1fff or row["counter"] > 0xffff or row["target"] > 0xffff
+                    for row in state["counters"])):
+            raise LockstepGdbError("Invalid DuckStation timer registers")
+        return {"serializer_version": version, "cpu_clock": clock,
+                "pending_sysclk_ticks": pending, **state}
+
+    def beam_state(self) -> dict:
+        if self.mode != "replay" or not self.remote.stopped:
+            raise LockstepGdbError("DuckStation must be paused in replay for beam state")
+        reply = self.remote.packet("qXportLockstepBeamState")
+        fields = reply.split(":")
+        if (len(fields) != 8 or fields[0] != "BEAMSTATE" or len(fields[7]) != 24 or
+                not all(re.fullmatch(r"[0-9a-fA-F]+", value) for value in fields[1:])):
+            raise LockstepGdbError(f"Malformed DuckStation beam state: {reply}")
+        clock, frequency, tick, line, start, end = (int(value, 16) for value in fields[1:7])
+        irq = dict(zip(("status", "mask", "lines"), struct.unpack("<3I", bytes.fromhex(fields[7]))))
+        if (clock > 0xffffffffffffffff or frequency not in (53203425, 53693175) or
+                tick >= 65536 or line >= 1024 or not 0 <= start < end <= 1024 or
+                any(value & ~0x7ff for value in irq.values())):
+            raise LockstepGdbError("Invalid DuckStation beam/IRQ state")
+        return {"cpu_clock": clock, "gpu_frequency": frequency, "tick": tick, "line": line,
+                "vertical_start": start, "vertical_end": end, "irq": irq}
 
     def attach_handoff(self, peer: dict, exceptions: dict,
                        boundary_targets: tuple[int, ...], start_frame: int,

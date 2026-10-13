@@ -2889,7 +2889,14 @@ sint32 SpuGetKeyStatus(uint32 voice_bit)
     xport_audio_lock();
     spu_synchronize_device_clock();
     if (spu.key_status & SPU_KEYCH(voice))
+    {
+#if !defined(LOCKSTEP_DEBUG)
+        // Pending starts are active before the mixer updates their envelope
+        status = (spu.key_on_pending & SPU_KEYCH(voice)) || spu.voices[voice].envelope != 0 ? SPU_ON : SPU_ON_ENV_OFF;
+#else
         status = spu.voices[voice].envelope != 0 ? SPU_ON : SPU_ON_ENV_OFF;
+#endif
+    }
     else
         status = spu.voices[voice].envelope != 0 ? SPU_OFF_ENV_ON : SPU_OFF;
     xport_audio_unlock();

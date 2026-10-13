@@ -116,16 +116,19 @@ index d729042..78a4756 100644
          ExecutionBreakpointCheck(g_state.pc);
  
 diff --git a/src/core/gdb_server.cpp b/src/core/gdb_server.cpp
-index ca45889..173eebd 100644
+index ca45889..41eeec3 100644
 --- a/src/core/gdb_server.cpp
 +++ b/src/core/gdb_server.cpp
-@@ -10,9 +10,20 @@
+@@ -10,9 +10,23 @@
  #include "cpu_core.h"
  #include "cpu_core_private.h"
  #include "gte.h"
 +#include "dma.h"
 +#include "gpu.h"
 +#include "timers.h"
++#include "timing_event.h"
++#include "interrupt_controller.h"
++#include "save_state_version.h"
  #include "system.h"
 +#include "settings.h"
 +#include "spu.h"
@@ -140,18 +143,20 @@ index ca45889..173eebd 100644
  #include "common/log.h"
  #include "common/small_string.h"
  #include "common/string_util.h"
-@@ -20,8 +31,9 @@
+@@ -20,8 +34,11 @@
  #include "common/timer.h"
  
  #include "util/sockets.h"
 -
++#include "util/state_wrapper.h"
++#include <array>
  #include <limits>
 +#include <cstdlib>
 +#include <cstdio>
  #include <optional>
  #include <utility>
  
-@@ -312,6 +324,35 @@ template<bool add_breakpoint>
+@@ -312,6 +329,37 @@ template<bool add_breakpoint>
  static bool Cmd$z(ClientSocket* client, std::string_view data);
  static bool Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data);
  static bool Cmd$qSupported(ClientSocket* client, std::string_view data);
@@ -165,6 +170,8 @@ index ca45889..173eebd 100644
 +static bool Cmd$qXportLockstepPreludeStart(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepStartAt(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepHandoffState(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepTimerState(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportLockstepBeamState(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepRecordStart(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepRecordRead(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportFunctionCoverageStart(ClientSocket* client, std::string_view data);
@@ -187,7 +194,7 @@ index ca45889..173eebd 100644
  static bool Cmd$qXferFeaturesRead(ClientSocket* client, std::string_view data);
  static bool Cmd$qXferMemoryMapRead(ClientSocket* client, std::string_view data);
  
-@@ -403,6 +444,49 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
+@@ -403,6 +451,51 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
    {"qXfer:features:read:", Cmd$qXferFeaturesRead},
    {"qXfer:memory-map:read:", Cmd$qXferMemoryMapRead},
    {"qSupported", Cmd$qSupported},
@@ -200,6 +207,8 @@ index ca45889..173eebd 100644
 +  {"qXportLockstepPreludeStart", Cmd$qXportLockstepPreludeStart},
 +  {"qXportLockstepStartAt:", Cmd$qXportLockstepStartAt},
 +  {"qXportLockstepHandoffState", Cmd$qXportLockstepHandoffState},
++  {"qXportLockstepTimerState", Cmd$qXportLockstepTimerState},
++  {"qXportLockstepBeamState", Cmd$qXportLockstepBeamState},
 +  {"qXportLockstepStart", Cmd$qXportLockstepStart},
 +  {"qXportLockstepRecordStart:", Cmd$qXportLockstepRecordStart},
 +  {"qXportLockstepRecordStart", Cmd$qXportLockstepRecordStart},
@@ -237,7 +246,7 @@ index ca45889..173eebd 100644
  };
  
  namespace {
-@@ -412,6 +496,36 @@ struct Locals
+@@ -412,6 +505,36 @@ struct Locals
    std::shared_ptr<ListenSocket> listen_socket;
    std::vector<std::shared_ptr<ClientSocket>> clients;
    std::vector<ManagedBreakpoint> breakpoints;
@@ -274,7 +283,7 @@ index ca45889..173eebd 100644
    u8 pending_stop_signal = GDB_SIGNAL_TRAP;
    bool resume_on_last_disconnect = false;
  };
-@@ -940,10 +1054,955 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
+@@ -940,10 +1063,988 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
    return true;
  }
  
@@ -770,6 +779,39 @@ index ca45889..173eebd 100644
 +  return true;
 +}
 +
++bool GDBServer::Cmd$qXportLockstepTimerState(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || System::IsExecuting() || !System::IsPaused() || !s_locals.lockstep_replay_active)
++    return SendLockstepError(client, "timer_state", "replay_not_paused");
++  std::array<u8, 64> bytes{};
++  StateWrapper sw(std::span<u8>(bytes), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
++  if (!Timers::DoState(sw) || sw.GetPosition() != 59)
++    return SendLockstepError(client, "timer_state", "serializer_contract_changed");
++  client->SendReplyWithAck(SmallString::from_format(
++    "TIMERSTATE:{:x}:{:x}:{:x}:{}", SAVE_STATE_VERSION,
++    TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks(),
++    Timers::GetPendingSysClkTicks(), StringUtil::EncodeHex(bytes.data(), sw.GetPosition())));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportLockstepBeamState(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || System::IsExecuting() || !System::IsPaused() || !s_locals.lockstep_replay_active)
++    return SendLockstepError(client, "beam_state", "replay_not_paused");
++  u32 tick, line;
++  GPU::GetBeamPosition(&tick, &line);
++  std::array<u8, 12> bytes{};
++  StateWrapper sw(std::span<u8>(bytes), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
++  if (!InterruptController::DoState(sw) || sw.GetPosition() != bytes.size())
++    return SendLockstepError(client, "beam_state", "irq_serializer_contract_changed");
++  client->SendReplyWithAck(SmallString::from_format(
++    "BEAMSTATE:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{}",
++    TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks(), GPU::GetCRTCFrequency(), tick, line,
++    GPU::GetCRTCActiveStartLine(), GPU::GetCRTCActiveEndLine(),
++    StringUtil::EncodeHex(bytes.data(), bytes.size())));
++  return true;
++}
++
 +bool GDBServer::Cmd$qXportLockstepRecordStart(ClientSocket* client, std::string_view data)
 +{
 +  const auto limit = data.empty() ? std::optional<u32>(0) : StringUtil::FromChars<u32>(data, 16);
@@ -1227,11 +1269,11 @@ index ca45889..173eebd 100644
  {
    client->SendReplyWithAck(
 -    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+", MAX_PACKET_SIZE));
-+    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+;qXportLockstepAttach+;qXportLockstepExceptions+;qXportLockstepMode+;qXportLockstepCompare+;qXportLockstepDiff+;qXportLockstepDetach+;qXportLockstepStart+;qXportLockstepPreludeStart+;qXportLockstepStartAt+;qXportLockstepHandoffState+;qXportLockstepRecordStart+;qXportLockstepRecordRead+;qXportFunctionCoverageStart+;qXportFunctionCoverageTarget+;qXportFunctionCoverageStop+;qXportFunctionCoverageRead+;qXportLockstepReplay+;qXportLockstepSeed+;qXportLockstepInput+;qXportLockstepPadRestore+;qXportLockstepBoundary+;qXportLockstepTail+;qXportLockstepNextEvent+;qXportLockstepDMA+;qXportLockstepCheckpointCapture+;qXportLockstepCheckpointExport+;qXportLockstepCheckpointImport+;qXportLockstepCheckpointRestore+;qXportLockstepLastInstruction+", MAX_PACKET_SIZE));
++    TinyString::from_format("PacketSize={:x};qXfer:features:read+;qXfer:memory-map:read+;qXportLockstepAttach+;qXportLockstepExceptions+;qXportLockstepMode+;qXportLockstepCompare+;qXportLockstepDiff+;qXportLockstepDetach+;qXportLockstepStart+;qXportLockstepPreludeStart+;qXportLockstepStartAt+;qXportLockstepHandoffState+;qXportLockstepTimerState+;qXportLockstepBeamState+;qXportLockstepRecordStart+;qXportLockstepRecordRead+;qXportFunctionCoverageStart+;qXportFunctionCoverageTarget+;qXportFunctionCoverageStop+;qXportFunctionCoverageRead+;qXportLockstepReplay+;qXportLockstepSeed+;qXportLockstepInput+;qXportLockstepPadRestore+;qXportLockstepBoundary+;qXportLockstepTail+;qXportLockstepNextEvent+;qXportLockstepDMA+;qXportLockstepCheckpointCapture+;qXportLockstepCheckpointExport+;qXportLockstepCheckpointImport+;qXportLockstepCheckpointRestore+;qXportLockstepLastInstruction+", MAX_PACKET_SIZE));
    return true;
  }
  
-@@ -1516,6 +2575,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
+@@ -1516,6 +2617,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
  
  void GDBServer::Shutdown()
  {
@@ -1470,6 +1512,34 @@ index 3c93cec..0f99ff5 100644
  
  /// Returns true if global states should be include in the slot list.
  bool AreGlobalSaveStatesEnabled();
+diff --git a/src/core/timers.cpp b/src/core/timers.cpp
+index a2859ee..37872f7 100644
+--- a/src/core/timers.cpp
++++ b/src/core/timers.cpp
+@@ -140,6 +140,11 @@ bool Timers::DoState(StateWrapper& sw)
+   return !sw.HasError();
+ }
+ 
++TickCount Timers::GetPendingSysClkTicks()
++{
++  return s_state.sysclk_event.GetTicksSinceLastExecution();
++}
++
+ void Timers::CPUClocksChanged()
+ {
+   s_state.sysclk_ticks_carry = 0;
+diff --git a/src/core/timers.h b/src/core/timers.h
+index 3d37c1a..72b36b3 100644
+--- a/src/core/timers.h
++++ b/src/core/timers.h
+@@ -13,6 +13,7 @@ void Initialize();
+ void Shutdown();
+ void Reset();
+ bool DoState(StateWrapper& sw);
++TickCount GetPendingSysClkTicks();
+ 
+ void SetGate(u32 timer, bool state);
+ 
 diff --git a/src/core/xport_lockstep_mips.h b/src/core/xport_lockstep_mips.h
 new file mode 100644
 index 0000000..0bc171c

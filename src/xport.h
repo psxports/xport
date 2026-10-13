@@ -15,6 +15,26 @@ typedef uint64_t uint64;
 typedef int64_t sint64;
 typedef intptr_t intptr;
 
+typedef union
+{
+    struct
+    {
+        float x, y, z;
+    };
+
+    float v[3];
+} VEC3F;
+
+typedef union
+{
+    struct
+    {
+        float x, y, z, w;
+    };
+
+    float v[4];
+} QUATF;
+
 #define PADLup (1 << 12)
 #define PADLdown (1 << 14)
 #define PADLleft (1 << 15)
@@ -84,6 +104,8 @@ extern "C"
     void *psx_addr(uint32 address, size_t count);
 
     /* Platform services implemented by the selected backend */
+    extern int xport_hd;
+    void xport_set_cleanup(void (*cleanup)(void));
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
     void xport_timer_wait_frame(uint32 refresh_rate);

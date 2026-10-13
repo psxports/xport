@@ -48,6 +48,8 @@ Agents run `record.ps1 -Action start` or the project `record.bat` with GUI permi
 the recorder explicitly on `WinSta0\Default`. A numbered slot resolves to the recording role's game save state and is checked against the configured game serial before launch;
 `trace_workflow record` accepts only bounded `--frames N` automation.
 
+Recording preserves the configured CPU overclock enable flag, numerator and denominator. Never normalize these settings to the default CPU clock. Capture them in the settings snapshot and effective recording contract.
+
 DuckStation polls its normal input sources. The recorder captures the effective state
 after polling and before the next frame executes. The native replay applies the same state
 from its own FrameDone hook. Intermediate game polls therefore observe the previous

@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "psx.h"
 #include "psx_gpu.h"
 
@@ -122,6 +123,9 @@ static PsxIrqState native_root_irq;
 static uint32 native_root_control_slot, native_root_mask_table;
 static uint64 native_root_last_us, native_root_tick_fraction;
 static uint32 native_root_polling, native_root_clock_started;
+static PsxRootClockSample native_root_clock_sample;
+static void *native_root_clock_context;
+static uint64 native_root_last_tick;
 static sint32 native_video_mode;
 void psx_root_counter_poll(void);
 static void mc_poll(void);
@@ -1352,13 +1356,28 @@ void psx_timers_export(PsxTimerState *state)
 
 static uint8 native_timer_irq_fired[3];
 
+sint32 psx_root_counter_import_irq(const PsxIrqState *state, const uint8 fired[3])
+{
+    uint32 index;
+    if (!psx_irq_validate(state) || !fired)
+        return 0;
+    for (index = 0; index < 3; ++index)
+        if (fired[index] > 1)
+            return 0;
+    native_root_irq = *state;
+    memcpy(native_timer_irq_fired, fired, sizeof(native_timer_irq_fired));
+    return 1;
+}
+
 static void psx_timer_irq(uint32 index)
 {
     uint32 mode = timers.mode[index];
     if (!(mode & 0x40u) && native_timer_irq_fired[index])
         return;
     native_timer_irq_fired[index] = 1u;
-    psx_interrupt_raise(index + 4u);
+    psx_irq_line(&native_root_irq, index + 4u, 0);
+    psx_irq_line(&native_root_irq, index + 4u, 1);
+    bios_native_irq_dispatch();
 }
 
 static void psx_timer_add(uint32 index, uint32 ticks)
@@ -1381,7 +1400,7 @@ static void psx_timer_add(uint32 index, uint32 ticks)
         if (step == to_target)
         {
             mode |= 0x800u;
-            if (mode & 8u)
+            if ((mode & 8u) && target != 0xFFFFu)
                 timers.counter[index] = 0u;
         }
         if (step == to_wrap)
@@ -2828,6 +2847,229 @@ SVECTOR *ApplyMatrixSV(MATRIX *m, SVECTOR *v, SVECTOR *out)
     out->vz = (sint16)q.vz;
     out->pad = 0;
     return out;
+}
+
+MATRIXF *IdentityMatrixf(MATRIXF *matrix)
+{
+    memset(matrix, 0, sizeof(*matrix));
+    matrix->m[0][0] = matrix->m[1][1] = matrix->m[2][2] = 1.0f;
+    return matrix;
+}
+
+VECTORF *ApplyMatrixf(const MATRIXF *matrix, const VECTORF *src, VECTORF *dst)
+{
+    VECTORF result;
+    result.vx = matrix->m[0][0] * src->vx + matrix->m[0][1] * src->vy + matrix->m[0][2] * src->vz;
+    result.vy = matrix->m[1][0] * src->vx + matrix->m[1][1] * src->vy + matrix->m[1][2] * src->vz;
+    result.vz = matrix->m[2][0] * src->vx + matrix->m[2][1] * src->vy + matrix->m[2][2] * src->vz;
+    *dst = result;
+    return dst;
+}
+
+VECTORF *RotTransf(const MATRIXF *matrix, const VECTORF *src, VECTORF *dst)
+{
+    ApplyMatrixf(matrix, src, dst);
+    dst->vx += matrix->t[0];
+    dst->vy += matrix->t[1];
+    dst->vz += matrix->t[2];
+    return dst;
+}
+
+MATRIXF *MulMatrix0f(const MATRIXF *left, const MATRIXF *right, MATRIXF *dst)
+{
+    float result[3][3];
+    for (uint32 row = 0; row < 3; ++row)
+        for (uint32 column = 0; column < 3; ++column)
+            result[row][column] = left->m[row][0] * right->m[0][column] + left->m[row][1] * right->m[1][column] + left->m[row][2] * right->m[2][column];
+    memcpy(dst->m, result, sizeof(result));
+    return dst;
+}
+
+MATRIXF *MulMatrixf(MATRIXF *left, const MATRIXF *right)
+{
+    return MulMatrix0f(left, right, left);
+}
+
+MATRIXF *MulMatrix2f(const MATRIXF *left, MATRIXF *right)
+{
+    return MulMatrix0f(left, right, right);
+}
+
+MATRIXF *CompMatrixf(const MATRIXF *left, const MATRIXF *right, MATRIXF *dst)
+{
+    MATRIXF result;
+    VECTORF pos = {right->t[0], right->t[1], right->t[2]};
+    MulMatrix0f(left, right, &result);
+    RotTransf(left, &pos, &pos);
+    result.t[0] = pos.vx;
+    result.t[1] = pos.vy;
+    result.t[2] = pos.vz;
+    *dst = result;
+    return dst;
+}
+
+MATRIXF *TransposeMatrixf(const MATRIXF *src, MATRIXF *dst)
+{
+    float result[3][3];
+    for (uint32 row = 0; row < 3; ++row)
+        for (uint32 column = 0; column < 3; ++column)
+            result[row][column] = src->m[column][row];
+    memcpy(dst->m, result, sizeof(result));
+    return dst;
+}
+
+MATRIXF *RotMatrixXf(float angle, MATRIXF *matrix)
+{
+    float s = sinf(angle), c = cosf(angle);
+    for (uint32 column = 0; column < 3; ++column)
+    {
+        float y = matrix->m[1][column], z = matrix->m[2][column];
+        matrix->m[1][column] = c * y - s * z;
+        matrix->m[2][column] = s * y + c * z;
+    }
+    return matrix;
+}
+
+MATRIXF *RotMatrixYf(float angle, MATRIXF *matrix)
+{
+    float s = sinf(angle), c = cosf(angle);
+    for (uint32 column = 0; column < 3; ++column)
+    {
+        float x = matrix->m[0][column], z = matrix->m[2][column];
+        matrix->m[0][column] = c * x + s * z;
+        matrix->m[2][column] = -s * x + c * z;
+    }
+    return matrix;
+}
+
+MATRIXF *RotMatrixZf(float angle, MATRIXF *matrix)
+{
+    float s = sinf(angle), c = cosf(angle);
+    for (uint32 column = 0; column < 3; ++column)
+    {
+        float x = matrix->m[0][column], y = matrix->m[1][column];
+        matrix->m[0][column] = c * x - s * y;
+        matrix->m[1][column] = s * x + c * y;
+    }
+    return matrix;
+}
+
+MATRIXF *RotMatrixf(const VECTORF *angles, MATRIXF *matrix)
+{
+    MATRIXF result;
+    IdentityMatrixf(&result);
+    RotMatrixZf(angles->vz, &result);
+    RotMatrixYf(angles->vy, &result);
+    RotMatrixXf(angles->vx, &result);
+    memcpy(matrix->m, result.m, sizeof(result.m));
+    return matrix;
+}
+
+MATRIXF *RotMatrixYXZf(const VECTORF *angles, MATRIXF *matrix)
+{
+    MATRIXF result;
+    IdentityMatrixf(&result);
+    RotMatrixZf(angles->vz, &result);
+    RotMatrixXf(angles->vx, &result);
+    RotMatrixYf(angles->vy, &result);
+    memcpy(matrix->m, result.m, sizeof(result.m));
+    return matrix;
+}
+
+MATRIXF *ScaleMatrixf(MATRIXF *matrix, const VECTORF *scale)
+{
+    for (uint32 row = 0; row < 3; ++row)
+    {
+        matrix->m[row][0] *= scale->vx;
+        matrix->m[row][1] *= scale->vy;
+        matrix->m[row][2] *= scale->vz;
+    }
+    return matrix;
+}
+
+MATRIXF *TransMatrixf(MATRIXF *matrix, const VECTORF *pos)
+{
+    matrix->t[0] = pos->vx;
+    matrix->t[1] = pos->vy;
+    matrix->t[2] = pos->vz;
+    return matrix;
+}
+
+VECTORF *OuterProductf(const VECTORF *left, const VECTORF *right, VECTORF *dst)
+{
+    VECTORF result;
+    result.vx = left->vy * right->vz - left->vz * right->vy;
+    result.vy = left->vz * right->vx - left->vx * right->vz;
+    result.vz = left->vx * right->vy - left->vy * right->vx;
+    *dst = result;
+    return dst;
+}
+
+float NormalizeVectorf(const VECTORF *src, VECTORF *dst)
+{
+    float length = sqrtf(src->vx * src->vx + src->vy * src->vy + src->vz * src->vz);
+    VECTORF result = {0};
+    if (length > 0)
+    {
+        result.vx = src->vx / length;
+        result.vy = src->vy / length;
+        result.vz = src->vz / length;
+    }
+    *dst = result;
+    return length;
+}
+
+float NormalizeQuatf(const QUATF *src, QUATF *dst)
+{
+    float length = sqrtf(src->x * src->x + src->y * src->y + src->z * src->z + src->w * src->w);
+    QUATF result = {{0, 0, 0, 1}};
+    if (length > 0)
+        for (uint32 idx = 0; idx < 4; ++idx)
+            result.v[idx] = src->v[idx] / length;
+    *dst = result;
+    return length;
+}
+
+QUATF *MulQuatf(const QUATF *left, const QUATF *right, QUATF *dst)
+{
+    QUATF result;
+    result.x = left->w * right->x + right->w * left->x + left->y * right->z - left->z * right->y;
+    result.y = left->w * right->y + right->w * left->y + left->z * right->x - left->x * right->z;
+    result.z = left->w * right->z + right->w * left->z + left->x * right->y - left->y * right->x;
+    result.w = left->w * right->w - left->x * right->x - left->y * right->y - left->z * right->z;
+    *dst = result;
+    return dst;
+}
+
+MATRIXF *QuatMatrixf(const QUATF *quat, MATRIXF *matrix)
+{
+    QUATF q;
+    NormalizeQuatf(quat, &q);
+    matrix->m[0][0] = 1 - 2 * (q.y * q.y + q.z * q.z);
+    matrix->m[1][1] = 1 - 2 * (q.x * q.x + q.z * q.z);
+    matrix->m[2][2] = 1 - 2 * (q.x * q.x + q.y * q.y);
+    matrix->m[1][0] = 2 * (q.x * q.y + q.w * q.z);
+    matrix->m[0][1] = 2 * (q.x * q.y - q.w * q.z);
+    matrix->m[2][0] = 2 * (q.x * q.z - q.w * q.y);
+    matrix->m[0][2] = 2 * (q.x * q.z + q.w * q.y);
+    matrix->m[2][1] = 2 * (q.y * q.z + q.w * q.x);
+    matrix->m[1][2] = 2 * (q.y * q.z - q.w * q.x);
+    return matrix;
+}
+
+void ProjectVertexf(const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4])
+{
+    clip[0] = src->vx * focal_x;
+    clip[1] = -src->vy * focal_y;
+    clip[2] = src->vz * (far_z + near_z) / (far_z - near_z) - 2.0f * far_z * near_z / (far_z - near_z);
+    clip[3] = src->vz;
+}
+
+void RotTransPersf(const MATRIXF *matrix, const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4])
+{
+    VECTORF point;
+    RotTransf(matrix, src, &point);
+    ProjectVertexf(&point, focal_x, focal_y, near_z, far_z, clip);
 }
 
 static void matrix_identity(MATRIX *m)
@@ -5387,6 +5629,16 @@ void psx_root_counter_bind(uint32 control_slot, uint32 mask_table)
     xport_memory_bind_mmio(0x1F801070u, 8u, native_root_irq_read, native_root_irq_write, NULL);
 }
 
+void psx_root_counter_bind_clock(PsxRootClockSample sample, void *context)
+{
+    native_root_clock_sample = sample;
+    native_root_clock_context = context;
+    native_root_last_tick = sample ? sample(context) : 0;
+    native_root_last_us = xport_timer_get();
+    native_root_tick_fraction = 0;
+    native_root_clock_started = 1;
+}
+
 void psx_root_counter_poll(void)
 {
     uint64 now, elapsed, ticks;
@@ -5398,13 +5650,29 @@ void psx_root_counter_poll(void)
         native_root_clock_started = 1u;
     }
     native_root_polling = 1u;
-    now = xport_timer_get();
-    elapsed = now - native_root_last_us;
-    native_root_last_us = now;
-    ticks = elapsed / 1000000u * 33868800u;
-    native_root_tick_fraction += elapsed % 1000000u * 33868800u;
-    ticks += native_root_tick_fraction / 1000000u;
-    native_root_tick_fraction %= 1000000u;
+    if (native_root_clock_sample)
+    {
+        now = native_root_clock_sample(native_root_clock_context);
+        if (now < native_root_last_tick)
+        {
+#ifdef _DEBUG
+            fputs("PSX: emulated root clock moved backwards\n", stderr);
+#endif
+            abort();
+        }
+        ticks = now - native_root_last_tick;
+        native_root_last_tick = now;
+    }
+    else
+    {
+        now = xport_timer_get();
+        elapsed = now - native_root_last_us;
+        native_root_last_us = now;
+        ticks = elapsed / 1000000u * 33868800u;
+        native_root_tick_fraction += elapsed % 1000000u * 33868800u;
+        ticks += native_root_tick_fraction / 1000000u;
+        native_root_tick_fraction %= 1000000u;
+    }
     {
         uint64 remaining = ticks;
         while (remaining)

@@ -82,6 +82,12 @@ The scheduler requires monotonic event sequences and call ordinals. It compares 
 
 For a matched PRE, POST, TAIL, or VBLANK, the scheduler sends one request ID to DuckStation. DuckStation scans its RAM against the read-only native mappings and returns only MATCH, a bounded first difference, or a stable error. A second pending event per side is impossible because neither process resumes until the current pair and its comparison have been accepted.
 
+## Timer migration observations
+
+`lockstep.timer_observation: true` requests a compact `qXportLockstepTimerState` observation at the paused handoff and at a divergent VBlank. The reply contains serializer version 85, the original CPU clock including pending ticks, pending SysClk event ticks, and the exact 59-byte timer serializer. Reading it must not advance timers, deliver IRQs, clear mode flags or export DRAM. Preserve counter modes, counting/gate flags, IRQ history and the SysClk/8 carry; serialized counters may lag the reported CPU clock by the explicit pending SysClk ticks.
+
+The supervisor writes `handoff-timers.json` and includes `original_timer_state` in the divergent result. These are migration evidence, not a paired checkpoint, a memory exception or a MATCH. Never copy a divergent game counter from this observation or replace the timer scheduler with a per-frame increment. Import the handoff device phase and preserve the emulated clock and interrupt timeline before enabling timer callbacks.
+
 ## Deterministic FrameDone record
 
 `tools/lockstep_record.py` owns `xport-lockstep-record-v1`. A record identifies the initial save state, every disc file, original executable, DuckStation commit and patch, settings, PAL or NTSC field rate, and one effective two-port controller state per FrameDone. Every file is size and SHA-256 checked before reuse. The canonical record identity also covers the complete input schedule.

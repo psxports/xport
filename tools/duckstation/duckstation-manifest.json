@@ -7,7 +7,7 @@
   },
   "patch": {
     "path": "internal-trace-api.patch",
-    "sha256": "0c3155d5f8ad2854e87d9e2393b45f67cf2785b88a949f76b941561b4cddb069"
+    "sha256": "e53eb603936c6cf69505c85dceb65660992e798cdb7f5f48a991bff184c72c29"
   },
   "dependencies": {
     "windows-x64": {
@@ -53,7 +53,9 @@
       "qXportLockstepCheckpointImport",
       "qXportLockstepCheckpointRestore",
       "qXportLockstepLastInstruction",
-      "XPORT_DUCKSTATION_DATA_ROOT"
+      "XPORT_DUCKSTATION_DATA_ROOT",
+      "qXportLockstepTimerState",
+      "qXportLockstepBeamState"
     ],
     "lockstep_protocol_version": 23,
     "lockstep_record_version": 1

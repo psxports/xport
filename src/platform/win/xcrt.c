@@ -25,6 +25,74 @@ static HANDLE process_heap;
 static INIT_ONCE errno_once = INIT_ONCE_STATIC_INIT;
 static DWORD errno_slot;
 
+static float float_extremum(float a, float b, int maximum)
+{
+    union
+    {
+        float value;
+        uint32_t bits;
+    } first = {a}, second = {b};
+
+    if (a != a)
+        return b;
+    if (b != b)
+        return a;
+    if (a == b)
+    {
+        if (a == 0)
+            first.bits = maximum ? first.bits & second.bits : first.bits | second.bits;
+        return first.value;
+    }
+    return maximum ? a > b ? a : b : a < b ? a : b;
+}
+
+float fminf(float a, float b)
+{
+    return float_extremum(a, b, 0);
+}
+
+float fmaxf(float a, float b)
+{
+    return float_extremum(a, b, 1);
+}
+
+#pragma function(floor)
+
+double floor(double value)
+{
+    union
+    {
+        double value;
+        uint64_t bits;
+    } number = {value};
+
+    int exponent = (int)(number.bits >> 52 & 0x7ff) - 1023;
+    if (exponent >= 52)
+        return value;
+    if (exponent < 0)
+    {
+        if (!(number.bits & UINT64_C(0x7fffffffffffffff)))
+            return value;
+        return number.bits >> 63 ? -1.0 : 0.0;
+    }
+    uint64_t mask = (UINT64_C(1) << (52 - exponent)) - 1;
+    if (!(number.bits & mask))
+        return value;
+    if (number.bits >> 63)
+        number.bits += UINT64_C(1) << (52 - exponent);
+    number.bits &= ~mask;
+    return number.value;
+}
+
+// The compiler passes x in ST0 and y in ST1, returning atan2(y, x) in ST0
+__declspec(naked) void _CIatan2(void)
+{
+    __asm {
+        fpatan
+        ret
+    }
+}
+
 void *malloc(size_t size)
 {
     return HeapAlloc(process_heap, 0, size ? size : 1);
@@ -374,6 +442,66 @@ int snprintf(char *dst, size_t capacity, const char *format, ...)
     result = wvnsprintfA(dst, (int)capacity, format, args);
     va_end(args);
     return result;
+}
+
+static const float float_unsigned_offset = 2147483648.0f;
+
+// Compiler helper takes a float in XMM0 and returns an unsigned word in EAX
+__declspec(naked) void _ftol3(void)
+{
+    __asm {
+        cvttss2si eax, xmm0
+        test eax, eax
+        jns done
+        ucomiss xmm0, DWORD PTR float_unsigned_offset
+        jb done
+        sub esp, 16
+        movups XMMWORD PTR[esp], xmm0
+        subss xmm0, DWORD PTR float_unsigned_offset
+        cvttss2si eax, xmm0
+        xor eax, 80000000h
+        movups xmm0, XMMWORD PTR[esp]
+        add esp, 16
+    done:
+        ret
+    }
+}
+
+// SSE2 math helpers take and return a double in XMM0
+__declspec(naked) void _libm_sse2_sqrt_precise(void)
+{
+    __asm {
+        sqrtsd xmm0, xmm0
+        ret
+    }
+}
+
+__declspec(naked) void _libm_sse2_sin_precise(void)
+{
+    __asm {
+        sub esp, 8
+        movsd QWORD PTR[esp], xmm0
+        fld QWORD PTR[esp]
+        fsin
+        fstp QWORD PTR[esp]
+        movsd xmm0, QWORD PTR[esp]
+        add esp, 8
+        ret
+    }
+}
+
+__declspec(naked) void _libm_sse2_cos_precise(void)
+{
+    __asm {
+        sub esp, 8
+        movsd QWORD PTR[esp], xmm0
+        fld QWORD PTR[esp]
+        fcos
+        fstp QWORD PTR[esp]
+        movsd xmm0, QWORD PTR[esp]
+        add esp, 8
+        ret
+    }
 }
 
 /* Shared division uses hardware DIV for 64 by 32 and at most 32 steps otherwise */

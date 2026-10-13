@@ -14,6 +14,8 @@ extern "C"
 #else
 extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
 #endif
+    uint32 gpu_vram_version(void);
+
     typedef struct GpuTimImage
     {
         uint32 mode;
@@ -33,6 +35,7 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     void gpu_bind_linked_submit(GpuLinkedSubmit submit, void *context);
     sint32 gpu_linked_submit_failed(void);
     sint32 gpu_execute_linked_dma(uint32 physical_address);
+    void gpu_set_raster(sint32 enabled);
 
     typedef struct GpuLinkedDmaState
     {
@@ -181,7 +184,10 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     void gpu_register_dma_range(void *begin, uint32 size);
     sint32 gpu_register_packet_range(void *begin, uint32 size);
     sint32 gpu_present(void);
-    // Host policy is disabled by default and excluded from portable GPU state
+    // Suppress presentation until all passes of a host frame are complete
+    void gpu_frame_begin(void);
+    void gpu_frame_end(void);
+    // Host frame policy is excluded from portable GPU state
     void gpu_set_frame_skip(sint32 enabled);
     sint32 gpu_frame_sync(uint32 fields);
     sint32 gpu_frame_skipped(void);

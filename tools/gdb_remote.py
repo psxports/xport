@@ -7,8 +7,10 @@ import csv
 import json
 import mmap
 import os
+import re
 import socket
 import struct
+import time
 from pathlib import Path
 
 
@@ -75,10 +77,21 @@ class Remote:
         if timeout is not None:
             self.s.settimeout(timeout)
         data = command.encode()
+        expects_stop = command == '?' or command[:1] in ('c', 's', 'C', 'S', 'v', 'k')
+        receive_timeout = self.s.gettimeout()
+        deadline = None if receive_timeout is None else time.monotonic() + receive_timeout
         try:
             self.s.sendall(b"$" + data + b"#" + self._sum(data))
             while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("GDB reply deadline expired")
+                    self.s.settimeout(remaining)
                 response = self._receive_packet()
+                # UI pauses can leave stop notifications ahead of a query reply
+                if not expects_stop and re.fullmatch(r"S[0-9a-fA-F]{2}|T[0-9a-fA-F]{2}.*", response):
+                    continue
                 # RSP console-output packets are asynchronous and may appear in
                 # front of the requested reply.  Treat only O + valid hex as a
                 # console packet; ordinary replies such as qXfer's `l...` remain
@@ -89,8 +102,7 @@ class Remote:
                     continue
                 return response
         finally:
-            if timeout is not None:
-                self.s.settimeout(previous_timeout)
+            self.s.settimeout(previous_timeout)
 
     def checkpoint(self, name: str, *, load: bool = False) -> None:
         """Project DuckStation extension; full state, paused target, no UI.

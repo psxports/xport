@@ -7,6 +7,9 @@
 #define XPORT_NO_PSYQ_CRITICAL_SECTION
 #include "psx_spu.h"
 #include "xport.h"
+#include "vid.h"
+
+int xport_hd = 1;
 #include "xport_trace.h"
 void psx_root_counter_poll(void);
 #if defined(LOCKSTEP_DEBUG)
@@ -61,6 +64,7 @@ static sint32 platform_headless;
 static sint32 platform_quit;
 static jmp_buf platform_game_exit;
 static sint32 platform_game_exit_active;
+static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
@@ -333,7 +337,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
     switch (message)
     {
         case WM_CLOSE:
-            DestroyWindow(window);
+            platform_quit = 1;
+            PostQuitMessage(0);
             return 0;
         case WM_DESTROY:
             platform_quit = 1;
@@ -361,6 +366,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KEYDOWN:
         case WM_KEYUP:
+            if (wparam == VK_TAB)
+            {
+                if (message == WM_KEYDOWN && !(lparam & (1L << 30)))
+                    xport_hd = !xport_hd;
+                return 0;
+            }
             for (sint32 controller = 0; controller < 2; ++controller)
             {
                 button = key_to_pad(controller, wparam, lparam);
@@ -430,7 +441,7 @@ sint32 xport_window_init(void)
     instance = GetModuleHandle(NULL);
     memset(&window_class, 0, sizeof(window_class));
     window_class.cbSize = sizeof(window_class);
-    window_class.style = CS_HREDRAW | CS_VREDRAW;
+    window_class.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance;
     window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -454,46 +465,27 @@ sint32 xport_window_init(void)
     platform_window = CreateWindow(window_class.lpszClassName, WND_TITLE, WS_OVERLAPPEDWINDOW, x, y, width, height, NULL, NULL, instance, NULL);
     if (platform_window == NULL)
         return 0;
+    if (!vid_init(platform_window))
+    {
+        xport_message_error("VID", "OpenGL 3.3 initialization failed");
+        DestroyWindow(platform_window);
+        return 0;
+    }
     ShowWindow(platform_window, SW_SHOW);
     return 1;
 }
 
-/* Save bounded producer pixels without desktop readback */
 sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title)
 {
-    RECT client;
-    HDC device;
-    BITMAPINFO bitmap;
-    sint32 client_height;
-    sint32 client_width;
-    sint32 result;
+    VID_RECT src = {source_x, source_y, source_width, source_height};
     xport_poll();
     if (platform_headless)
         return 1;
-    if (pixels == NULL || bitmap_width <= 0 || bitmap_height <= 0 || source_x < 0 || source_y < 0 || source_width <= 0 || source_height <= 0 || source_x + source_width > bitmap_width || source_y + source_height > bitmap_height || platform_window == NULL || platform_quit)
+    if (platform_window == NULL || platform_quit)
         return 0;
-    if (!GetClientRect(platform_window, &client))
-        return 0;
-    client_width = client.right - client.left;
-    client_height = client.bottom - client.top;
-    if (client_width <= 0 || client_height <= 0)
-        return 0;
-    memset(&bitmap, 0, sizeof(bitmap));
-    bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmap.bmiHeader.biWidth = bitmap_width;
-    bitmap.bmiHeader.biHeight = -bitmap_height;
-    bitmap.bmiHeader.biPlanes = 1;
-    bitmap.bmiHeader.biBitCount = 32;
-    bitmap.bmiHeader.biCompression = BI_RGB;
-    device = GetDC(platform_window);
-    if (device == NULL)
-        return 0;
-    SetStretchBltMode(device, COLORONCOLOR);
-    result = StretchDIBits(device, 0, 0, client_width, client_height, source_x, source_y, source_width, source_height, pixels, &bitmap, DIB_RGB_COLORS, SRCCOPY);
-    ReleaseDC(platform_window, device);
     if (title != NULL)
         SetWindowText(platform_window, title);
-    return result != 0 && result != GDI_ERROR;
+    return vid_blit(pixels, bitmap_width, bitmap_height, src);
 }
 
 sint32 xport_is_headless(void)
@@ -885,9 +877,19 @@ void xport_message_error(const char *title, const char *message)
     MessageBoxA(platform_window, message, title, MB_OK | MB_ICONERROR);
 }
 
+void xport_set_cleanup(void (*cleanup)(void))
+{
+    platform_cleanup = cleanup;
+}
+
 void xport_shutdown(void)
 {
+    void (*cleanup)(void) = platform_cleanup;
+    platform_cleanup = NULL;
+    if (cleanup)
+        cleanup();
     xport_audio_shutdown();
+    vid_free();
     _XInputGetState = NULL;
     if (platform_xinput_module != NULL)
     {

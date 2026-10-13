@@ -145,6 +145,7 @@ extern "C"
 #define PSX_CLOCK_EVENTS 32u
 
     typedef sint32 (*PsxBiosEventService)(void *context);
+    typedef uint64 (*PsxRootClockSample)(void *context);
 
     typedef struct PsxBiosCardInfoLayout
     {
@@ -251,6 +252,43 @@ extern "C"
         sint16 m[3][3];
         sint32 t[3];
     } MATRIX;
+
+    typedef struct
+    {
+        float vx, vy, vz;
+    } VECTORF;
+
+    typedef struct
+    {
+        float m[3][3];
+        float t[3];
+    } MATRIXF;
+
+#define RAD12 (6.28318530718f / 4096.0f)
+
+    // Float transforms use radians and do not access GTE registers
+    MATRIXF *IdentityMatrixf(MATRIXF *matrix);
+    MATRIXF *RotMatrixf(const VECTORF *angles, MATRIXF *matrix);
+    MATRIXF *RotMatrixYXZf(const VECTORF *angles, MATRIXF *matrix);
+    MATRIXF *RotMatrixXf(float angle, MATRIXF *matrix);
+    MATRIXF *RotMatrixYf(float angle, MATRIXF *matrix);
+    MATRIXF *RotMatrixZf(float angle, MATRIXF *matrix);
+    MATRIXF *MulMatrix0f(const MATRIXF *left, const MATRIXF *right, MATRIXF *dst);
+    MATRIXF *MulMatrixf(MATRIXF *left, const MATRIXF *right);
+    MATRIXF *MulMatrix2f(const MATRIXF *left, MATRIXF *right);
+    MATRIXF *CompMatrixf(const MATRIXF *left, const MATRIXF *right, MATRIXF *dst);
+    MATRIXF *TransposeMatrixf(const MATRIXF *src, MATRIXF *dst);
+    MATRIXF *ScaleMatrixf(MATRIXF *matrix, const VECTORF *scale);
+    MATRIXF *TransMatrixf(MATRIXF *matrix, const VECTORF *pos);
+    VECTORF *ApplyMatrixf(const MATRIXF *matrix, const VECTORF *src, VECTORF *dst);
+    VECTORF *RotTransf(const MATRIXF *matrix, const VECTORF *src, VECTORF *dst);
+    float NormalizeVectorf(const VECTORF *src, VECTORF *dst);
+    VECTORF *OuterProductf(const VECTORF *left, const VECTORF *right, VECTORF *dst);
+    float NormalizeQuatf(const QUATF *src, QUATF *dst);
+    QUATF *MulQuatf(const QUATF *left, const QUATF *right, QUATF *dst);
+    MATRIXF *QuatMatrixf(const QUATF *quat, MATRIXF *matrix);
+    void ProjectVertexf(const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4]);
+    void RotTransPersf(const MATRIXF *matrix, const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4]);
 
     struct PsxGteSnapshot
     {
@@ -365,6 +403,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 psx_video_timing_validate(const PsxVideoTiming *state);
         sint32 psx_video_timing_advance(PsxVideoTiming *state, uint32 cpu_ticks, PsxCrtcStep *result);
         sint32 psx_timers_import(const PsxTimerState *state);
+        sint32 psx_root_counter_import_irq(const PsxIrqState *state, const uint8 fired[3]);
         void psx_timers_export(PsxTimerState *state);
         sint32 psx_timers_advance(uint32 cpu_ticks, uint32 dot_ticks, uint32 hblank_ticks);
         sint32 SetRCnt(uint32 counter, uint16 target, sint32 mode);
@@ -1368,6 +1407,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
     sint32 StartRCnt(uint32 counter);
     void psx_root_counter_bind(uint32 control_slot, uint32 mask_table);
+    void psx_root_counter_bind_clock(PsxRootClockSample sample, void *context);
     void psx_root_counter_poll(void);
 
     void psx_bios_bind_tap_interrupt(uint32 node);

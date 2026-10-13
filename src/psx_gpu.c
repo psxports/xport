@@ -126,6 +126,35 @@ static struct
 #endif
 };
 
+static sint32 frame_raster = 1;
+static uint32 frame_present_depth;
+static uint32 vram_version = 1;
+
+static void gpu_vram_invalidate(void)
+{
+    if (!++vram_version)
+        vram_version = 1;
+}
+
+uint32 gpu_vram_version(void)
+{
+    return vram_version;
+}
+
+void gpu_set_raster(sint32 enabled)
+{
+#if defined(LOCKSTEP_DEBUG)
+    (void)enabled;
+#else
+    enabled = enabled != 0;
+    if (!enabled && frame_raster)
+        gpu_vram_invalidate();
+    if (enabled && !frame_raster)
+        frame_skip.started = frame_skip.skipped = 0;
+    frame_raster = enabled;
+#endif
+}
+
 void gpu_set_frame_skip(sint32 enabled)
 {
     memset(&frame_skip, 0, sizeof(frame_skip));
@@ -536,6 +565,7 @@ sint32 gpu_load_rect(uint32 source, sint32 x, sint32 y, sint32 width, sint32 hei
         xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_UPLOAD, XPORT_DEVICE_DIRECTION_TO_DEVICE, 2u, 0xa0u);
         xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, (uint32)(gpu_wrap_y(y) * GPU_VRAM_WIDTH + gpu_wrap_x(x)) * 2u, (uint32)(width * height) * 2u, 0xffffffffu);
     }
+    gpu_vram_invalidate();
     for (row = 0; row < height; ++row)
     {
         const uint16 *pixels = (const uint16 *)psx_addr(source + (uint32)(row * width * 2), (size_t)width * 2);
@@ -715,6 +745,7 @@ sint32 LoadImagePSX(PSX_RECT *rectangle, uint32 *pixels)
         xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_UPLOAD, XPORT_DEVICE_DIRECTION_TO_DEVICE, 2u, 0xa0u);
         xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, (uint32)(gpu_wrap_y(rectangle->y) * GPU_VRAM_WIDTH + gpu_wrap_x(rectangle->x)) * 2u, (uint32)rectangle->w * (uint32)rectangle->h * 2u, 0xffffffffu);
     }
+    gpu_vram_invalidate();
     for (row = 0; row < rectangle->h; ++row)
     {
         for (column = 0; column < rectangle->w; ++column)
@@ -737,6 +768,7 @@ sint32 StoreImage(PSX_RECT *rectangle, uint32 *pixels)
     uint16 *destination = (uint16 *)pixels;
     if (!rectangle || !destination || rectangle->w < 0 || rectangle->h < 0)
         return -1;
+    gpu_vram_invalidate();
     for (row = 0; row < rectangle->h; ++row)
         for (column = 0; column < rectangle->w; ++column)
             destination[row * rectangle->w + column] = VRAM[gpu_wrap_y(rectangle->y + row) * GPU_VRAM_WIDTH + gpu_wrap_x(rectangle->x + column)];
@@ -749,6 +781,7 @@ static void gpu_vram_copy(PSX_RECT *rectangle, sint32 x, sint32 y, XportDeviceOp
 {
     uint16 row_pixels[GPU_VRAM_WIDTH];
     sint32 first, last, step, row, column;
+    gpu_vram_invalidate();
     first = y > rectangle->y ? rectangle->h - 1 : 0;
     last = y > rectangle->y ? -1 : rectangle->h;
     step = y > rectangle->y ? -1 : 1;
@@ -875,8 +908,9 @@ sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
             packet[10] = 0xe3000000u | state.area[0] | (state.area[1] << 10);
             packet[11] = 0xe4000000u | state.area[2] | (state.area[3] << 10);
             packet[12] = 0xe5000000u | ((uint32)state.offset[0] & 0x7ffu) | (((uint32)state.offset[1] & 0x7ffu) << 11);
-            for (command = 0x10000003u; command <= 0x10000005u; ++command)
-                transfer_observer(transfer_observer_context, 1u, 4u, &command, 1u);
+            if (transfer_observer)
+                for (command = 0x10000003u; command <= 0x10000005u; ++command)
+                    transfer_observer(transfer_observer_context, 1u, 4u, &command, 1u);
         }
         gpu_observe_dma_direction();
         gpu_observe_ot(clear_image_packet, packet, 0);
@@ -894,6 +928,7 @@ sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
         xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_FILL, XPORT_DEVICE_DIRECTION_INTERNAL, 2u, 0x02u);
         xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_NONE, 0u, XPORT_DEVICE_REGION_VRAM, (uint32)(gpu_wrap_y(rectangle->y) * GPU_VRAM_WIDTH + gpu_wrap_x(rectangle->x)) * 2u, (uint32)rectangle->w * (uint32)rectangle->h * 2u, 0xffffffffu);
     }
+    gpu_vram_invalidate();
     for (row = 0; row < rectangle->h; ++row)
     {
         for (column = 0; column < rectangle->w; ++column)
@@ -1427,6 +1462,8 @@ static void gpu_w8(uint32 address, uint8 value)
  * VRAM/pixel verification must explicitly set the game-provided environment variables */
 static sint32 raster_enabled(void)
 {
+    if (!frame_raster)
+        return 0;
 #if defined(LOCKSTEP_DEBUG)
     // Lockstep must preserve GPU readback semantics
     return 1;
@@ -1455,6 +1492,7 @@ sint32 gpu_import_raster(const GpuRasterState *state, const void *vram, size_t b
 {
     if (!state || !vram || bytes != sizeof(VRAM) || (state->draw_mode & ~0x1ffu) || (state->draw_flags & ~0x600u) || state->texture_window > 0xfffffu || state->area[0] >= VRAM_W || state->area[2] >= VRAM_W || state->area[1] >= VRAM_H || state->area[3] >= VRAM_H || state->offset[0] < -1024 || state->offset[0] > 1023 || state->offset[1] < -1024 || state->offset[1] > 1023)
         return 0;
+    gpu_vram_invalidate();
     memmove(VRAM, vram, sizeof(VRAM));
     active_tpage = (uint16)state->draw_mode;
     active_draw_flags = (uint16)state->draw_flags;
@@ -2732,9 +2770,20 @@ static void gpu_convert_display(void)
         }
 }
 
+void gpu_frame_begin(void)
+{
+    ++frame_present_depth;
+}
+
+void gpu_frame_end(void)
+{
+    if (frame_present_depth)
+        --frame_present_depth;
+}
+
 sint32 gpu_present(void)
 {
-    if (gpu_frame_skipped() || (display_state & 2u))
+    if (frame_present_depth || gpu_frame_skipped() || (display_state & 2u))
         return 1;
     if (!raster_enabled())
         return 1;
@@ -2778,12 +2827,14 @@ void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height)
 
 void gpu_init_empty(void)
 {
+    frame_present_depth = 0;
     frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
     scanout_fraction = native_disp_cached = 0u;
     display_state = 0;
+    gpu_vram_invalidate();
     memset(VRAM, 0, sizeof(VRAM));
     active_tpage = 0;
     active_draw_flags = 0;
@@ -2799,6 +2850,7 @@ void gpu_init_empty(void)
 sint32 gpu_load_vram(const char *path)
 {
     size_t n;
+    gpu_vram_invalidate();
     return xport_file_read(path, VRAM, sizeof(VRAM), &n) && n == sizeof(VRAM);
 }
 
@@ -2820,6 +2872,7 @@ sint32 gpu_save_frame(const char *path)
 /* Reset only host GPU state; PsyQ environment calls provide game dimensions */
 void gpu_reset_graph_state(void)
 {
+    frame_present_depth = 0;
     frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
@@ -3074,6 +3127,7 @@ void gpu_clear_menu_surfaces(void)
     uint32 y;
     if (gpu_frame_skipped())
         return;
+    gpu_vram_invalidate();
     for (y = 0; y < 256; y++)
         memset(VRAM + y * VRAM_W, 0, 640 * sizeof(uint16));
 }
@@ -3114,6 +3168,8 @@ typedef struct GPU_PORTABLE_SCALARS
 
 int gpu_state_io(FILE *f, int load)
 {
+    if (load)
+        gpu_vram_invalidate();
     GPU_PORTABLE_SCALARS scalars = {0};
     if (!load)
         gpu_scanout_poll();
@@ -3142,6 +3198,7 @@ int gpu_state_io(FILE *f, int load)
         soft_reset_tail = scalars.soft_reset_tail;
         transfer_observation_failed = scalars.transfer_observation_failed;
         linked_submit_failed = scalars.linked_submit_failed;
+        frame_present_depth = 0;
         frame_skip.started = frame_skip.skipped = 0;
         return 1;
     }

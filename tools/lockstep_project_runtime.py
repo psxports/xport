@@ -209,10 +209,11 @@ class OwnedProcess:
 
 class AttachedSession:
     def __init__(self, scheduler, original_adapter, native_adapter, *, checkpoint_enabled=False,
-                 checkpoint_target_frame=0, native_checkpoint_path=None):
+                 checkpoint_target_frame=0, native_checkpoint_path=None, timer_observation=False):
         self.scheduler = scheduler
         self.original_adapter = original_adapter
         self.native_adapter = native_adapter
+        self.timer_observation = timer_observation
         self.checkpoint_enabled = checkpoint_enabled
         self.checkpoint_target_frame = checkpoint_target_frame
         self.checkpoint_frame = None
@@ -235,6 +236,11 @@ class AttachedSession:
 
     def _with_writer_ring(self, result: dict) -> dict:
         controller = self.native_adapter.controller
+        if (getattr(self, "timer_observation", False) and result.get("status") == "memory_divergence" and
+                (result.get("original") or {}).get("kind") == "VBLANK"):
+            result["original_timer_state"] = self.original_adapter.timer_state()
+        if (result.get("native") or {}).get("kind") in {"PROCESS_EXIT", "FAULT"}:
+            result["native_debugger_output"] = controller.output[-32768:]
         if (result.get("status") in {
                 "memory_divergence", "control_flow_divergence", "runtime_divergence"} or
                 self.scheduler.watch_target is not None):
@@ -771,6 +777,18 @@ class ProjectLockstepHooks:
             if not 0 < adapter.input_index < len(record["frames"]):
                 raise RuntimeError("Lockstep handoff did not consume a valid input prefix")
             device_state = adapter.handoff_state()
+            if getattr(self, "lockstep", {}).get("timer_observation"):
+                timer_state = adapter.timer_state()
+                beam_state = adapter.beam_state()
+                write_receipt(self.root / "status" / "lockstep-converge" / self.name /
+                              "handoff-timers.json", {
+                    "contract": "xport-lockstep-handoff-timers-v1",
+                    "record_id": record["record_id"], "frame": adapter.input_index,
+                    "pc": registers["pc"], "runtime": original.runtime_identity,
+                    "state": timer_state, "beam": beam_state,
+                })
+                self.handoff_timer_state = timer_state
+                self.handoff_beam_state = beam_state
             gte_control = adapter.gte_control_registers()
             self.handoff_adapter = adapter
             self.handoff_frame = adapter.input_index
@@ -800,6 +818,11 @@ class ProjectLockstepHooks:
             disc_image = self.root / disc_image
         environment["XPORT_DISC_IMAGE"] = str(disc_image.resolve())
         environment["XPORT_LOCKSTEP_INITIAL_SPU_RAM"] = str(initial_spu_ram_path(record))
+        if self.handoff_config and self.handoff_config.get("gpu_state"):
+            environment["XPORT_LOCKSTEP_HANDOFF_GPU_STATE"] = str(
+                self.input_path.parent / f"handoff-gpu-{run_id}.bin")
+            environment["XPORT_LOCKSTEP_HANDOFF_CLOCK_STATE"] = str(
+                self.input_path.parent / f"handoff-gpu-{run_id}.clock.bin")
         if self.handoff_frame is not None:
             handoff = self.handoff_config or self.lockstep["handoff"]
             environment["XPORT_LOCKSTEP_START_FRAME"] = str(self.handoff_frame)
@@ -892,6 +915,13 @@ class ProjectLockstepHooks:
             original_adapter.attach(peer, self.exceptions, record, self.boundary_targets,
                                     self.tail_calls, self.target_frame, self.argument_registers,
                                     portable_frame=restored_frame)
+        if restored_frame is None and self.handoff_config and self.handoff_config.get("gpu_state"):
+            from lockstep_gpu_handoff import export_gpu_handoff
+            receipt = export_gpu_handoff(
+                original_adapter, self.input_path.parent / "last-match.duck.raw",
+                self.input_path.parent / f"handoff-gpu-{run_id}.bin", record["record_id"],
+                self.handoff_frame, int(self.handoff_registers["pc"], 16))
+            write_receipt(self.input_path.parent / f"handoff-gpu-{run_id}.json", receipt)
         if restored_frame is not None:
             (self.root / "status" / "lockstep-converge" / self.name /
              "last-match.duck.raw").unlink(missing_ok=True)
@@ -915,7 +945,8 @@ class ProjectLockstepHooks:
             scheduler, original_adapter, native_adapter,
             checkpoint_enabled=bool(self.lockstep.get("same_revision_checkpoint")),
             checkpoint_target_frame=self.target_frame,
-            native_checkpoint_path=self.native_checkpoint_path)
+            native_checkpoint_path=self.native_checkpoint_path,
+            timer_observation=bool(self.lockstep.get("timer_observation")))
         if restored_frame is not None:
             session.checkpoint_frame = restored_frame
             session.checkpoint_path = restored_native_path
@@ -945,7 +976,8 @@ class ProjectLockstepHooks:
             session = AttachedSession(scheduler, original_adapter, native_adapter,
                                       checkpoint_enabled=bool(self.lockstep.get("same_revision_checkpoint")),
                                       checkpoint_target_frame=self.target_frame,
-                                      native_checkpoint_path=self.native_checkpoint_path)
+                                      native_checkpoint_path=self.native_checkpoint_path,
+                                      timer_observation=bool(self.lockstep.get("timer_observation")))
             if session.checkpoint_enabled:
                 session.checkpoint_frame = frame
                 session.checkpoint_path = Path(path).resolve()

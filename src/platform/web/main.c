@@ -5,6 +5,9 @@
 #include <string.h>
 #include "psx_spu.h"
 #include "xport.h"
+#include "vid.h"
+
+int xport_hd = 1;
 #include "xport_trace.h"
 
 enum
@@ -15,6 +18,7 @@ enum
 
 static sint32 platform_headless;
 static sint32 platform_quit;
+static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
@@ -109,28 +113,6 @@ EM_JS(void, xport_audio_push, (const float *samples, uint32 frames), {
 
 EM_JS(void, xport_canvas_title, (const char *title), { document.title = UTF8ToString(title); });
 
-EM_JS(sint32, xport_canvas_present, (const uint32 *pixels, sint32 width, sint32 height), {
-    const canvas = Module.canvas;
-    const context = canvas.getContext('2d', {alpha : false});
-    const count = width * height;
-    if (canvas.width != width || canvas.height != height)
-    {
-        canvas.width = width;
-        canvas.height = height;
-        Module.xportImage = null;
-    }
-    const image = Module.xportImage || (Module.xportImage = context.createImageData(width, height));
-    const source = HEAPU32.subarray(pixels >> 2, (pixels >> 2) + count);
-    const target = new Uint32Array(image.data.buffer);
-    for (let index = 0; index < count; ++index)
-    {
-        const color = source[index];
-        target[index] = 0xff000000 | ((color & 0xff) << 16) | (color & 0xff00) | ((color >> 16) & 0xff);
-    }
-    context.putImageData(image, 0, 0);
-    return 1;
-});
-
 EM_JS(void, xport_error, (const char *title, const char *message), {
     const text = UTF8ToString(title) + ': ' + UTF8ToString(message);
     const status = document.getElementById('status');
@@ -208,6 +190,13 @@ static uint32 key_to_pad(sint32 controller, const char *code)
 
 static EM_BOOL key_event(sint32 type, const EmscriptenKeyboardEvent *event, void *user)
 {
+    if (!strcmp(event->code, "Tab"))
+    {
+        if (type == EMSCRIPTEN_EVENT_KEYDOWN && !event->repeat)
+            xport_hd = !xport_hd;
+        return EM_TRUE;
+    }
+
     EM_BOOL handled = EM_FALSE;
     (void)user;
     for (sint32 controller = 0; controller < 2; ++controller)
@@ -297,20 +286,24 @@ void xport_input_override(sint32 enabled, uint32 buttons)
 sint32 xport_window_init(void)
 {
     xport_canvas_title(WND_TITLE);
+    if (platform_headless)
+        return 1;
+    if (!vid_init(NULL))
+    {
+        xport_message_error("VID", "WebGL 2.0 initialization failed");
+        return 0;
+    }
     return 1;
 }
 
 sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title)
 {
-    (void)source_x;
-    (void)source_y;
-    (void)source_width;
-    (void)source_height;
+    VID_RECT src = {source_x, source_y, source_width, source_height};
     if (title)
         xport_canvas_title(title);
-    if (!pixels || bitmap_width <= 0 || bitmap_height <= 0)
-        return 0;
-    return xport_canvas_present(pixels, bitmap_width, bitmap_height);
+    if (platform_headless)
+        return 1;
+    return vid_blit(pixels, bitmap_width, bitmap_height, src);
 }
 
 sint32 xport_is_headless(void)
@@ -471,8 +464,18 @@ void xport_message_error(const char *title, const char *message)
     xport_error(title, message);
 }
 
+void xport_set_cleanup(void (*cleanup)(void))
+{
+    platform_cleanup = cleanup;
+}
+
 void xport_shutdown(void)
 {
+    void (*cleanup)(void) = platform_cleanup;
+    platform_cleanup = NULL;
+    if (cleanup)
+        cleanup();
+    vid_free();
     xport_audio_shutdown();
 }
 
