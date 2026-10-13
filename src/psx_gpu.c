@@ -111,6 +111,72 @@ static void *linked_submit_context;
 static sint32 linked_submit_failed;
 static void gpu_draw_linked_dma(uint32 *ot);
 static XportDeviceOperation *linked_trace_operation;
+static GpuSyncSample sync_sample;
+
+static struct
+{
+    uint64 deadline, last_time;
+    uint32 fraction, started, skipped, skipped_count;
+    sint32 enabled;
+} frame_skip = {0, 0, 0, 0, 0, 0,
+#if defined(LOCKSTEP_DEBUG)
+                0
+#else
+                1
+#endif
+};
+
+void gpu_set_frame_skip(sint32 enabled)
+{
+    memset(&frame_skip, 0, sizeof(frame_skip));
+#if !defined(LOCKSTEP_DEBUG)
+    frame_skip.enabled = enabled != 0;
+#else
+    (void)enabled;
+#endif
+}
+
+sint32 gpu_frame_skipped(void)
+{
+    return frame_skip.skipped && !transfer_observer && !linked_submit && !sync_sample && !xport_device_trace_enabled();
+}
+
+uint32 gpu_skipped_frames(void)
+{
+    return frame_skip.skipped_count;
+}
+
+sint32 gpu_frame_sync(uint32 fields)
+{
+    uint64 now, span, scaled;
+    if (!frame_skip.enabled || transfer_observer || linked_submit || sync_sample || xport_device_trace_enabled())
+    {
+        frame_skip.started = frame_skip.skipped = 0;
+        return 0;
+    }
+    now = xport_timer_get();
+    scaled = (uint64)fields * 1000000;
+    span = scaled / FIELD_RATE;
+    // Rebase after a pause instead of replaying an unbounded backlog
+    if (!frame_skip.started || now < frame_skip.last_time || now - frame_skip.last_time > 1000000)
+    {
+        frame_skip.deadline = now;
+        frame_skip.fraction = 0;
+        frame_skip.started = 1;
+    }
+    else
+    {
+        scaled += frame_skip.fraction;
+        frame_skip.deadline += scaled / FIELD_RATE;
+        frame_skip.fraction = scaled % FIELD_RATE;
+    }
+    frame_skip.last_time = now;
+    // Blocking VSync latches one decision for every pass of the following frame
+    frame_skip.skipped = now >= frame_skip.deadline + span;
+    if (frame_skip.skipped)
+        ++frame_skip.skipped_count;
+    return frame_skip.skipped;
+}
 
 void gpu_bind_linked_submit(GpuLinkedSubmit submit, void *context)
 {
@@ -126,7 +192,6 @@ sint32 gpu_linked_submit_failed(void)
 
 static void gpu_psyq_gp1(uint32 command);
 static uint32 sync_head, sync_tail, sync_budget;
-static GpuSyncSample sync_sample;
 static GpuSyncStep sync_pump, sync_wait;
 static void *sync_context;
 static sint32 sync_failed, sync_running;
@@ -822,6 +887,8 @@ sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
         gpu_unobserved_transfer();
     if (!rectangle || rectangle->w < 0 || rectangle->h < 0)
         return -1;
+    if (gpu_frame_skipped())
+        return 0;
     if (xport_device_trace_enabled())
     {
         xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_FILL, XPORT_DEVICE_DIRECTION_INTERNAL, 2u, 0x02u);
@@ -1913,7 +1980,7 @@ static void gpu_draw_command(void *raw)
         }
         return;
     }
-    if (!raster_enabled())
+    if (gpu_frame_skipped() || !raster_enabled())
         return;
     ca = packet_rgb(p, 4);
     // Flat lines and polylines share clipping, draw offset and blending
@@ -2239,7 +2306,7 @@ static void gpu_draw_env_native(DRAWENV *environment, sint32 surface_x, sint32 s
     active_draw_flags = (e[22] ? 0x200u : 0u) | (e[23] ? 0x400u : 0u);
     /* Pack the PsyQ texture-window fields into a GP0 command */
     texture_window = (((uint32)(-read_s16_le_at(e, 16)) & 255u) >> 3) | ((((uint32)(-read_s16_le_at(e, 18)) & 255u) >> 3) << 5) | ((uint32)(e[12] >> 3) << 10) | ((uint32)(e[14] >> 3) << 15);
-    if (e[24] && raster_enabled())
+    if (e[24] && !gpu_frame_skipped() && raster_enabled())
     {
         uint32 color = (uint32)e[25] << 16 | (uint32)e[26] << 8 | e[27];
         for (y = raster_clip_y0; y < raster_clip_y1; y++)
@@ -2667,7 +2734,7 @@ static void gpu_convert_display(void)
 
 sint32 gpu_present(void)
 {
-    if (display_state & 2u)
+    if (gpu_frame_skipped() || (display_state & 2u))
         return 1;
     if (!raster_enabled())
         return 1;
@@ -2711,6 +2778,7 @@ void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height)
 
 void gpu_init_empty(void)
 {
+    frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
@@ -2752,6 +2820,7 @@ sint32 gpu_save_frame(const char *path)
 /* Reset only host GPU state; PsyQ environment calls provide game dimensions */
 void gpu_reset_graph_state(void)
 {
+    frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
@@ -3003,6 +3072,8 @@ DISPENV *PutDispEnv(DISPENV *environment)
 void gpu_clear_menu_surfaces(void)
 {
     uint32 y;
+    if (gpu_frame_skipped())
+        return;
     for (y = 0; y < 256; y++)
         memset(VRAM + y * VRAM_W, 0, 640 * sizeof(uint16));
 }
@@ -3071,6 +3142,7 @@ int gpu_state_io(FILE *f, int load)
         soft_reset_tail = scalars.soft_reset_tail;
         transfer_observation_failed = scalars.transfer_observation_failed;
         linked_submit_failed = scalars.linked_submit_failed;
+        frame_skip.started = frame_skip.skipped = 0;
         return 1;
     }
     if (native_dma_range_count || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)

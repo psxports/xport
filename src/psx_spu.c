@@ -720,8 +720,7 @@ static void update_adsr(SPU_VOICE *voice);
 static void spu_irq_check_range(uint32 address, uint32 bytes)
 {
     uint32 target = (uint32)spu.irq_address << 3;
-    if ((reverb_control.control & 0x40) && !spu.irq_flag &&
-        ((target - address) & (SPU_RAM_SIZE - 1)) < bytes)
+    if ((reverb_control.control & 0x40) && !spu.irq_flag && ((target - address) & (SPU_RAM_SIZE - 1)) < bytes)
     {
         spu.irq_flag = 1;
         spu.irq_pending = 1;
@@ -1478,8 +1477,7 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
     for (index = 0u; index < count; ++index)
     {
         uint32 changed = values[index] ^ previous[index];
-        if ((addresses[index] == 0x1F801D80u || addresses[index] == 0x1F801D82u ||
-             (addresses[index] < 0x1F801D80 && (addresses[index] & 15) < 4)) && (values[index] & 0x8000u))
+        if ((addresses[index] == 0x1F801D80u || addresses[index] == 0x1F801D82u || (addresses[index] < 0x1F801D80 && (addresses[index] & 15) < 4)) && (values[index] & 0x8000u))
         {
 #ifndef NDEBUG
             fprintf(stderr, "xport_spu_write unsupported volume sweep address=%08X value=%04X\n", addresses[index], values[index]);
@@ -1507,17 +1505,33 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
             SPU_VOICE *voice = spu.voices + (addresses[index] - 0x1F801C00) / 16;
             switch ((addresses[index] & 15) >> 1)
             {
-            case 0: voice->registers.volume_left = (sint16)values[index]; break;
-            case 1: voice->registers.volume_right = (sint16)values[index]; break;
-            case 2: voice->registers.pitch = values[index]; break;
-            case 3: voice->registers.start_address = values[index]; break;
-            case 4: voice->registers.adsr1 = values[index]; update_adsr(voice); break;
-            case 5: voice->registers.adsr2 = values[index]; update_adsr(voice); break;
-            case 6: voice->envelope = values[index] & 0x7FFF; break;
-            case 7:
-                voice->registers.repeat_address = values[index];
-                voice->repeat_address = (uint32)values[index] << 3;
-                break;
+                case 0:
+                    voice->registers.volume_left = (sint16)values[index];
+                    break;
+                case 1:
+                    voice->registers.volume_right = (sint16)values[index];
+                    break;
+                case 2:
+                    voice->registers.pitch = values[index];
+                    break;
+                case 3:
+                    voice->registers.start_address = values[index];
+                    break;
+                case 4:
+                    voice->registers.adsr1 = values[index];
+                    update_adsr(voice);
+                    break;
+                case 5:
+                    voice->registers.adsr2 = values[index];
+                    update_adsr(voice);
+                    break;
+                case 6:
+                    voice->envelope = values[index] & 0x7FFF;
+                    break;
+                case 7:
+                    voice->registers.repeat_address = values[index];
+                    voice->repeat_address = (uint32)values[index] << 3;
+                    break;
             }
             continue;
         }

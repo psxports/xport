@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "psx.h"
+#include "psx_gpu.h"
 
 #if defined(XPORT_MEMORY_DIAGNOSTICS)
     #undef w_u8
@@ -3630,6 +3631,8 @@ sint32 VSync(sint32 mode)
     if (mode == 1)
         return 0;
     frames = mode > 1 ? (uint32)mode : 1;
+    if (!vblank_wait && gpu_frame_sync(frames))
+        return (sint32)frames;
     for (frame = 0; frame < frames; ++frame)
     {
         if (vblank_wait)

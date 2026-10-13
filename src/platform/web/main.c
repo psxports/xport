@@ -20,6 +20,7 @@ static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static uint64 platform_frame_deadline;
+static uint64 platform_poll_deadline;
 static sint32 audio_active;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
@@ -246,8 +247,12 @@ void xport_timer_wait_frame(uint32 refresh_rate)
     period = 1000000u / refresh_rate;
     if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
         platform_frame_deadline = now + period;
-    if (now < platform_frame_deadline)
+    while (now < platform_frame_deadline)
+    {
         emscripten_sleep((unsigned)((platform_frame_deadline - now + 999u) / 1000u));
+        now = xport_timer_get();
+        platform_poll_deadline = now + period;
+    }
     platform_frame_deadline += period;
 }
 
@@ -265,7 +270,12 @@ sint32 xport_input_init(void)
 
 sint32 xport_poll(void)
 {
-    emscripten_sleep(0);
+    // Frame waits already dispatch browser events without an extra clamped timer
+    if (xport_timer_get() >= platform_poll_deadline)
+    {
+        emscripten_sleep(0);
+        platform_poll_deadline = xport_timer_get() + 1000000u / FIELD_RATE;
+    }
     return !platform_quit;
 }
 

@@ -22,7 +22,7 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertIn('>RapidRacer-xport</h1>', text)
             self.assertIn('https://psxports.to/RR/', text)
             for label in ('decomp', 'refactor', 'enhance', 'remaster'):
-                self.assertIn('repo=RapidRacer-xport&amp;label='+label, text)
+                self.assertIn('repo=RapidRacer-xport&label='+label, text)
             self.assertNotIn('@@', text)
 
     def test_readme_escapes_display_names_and_encodes_repository(self):

@@ -181,6 +181,11 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     void gpu_register_dma_range(void *begin, uint32 size);
     sint32 gpu_register_packet_range(void *begin, uint32 size);
     sint32 gpu_present(void);
+    // Host policy is disabled by default and excluded from portable GPU state
+    void gpu_set_frame_skip(sint32 enabled);
+    sint32 gpu_frame_sync(uint32 fields);
+    sint32 gpu_frame_skipped(void);
+    uint32 gpu_skipped_frames(void);
     void gpu_display_offset(sint32 x, sint32 y);
     void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height);
     sint32 gpu_load_vram(const char *path);
