@@ -56,34 +56,6 @@ float fmaxf(float a, float b)
     return float_extremum(a, b, 1);
 }
 
-#pragma function(floor)
-
-double floor(double value)
-{
-    union
-    {
-        double value;
-        uint64_t bits;
-    } number = {value};
-
-    int exponent = (int)(number.bits >> 52 & 0x7ff) - 1023;
-    if (exponent >= 52)
-        return value;
-    if (exponent < 0)
-    {
-        if (!(number.bits & UINT64_C(0x7fffffffffffffff)))
-            return value;
-        return number.bits >> 63 ? -1.0 : 0.0;
-    }
-    uint64_t mask = (UINT64_C(1) << (52 - exponent)) - 1;
-    if (!(number.bits & mask))
-        return value;
-    if (number.bits >> 63)
-        number.bits += UINT64_C(1) << (52 - exponent);
-    number.bits &= ~mask;
-    return number.value;
-}
-
 // The compiler passes x in ST0 and y in ST1, returning atan2(y, x) in ST0
 __declspec(naked) void _CIatan2(void)
 {

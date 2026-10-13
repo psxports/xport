@@ -20,6 +20,7 @@ static sint32 platform_headless;
 static sint32 platform_quit;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
+static uint8 platform_hd_pressed[2];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
@@ -91,6 +92,8 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player), {
             buttons |= 0x0100;
         if (pressed(pad, 9))
             buttons |= 0x0800;
+        if (pressed(pad, 10))
+            buttons |= 0x0200;
         if (pressed(pad, 12))
             buttons |= 0x1000;
         if (pressed(pad, 13))
@@ -248,6 +251,7 @@ void xport_timer_wait_frame(uint32 refresh_rate)
 sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
+    memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
@@ -274,7 +278,12 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
         return 0;
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    return platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0) | xport_gamepad_buttons(controller);
+    uint32 buttons = xport_gamepad_buttons(controller);
+    uint8 pressed = (buttons & PADi) != 0;
+    if (pressed && !platform_hd_pressed[controller])
+        xport_hd = !xport_hd;
+    platform_hd_pressed[controller] = pressed;
+    return platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0) | (buttons & ~PADi);
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)

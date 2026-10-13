@@ -66,6 +66,7 @@ static jmp_buf platform_game_exit;
 static sint32 platform_game_exit_active;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
+static uint8 platform_hd_pressed[2];
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static LARGE_INTEGER platform_timer_frequency;
@@ -389,6 +390,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
+    memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     platform_pad_override = 0;
     platform_override_buttons = 0;
     if (_XInputGetState == NULL)
@@ -418,7 +420,12 @@ uint32 xport_input_read(sint32 controller)
         return 0;
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    return platform_pad_buttons[controller] | xinput_read(controller);
+    uint32 buttons = xinput_read(controller);
+    uint8 pressed = (buttons & PADi) != 0;
+    if (pressed && !platform_hd_pressed[controller])
+        xport_hd = !xport_hd;
+    platform_hd_pressed[controller] = pressed;
+    return platform_pad_buttons[controller] | (buttons & ~PADi);
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)

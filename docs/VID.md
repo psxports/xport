@@ -63,7 +63,7 @@ RapidRacer submits the sun before world geometry and the six lens ghosts after w
 
 ## OG/HD transition
 
-Windows and Web initialize `extern int xport_hd` to 1. The host toggles it on a non-repeated Tab keydown. It does not map Tab into PSX PAD buttons. The game latches its frame path at a complete producer boundary.
+Windows and Web initialize `extern int xport_hd` to 1. The host toggles it on a non-repeated Tab keydown or an L3 press from either player controller. Each controller tracks its own press edge; holding L3 does not repeat the toggle. Tab and L3 are consumed by the host rather than mapped into game PAD buttons. The game latches its frame path at a complete producer boundary.
 
 Paused-scene ownership belongs to the game. RapidRacer renders a fresh HD scene and full-window pause overlay without dispatching simulation callbacks; it queries the current projection and cached target indicator and preserves game RNG/render sampling/trail state around render-only work. Switching to OG during pause constructs a complete OG scene and creates its software capture once. VID retains no pause, simulation or interpolation history
 
