@@ -33,6 +33,7 @@ DEPFILES := $(foreach source,$(SOURCES),$(call dep_for,$(source)))
 COMMON_FLAGS := -std=c11 -fdeclspec -fno-strict-aliasing -fwrapv -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
 COMMON_FLAGS += -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-ignored-attributes -Wno-incompatible-library-redeclaration
 COMMON_FLAGS += -DGAPI_OGL -DXPORT_NATIVE -I$(PROJECT_ROOT)/src -I$(XPORT_ROOT)/src $(APP_DEFINES)
+COMMON_FLAGS += -DSHORT_NAME=\"$(SHORT_NAME)\"
 LINK_FLAGS := -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sASYNCIFY -sEMULATE_FUNCTION_POINTER_CASTS -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=0 -sENVIRONMENT=web
 LINK_FLAGS += -sEXPORTED_RUNTIME_METHODS=callMain,FS,addRunDependency,removeRunDependency
 

@@ -3030,6 +3030,34 @@ float NormalizeQuatf(const QUATF *src, QUATF *dst)
     return length;
 }
 
+QUATF *SlerpQuatf(const QUATF *previous, const QUATF *current, float fract, QUATF *dst)
+{
+    QUATF a, b, result;
+    NormalizeQuatf(previous, &a);
+    NormalizeQuatf(current, &b);
+    fract = fminf(1, fmaxf(0, fract));
+    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (dot < 0)
+    {
+        dot = -dot;
+        for (uint32 idx = 0; idx < 4; ++idx)
+            b.v[idx] = -b.v[idx];
+    }
+    float weight0 = 1 - fract;
+    float weight1 = fract;
+    if (dot < 0.9995f)
+    {
+        float angle = atan2f(sqrtf(fmaxf(0, 1 - dot * dot)), dot);
+        float denominator = sinf(angle);
+        weight0 = sinf((1 - fract) * angle) / denominator;
+        weight1 = sinf(fract * angle) / denominator;
+    }
+    for (uint32 idx = 0; idx < 4; ++idx)
+        result.v[idx] = a.v[idx] * weight0 + b.v[idx] * weight1;
+    NormalizeQuatf(&result, dst);
+    return dst;
+}
+
 QUATF *MulQuatf(const QUATF *left, const QUATF *right, QUATF *dst)
 {
     QUATF result;
@@ -3055,6 +3083,34 @@ MATRIXF *QuatMatrixf(const QUATF *quat, MATRIXF *matrix)
     matrix->m[2][1] = 2 * (q.y * q.z + q.w * q.x);
     matrix->m[1][2] = 2 * (q.y * q.z - q.w * q.x);
     return matrix;
+}
+
+QUATF *MatrixQuatf(const MATRIXF *matrix, QUATF *quat)
+{
+    QUATF result;
+    float trace = matrix->m[0][0] + matrix->m[1][1] + matrix->m[2][2];
+    if (trace > 0)
+    {
+        float scale = 2 * sqrtf(1 + trace);
+        result.w = scale * 0.25f;
+        result.x = (matrix->m[2][1] - matrix->m[1][2]) / scale;
+        result.y = (matrix->m[0][2] - matrix->m[2][0]) / scale;
+        result.z = (matrix->m[1][0] - matrix->m[0][1]) / scale;
+    }
+    else
+    {
+        uint32 i = matrix->m[1][1] > matrix->m[0][0] ? 1 : 0;
+        if (matrix->m[2][2] > matrix->m[i][i])
+            i = 2;
+        uint32 j = (i + 1) % 3, k = (i + 2) % 3;
+        float scale = 2 * sqrtf(1 + matrix->m[i][i] - matrix->m[j][j] - matrix->m[k][k]);
+        result.v[i] = scale * 0.25f;
+        result.v[j] = (matrix->m[j][i] + matrix->m[i][j]) / scale;
+        result.v[k] = (matrix->m[k][i] + matrix->m[i][k]) / scale;
+        result.w = (matrix->m[k][j] - matrix->m[j][k]) / scale;
+    }
+    NormalizeQuatf(&result, quat);
+    return quat;
 }
 
 void ProjectVertexf(const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4])
@@ -3931,7 +3987,12 @@ static uint8 *pad_actuators[2];
 static uint8 pad_actuator_lengths[2];
 static uint8 pad_alignment[2][6];
 static sint32 pad_active;
+#if defined(LOCKSTEP_DEBUG)
 static sint32 pad_main_mode[2];
+#else
+static sint32 pad_main_mode[2] = {1, 1};
+#endif
+static uint8 pad_main_mode_lock[2];
 static uint8 pad_current_id[2];
 static uint32 native_pad_packet_owners[2];
 static uint32 pad_buttons;
@@ -4031,6 +4092,8 @@ static sint32 pad_index(sint32 port)
 void pad_publish(sint32 controller, sint32 connected, uint16 buttons)
 {
     uint8 *packet;
+    uint8 axes[4];
+    sint32 analog;
     if (pad_replay_bound)
         return;
     if (controller < 0 || controller >= 2)
@@ -4042,8 +4105,10 @@ void pad_publish(sint32 controller, sint32 connected, uint16 buttons)
     if (!connected)
         return;
     packet[0] = 0;
-    packet[1] = 0x41;
-    pad_current_id[controller] = 4u;
+    analog = xport_input_analog(controller, axes) && pad_main_mode[controller];
+    packet[1] = analog ? 0x73u : 0x41u;
+    pad_current_id[controller] = analog ? 7u : 4u;
+    memcpy(packet + 4, axes, 4);
     packet[2] = (uint8)buttons;
     packet[3] = (uint8)(buttons >> 8);
 }
@@ -4083,6 +4148,10 @@ void PadInitDirect(uint8 *pad1, uint8 *pad2)
     pad_packets[0] = pad1;
     pad_packets[1] = pad2;
     memset(pad_current_id, 0, sizeof(pad_current_id));
+#if !defined(LOCKSTEP_DEBUG)
+    pad_main_mode[0] = pad_main_mode[1] = 1;
+    memset(pad_main_mode_lock, 0, sizeof(pad_main_mode_lock));
+#endif
     bios_pad_initialized = 1u;
     if (pad1)
     {
@@ -4102,6 +4171,9 @@ typedef struct
     uint8 received;
     uint8 acknowledged;
     uint8 ready;
+    uint8 analog;
+    uint8 axes[4];
+    uint16 buttons;
 } NativePadSerial;
 
 static NativePadSerial native_pad_serial[2];
@@ -4131,7 +4203,6 @@ uint32 psx_pad_serial_release_ack(uint32 port)
 static void native_pad_serial_send(uint32 port, uint8 command)
 {
     NativePadSerial *serial = &native_pad_serial[port];
-    uint16 buttons = (uint16)~xport_input_read((sint32)port);
     serial->received = 0xFFu;
     serial->ready = 1u;
     serial->acknowledged = 0u;
@@ -4147,7 +4218,9 @@ static void native_pad_serial_send(uint32 port, uint8 command)
         case 1:
             if (command == 0x42u)
             {
-                serial->received = 0x41u;
+                serial->buttons = (uint16)~xport_input_read((sint32)port);
+                serial->analog = (uint8)(xport_input_analog((sint32)port, serial->axes) && pad_main_mode[port]);
+                serial->received = serial->analog ? 0x73u : 0x41u;
                 serial->phase = 2u;
                 serial->acknowledged = 1u;
             }
@@ -4158,13 +4231,22 @@ static void native_pad_serial_send(uint32 port, uint8 command)
             serial->acknowledged = 1u;
             break;
         case 3:
-            serial->received = (uint8)(buttons >> 8);
+            serial->received = (uint8)(serial->buttons >> 8);
             serial->phase = 4u;
             serial->acknowledged = 1u;
             break;
         case 4:
-            serial->received = (uint8)buttons;
-            serial->phase = 0u;
+            serial->received = (uint8)serial->buttons;
+            serial->phase = serial->analog ? 5u : 0u;
+            serial->acknowledged = serial->analog;
+            break;
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+            serial->received = serial->axes[serial->phase - 5u];
+            serial->acknowledged = serial->phase < 8u;
+            serial->phase = serial->phase < 8u ? serial->phase + 1u : 0u;
             break;
         default:
             abort();
@@ -4218,7 +4300,8 @@ static void bios_native_pad_poll(void)
             uint32 owner = native_pad_packet_owners[port];
             uint32 packet;
             uint16 owner_buttons = (uint16)~xport_input_read((sint32)port);
-            // Both keyboard layouts are connected digital controllers
+            uint8 axes[4];
+            sint32 analog = xport_input_analog((sint32)port, axes) && pad_main_mode[port];
             pad_publish((sint32)port, 1, (uint16)((owner_buttons >> 8) | (owner_buttons << 8)));
             if (!owner)
                 continue;
@@ -4226,9 +4309,13 @@ static void bios_native_pad_poll(void)
             if (!packet)
                 continue;
             w_u8(packet, 0u);
-            w_u8(packet + 1u, 0x41u);
+            w_u8(packet + 1u, analog ? 0x73u : 0x41u);
             w_u8(packet + 2u, (uint8)(owner_buttons >> 8));
             w_u8(packet + 3u, (uint8)owner_buttons);
+            w_u8(packet + 4u, axes[0]);
+            w_u8(packet + 5u, axes[1]);
+            w_u8(packet + 6u, axes[2]);
+            w_u8(packet + 7u, axes[3]);
         }
     }
 }
@@ -4275,6 +4362,34 @@ sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset)
 {
     uint32 index = ((uint32)port & 0xF0u) != 0u;
     uint32 owner = native_pad_packet_owners[index];
+#if !defined(LOCKSTEP_DEBUG)
+    if (!pad_replay_bound)
+    {
+        uint8 axes[4];
+        sint32 capable;
+        if ((port != 0 && port != 0x10) || !pad_active || (!pad_packets[index] && !owner))
+            return 0;
+        (void)xport_input_read((sint32)index);
+        capable = xport_input_analog((sint32)index, axes);
+        switch (term)
+        {
+            case 1:
+                return capable && pad_main_mode[index] ? 7 : 4;
+            case 2:
+                return capable ? 7 : 0;
+            case 3:
+                return capable ? pad_main_mode[index] : 0;
+            case 4:
+                if (offset == -1)
+                    return capable ? 2 : 1;
+                if (offset == 0)
+                    return 4;
+                return capable && offset == 1 ? 7 : 0;
+            default:
+                return 0;
+        }
+    }
+#endif
     if (owner)
     {
         switch (term)
@@ -4380,7 +4495,22 @@ sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
     uint8 current_offset;
     uint8 requested_mode = (uint8)mode;
     uint8 requested_lock = (uint8)lock;
-    /* Native digital input has no extended-mode command engine */
+#if !defined(LOCKSTEP_DEBUG)
+    if (!pad_replay_bound)
+    {
+        uint8 axes[4];
+        if ((port != 0 && port != 0x10) || (mode != 0 && mode != 1) || lock < 0 || lock > 3 || !pad_active || (!pad_packets[index] && !owner))
+            return 0;
+        (void)xport_input_read((sint32)index);
+        if (!xport_input_analog((sint32)index, axes))
+            return 0;
+        pad_main_mode[index] = mode;
+        if (lock == 2 || lock == 3)
+            pad_main_mode_lock[index] = (uint8)(lock == 3);
+        bios_native_pad_poll();
+        return 1;
+    }
+#endif
     if (!owner)
         return 0;
     if (!r_u16(owner + 0xE6u) || r_u8(owner + 0x46u) != 0xFFu)

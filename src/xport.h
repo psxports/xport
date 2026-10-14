@@ -109,9 +109,11 @@ extern "C"
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
     void xport_timer_wait_frame(uint32 refresh_rate);
+    void xport_render_wait(void);
     sint32 xport_input_init(void);
     sint32 xport_poll(void);
     uint32 xport_input_read(sint32 controller);
+    sint32 xport_input_analog(sint32 controller, uint8 axes[4]);
     void xport_input_override(sint32 enabled, uint32 buttons);
     sint32 xport_window_init(void);
     sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title);
@@ -127,6 +129,8 @@ extern "C"
     sint32 xport_file_size(const char *path, size_t *size);
     FILE *xport_fopen(const char *path, const char *mode);
     sint32 xport_file_read(const char *path, void *data, size_t capacity, size_t *size);
+    sint32 xport_save(const void *data, sint32 size);
+    sint32 xport_load(void *data, sint32 capacity);
     sint32 xport_memory_readable(const void *address, size_t size);
     uint32 xport_memory_read(uint32 address, uint32 width);
     sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byte_mask);

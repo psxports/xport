@@ -8,6 +8,89 @@
 #include "vid.h"
 
 int xport_hd = 1;
+
+#ifndef SHORT_NAME
+    #error SHORT_NAME must be defined by the consuming project
+#endif
+
+EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, sint32 writing), {
+    if (!data || size <= 0)
+        return -1;
+    let db;
+    try
+    {
+        const key = UTF8ToString(name);
+        // Copy before yielding so a growing WASM heap cannot invalidate the view
+        const bytes = writing ? HEAPU8.slice(data, data + size) : null;
+        db = await new Promise((resolve, reject) => {
+            let blocked = false;
+            const request = indexedDB.open('XPORT_SAVES', 1);
+            request.onupgradeneeded = () => request.result.createObjectStore('saves');
+            request.onsuccess = () => {
+                if (blocked) request.result.close();
+                else resolve(request.result);
+            };
+            request.onerror = () => reject(request.error);
+            request.onblocked = () => { blocked = true; reject(new Error('Save database blocked')); };
+        });
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction('saves', writing ? 'readwrite' : 'readonly');
+            const store = transaction.objectStore('saves');
+            let loaded;
+            if (writing)
+                store.put(bytes, key);
+            else
+            {
+                const request = store.get(key);
+                request.onsuccess = () =>
+                {
+                    loaded = request.result;
+                };
+            }
+            transaction.onabort = transaction.onerror = () => reject(transaction.error);
+            transaction.oncomplete = () =>
+            {
+                if (writing)
+                {
+                    resolve(1);
+                    return;
+                }
+                if (loaded === undefined)
+                {
+                    resolve(0);
+                    return;
+                }
+                if (!(loaded instanceof Uint8Array) || !loaded.length || loaded.length > size)
+                {
+                    resolve(-1);
+                    return;
+                }
+                HEAPU8.set(loaded, data);
+                resolve(loaded.length);
+            };
+        });
+    }
+    catch (error)
+    {
+        return -1;
+    }
+    finally
+    {
+        if (db)
+            db.close();
+    }
+});
+
+sint32 xport_save(const void *data, sint32 size)
+{
+    return save_transfer(SHORT_NAME, (void *)data, size, 1);
+}
+
+sint32 xport_load(void *data, sint32 capacity)
+{
+    return save_transfer(SHORT_NAME, data, capacity, 0);
+}
+
 #include "xport_trace.h"
 
 enum
@@ -21,6 +104,8 @@ static sint32 platform_quit;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static uint8 platform_hd_pressed[2];
+/* Four PS1 axes followed by the analog-controller availability flag */
+static uint8 platform_pad_analog[2][5];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
@@ -50,7 +135,9 @@ extern "C"
 }
 
 // clang-format off
-EM_JS(uint32, xport_gamepad_buttons, (sint32 player), {
+EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
+    HEAPU8.fill(128, axes, axes + 4);
+    HEAPU8[axes + 4] = 0;
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const pressed = (pad, index) => index < pad.buttons.length && (pad.buttons[index].pressed || pad.buttons[index].value > 0.5);
     let buttons = 0;
@@ -61,6 +148,15 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player), {
             continue;
         if (controller++ !== player)
             continue;
+        const axis = index => {
+            const value = pad.axes[index];
+            return Number.isFinite(value) ? Math.max(0, Math.min(255, Math.floor((value + 1) * 128))) : 128;
+        };
+        HEAPU8[axes] = axis(2);
+        HEAPU8[axes + 1] = axis(3);
+        HEAPU8[axes + 2] = axis(0);
+        HEAPU8[axes + 3] = axis(1);
+        HEAPU8[axes + 4] = pad.axes.length >= 4 ? 1 : 0;
         if (pad.axes.length > 1)
         {
             if (pad.axes[0] < -0.4)
@@ -227,8 +323,18 @@ static EM_BOOL blur_event(sint32 type, const EmscriptenFocusEvent *event, void *
 
 uint64 xport_timer_get(void)
 {
-    return (uint64)(emscripten_get_now() * 1000.0);
+    static uint64 start;
+    static sint32 initialized;
+    uint64 now = (uint64)(emscripten_get_now() * 1000.0);
+    if (!initialized)
+    {
+        start = now;
+        initialized = 1;
+    }
+    return now - start;
 }
+
+EM_ASYNC_JS(void, xport_render_wait, (void), { await new Promise(function(wake) { requestAnimationFrame(wake); }); });
 
 void xport_timer_wait_frame(uint32 refresh_rate)
 {
@@ -252,6 +358,8 @@ sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
+    memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
+    platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
     platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
@@ -278,12 +386,21 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
         return 0;
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    uint32 buttons = xport_gamepad_buttons(controller);
+    uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller]);
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;
     platform_hd_pressed[controller] = pressed;
     return platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0) | (buttons & ~PADi);
+}
+
+sint32 xport_input_analog(sint32 controller, uint8 axes[4])
+{
+    memset(axes, 128, 4);
+    if (controller < 0 || controller >= 2 || (controller == 0 && platform_pad_override))
+        return 0;
+    memcpy(axes, platform_pad_analog[controller], 4);
+    return platform_pad_analog[controller][4];
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)

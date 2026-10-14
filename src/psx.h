@@ -285,8 +285,10 @@ extern "C"
     float NormalizeVectorf(const VECTORF *src, VECTORF *dst);
     VECTORF *OuterProductf(const VECTORF *left, const VECTORF *right, VECTORF *dst);
     float NormalizeQuatf(const QUATF *src, QUATF *dst);
+    QUATF *SlerpQuatf(const QUATF *previous, const QUATF *current, float fract, QUATF *dst);
     QUATF *MulQuatf(const QUATF *left, const QUATF *right, QUATF *dst);
     MATRIXF *QuatMatrixf(const QUATF *quat, MATRIXF *matrix);
+    QUATF *MatrixQuatf(const MATRIXF *matrix, QUATF *quat);
     void ProjectVertexf(const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4]);
     void RotTransPersf(const MATRIXF *matrix, const VECTORF *src, float focal_x, float focal_y, float near_z, float far_z, float clip[4]);
 

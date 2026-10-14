@@ -10,6 +10,63 @@
 #include "vid.h"
 
 int xport_hd = 1;
+
+#ifndef SHORT_NAME
+    #error SHORT_NAME must be defined by the consuming project
+#endif
+
+static sint32 save_path(char path[MAX_PATH], const char *suffix)
+{
+    DWORD length = GetEnvironmentVariableA("APPDATA", path, MAX_PATH);
+    if (!length || length >= MAX_PATH || length + sizeof("\\xport\\" SHORT_NAME ".sav.tmp") > MAX_PATH)
+        return 0;
+    strcat(path, "\\xport");
+    CreateDirectoryA(path, NULL);
+    strcat(path, "\\" SHORT_NAME ".sav");
+    strcat(path, suffix);
+    return 1;
+}
+
+sint32 xport_save(const void *data, sint32 size)
+{
+    char path[MAX_PATH], temporary[MAX_PATH];
+    HANDLE file;
+    DWORD written;
+    sint32 success;
+    if (!data || size <= 0 || !save_path(path, "") || !save_path(temporary, ".tmp"))
+        return -1;
+    file = CreateFileA(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return -1;
+    success = WriteFile(file, data, (DWORD)size, &written, NULL) && written == (DWORD)size;
+    if (!CloseHandle(file))
+        success = 0;
+    if (success && MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return 1;
+    DeleteFileA(temporary);
+    return -1;
+}
+
+sint32 xport_load(void *data, sint32 capacity)
+{
+    char path[MAX_PATH];
+    HANDLE file;
+    LARGE_INTEGER size;
+    DWORD read;
+    sint32 result = -1;
+    if (!data || capacity <= 0 || !save_path(path, ""))
+        return -1;
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+        return 0;
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return -1;
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= capacity && ReadFile(file, data, (DWORD)size.QuadPart, &read, NULL) && read == (DWORD)size.QuadPart)
+        result = (sint32)read;
+    CloseHandle(file);
+    return result;
+}
+
 #include "xport_trace.h"
 void psx_root_counter_poll(void);
 #if defined(LOCKSTEP_DEBUG)
@@ -56,6 +113,7 @@ typedef DWORD(WINAPI *XInputGetStateProc)(DWORD dwUserIndex, XINPUT_STATE *pStat
 #define XINPUT_GAMEPAD_X 0x4000
 #define XINPUT_GAMEPAD_Y 0x8000
 #define XINPUT_GAMEPAD_TRIGGER_THRESHOLD 30
+#define XINPUT_STICK_DPAD_THRESHOLD 13107
 
 static HWND platform_window;
 static sint32 platform_window_width = WND_WIDTH;
@@ -67,6 +125,8 @@ static sint32 platform_game_exit_active;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static uint8 platform_hd_pressed[2];
+/* Four PS1 axes followed by the analog-controller availability flag */
+static uint8 platform_pad_analog[2][5];
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static LARGE_INTEGER platform_timer_frequency;
@@ -119,6 +179,37 @@ void xport_timer_wait_frame(uint32 refresh_rate)
         now = xport_timer_get();
     }
     platform_frame_deadline += period;
+}
+
+void xport_render_wait(void)
+{
+    static uint64 deadline;
+    static HMONITOR monitor;
+    static uint32 rate = 60;
+    HMONITOR current = MonitorFromWindow(platform_window, MONITOR_DEFAULTTOPRIMARY);
+    if (monitor != current)
+    {
+        MONITORINFOEXW info = {0};
+        DEVMODEW settings = {0};
+        info.cbSize = sizeof(info);
+        settings.dmSize = sizeof(settings);
+        rate = 60;
+        if (GetMonitorInfoW(current, (MONITORINFO *)&info) && EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &settings) && settings.dmDisplayFrequency > 1)
+            rate = settings.dmDisplayFrequency;
+        monitor = current;
+        deadline = 0;
+    }
+    uint64 now = xport_timer_get();
+    uint64 period = 1000000u / rate;
+    if (!deadline || now > deadline + period)
+        deadline = now + period;
+    while (now < deadline)
+    {
+        uint64 remaining = deadline - now;
+        Sleep(remaining > 2000 ? (DWORD)(remaining / 1000 - 1) : 0);
+        now = xport_timer_get();
+    }
+    deadline += period;
 }
 
 static uint32 key_to_pad(sint32 controller, WPARAM key, LPARAM flags)
@@ -282,13 +373,29 @@ static uint32 xinput_to_pad(const XINPUT_GAMEPAD *gamepad)
         buttons |= PADL2;
     if (gamepad->bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD)
         buttons |= PADR2;
+    if (gamepad->sThumbLX < -XINPUT_STICK_DPAD_THRESHOLD)
+        buttons |= PADLleft;
+    if (gamepad->sThumbLX > XINPUT_STICK_DPAD_THRESHOLD)
+        buttons |= PADLright;
+    if (gamepad->sThumbLY < -XINPUT_STICK_DPAD_THRESHOLD)
+        buttons |= PADLdown;
+    if (gamepad->sThumbLY > XINPUT_STICK_DPAD_THRESHOLD)
+        buttons |= PADLup;
     return buttons;
 }
 
-static uint32 xinput_read(sint32 player)
+static uint8 xinput_axis(SHORT value, sint32 invert)
+{
+    sint32 scaled = invert ? 32768 - (sint32)value : 32768 + (sint32)value;
+    return (uint8)(scaled > 65535 ? 255 : scaled >> 8);
+}
+
+static uint32 xinput_read(sint32 player, uint8 axes[5])
 {
     DWORD controller;
     XINPUT_STATE state;
+    memset(axes, 128, 4);
+    axes[4] = 0;
     if (_XInputGetState == NULL)
         return 0;
     for (controller = 0; controller < XUSER_MAX_COUNT; ++controller)
@@ -298,7 +405,11 @@ static uint32 xinput_read(sint32 player)
         {
             if (player-- != 0)
                 continue;
-            /* TODO: Publish left and right sticks when live PsyQ analog packets are supported */
+            axes[0] = xinput_axis(state.Gamepad.sThumbRX, 0);
+            axes[1] = xinput_axis(state.Gamepad.sThumbRY, 1);
+            axes[2] = xinput_axis(state.Gamepad.sThumbLX, 0);
+            axes[3] = xinput_axis(state.Gamepad.sThumbLY, 1);
+            axes[4] = 1;
             return xinput_to_pad(&state.Gamepad);
         }
     }
@@ -404,6 +515,8 @@ sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
+    memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
+    platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
     if (_XInputGetState == NULL)
@@ -433,12 +546,21 @@ uint32 xport_input_read(sint32 controller)
         return 0;
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    uint32 buttons = xinput_read(controller);
+    uint32 buttons = xinput_read(controller, platform_pad_analog[controller]);
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;
     platform_hd_pressed[controller] = pressed;
     return platform_pad_buttons[controller] | (buttons & ~PADi);
+}
+
+sint32 xport_input_analog(sint32 controller, uint8 axes[4])
+{
+    memset(axes, 128, 4);
+    if (controller < 0 || controller >= 2 || (controller == 0 && platform_pad_override))
+        return 0;
+    memcpy(axes, platform_pad_analog[controller], 4);
+    return platform_pad_analog[controller][4];
 }
 
 void xport_input_override(sint32 enabled, uint32 buttons)
