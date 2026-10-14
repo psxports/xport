@@ -13,6 +13,7 @@ int xport_hd = 1;
     #error SHORT_NAME must be defined by the consuming project
 #endif
 
+// clang-format off
 EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, sint32 writing), {
     if (!data || size <= 0)
         return -1;
@@ -80,6 +81,7 @@ EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, s
             db.close();
     }
 });
+// clang-format on
 
 sint32 xport_save(const void *data, sint32 size)
 {
@@ -104,8 +106,8 @@ static sint32 platform_quit;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static uint8 platform_hd_pressed[2];
-/* Four PS1 axes followed by the analog-controller availability flag */
-static uint8 platform_pad_analog[2][5];
+/* Four PS1 axes, analog availability and physical D-pad bits */
+static uint8 platform_pad_analog[2][6];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
@@ -138,6 +140,7 @@ extern "C"
 EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
     HEAPU8.fill(128, axes, axes + 4);
     HEAPU8[axes + 4] = 0;
+    HEAPU8[axes + 5] = 0;
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const pressed = (pad, index) => index < pad.buttons.length && (pad.buttons[index].pressed || pad.buttons[index].value > 0.5);
     let buttons = 0;
@@ -157,6 +160,8 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
         HEAPU8[axes + 2] = axis(0);
         HEAPU8[axes + 3] = axis(1);
         HEAPU8[axes + 4] = pad.axes.length >= 4 ? 1 : 0;
+        HEAPU8[axes + 5] = (pressed(pad, 12) ? 1 : 0) | (pressed(pad, 13) ? 2 : 0) |
+            (pressed(pad, 14) ? 4 : 0) | (pressed(pad, 15) ? 8 : 0);
         if (pad.axes.length > 1)
         {
             if (pad.axes[0] < -0.4)
@@ -360,6 +365,7 @@ sint32 xport_input_init(void)
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
     platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
+    platform_pad_analog[0][5] = platform_pad_analog[1][5] = 0;
     platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
@@ -387,6 +393,16 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
     uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller]);
+    uint8 *axes = platform_pad_analog[controller];
+    uint32 directions = platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0);
+    if (axes[5] & 1u) directions |= PADLup;
+    if (axes[5] & 2u) directions |= PADLdown;
+    if (axes[5] & 4u) directions |= PADLleft;
+    if (axes[5] & 8u) directions |= PADLright;
+    if (directions & (PADLleft | PADLright))
+        axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
+    if (directions & (PADLup | PADLdown))
+        axes[3] = (directions & PADLup) ? ((directions & PADLdown) ? 128 : 0) : 255;
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;

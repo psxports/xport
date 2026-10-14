@@ -19,7 +19,6 @@ from duckstation_runtime import (data_directory, environment as duckstation_envi
                                  executable as duckstation_executable, launch_process,
                                  record_owner, runtime_identity, stop_owned_endpoint,
                                  validate_settings)
-from duckstation_state85 import initial_state as read_duckstation_state
 from lockstep_cdb import CdbController, CdbError
 from lockstep_contract import exceptions_identity, mapping_name, validate_exceptions
 from lockstep_coverage import MIPS_REGISTERS, load_registry
@@ -72,29 +71,17 @@ def native_checkpoint_export_path(directory: Path, load_path: Path | None) -> Pa
     return primary
 
 
-def initial_spu_ram_path(record: dict) -> Path:
-    state_path = Path(record["initial_state"]["path"])
-    output = state_path.with_suffix(".spu")
-    expected = record["initial_state"]["sha256"]
-    receipt = output.with_suffix(".spu.json")
-    if output.is_file() and output.stat().st_size == 512 * 1024 and receipt.is_file():
-        value = json.loads(receipt.read_text(encoding="utf-8"))
-        if value.get("initial_state_sha256") == expected:
-            return output
-    sound = read_duckstation_state(state_path)["spu"]
-    ram = sound["ram"]
-    if len(ram) != 512 * 1024:
-        raise RuntimeError("DuckStation initial SPU RAM has an invalid size")
+def initial_spu_ram_path(record: dict, adapter: DuckStationLockstep) -> Path:
+    output = Path(record["initial_state"]["path"]).with_suffix(".spu")
     temporary = output.with_suffix(".spu.tmp")
-    temporary.write_bytes(ram)
+    with temporary.open("wb") as target:
+        for offset in range(0, 512 * 1024, 4096):
+            reply = adapter.remote.packet(f"qXportSpuRAMRead:{offset:x}:1000")
+            data = bytes.fromhex(reply)
+            if len(data) != 4096:
+                raise RuntimeError("DuckStation SPU RAM read was incomplete")
+            target.write(data)
     os.replace(temporary, output)
-    write_receipt(receipt, {
-        "schema": 1,
-        "contract": "xport-lockstep-initial-spu-ram-v1",
-        "initial_state_sha256": expected,
-        "size": len(ram),
-        "sha256": digest(output),
-    })
     return output
 
 
@@ -176,6 +163,11 @@ def align_refinement(session, anchor: dict, target_frame: int, max_steps: int = 
                     _matches_refinement_anchor(original, anchor)):
                 break
             continue
+        native = last_step.get("native") or {}
+        if (original.get("kind") in {"PRE_CALL", "POST_CALL"} and
+                original.get("mode") == native.get("mode") == "DETAILED" and
+                original.get("epoch") == native.get("epoch") == anchor.get("epoch")):
+            transitioned = True
         if transitioned and _matches_refinement_anchor(original, anchor):
             break
     else:
@@ -651,6 +643,13 @@ class ProjectLockstepHooks:
         try:
             record_owner(directory, port, process.pid)
             wait_port(host, port, process)
+            initial_adapter = DuckStationLockstep(host, port)
+            try:
+                if not initial_adapter.remote.packet("?").startswith(("S", "T")):
+                    raise RuntimeError("DuckStation did not load the initial state paused")
+                self.initial_spu_path = initial_spu_ram_path(record, initial_adapter)
+            finally:
+                initial_adapter.close()
         except Exception:
             OwnedProcess(process, port=port).close()
             raise
@@ -662,6 +661,9 @@ class ProjectLockstepHooks:
         if handoff is not None:
             try:
                 self._prepare_handoff(owned, record, handoff)
+                from lockstep_gpu_handoff import export_clock_handoff
+                self.handoff_clock_path = export_clock_handoff(
+                    self.handoff_adapter, self.input_path.parent / f"handoff-clock-{run_id}.bin")
             except Exception:
                 owned.close()
                 raise
@@ -705,6 +707,7 @@ class ProjectLockstepHooks:
             stop = adapter.remote.packet("?")
             if not stop.startswith(("S", "T")):
                 raise RuntimeError("DuckStation did not start paused at the record state")
+            adapter.configure_wait_points(self.config["duckstation"]["wait_points"])
             adapter.start_prelude(record)
             armed = set(all_addresses)
             for address in all_addresses:
@@ -817,13 +820,16 @@ class ProjectLockstepHooks:
         if not disc_image.is_absolute():
             disc_image = self.root / disc_image
         environment["XPORT_DISC_IMAGE"] = str(disc_image.resolve())
-        environment["XPORT_LOCKSTEP_INITIAL_SPU_RAM"] = str(initial_spu_ram_path(record))
+        environment["XPORT_LOCKSTEP_INITIAL_SPU_RAM"] = str(self.initial_spu_path)
         if self.handoff_config and self.handoff_config.get("gpu_state"):
             environment["XPORT_LOCKSTEP_HANDOFF_GPU_STATE"] = str(
                 self.input_path.parent / f"handoff-gpu-{run_id}.bin")
-            environment["XPORT_LOCKSTEP_HANDOFF_CLOCK_STATE"] = str(
-                self.input_path.parent / f"handoff-gpu-{run_id}.clock.bin")
+        environment["XPORT_LOCKSTEP_HANDOFF_CD_STATE"] = str(
+            self.input_path.parent / f"handoff-cd-{run_id}.bin")
+        environment["XPORT_LOCKSTEP_HANDOFF_SPU_STATE"] = str(
+            self.input_path.parent / f"handoff-spu-{run_id}.bin")
         if self.handoff_frame is not None:
+            environment["XPORT_LOCKSTEP_HANDOFF_CLOCK_STATE"] = str(self.handoff_clock_path)
             handoff = self.handoff_config or self.lockstep["handoff"]
             environment["XPORT_LOCKSTEP_START_FRAME"] = str(self.handoff_frame)
             environment["XPORT_LOCKSTEP_CONTINUATION"] = str(handoff["continuation"])
@@ -894,6 +900,7 @@ class ProjectLockstepHooks:
             if not stop.startswith(("S", "T")):
                 original_adapter.close()
                 raise RuntimeError("DuckStation did not start paused at the record state")
+            original_adapter.configure_wait_points(self.config["duckstation"]["wait_points"])
         peer = {
             "schema": 1, "contract": "xport-lockstep-peer-v1", "run_id": run_id,
             "dram": mapping_name(run_id, "dram"),
@@ -922,6 +929,17 @@ class ProjectLockstepHooks:
                 self.input_path.parent / f"handoff-gpu-{run_id}.bin", record["record_id"],
                 self.handoff_frame, int(self.handoff_registers["pc"], 16))
             write_receipt(self.input_path.parent / f"handoff-gpu-{run_id}.json", receipt)
+            os.replace(self.input_path.parent / f"handoff-gpu-{run_id}.cd.bin",
+                       self.input_path.parent / f"handoff-cd-{run_id}.bin")
+            os.replace(self.input_path.parent / f"handoff-gpu-{run_id}.spu.bin",
+                       self.input_path.parent / f"handoff-spu-{run_id}.bin")
+        if restored_frame is None and self.handoff_config and not self.handoff_config.get("gpu_state"):
+            from lockstep_gpu_handoff import capture_handoff_state, export_cd_handoff, export_spu_handoff
+            state, unused = capture_handoff_state(
+                original_adapter, self.input_path.parent / "last-match.duck.raw",
+                self.input_path.parent / f"handoff-cd-{run_id}.bin", self.handoff_frame)
+            export_cd_handoff(state, self.input_path.parent / f"handoff-cd-{run_id}.bin")
+            export_spu_handoff(state, self.input_path.parent / f"handoff-spu-{run_id}.bin")
         if restored_frame is not None:
             (self.root / "status" / "lockstep-converge" / self.name /
              "last-match.duck.raw").unlink(missing_ok=True)

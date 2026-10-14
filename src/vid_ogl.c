@@ -26,7 +26,7 @@ struct VID_SHADER
 {
     struct VID_SHADER *next;
     uint32 program, refs, released;
-    sint32 textured, params;
+    sint32 textured, params, fog;
 };
 
 static VID_SHADER *shaders;
@@ -57,6 +57,7 @@ typedef struct VID_DRAW
     VID_RECT viewport;
     uint32 first, count;
     VID_SAMPLE *sample;
+    float fog[12];
     float sample_x, sample_y;
 } VID_DRAW;
 
@@ -229,8 +230,12 @@ static sint32 vid_load_gl(void)
 static const char *vid_vertex_source = VID_GLSL "layout(location=0) in vec4 aPos;\n"
                                                 "layout(location=1) in vec2 aUV;\n"
                                                 "layout(location=2) in vec4 aColor;\n"
-                                                "out vec2 vUV; out vec4 vColor;\n"
-                                                "void main(){gl_Position=aPos;vUV=aUV;vColor=aColor;}\n";
+                                                "out vec2 vUV; out vec4 vColor; out float vDepth; out vec2 vFog; uniform vec4 uFog[3];\n"
+                                                "void main(){gl_Position=aPos;vUV=aUV;vColor=aColor;vDepth=aPos.w;vFog=vec2(0.0);"
+                                                "if(uFog[0].y>uFog[0].x){"
+                                                "float d=length(vec3(aPos.x*uFog[2].x,-aPos.y*uFog[2].y,aPos.w));"
+                                                "vFog=clamp(vec2(log(max(d,uFog[0].x)/uFog[0].x)/log(uFog[0].y/uFog[0].x),"
+                                                "log(max(d,uFog[0].y)/uFog[0].y)/log(uFog[0].z/uFog[0].y)),0.0,1.0);vFog*=vFog;}}\n";
 
 static GLuint vid_program, vid_array, vid_blit_buffer, vid_blit_texture;
 static GLint vid_textured;
@@ -512,11 +517,14 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
         else
             glDisable(GL_DEPTH_TEST);
         glDepthMask(material->depth_write ? GL_TRUE : GL_FALSE);
-        if (material->blend)
+        uint32 blend = material->blend;
+        if (!blend && material->shader && draws->fog[1] > draws->fog[0])
+            blend = VID_BLEND_ALPHA;
+        if (blend)
         {
             glEnable(GL_BLEND);
-            glBlendEquation(material->blend == VID_BLEND_SUBTRACT ? GL_FUNC_REVERSE_SUBTRACT : GL_FUNC_ADD);
-            glBlendFunc(GL_SRC_ALPHA, material->blend == VID_BLEND_ALPHA ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE);
+            glBlendEquation(blend == VID_BLEND_SUBTRACT ? GL_FUNC_REVERSE_SUBTRACT : GL_FUNC_ADD);
+            glBlendFunc(GL_SRC_ALPHA, blend == VID_BLEND_ALPHA ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE);
         }
         else
             glDisable(GL_BLEND);
@@ -525,6 +533,12 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             glUseProgram(material->shader->program);
             glUniform1i(material->shader->textured, material->texture != NULL);
             glUniform4fv(material->shader->params, 2, material->params);
+            {
+                float fog[12];
+                memcpy(fog, draws->fog, sizeof(fog));
+                fog[3] = (float)material->blend;
+                glUniform4fv(material->shader->fog, 3, fog);
+            }
         }
         else
         {
@@ -565,6 +579,7 @@ static VID_TEXTURE *textures;
 static VID_MATERIAL *materials;
 static VID_DRAW *draw_head, *draw_tail, *draw_pool;
 static VID_RECT frame_viewport;
+static float frame_fog[12];
 static sint32 frame_width, frame_height;
 static float frame_clear[3];
 static sint32 frame_active, initialized;
@@ -766,7 +781,14 @@ void vid_tex_free(VID_TEXTURE *texture)
 
 VID_SHADER *vid_shader_create(const char *fragment)
 {
-    static const char prefix[] = VID_GLSL "in vec2 vUV; in vec4 vColor; uniform sampler2D uTex; uniform int uTextured; uniform vec4 uParams[2]; out vec4 outColor;\n";
+    static const char prefix[] = VID_GLSL "in vec2 vUV; in vec4 vColor; in float vDepth; uniform sampler2D uTex; uniform int uTextured; uniform vec4 uParams[2]; out vec4 outColor;\n"
+                                          "in vec2 vFog; uniform vec4 uFog[3];\n"
+                                          "vec4 vidFog(vec4 color){if(uFog[0].y<=uFog[0].x)return color;"
+                                          "float f=vFog.x;"
+                                          "if(uFog[0].w>=2.0)color.rgb*=1.0-f;"
+                                          "else {color.rgb=mix(color.rgb,uFog[1].rgb,f);"
+                                          "float h=vFog.y;"
+                                          "color.a*=1.0-h;if(color.a<=0.0)discard;}return color;}\n";
     VID_SHADER *shader;
     GLuint vertex, pixel;
     GLint success;
@@ -818,6 +840,7 @@ VID_SHADER *vid_shader_create(const char *fragment)
     }
     shader->textured = glGetUniformLocation(shader->program, "uTextured");
     shader->params = glGetUniformLocation(shader->program, "uParams");
+    shader->fog = glGetUniformLocation(shader->program, "uFog");
     shader->refs = 1;
     shader->next = shaders;
     shaders = shader;
@@ -973,6 +996,7 @@ sint32 vid_draw(VID_GEOMETRY *geometry, uint32 first, uint32 count, VID_MATERIAL
     draw->viewport = frame_viewport;
     draw->first = first;
     draw->count = count;
+    memcpy(draw->fog, frame_fog, sizeof(draw->fog));
     ++geometry->refs;
     ++material->refs;
     if (draw->data.texture)
@@ -1014,6 +1038,22 @@ sint32 vid_sample(VID_SAMPLE *sample, float x, float y)
     return 1;
 }
 
+void vid_fog(const VID_FOG *fog)
+{
+    if (!frame_active || (fog && !(fog->near_dist > 0 && fog->far_dist > fog->near_dist && fog->horizon_dist > fog->far_dist && fog->focal[0] > 0 && fog->focal[1] > 0)))
+        abort();
+    memset(frame_fog, 0, sizeof(frame_fog));
+    if (fog)
+    {
+        frame_fog[0] = fog->near_dist;
+        frame_fog[1] = fog->far_dist;
+        frame_fog[2] = fog->horizon_dist;
+        memcpy(frame_fog + 4, fog->color, sizeof(fog->color));
+        frame_fog[8] = 1.0f / fog->focal[0];
+        frame_fog[9] = 1.0f / fog->focal[1];
+    }
+}
+
 void vid_cancel(void)
 {
     VID_DRAW *draw;
@@ -1022,7 +1062,7 @@ void vid_cancel(void)
         draw_head = draw->next;
         if (draw->sample)
             sample_release(draw->sample);
-        else
+        else if (draw->geometry)
             geometry_release(draw->geometry);
         if (draw->data.texture)
         {
@@ -1036,6 +1076,7 @@ void vid_cancel(void)
     }
     draw_tail = NULL;
     frame_active = 0;
+    memset(frame_fog, 0, sizeof(frame_fog));
 }
 
 sint32 vid_end(void)

@@ -372,6 +372,27 @@ class CdbController:
         suffix = " /1" if one_shot else ""
         self._send(f"bp{suffix} 0x{address:x}")
 
+    def stop_at_game_entry(self, symbol: str) -> None:
+        if self._running or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', symbol):
+            raise CdbError('Invalid stopped game entry request')
+        self._send(f'bu /1 {self.module}!{symbol} ".printf \\"XPORT|GAME_ENTRY|{self.token}|%x\\\\n\\", @$tpid"')
+        self.continue_execution()
+        marker = self._wait('GAME_ENTRY', self.timeout)
+        self._running = False
+        self._remember_pid(marker[2])
+
+    def set_ot_submission_breakpoint(self, *, draw_ot_only=False) -> None:
+        if self._running:
+            raise CdbError("Target must be stopped before installing the OT observer")
+        entries = (("DrawOTag", 0),) if draw_ot_only else (("DrawOTag", 0), ("gpu_draw_env_native", 28))
+        for symbol, packet_offset in entries:
+            self._send(
+                f'bu {self.module}!{symbol} ".printf \\"XPORT|OT|{self.token}|%x|%x|%x|%y|%y|%y|%y\\\\n\\", '
+                f'@$tpid, poi(@esp+4)+{packet_offset:x}-poi({self.module}!xport_lockstep_dram), '
+                f'poi({self.module}!frame_entry_index), poi(@esp), poi(@ebp+4), '
+                f'poi(poi(@ebp)+4), poi(poi(poi(@ebp))+4)"'
+            )
+
     def probe_function_entry(self, symbol: str, output_address: int, *,
                              max_hits: int = 128, timeout: float = 30.0,
                              second_storage: str = "guest",
@@ -438,6 +459,22 @@ class CdbController:
                 return result
         raise CdbError("Native function entry did not receive the requested output address")
 
+    def set_causal_entry_breakpoint(self, symbol: str, *, quaternion_inputs: bool = False,
+                                   all_symbol_matches: bool = False) -> None:
+        if self._running or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', symbol):
+            raise CdbError('Invalid causal entry request')
+        if quaternion_inputs and symbol != 'sub_8001005C':
+            raise CdbError('Quaternion capture requires the reviewed quaternion conversion ABI')
+        first = (f'poi(@esp+4)-poi({self.module}!xport_lockstep_dram)+0x80000000'
+                 if quaternion_inputs else 'poi(@esp+4)')
+        formats = '|%x|%x|%x|%x' if quaternion_inputs else ''
+        reads = (', poi(poi(@esp+8)), poi(poi(@esp+8)+4), '
+                 'poi(poi(@esp+8)+8), poi(poi(@esp+8)+0xc)' if quaternion_inputs else '')
+        command = 'bm' if all_symbol_matches else 'bu'
+        self._send(
+            f'{command} {self.module}!{symbol} ".printf \\"XPORT|CAUSAL_ENTRY|{self.token}|%x|%x|%x|%x|%x{formats}\\\\n\\", '
+            f'@$tpid, {first}, poi(@esp+8), poi(@esp+0xc), poi(@esp+0x10){reads}"')
+
     def set_data_watchpoint(self, region: str, offset: int, width: int = 1) -> None:
         if self._running:
             raise CdbError("Target must be stopped before setting a data watchpoint")
@@ -459,6 +496,20 @@ class CdbController:
             f'poi(poi(poi(poi(@ebp)))+4)"'
         )
         self._refinement_watchpoint = True
+
+    def capture_writer_locals(self) -> str:
+        if self._running:
+            raise CdbError('Writer locals require a stopped target')
+        start = len(self.output)
+        self._send('.frame 0')
+        self._send('dv /t')
+        self._send('.frame 2')
+        self._send('dv /t')
+        self._send(f'dt -r2 {self.module}!gte')
+        self._send('.frame 0')
+        self._send(f'.echo XPORT|WRITER_LOCALS|{self.token}')
+        self._wait('WRITER_LOCALS', self.timeout)
+        return self.output[start:]
 
     def writer_ring(self, limit: int = 16) -> dict:
         if self._running:
@@ -879,6 +930,16 @@ class CdbController:
             parts = marker.split("|")
             if len(parts) < 2 or parts[1] != self.token:
                 continue
+            if parts[0] == "OT":
+                if len(parts) != 9:
+                    raise CdbProtocolError(f"Malformed OT submission marker: {parts}")
+                self._running = False
+                self._remember_pid(parts[2])
+                root, frame = (int(value.split()[0], 16) for value in parts[3:5])
+                if root & 3 or root >= 0x200000:
+                    raise CdbProtocolError("Native OT root is outside mapped DRAM")
+                return {"kind": "OT_SUBMIT", "side": "native", "frame": frame,
+                        "root": root, "callers": [value.strip() for value in parts[5:]]}
             if parts[0] == "BOUNDARY":
                 self._remember_pid(parts[2])
                 self._running = False
@@ -892,6 +953,17 @@ class CdbController:
                 if event is not None:
                     return event
                 self.continue_execution()
+            if parts[0] == 'CAUSAL_ENTRY':
+                self._running = False
+                self._remember_pid(parts[2])
+                if len(parts) not in (7, 11):
+                    raise CdbProtocolError(f'Malformed causal entry marker: {parts}')
+                result = {'stop': 'causal_entry', 'side': 'native',
+                          'arguments': [f'0x{int(value.split()[0], 16):08x}' for value in parts[3:7]]}
+                if len(parts) == 11:
+                    result['quaternion'] = b''.join(int(value.split()[0], 16).to_bytes(4, 'little')
+                                                  for value in parts[7:11]).hex()
+                return result
             if parts[0] == "WATCH":
                 self._running = False
                 self._remember_pid(parts[2])

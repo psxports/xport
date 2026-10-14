@@ -70,7 +70,7 @@ def record(root: Path, state: Path, output: Path, frames: int, timeout: float) -
     directory = (root / config["duckstation"]["data_directories"][role]).resolve()
     directory = validate_settings(directory, port)
     cue = (root / config["paths"]["disc_image"]).resolve()
-    original = (root / "orig" / lockstep["original_image"]).resolve()
+    original = (root / config["paths"]["original_executable"]).resolve()
     manifest_path = Path(__file__).resolve().parent / "duckstation" / "duckstation-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     command = [str(duckstation_executable()), "-batch", "-fastboot", "-statefile",
@@ -85,6 +85,7 @@ def record(root: Path, state: Path, output: Path, frames: int, timeout: float) -
         stop = adapter.remote.packet("?")
         if not stop.startswith(("S", "T")):
             raise RuntimeError("DuckStation did not start paused")
+        adapter.configure_wait_points(config["duckstation"]["wait_points"])
         adapter.start_record(frames)
         recorder = FrameDoneRecorder()
         capture_started = time.monotonic()

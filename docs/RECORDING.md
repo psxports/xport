@@ -1,11 +1,14 @@
 # Lockstep recording
 
-The public recorder writes `xport-lockstep-record-v1`. Its complete payload is:
+The public recorder writes `record.bin` with one fixed little-endian layout:
 
-- Identity and SHA-256 of the initial save state
-- Identity of every disc file, original executable, settings and patched DuckStation
-- Video standard and effective field rate
-- One effective state for both controller ports at every FrameDone
+- Four `uint32` values: save-state byte count, frame count, event count, field rate
+- The initial DuckStation save-state bytes
+- Six `uint32` values per frame: two controller types, two button states, two analog states
+- Four `uint32` values per event: frame, guest PC, event kind, value
+
+The file has no format version, hash inventory or migration path. Project paths come from
+`xport-project.json`. Recorder, replay and supervisor use `lockstep_record.py`.
 
 Agent task commands are:
 
@@ -18,9 +21,8 @@ This `stop` applies only to the active `record SLOT NAME` operation. After `func
 
 `SLOT` is an integer from `1` through `10`. It identifies
 `tools/duckstation/data/ROLE/savestates/SERIAL_SLOT.sav`, where `ROLE` and
-`SERIAL` come from `xport-project.json`. The recorder rejects a missing slot, a
-state with an unsupported header and a state whose serial differs from the
-configured game serial.
+`SERIAL` come from `xport-project.json`. The recorder resolves the slot file and lets
+DuckStation interpret and load it without another serializer-version or serial gate.
 
 The generated project launcher implements `record SLOT NAME` as:
 
@@ -45,7 +47,7 @@ Only one interactive recording may have status `starting` or `recording`. A new
 session and fails if none exists or if persisted state violates the singleton invariant.
 
 Agents run `record.ps1 -Action start` or the project `record.bat` with GUI permission outside their sandbox. Both start
-the recorder explicitly on `WinSta0\Default`. A numbered slot resolves to the recording role's game save state and is checked against the configured game serial before launch;
+the recorder explicitly on `WinSta0\Default`. A numbered slot resolves to the recording role's configured save filename; DuckStation loads and interprets the state;
 `trace_workflow record` accepts only bounded `--frames N` automation.
 
 Recording preserves the configured CPU overclock enable flag, numerator and denominator. Never normalize these settings to the default CPU clock. Capture them in the settings snapshot and effective recording contract.
@@ -57,15 +59,15 @@ FrameDone state on both sides.
 
 Interactive recording never stops at FrameDone. DuckStation appends each compact two-port
 state to an internal buffer while emulation continues. `record.ps1 -Action stop` interrupts
-the emulator once, drains the buffer in bounded pages and commits `record.json`. The GDB
+the emulator once, drains the buffer in bounded pages and commits `record.bin`. The GDB
 stop/continue cycle at every frame is reserved for converge and must not be used by record.
 
 The record stores no periodic RAM, VRAM or SPU snapshots. Initial RAM and scratchpad come
-from the save state and are seeded into shared mappings once. A changed source file, disc,
-executable, settings file or save state invalidates the record before replay.
+from the embedded save state and are seeded into shared mappings once. Replay uses the
+project's current disc, executable and settings without a record hash-admission gate.
 
 The first command returns only after capture is armed. The default-desktop worker owns the visible
-DuckStation instance. The stop command waits for `record.json`, then the worker closes the
+DuckStation instance. The stop command waits for `record.bin`, then the worker closes the
 emulator. Recording launches DuckStation for reason `record_capture`. Existing names are
 immutable; choose another name rather than overwriting evidence.
 

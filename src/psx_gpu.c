@@ -2625,11 +2625,23 @@ static void gpu_draw_linked_dma(uint32 *ot)
 }
 
 static PsxInterruptCallback native_draw_sync_callback;
+static uint32 native_draw_sync_pending;
+
+static void gpu_wait_service(void)
+{
+    while (native_draw_sync_pending && psx_callbacks_allowed())
+    {
+        --native_draw_sync_pending;
+        if (native_draw_sync_callback)
+            native_draw_sync_callback();
+    }
+}
 
 PsxInterruptCallback DrawSyncCallback(PsxInterruptCallback callback)
 {
     PsxInterruptCallback previous = native_draw_sync_callback;
     native_draw_sync_callback = callback;
+    psx_wait_bind_service(2, gpu_wait_service);
     return previous;
 }
 
@@ -2659,7 +2671,11 @@ void DrawOTag(uint32 *ot)
     gpu_draw_linked_dma(ot);
     linked_trace_operation = NULL;
     if (!transfer_observation_failed && !linked_submit_failed && native_draw_sync_callback)
-        native_draw_sync_callback();
+    {
+        ++native_draw_sync_pending;
+        if (psx_callbacks_allowed())
+            gpu_wait_service();
+    }
     if (operation.active)
     {
         xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
@@ -3142,6 +3158,7 @@ static int gpu_state_block(FILE *file, void *data, size_t size, int load)
 
 typedef struct GPU_PORTABLE_SCALARS
 {
+    uint32 draw_sync_pending;
     GpuScanoutState scanout;
     uint32 scanout_fraction;
     DISPENV native_disp_cache;
@@ -3181,6 +3198,7 @@ int gpu_state_io(FILE *f, int load)
         if (!gpu_state_block(f, &scalars, sizeof(scalars), 1) || !gpu_scanout_validate(&scalars.scanout) || scalars.scanout_fraction >= 1000000u || scalars.native_disp_cached > 1u || scalars.sync_running || scalars.psyq_bound != psyq_bound || scalars.psyq_queue_bound != psyq_queue_bound || (psyq_bound && memcmp(&scalars.psyq_binding, &psyq_binding, sizeof(psyq_binding))) || (psyq_queue_bound && memcmp(&scalars.psyq_queue_binding, &psyq_queue_binding, sizeof(psyq_queue_binding))))
             return 0;
         native_scanout = scalars.scanout;
+        native_draw_sync_pending = scalars.draw_sync_pending;
         scanout_fraction = scalars.scanout_fraction;
         native_disp_cache = scalars.native_disp_cache;
         native_disp_cached = scalars.native_disp_cached;
@@ -3205,6 +3223,7 @@ int gpu_state_io(FILE *f, int load)
     if (native_dma_range_count || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)
         return 0;
     scalars.scanout = native_scanout;
+    scalars.draw_sync_pending = native_draw_sync_pending;
     scalars.scanout_fraction = scanout_fraction;
     scalars.native_disp_cache = native_disp_cache;
     scalars.native_disp_cached = native_disp_cached;

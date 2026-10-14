@@ -36,6 +36,38 @@ index 832539a..7f57f0d 100644
  
    void ResetTransferState() override;
    bool Transfer(const u8 data_in, u8* data_out) override;
+diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
+index 13e90aa..0f78bde 100644
+--- a/src/core/cdrom.cpp
++++ b/src/core/cdrom.cpp
+@@ -570,9 +570,7 @@ void CDROM::Initialize()
+   s_state.disc_region = DiscRegion::NonPS1;
+   s_state.manual_lid_control = MANUAL_LID_CONTROL_DISABLED;
+ 
+-  if (g_settings.cdrom_readahead_sectors > 0)
+-    s_reader.StartThread(g_settings.cdrom_readahead_sectors);
+-
++  // Read sector bytes synchronously when the virtual CD event requests them
+   Reset();
+ }
+ 
+@@ -1113,15 +1111,7 @@ TinyString CDROM::LBAToMSFString(CDImage::LBA lba)
+ 
+ void CDROM::SetReadaheadSectors(u32 readahead_sectors)
+ {
+-  const bool want_thread = (readahead_sectors > 0);
+-  if (want_thread == s_reader.IsUsingThread() && s_reader.GetReadaheadCount() == readahead_sectors)
+-    return;
+-
+-  if (want_thread)
+-    s_reader.StartThread(readahead_sectors);
+-  else
+-    s_reader.StopThread();
+-
++  s_reader.StopThread();
+   if (HasMedia())
+     s_reader.QueueReadSector(s_state.requested_lba);
+ }
 diff --git a/src/core/core.cpp b/src/core/core.cpp
 index c4ca720..2e80169 100644
 --- a/src/core/core.cpp
@@ -62,7 +94,7 @@ index c4ca720..2e80169 100644
    // This bullshit here because AppImage mounts in /tmp, so we need to check the "real" appimage location.
    std::string_view real_approot = EmuFolders::AppRoot;
 diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
-index d729042..78a4756 100644
+index d729042..ab70dd4 100644
 --- a/src/core/cpu_core.cpp
 +++ b/src/core/cpu_core.cpp
 @@ -8,6 +8,7 @@
@@ -94,10 +126,21 @@ index d729042..78a4756 100644
      (g_settings.cpu_execution_mode == CPUExecutionMode::Interpreter && g_settings.bios_tty_logging);
    if (use_debug_dispatcher == g_state.using_debug_dispatcher)
      return false;
-@@ -2559,6 +2567,20 @@ template<PGXPMode pgxp_mode, bool debug>
+@@ -2159,8 +2167,7 @@ bool CPU::UpdateDebugDispatcherFlag()
+ void CPU::CheckForExecutionModeChange()
+ {
+   // Currently, any breakpoints require the interpreter.
+-  const CPUExecutionMode new_execution_mode =
+-    (g_state.using_debug_dispatcher ? CPUExecutionMode::Interpreter : g_settings.cpu_execution_mode);
++  const CPUExecutionMode new_execution_mode = CPUExecutionMode::Interpreter;
+   if (s_locals.current_execution_mode == new_execution_mode) [[likely]]
+   {
+     DebugAssert(g_state.using_interpreter == (s_locals.current_execution_mode == CPUExecutionMode::Interpreter));
+@@ -2559,6 +2566,21 @@ template<PGXPMode pgxp_mode, bool debug>
    {
      do
      {
++      TimingEvents::BeforeInstruction(g_state.pc);
 +      if constexpr (debug)
 +      {
 +#ifdef ENABLE_GDB_SERVER
@@ -115,8 +158,237 @@ index d729042..78a4756 100644
        if constexpr (debug)
          ExecutionBreakpointCheck(g_state.pc);
  
+@@ -2609,6 +2631,7 @@ template<PGXPMode pgxp_mode, bool debug>
+ 
+       // next load delay
+       UpdateLoadDelay();
++      TimingEvents::AfterInstruction(g_state.current_instruction_pc);
+ 
+       if constexpr (debug)
+       {
+diff --git a/src/core/cpu_core_private.h b/src/core/cpu_core_private.h
+index 19613e9..c3d8881 100644
+--- a/src/core/cpu_core_private.h
++++ b/src/core/cpu_core_private.h
+@@ -35,8 +35,7 @@ ALWAYS_INLINE bool HasPendingInterrupt()
+ 
+ ALWAYS_INLINE void CheckForPendingInterrupt()
+ {
+-  if (HasPendingInterrupt())
+-    g_state.downcount = 0;
++  // Pending IRQ flags are delivered by the cooperative wait scheduler
+ }
+ 
+ void DispatchInterrupt();
+diff --git a/src/core/dma.cpp b/src/core/dma.cpp
+index 4774d16..4c680fc 100644
+--- a/src/core/dma.cpp
++++ b/src/core/dma.cpp
+@@ -21,12 +21,14 @@
+ 
+ #include "common/bitfield.h"
+ #include "common/log.h"
++#include "common/scoped_guard.h"
+ #include "common/string_util.h"
+ 
+ #include "fmt/format.h"
+ 
+ #include <array>
+ #include <memory>
++#include <utility>
+ #include <vector>
+ 
+ LOG_CHANNEL(DMA);
+@@ -204,8 +206,6 @@ static TickCount TransferDeviceToMemory(u32 address, u32 increment, u32 word_cou
+ template<Channel channel>
+ static TickCount TransferMemoryToDevice(u32 address, u32 increment, u32 word_count);
+ 
+-template<Channel channel>
+-static TickCount GetMaxSliceTicks(TickCount max_slice_size);
+ 
+ // configuration
+ namespace {
+@@ -222,6 +222,7 @@ struct DMAState
+ } // namespace
+ 
+ ALIGN_TO_CACHE_LINE static DMAState s_state;
++static std::array<bool, NUM_CHANNELS> s_transferring{};
+ 
+ static constexpr std::array<bool (*)(), NUM_CHANNELS> s_channel_transfer_functions = {{
+   &TransferChannel<Channel::MDECin>,
+@@ -400,32 +401,7 @@ void DMA::WriteRegister(u32 offset, u32 value)
+ 
+         if (CanTransferChannel(static_cast<Channel>(channel_index), ignore_halt))
+         {
+-          if (static_cast<Channel>(channel_index) != Channel::OTC &&
+-              state.channel_control.sync_mode == SyncMode::Manual && state.channel_control.chopping_enable)
+-          {
+-            // Figure out how roughly many CPU cycles it'll take for the transfer to complete, and delay the transfer.
+-            // Needed for Lagnacure Legend, which sets DICR to enable interrupts after CHCR to kickstart the transfer.
+-            // This has an artificial 500 cycle cap, setting it too high causes Namco Museum Vol. 4 and a couple of
+-            // other games to crash... so clearly something is missing here. Small blocks are similarly excluded,
+-            // Dotchi Mecha! sets up a 3 word transfer for the CD sector header and expects it to complete immediately.
+-            const u32 cpu_cycles_per_block = (1u << state.channel_control.chopping_cpu_window_size);
+-            const u32 blocks = state.block_control.manual.word_count >> state.channel_control.chopping_dma_window_size;
+-            const TickCount delay_cycles = std::min(static_cast<TickCount>(cpu_cycles_per_block * blocks), 500);
+-            if (state.block_control.manual.word_count > 4 && delay_cycles > 1)
+-            {
+-              DEV_LOG("Delaying {} transfer by {} cycles due to chopping", static_cast<Channel>(channel_index),
+-                      delay_cycles);
+-              HaltTransfer(delay_cycles);
+-            }
+-            else
+-            {
+-              s_channel_transfer_functions[channel_index]();
+-            }
+-          }
+-          else
+-          {
+-            s_channel_transfer_functions[channel_index]();
+-          }
++          s_channel_transfer_functions[channel_index]();
+         }
+         return;
+       }
+@@ -547,31 +523,14 @@ ALWAYS_INLINE_RELEASE void DMA::CompleteTransfer(Channel channel, ChannelState&
+   }
+ }
+ 
+-template<DMA::Channel channel>
+-TickCount DMA::GetMaxSliceTicks(TickCount max_slice_size)
+-{
+-  TickCount max = Pad::IsTransmitting() ? SLICE_SIZE_WHEN_TRANSMITTING_PAD : max_slice_size;
+-
+-  // Prevent the slice size from being too large for MDEC.
+-  // Since we use a larger than real FIFO, this can lead to excessively large chunks of data being
+-  // transferred and queued in the FIFO (multiple kilobytes), which steals a large number of CPU
+-  // cycles and results in other interrupts being missed. I hate it, but unless we do tight sync
+-  // all the time, which has a massive performance penalty, it's really the best option.
+-  if constexpr (channel == Channel::MDECin || channel == Channel::MDECout)
+-    max = MDEC::IsDecodingMacroblock() ? SLICE_SIZE_WHEN_DECODING_MDEC : max;
+-
+-  if (!TimingEvents::IsRunningEvents())
+-    return max;
+-
+-  const TickCount remaining_in_event_loop =
+-    static_cast<TickCount>(TimingEvents::GetEventRunTickCounter() - TimingEvents::GetGlobalTickCounter());
+-  return std::max<TickCount>(max - remaining_in_event_loop, 1);
+-}
+-
+ template<DMA::Channel channel>
+ bool DMA::TransferChannel()
+ {
+-  ChannelState& cs = s_state.channels[static_cast<u32>(channel)];
++  const u32 channel_index = static_cast<u32>(channel);
++  if (std::exchange(s_transferring[channel_index], true))
++    return true;
++  ScopedGuard transfer_guard([channel_index]() { s_transferring[channel_index] = false; });
++  ChannelState& cs = s_state.channels[channel_index];
+ 
+   const bool copy_to_device = cs.channel_control.copy_to_device;
+ 
+@@ -617,9 +576,7 @@ bool DMA::TransferChannel()
+       const u8* const ram_ptr = g_bus.ram;
+       const u32 mask = g_bus.ram_mask;
+ 
+-      const TickCount slice_ticks = GetMaxSliceTicks<channel>(g_settings.dma_max_slice_ticks);
+-      TickCount remaining_ticks = slice_ticks;
+-      while (cs.request && remaining_ticks > 0)
++      while (cs.request)
+       {
+         u32 header;
+         PhysicalMemoryAddress transfer_addr = current_address & TRANSFER_ADDRESS_MASK;
+@@ -639,7 +596,6 @@ bool DMA::TransferChannel()
+                                         (LINKED_LIST_HEADER_READ_TICKS + LINKED_LIST_BLOCK_SETUP_TICKS) :
+                                         LINKED_LIST_HEADER_READ_TICKS;
+         CPU::AddPendingTicks(setup_ticks);
+-        remaining_ticks -= setup_ticks;
+ 
+         if (word_count > 0)
+         {
+@@ -651,7 +607,6 @@ bool DMA::TransferChannel()
+ 
+           const TickCount block_ticks = TransferMemoryToDevice<channel>(transfer_addr + sizeof(header), 4, word_count);
+           CPU::AddPendingTicks(block_ticks);
+-          remaining_ticks -= block_ticks;
+         }
+ 
+         current_address = next_address;
+@@ -665,17 +620,8 @@ bool DMA::TransferChannel()
+       }
+ 
+       cs.base_address = current_address;
+-      if (cs.request)
+-      {
+-        // stall the transfer for a bit if we ran for too long
+-        HaltTransfer(g_settings.dma_halt_ticks);
+-        return false;
+-      }
+-      else
+-      {
+-        // linked list not yet complete
+-        return true;
+-      }
++      // A producer request is required before consuming its next packet
++      return true;
+     }
+ 
+     case SyncMode::Request:
+@@ -687,7 +633,6 @@ bool DMA::TransferChannel()
+ 
+       const u32 block_size = cs.block_control.request.GetBlockSize();
+       u32 blocks_remaining = cs.block_control.request.GetBlockCount();
+-      TickCount ticks_remaining = GetMaxSliceTicks<channel>(g_settings.dma_max_slice_ticks);
+ 
+       if (copy_to_device)
+       {
+@@ -704,11 +649,10 @@ bool DMA::TransferChannel()
+           const TickCount ticks = TransferMemoryToDevice<channel>(transfer_addr, increment, block_size);
+           CPU::AddPendingTicks(ticks);
+ 
+-          ticks_remaining -= ticks;
+           blocks_remaining--;
+ 
+           current_address = (transfer_addr + (increment * block_size));
+-        } while (cs.request && blocks_remaining > 0 && ticks_remaining > 0);
++        } while (cs.request && blocks_remaining > 0);
+       }
+       else
+       {
+@@ -725,11 +669,10 @@ bool DMA::TransferChannel()
+           const TickCount ticks = TransferDeviceToMemory<channel>(transfer_addr, increment, block_size);
+           CPU::AddPendingTicks(ticks);
+ 
+-          ticks_remaining -= ticks;
+           blocks_remaining--;
+ 
+           current_address = (transfer_addr + (increment * block_size));
+-        } while (cs.request && blocks_remaining > 0 && ticks_remaining > 0);
++        } while (cs.request && blocks_remaining > 0);
+       }
+ 
+       cs.base_address = current_address;
+@@ -737,18 +680,7 @@ bool DMA::TransferChannel()
+ 
+       // finish transfer later if the request was cleared
+       if (blocks_remaining > 0)
+-      {
+-        if (cs.request)
+-        {
+-          // we got halted
+-          if (!s_state.unhalt_event.IsActive())
+-            HaltTransfer(g_settings.dma_halt_ticks);
+-
+-          return false;
+-        }
+-
+         return true;
+-      }
+ 
+       CompleteTransfer(channel, cs);
+       return true;
 diff --git a/src/core/gdb_server.cpp b/src/core/gdb_server.cpp
-index ca45889..41eeec3 100644
+index ca45889..f097280 100644
 --- a/src/core/gdb_server.cpp
 +++ b/src/core/gdb_server.cpp
 @@ -10,9 +10,23 @@
@@ -156,7 +428,7 @@ index ca45889..41eeec3 100644
  #include <optional>
  #include <utility>
  
-@@ -312,6 +329,37 @@ template<bool add_breakpoint>
+@@ -312,6 +329,41 @@ template<bool add_breakpoint>
  static bool Cmd$z(ClientSocket* client, std::string_view data);
  static bool Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data);
  static bool Cmd$qSupported(ClientSocket* client, std::string_view data);
@@ -179,6 +451,10 @@ index ca45889..41eeec3 100644
 +static bool Cmd$qXportFunctionCoverageStop(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportFunctionCoverageRead(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepReplay(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportWaitPoints(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportSpuRAMRead(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportFastForward(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportCRTCState(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepSeed(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepInput(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepPadRestore(ClientSocket* client, std::string_view data);
@@ -194,7 +470,7 @@ index ca45889..41eeec3 100644
  static bool Cmd$qXferFeaturesRead(ClientSocket* client, std::string_view data);
  static bool Cmd$qXferMemoryMapRead(ClientSocket* client, std::string_view data);
  
-@@ -403,6 +451,51 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
+@@ -403,6 +455,55 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
    {"qXfer:features:read:", Cmd$qXferFeaturesRead},
    {"qXfer:memory-map:read:", Cmd$qXferMemoryMapRead},
    {"qSupported", Cmd$qSupported},
@@ -218,6 +494,10 @@ index ca45889..41eeec3 100644
 +  {"qXportFunctionCoverageStop", Cmd$qXportFunctionCoverageStop},
 +  {"qXportFunctionCoverageRead:", Cmd$qXportFunctionCoverageRead},
 +  {"qXportLockstepReplay:", Cmd$qXportLockstepReplay},
++  {"qXportWaitPoints:", Cmd$qXportWaitPoints},
++  {"qXportSpuRAMRead:", Cmd$qXportSpuRAMRead},
++  {"qXportFastForward:", Cmd$qXportFastForward},
++  {"qXportCRTCState", Cmd$qXportCRTCState},
 +  {"qXportLockstepSeed:", Cmd$qXportLockstepSeed},
 +  {"qXportLockstepInput:", Cmd$qXportLockstepInput},
 +  {"qXportLockstepPadRestore:", Cmd$qXportLockstepPadRestore},
@@ -246,7 +526,7 @@ index ca45889..41eeec3 100644
  };
  
  namespace {
-@@ -412,6 +505,36 @@ struct Locals
+@@ -412,6 +513,36 @@ struct Locals
    std::shared_ptr<ListenSocket> listen_socket;
    std::vector<std::shared_ptr<ClientSocket>> clients;
    std::vector<ManagedBreakpoint> breakpoints;
@@ -283,7 +563,7 @@ index ca45889..41eeec3 100644
    u8 pending_stop_signal = GDB_SIGNAL_TRAP;
    bool resume_on_last_disconnect = false;
  };
-@@ -940,10 +1063,988 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
+@@ -940,10 +1071,1062 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
    return true;
  }
  
@@ -789,7 +1069,7 @@ index ca45889..41eeec3 100644
 +    return SendLockstepError(client, "timer_state", "serializer_contract_changed");
 +  client->SendReplyWithAck(SmallString::from_format(
 +    "TIMERSTATE:{:x}:{:x}:{:x}:{}", SAVE_STATE_VERSION,
-+    TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks(),
++    TimingEvents::GetGlobalTickCounter(),
 +    Timers::GetPendingSysClkTicks(), StringUtil::EncodeHex(bytes.data(), sw.GetPosition())));
 +  return true;
 +}
@@ -806,9 +1086,57 @@ index ca45889..41eeec3 100644
 +    return SendLockstepError(client, "beam_state", "irq_serializer_contract_changed");
 +  client->SendReplyWithAck(SmallString::from_format(
 +    "BEAMSTATE:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{}",
-+    TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks(), GPU::GetCRTCFrequency(), tick, line,
++    TimingEvents::GetGlobalTickCounter(), GPU::GetCRTCFrequency(), tick, line,
 +    GPU::GetCRTCActiveStartLine(), GPU::GetCRTCActiveEndLine(),
 +    StringUtil::EncodeHex(bytes.data(), bytes.size())));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportCRTCState(ClientSocket* client, std::string_view data)
++{
++  if (!data.empty() || !System::IsPaused() || System::IsExecuting())
++    return SendLockstepError(client, "crtc", "not_paused");
++  const auto state = GPU::GetXportCRTCState();
++  client->SendReplyWithAck(StringUtil::EncodeHex(state.data(), sizeof(state)));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportFastForward(ClientSocket* client, std::string_view data)
++{
++  if (!System::IsPaused() || (data != "0" && data != "1"))
++    return SendLockstepError(client, "presentation", "invalid_speed");
++  System::SetFastForwardEnabled(data == "1");
++  client->SendReplyWithAck("OK:presentation");
++  return true;
++}
++
++bool GDBServer::Cmd$qXportSpuRAMRead(ClientSocket* client, std::string_view data)
++{
++  const auto offset = StringUtil::FromChars<u32>(TakeLockstepField(&data), 16);
++  const auto count = StringUtil::FromChars<u32>(TakeLockstepField(&data), 16);
++  if (!System::IsPaused() || System::IsExecuting() || !data.empty() || !offset.has_value() ||
++      !count.has_value() || !*count || *count > 4096 || *offset > SPU::RAM_SIZE ||
++      *count > SPU::RAM_SIZE - *offset)
++    return SendLockstepError(client, "spu", "invalid_read");
++  const auto& ram = SPU::GetRAM();
++  client->SendReplyWithAck(StringUtil::EncodeHex(ram.data() + *offset, *count));
++  return true;
++}
++
++bool GDBServer::Cmd$qXportWaitPoints(ClientSocket* client, std::string_view data)
++{
++  if (System::IsExecuting())
++    return SendLockstepError(client, "wait", "not_paused");
++  std::vector<u32> pcs;
++  while (!data.empty())
++  {
++    const auto pc = StringUtil::FromChars<u32>(TakeLockstepField(&data), 16);
++    if (!pc.has_value() || (*pc & 3))
++      return SendLockstepError(client, "wait", "invalid_pc");
++    pcs.push_back(*pc);
++  }
++  TimingEvents::SetWaitPoints(pcs);
++  client->SendReplyWithAck("OK:wait");
 +  return true;
 +}
 +
@@ -1150,18 +1478,26 @@ index ca45889..41eeec3 100644
 +  const auto frame = StringUtil::FromChars<u32>(data, 16);
 +  if (!frame.has_value() || *frame == UINT32_MAX || !System::IsPaused() || System::IsExecuting() ||
 +      !s_locals.lockstep_peer.IsAttached() || !s_locals.lockstep_replay_active ||
-+      !s_locals.lockstep_frame_active || !s_locals.lockstep_prefix_guard ||
++      !s_locals.lockstep_frame_active ||
 +      s_locals.lockstep_event_pending || s_locals.lockstep_transition_pending ||
 +      s_locals.lockstep_frame != *frame + 1u)
 +    return SendLockstepError(client, "checkpoint", "capture_not_ready");
 +
 +  std::vector<u8>& candidate = s_locals.lockstep_checkpoint_candidate;
-+  candidate.resize(System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE));
++  const std::vector<u32> wait_state = TimingEvents::CaptureWaitState();
++  const size_t capacity = System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE);
++  const u32 wait_bytes = static_cast<u32>(wait_state.size() * sizeof(u32));
++  candidate.resize(8 + capacity + wait_bytes);
 +  size_t size = 0;
 +  Error error;
-+  if (!System::SaveStateDataToBuffer(std::span<u8>(candidate.data(), candidate.size()), &size, &error) ||
-+      !size || size > candidate.size())
++  if (!System::SaveStateDataToBuffer(std::span<u8>(candidate.data() + 8, capacity), &size, &error) ||
++      !size || size > capacity)
 +    return SendLockstepError(client, "checkpoint", "capture_failed");
++  const u32 state_bytes = static_cast<u32>(size);
++  std::memcpy(candidate.data(), &state_bytes, sizeof(state_bytes));
++  std::memcpy(candidate.data() + 4, &wait_bytes, sizeof(wait_bytes));
++  std::memcpy(candidate.data() + 8 + size, wait_state.data(), wait_bytes);
++  size += 8 + wait_bytes;
 +  candidate.swap(s_locals.lockstep_checkpoint_state);
 +  s_locals.lockstep_checkpoint_size = size;
 +  s_locals.lockstep_checkpoint_frame = *frame;
@@ -1187,6 +1523,24 @@ index ca45889..41eeec3 100644
 +  return true;
 +}
 +
++static bool LoadLockstepCheckpoint(std::span<const u8> checkpoint, Error* error)
++{
++  if (checkpoint.size() < 20)
++    return false;
++  u32 state_bytes, wait_bytes;
++  std::memcpy(&state_bytes, checkpoint.data(), sizeof(state_bytes));
++  std::memcpy(&wait_bytes, checkpoint.data() + 4, sizeof(wait_bytes));
++  if (wait_bytes < 12 || (wait_bytes & 3) ||
++      static_cast<size_t>(state_bytes) + wait_bytes + 8 != checkpoint.size())
++    return false;
++  std::vector<u32> wait_state(wait_bytes / sizeof(u32));
++  std::memcpy(wait_state.data(), checkpoint.data() + 8 + state_bytes, wait_bytes);
++  if (!System::LoadStateDataFromBuffer(checkpoint.subspan(8, state_bytes), error))
++    return false;
++  TimingEvents::RestoreWaitState(wait_state);
++  return true;
++}
++
 +bool GDBServer::Cmd$qXportLockstepCheckpointImport(ClientSocket* client, std::string_view data)
 +{
 +  const std::string_view frame_text = TakeLockstepField(&data);
@@ -1204,7 +1558,7 @@ index ca45889..41eeec3 100644
 +    return SendLockstepError(client, "checkpoint", "import_open_failed");
 +  const long length = std::ftell(source.get());
 +  if (length <= 0 || static_cast<size_t>(length) >
-+        System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE) ||
++        System::GetMaxSaveStateSize(g_bus.ram_size > Bus::RAM_2MB_SIZE) + 65536 ||
 +      std::fseek(source.get(), 0, SEEK_SET) != 0)
 +    return SendLockstepError(client, "checkpoint", "import_size_invalid");
 +  std::vector<u8> candidate(static_cast<size_t>(length));
@@ -1212,7 +1566,7 @@ index ca45889..41eeec3 100644
 +    return SendLockstepError(client, "checkpoint", "import_read_failed");
 +  if (prepare)
 +  {
-+    if (!System::LoadStateDataFromBuffer(candidate, &error))
++    if (!LoadLockstepCheckpoint(candidate, &error))
 +      return SendLockstepError(client, "checkpoint", "import_state_invalid");
 +    client->SendReplyWithAck(TinyString::from_format("OK:{:x}:prepared", *frame));
 +    return true;
@@ -1243,7 +1597,7 @@ index ca45889..41eeec3 100644
 +
 +  Error error;
 +  const std::vector<u8>& checkpoint = s_locals.lockstep_checkpoint_state;
-+  if (!System::LoadStateDataFromBuffer(std::span<const u8>(checkpoint.data(), s_locals.lockstep_checkpoint_size), &error))
++  if (!LoadLockstepCheckpoint(std::span<const u8>(checkpoint.data(), s_locals.lockstep_checkpoint_size), &error))
 +    return SendLockstepError(client, "checkpoint", "restore_failed");
 +
 +  s_locals.lockstep_tracker.ResetCheckpointEpoch();
@@ -1273,7 +1627,7 @@ index ca45889..41eeec3 100644
    return true;
  }
  
-@@ -1516,6 +2617,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
+@@ -1516,6 +2699,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
  
  void GDBServer::Shutdown()
  {
@@ -1312,10 +1666,27 @@ index 9927f11..93875fa 100644
  } // namespace GDBServer
  
 diff --git a/src/core/gpu.cpp b/src/core/gpu.cpp
-index 470148f..8f48f7b 100644
+index 470148f..152008f 100644
 --- a/src/core/gpu.cpp
 +++ b/src/core/gpu.cpp
-@@ -2429,6 +2429,11 @@ void GPU::ReadVRAM(u16 x, u16 y, u16 width, u16 height)
+@@ -1005,6 +1005,16 @@ void GPU::AddCommandTicks(TickCount ticks)
+   s_locals.active_ticks_since_last_update += ticks;
+ }
+ 
++std::array<u32, 13> GPU::GetXportCRTCState()
++{
++  const CRTCState& cs = s_locals.crtc_state;
++  return {BoolToUInt32(s_locals.console_is_pal), cs.horizontal_total, cs.horizontal_visible_start,
++          cs.horizontal_visible_end, cs.vertical_total, cs.vertical_display_start, cs.vertical_display_end,
++          cs.dot_clock_divider, BoolToUInt32(Timers::IsUsingExternalClock(0)),
++          static_cast<u32>(cs.fractional_ticks), static_cast<u32>(cs.fractional_dot_ticks),
++          cs.current_scanline, static_cast<u32>(cs.current_tick_in_scanline)};
++}
++
+ void GPU::SynchronizeCRTC()
+ {
+   s_locals.crtc_tick_event.InvokeEarly();
+@@ -2429,6 +2439,11 @@ void GPU::ReadVRAM(u16 x, u16 y, u16 width, u16 height)
    GPUBackend::PushCommandAndSync(cmd, true);
  }
  
@@ -1327,11 +1698,49 @@ index 470148f..8f48f7b 100644
  void GPU::UpdateVRAM(u16 x, u16 y, u16 width, u16 height, const void* data, bool set_mask, bool check_mask)
  {
    const u32 num_words = width * height;
+@@ -2716,7 +2731,12 @@ void GPU::ExecuteCommands()
+ {
+   const bool was_executing_from_event = std::exchange(s_locals.executing_commands, true);
+ 
++  // Finish submitted work synchronously without advancing the beam
++  s_locals.pending_command_ticks = 0;
++  s_locals.command_tick_event.Deactivate();
+   TryExecuteCommands();
++  s_locals.pending_command_ticks = 0;
++  s_locals.command_tick_event.Deactivate();
+   UpdateDMARequest();
+   UpdateGPUIdle();
+ 
+@@ -2727,7 +2747,7 @@ void GPU::ExecuteCommands()
+ 
+ void GPU::TryExecuteCommands()
+ {
+-  while (s_locals.pending_command_ticks <= s_locals.max_run_ahead && !s_locals.fifo.IsEmpty())
++  while (!s_locals.fifo.IsEmpty())
+   {
+     switch (s_locals.blitter_state)
+     {
 diff --git a/src/core/gpu.h b/src/core/gpu.h
-index 6c43ac0..f5dba7e 100644
+index 6c43ac0..9adf762 100644
 --- a/src/core/gpu.h
 +++ b/src/core/gpu.h
-@@ -121,6 +121,9 @@ GSVector4i GetCRTCVRAMSourceRect();
+@@ -9,6 +9,7 @@
+ #include "common/gsvector.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <span>
+ #include <string>
+ #include <utility>
+@@ -73,6 +74,7 @@ bool IsCRTCScanlinePending();
+ 
+ /// Synchronizes the CRTC, updating the hblank timer.
+ void SynchronizeCRTC();
++std::array<u32, 13> GetXportCRTCState();
+ 
+ /// Recompile shaders/recreate framebuffers when needed.
+ void UpdateSettings(const Settings& old_settings);
+@@ -121,6 +123,9 @@ GSVector4i GetCRTCVRAMSourceRect();
  // Dumps raw VRAM to a file.
  bool DumpVRAMToFile(std::string path, Error* error);
  
@@ -1341,19 +1750,160 @@ index 6c43ac0..f5dba7e 100644
  // Kicks the current frame to the backend for display.
  void UpdateDisplay(bool submit_frame);
  
+diff --git a/src/core/mdec.cpp b/src/core/mdec.cpp
+index c7fdf7a..041bfcb 100644
+--- a/src/core/mdec.cpp
++++ b/src/core/mdec.cpp
+@@ -15,11 +15,13 @@
+ #include "common/fifo_queue.h"
+ #include "common/gsvector.h"
+ #include "common/log.h"
++#include "common/scoped_guard.h"
+ 
+ #include "imgui.h"
+ 
+ #include <array>
+ #include <memory>
++#include <utility>
+ 
+ LOG_CHANNEL(MDEC);
+ 
+@@ -112,7 +114,6 @@ static void HandleSetScaleCommand();
+ static void SetScaleMatrix(const u16* values);
+ static bool DecodeMonoMacroblock();
+ static bool DecodeColoredMacroblock();
+-static void ScheduleBlockCopyOut(TickCount ticks);
+ static void CopyOutBlock(void* param, TickCount ticks);
+ 
+ static bool DecodeRLE_Old(s16* blk, const u8* qt);
+@@ -162,6 +163,7 @@ struct MDECState
+ } // namespace
+ 
+ ALIGN_TO_CACHE_LINE static MDECState s_state;
++static bool s_executing = false;
+ } // namespace MDEC
+ 
+ void MDEC::Initialize()
+@@ -414,12 +416,16 @@ void MDEC::WriteCommandRegister(u32 value)
+ 
+ void MDEC::Execute()
+ {
++  if (std::exchange(s_executing, true))
++    return;
++  ScopedGuard execute_guard([]() { s_executing = false; });
+   if (std::exchange(s_state.active_frame_count, ACTIVE_FRAME_COUNT) == 0)
+   {
+     if (g_settings.mdec_disable_cdrom_speedup)
+       CDROM::DisableReadSpeedup();
+   }
+ 
++execute_pending:
+   for (;;)
+   {
+     switch (s_state.state)
+@@ -479,7 +485,7 @@ void MDEC::Execute()
+         {
+           // we should be writing out now
+           DebugAssert(s_state.state == State::WritingMacroblock);
+-          goto finished;
++          continue;
+         }
+ 
+         if (s_state.remaining_halfwords == 0 && s_state.current_block != NUM_BLOCKS)
+@@ -495,8 +501,9 @@ void MDEC::Execute()
+ 
+       case State::WritingMacroblock:
+       {
+-        // this gets executed via the event, so if we get here, wait.
+-        goto finished;
++        // Publish the completed macroblock before returning to the caller
++        CopyOutBlock(nullptr, 0);
++        continue;
+       }
+ 
+       case State::SetIqTable:
+@@ -542,8 +549,11 @@ void MDEC::Execute()
+   }
+ 
+ finished:
+-  // if we get here, it's because the FIFO is now empty
++  const u32 input_size = s_state.data_in_fifo.GetSize();
++  const u32 output_size = s_state.data_out_fifo.GetSize();
+   UpdateStatus();
++  if (input_size != s_state.data_in_fifo.GetSize() || output_size != s_state.data_out_fifo.GetSize())
++    goto execute_pending;
+ }
+ 
+ bool MDEC::HandleDecodeMacroblockCommand()
+@@ -581,7 +591,6 @@ bool MDEC::DecodeMonoMacroblock()
+ 
+   YUVToMono(s_state.blocks[0]);
+ 
+-  ScheduleBlockCopyOut(TICKS_PER_BLOCK * 6);
+ 
+ #if defined(_DEBUG) || defined(_DEVEL)
+   s_state.total_blocks_decoded++;
+@@ -644,18 +653,9 @@ bool MDEC::DecodeColoredMacroblock()
+   s_state.total_blocks_decoded += 4;
+ #endif
+ 
+-  ScheduleBlockCopyOut(TICKS_PER_BLOCK * 6);
+   return true;
+ }
+ 
+-void MDEC::ScheduleBlockCopyOut(TickCount ticks)
+-{
+-  DebugAssert(!HasPendingBlockCopyOut());
+-  DEBUG_LOG("Scheduling block copy out in {} ticks", ticks);
+-
+-  s_state.block_copy_out_event.SetIntervalAndSchedule(ticks);
+-}
+-
+ void MDEC::CopyOutBlock(void* param, TickCount ticks)
+ {
+   Assert(s_state.state == State::WritingMacroblock);
+diff --git a/src/core/settings.cpp b/src/core/settings.cpp
+index f0ff209..c807235 100644
+--- a/src/core/settings.cpp
++++ b/src/core/settings.cpp
+@@ -1212,6 +1212,12 @@ void Settings::ApplySettingRestrictions()
+ 
+ void Settings::FixIncompatibleSettings(const SettingsInterface& si, bool display_osd_messages)
+ {
++  // Use one deterministic execution path for recording and comparison
++  cpu_execution_mode = CPUExecutionMode::Interpreter;
++  gpu_renderer = GPURenderer::Software;
++  gpu_use_thread = false;
++  gpu_pgxp_enable = false;
++  cdrom_readahead_sectors = 0;
+   // fast forward boot requires fast boot
+   bios_fast_forward_boot = bios_patch_fast_boot && bios_fast_forward_boot;
+ 
 diff --git a/src/core/spu.cpp b/src/core/spu.cpp
-index 92b1776..8404fda 100644
+index 92b1776..cdb79a8 100644
 --- a/src/core/spu.cpp
 +++ b/src/core/spu.cpp
-@@ -4,6 +4,7 @@
+@@ -2,8 +2,11 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
  #include "spu.h"
++
++#include <utility>
  #include "cdrom.h"
  #include "dma.h"
 +#include "gdb_server.h"
  #include "imgui_overlays.h"
  #include "interrupt_controller.h"
  #include "system.h"
-@@ -381,6 +382,7 @@ struct SPUState
+@@ -22,6 +25,7 @@
+ #include "common/fifo_queue.h"
+ #include "common/gsvector.h"
+ #include "common/log.h"
++#include "common/scoped_guard.h"
+ #include "common/path.h"
+ 
+ #include "IconsEmoji.h"
+@@ -381,6 +385,7 @@ struct SPUState
    TickCount ticks_carry = 0;
    TickCount cpu_ticks_per_spu_tick = 0;
    TickCount cpu_tick_divider = 0;
@@ -1361,7 +1911,15 @@ index 92b1776..8404fda 100644
  
    SPUCNTRegister SPUCNT = {};
    SPUSTATRegister SPUSTAT = {};
-@@ -552,6 +554,7 @@ void SPU::Shutdown()
+@@ -445,6 +450,7 @@ struct SPUState
+ } // namespace
+ 
+ ALIGN_TO_CACHE_LINE static SPUState s_state;
++static bool s_transferring = false;
+ ALIGN_TO_CACHE_LINE static std::array<u8, RAM_SIZE> s_ram{};
+ ALIGN_TO_CACHE_LINE static std::array<s16, (44100 / 60) * 2> s_muted_output_buffer{};
+ 
+@@ -552,6 +558,7 @@ void SPU::Shutdown()
  void SPU::Reset()
  {
    s_state.ticks_carry = 0;
@@ -1369,7 +1927,7 @@ index 92b1776..8404fda 100644
  
    s_state.SPUCNT.bits = 0;
    s_state.SPUSTAT.bits = 0;
-@@ -724,6 +727,7 @@ bool SPU::DoCompatibleState(StateWrapper& sw)
+@@ -724,6 +731,7 @@ bool SPU::DoCompatibleState(StateWrapper& sw)
  
    if (sw.IsReading())
    {
@@ -1377,7 +1935,7 @@ index 92b1776..8404fda 100644
      UpdateEventInterval();
      UpdateTransferEvent();
    }
-@@ -905,6 +909,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+@@ -905,6 +913,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
      {
        DEBUG_LOG("SPU key on low <- 0x{:04X}", value);
        GeneratePendingSamples();
@@ -1385,7 +1943,7 @@ index 92b1776..8404fda 100644
        s_state.key_on_register = (s_state.key_on_register & 0xFFFF0000) | ZeroExtend32(value);
      }
      break;
-@@ -913,6 +918,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+@@ -913,6 +922,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
      {
        DEBUG_LOG("SPU key on high <- 0x{:04X}", value);
        GeneratePendingSamples();
@@ -1393,7 +1951,7 @@ index 92b1776..8404fda 100644
        s_state.key_on_register = (s_state.key_on_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
      }
      break;
-@@ -921,6 +927,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+@@ -921,6 +931,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
      {
        DEBUG_LOG("SPU key off low <- 0x{:04X}", value);
        GeneratePendingSamples();
@@ -1401,7 +1959,7 @@ index 92b1776..8404fda 100644
        s_state.key_off_register = (s_state.key_off_register & 0xFFFF0000) | ZeroExtend32(value);
      }
      break;
-@@ -929,6 +936,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
+@@ -929,6 +940,7 @@ void SPU::WriteRegister(u32 offset, u16 value)
      {
        DEBUG_LOG("SPU key off high <- 0x{:04X}", value);
        GeneratePendingSamples();
@@ -1409,7 +1967,7 @@ index 92b1776..8404fda 100644
        s_state.key_off_register = (s_state.key_off_register & 0x0000FFFF) | (ZeroExtend32(value) << 16);
      }
      break;
-@@ -1181,8 +1189,11 @@ u16 SPU::ReadVoiceRegister(u32 offset)
+@@ -1181,8 +1193,11 @@ u16 SPU::ReadVoiceRegister(u32 offset)
    if (reg_index >= 6 && (voice.IsOn() || s_state.key_on_register & (1u << voice_index)))
      GeneratePendingSamples();
  
@@ -1423,7 +1981,52 @@ index 92b1776..8404fda 100644
  }
  
  void SPU::WriteVoiceRegister(u32 offset, u16 value)
-@@ -1631,6 +1642,11 @@ void SPU::GeneratePendingSamples()
+@@ -1410,6 +1425,9 @@ ALWAYS_INLINE_RELEASE void SPU::ExecuteFIFOWriteToRAM(TickCount& ticks)
+ 
+ void SPU::ExecuteTransfer(void* param, TickCount ticks)
+ {
++  if (std::exchange(s_transferring, true))
++    return;
++  ScopedGuard transfer_guard([]() { s_transferring = false; });
+   const RAMTransferMode mode = s_state.SPUCNT.ram_transfer_mode;
+   DebugAssert(mode != RAMTransferMode::Stopped);
+   InternalGeneratePendingSamples();
+@@ -1485,29 +1503,11 @@ void SPU::ManualTransferWrite(u16 value)
+ 
+ void SPU::UpdateTransferEvent()
+ {
+-  const RAMTransferMode mode = s_state.SPUCNT.ram_transfer_mode;
+-  if (mode == RAMTransferMode::Stopped)
+-  {
+-    s_state.transfer_event.Deactivate();
+-  }
+-  else if (mode == RAMTransferMode::DMARead)
+-  {
+-    // transfer event fills the fifo
+-    if (s_state.transfer_fifo.IsFull())
+-      s_state.transfer_event.Deactivate();
+-    else if (!s_state.transfer_event.IsActive())
+-      s_state.transfer_event.Schedule(TickCount(s_state.transfer_fifo.GetSpace() * u32(TRANSFER_TICKS_PER_HALFWORD)));
+-  }
+-  else
+-  {
+-    // transfer event copies from fifo to ram
+-    if (s_state.transfer_fifo.IsEmpty())
+-      s_state.transfer_event.Deactivate();
+-    else if (!s_state.transfer_event.IsActive())
+-      s_state.transfer_event.Schedule(TickCount(s_state.transfer_fifo.GetSize() * u32(TRANSFER_TICKS_PER_HALFWORD)));
+-  }
+-
+-  s_state.SPUSTAT.transfer_busy = s_state.transfer_event.IsActive();
++  // Complete RAM movement before publishing transfer readiness
++  s_state.transfer_event.Deactivate();
++  if (s_state.SPUCNT.ram_transfer_mode != RAMTransferMode::Stopped)
++    ExecuteTransfer(nullptr, std::numeric_limits<s32>::max());
++  s_state.SPUSTAT.transfer_busy = false;
+ }
+ 
+ void SPU::UpdateDMARequest()
+@@ -1631,6 +1631,11 @@ void SPU::GeneratePendingSamples()
    InternalGeneratePendingSamples();
  }
  
@@ -1435,7 +2038,7 @@ index 92b1776..8404fda 100644
  void SPU::InternalGeneratePendingSamples()
  {
    const TickCount ticks_pending = s_state.tick_event.GetTicksSinceLastExecution();
-@@ -2403,6 +2419,7 @@ void SPU::Execute(void* param, TickCount ticks)
+@@ -2403,6 +2408,7 @@ void SPU::Execute(void* param, TickCount ticks)
      remaining_frames = static_cast<u32>((ticks + s_state.ticks_carry) / SYSCLK_TICKS_PER_SPU_TICK);
      s_state.ticks_carry = (ticks + s_state.ticks_carry) % SYSCLK_TICKS_PER_SPU_TICK;
    }
@@ -1458,10 +2061,38 @@ index a38e618..e3c2eeb 100644
  const std::array<u8, RAM_SIZE>& GetRAM();
  std::array<u8, RAM_SIZE>& GetWritableRAM();
 diff --git a/src/core/system.cpp b/src/core/system.cpp
-index 06e64d0..6be8ca4 100644
+index 06e64d0..bff6830 100644
 --- a/src/core/system.cpp
 +++ b/src/core/system.cpp
-@@ -2140,6 +2140,10 @@ void System::FrameDone()
+@@ -416,6 +416,15 @@ void System::CancelPendingStartup()
+     s_state.startup_cancelled.store(true, std::memory_order_release);
+ }
+ 
++void System::PollCooperativeHost()
++{
++  Host::PumpMessagesOnCoreThread();
++#ifdef ENABLE_GDB_SERVER
++  GDBServer::PollUntil(0);
++#endif
++  CheckForAndExitExecution();
++}
++
+ void System::InterruptExecution()
+ {
+   if (s_state.system_executing)
+@@ -500,10 +509,7 @@ void System::UpdateOverclock()
+ 
+ GlobalTicks System::GetGlobalTickCounter()
+ {
+-  // When running events, the counter actually goes backwards, because the pending ticks are added in chunks.
+-  // So, we need to return the counter with all pending ticks added in such cases.
+-  return TimingEvents::IsRunningEvents() ? TimingEvents::GetEventRunTickCounter() :
+-                                           (TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks());
++  return TimingEvents::GetGlobalTickCounter();
+ }
+ 
+ u32 System::GetFrameNumber()
+@@ -2140,6 +2146,10 @@ void System::FrameDone()
      InputManager::PollSources();
    }
  
@@ -1472,7 +2103,7 @@ index 06e64d0..6be8ca4 100644
    // Frame step can still trigger exit
    CheckForAndExitExecution();
  
-@@ -3340,6 +3344,27 @@ bool System::SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error*
+@@ -3340,6 +3350,27 @@ bool System::SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error*
    return true;
  }
  
@@ -1501,10 +2132,18 @@ index 06e64d0..6be8ca4 100644
  {
    return Core::GetBaseBoolSettingValue("Main", "EnableGlobalStates", false);
 diff --git a/src/core/system.h b/src/core/system.h
-index 3c93cec..0f99ff5 100644
+index 3c93cec..bc72da1 100644
 --- a/src/core/system.h
 +++ b/src/core/system.h
-@@ -308,6 +308,7 @@ void SaveStateToSlot(bool global, s32 slot);
+@@ -199,6 +199,7 @@ size_t GetGPUDumpFrameCount();
+ bool IsStartupCancelled();
+ void CancelPendingStartup();
+ void InterruptExecution();
++void PollCooperativeHost();
+ 
+ ConsoleRegion GetRegion();
+ bool IsPALRegion();
+@@ -308,6 +309,7 @@ void SaveStateToSlot(bool global, s32 slot);
  
  /// State data access, use with care as the media path is not updated.
  bool SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error* error);
@@ -1513,13 +2152,18 @@ index 3c93cec..0f99ff5 100644
  /// Returns true if global states should be include in the slot list.
  bool AreGlobalSaveStatesEnabled();
 diff --git a/src/core/timers.cpp b/src/core/timers.cpp
-index a2859ee..37872f7 100644
+index a2859ee..7bf54da 100644
 --- a/src/core/timers.cpp
 +++ b/src/core/timers.cpp
-@@ -140,6 +140,11 @@ bool Timers::DoState(StateWrapper& sw)
+@@ -140,6 +140,16 @@ bool Timers::DoState(StateWrapper& sw)
    return !sw.HasError();
  }
  
++void Timers::Synchronize()
++{
++  s_state.sysclk_event.InvokeEarly();
++}
++
 +TickCount Timers::GetPendingSysClkTicks()
 +{
 +  return s_state.sysclk_event.GetTicksSinceLastExecution();
@@ -1529,17 +2173,293 @@ index a2859ee..37872f7 100644
  {
    s_state.sysclk_ticks_carry = 0;
 diff --git a/src/core/timers.h b/src/core/timers.h
-index 3d37c1a..72b36b3 100644
+index 3d37c1a..8518228 100644
 --- a/src/core/timers.h
 +++ b/src/core/timers.h
-@@ -13,6 +13,7 @@ void Initialize();
+@@ -13,6 +13,8 @@ void Initialize();
  void Shutdown();
  void Reset();
  bool DoState(StateWrapper& sw);
 +TickCount GetPendingSysClkTicks();
++void Synchronize();
  
  void SetGate(u32 timer, bool state);
  
+diff --git a/src/core/timing_event.cpp b/src/core/timing_event.cpp
+index a0fbc06..ff0c3e0 100644
+--- a/src/core/timing_event.cpp
++++ b/src/core/timing_event.cpp
+@@ -5,6 +5,9 @@
+ #include "cpu_core.h"
+ #include "cpu_core_private.h"
+ #include "system.h"
++#include "gpu.h"
++#include "spu.h"
++#include "timers.h"
+ 
+ #include "util/state_wrapper.h"
+ 
+@@ -13,6 +16,9 @@
+ #include "common/small_string.h"
+ #include "common/thirdparty/SmallVector.h"
+ 
++#include <algorithm>
++#include <vector>
++
+ LOG_CHANNEL(TimingEvents);
+ 
+ namespace TimingEvents {
+@@ -38,6 +44,10 @@ struct TimingEventsState
+   GlobalTicks current_event_next_run_time = 0;
+   GlobalTicks global_tick_counter = 0;
+   GlobalTicks event_run_tick_counter = 0;
++  std::vector<u32> wait_points;
++  std::vector<u32> serviced_wait_points;
++  u32 servicing_pc = 0;
++  GlobalTicks servicing_target = 0;
+ };
+ } // namespace
+ 
+@@ -52,9 +62,7 @@ GlobalTicks TimingEvents::GetGlobalTickCounter()
+ 
+ GlobalTicks TimingEvents::GetTimestampForNewEvent()
+ {
+-  // we want to schedule relative to the currently-being processed event, but if we haven't run events in a while, it
+-  // needs to include the pending time. so explicitly add the two.
+-  return s_state.global_tick_counter + CPU::GetPendingTicks();
++  return s_state.global_tick_counter;
+ }
+ 
+ GlobalTicks TimingEvents::GetEventRunTickCounter()
+@@ -71,6 +79,9 @@ void TimingEvents::Reset()
+ {
+   s_state.global_tick_counter = 0;
+   s_state.event_run_tick_counter = 0;
++  s_state.serviced_wait_points.clear();
++  s_state.servicing_pc = 0;
++  s_state.servicing_target = 0;
+ }
+ 
+ void TimingEvents::Shutdown()
+@@ -80,10 +91,8 @@ void TimingEvents::Shutdown()
+ 
+ void TimingEvents::UpdateCPUDowncount()
+ {
+-  DebugAssert(s_state.active_events_head->m_next_run_time >= s_state.global_tick_counter);
+-  const u32 event_downcount =
+-    static_cast<u32>(s_state.active_events_head->m_next_run_time - s_state.global_tick_counter);
+-  CPU::g_state.downcount = CPU::HasPendingInterrupt() ? 0 : event_downcount;
++  // This budget yields the host dispatcher without advancing devices
++  CPU::g_state.downcount = 4096;
+ }
+ 
+ TimingEvent** TimingEvents::GetHeadEventPtr()
+@@ -96,15 +105,21 @@ void TimingEvents::SetGlobalTickCounter(GlobalTicks ticks)
+   s_state.global_tick_counter = ticks;
+ }
+ 
++static bool EventPrecedes(const TimingEvent* left, const TimingEvent* right)
++{
++  if (left->m_next_run_time != right->m_next_run_time)
++    return left->m_next_run_time < right->m_next_run_time;
++  return std::string_view(left->GetName()) < std::string_view(right->GetName());
++}
++
+ void TimingEvents::SortEvent(TimingEvent* event)
+ {
+-  const GlobalTicks event_runtime = event->m_next_run_time;
+ 
+-  if (event->prev && event->prev->m_next_run_time > event_runtime)
++  if (event->prev && EventPrecedes(event, event->prev))
+   {
+     // move backwards
+     TimingEvent* current = event->prev;
+-    while (current && current->m_next_run_time > event_runtime)
++    while (current && EventPrecedes(event, current))
+       current = current->prev;
+ 
+     // unlink
+@@ -141,11 +156,11 @@ void TimingEvents::SortEvent(TimingEvent* event)
+         UpdateCPUDowncount();
+     }
+   }
+-  else if (event->next && event_runtime > event->next->m_next_run_time)
++  else if (event->next && EventPrecedes(event->next, event))
+   {
+     // move forwards
+     TimingEvent* current = event->next;
+-    while (current && event_runtime > current->m_next_run_time)
++    while (current && EventPrecedes(current, event))
+       current = current->next;
+ 
+     // unlink
+@@ -200,10 +215,9 @@ void TimingEvents::AddActiveEvent(TimingEvent* event)
+   DebugAssert(!event->prev && !event->next);
+   s_state.active_event_count++;
+ 
+-  const GlobalTicks event_runtime = event->m_next_run_time;
+   TimingEvent* current = nullptr;
+   TimingEvent* next = s_state.active_events_head;
+-  while (next && event_runtime > next->m_next_run_time)
++  while (next && EventPrecedes(next, event))
+   {
+     current = next;
+     next = next->next;
+@@ -371,43 +385,105 @@ ALWAYS_INLINE_RELEASE void TimingEvents::CommitGlobalTicks(const GlobalTicks new
+ 
+ void TimingEvents::RunEvents()
+ {
+-  DebugAssert(!s_state.current_event);
+-  DebugAssert(CPU::GetPendingTicks() >= CPU::g_state.downcount);
+-
+-  do
+-  {
+-    const GlobalTicks new_global_ticks =
+-      s_state.event_run_tick_counter + static_cast<GlobalTicks>(CPU::GetPendingTicks());
+-    if (new_global_ticks >= s_state.active_events_head->m_next_run_time)
+-    {
+-      CPU::ResetPendingTicks();
+-      CommitGlobalTicks(new_global_ticks);
+-    }
++  // Preserve CPU completion latencies when recycling its local budget
++  CPU::ResetPendingTicks();
++  UpdateCPUDowncount();
++  System::PollCooperativeHost();
++}
+ 
+-    if (CPU::HasPendingInterrupt())
+-      CPU::DispatchInterrupt();
++void TimingEvents::CommitLeftoverTicks()
++{
++  // Pausing or resuming the host must not advance guest devices
++  UpdateCPUDowncount();
++}
+ 
+-    UpdateCPUDowncount();
+-  } while (CPU::GetPendingTicks() >= CPU::g_state.downcount);
++void TimingEvents::SetWaitPoints(std::span<const u32> pcs)
++{
++  s_state.wait_points.assign(pcs.begin(), pcs.end());
++  std::sort(s_state.wait_points.begin(), s_state.wait_points.end());
++  s_state.wait_points.erase(std::unique(s_state.wait_points.begin(), s_state.wait_points.end()),
++                           s_state.wait_points.end());
+ }
+ 
+-void TimingEvents::CommitLeftoverTicks()
++static bool IsBlockingPollTaken()
+ {
+-#if defined(_DEBUG) || defined(_DEVEL)
+-  if (s_state.event_run_tick_counter > s_state.global_tick_counter)
+-    DEV_LOG("Late-running {} ticks before execution", s_state.event_run_tick_counter - s_state.global_tick_counter);
+-#endif
++  const u32 instruction = CPU::g_state.next_instruction.bits;
++  const u32 op = instruction >> 26;
++  const u32 lhs = CPU::g_state.regs.r[(instruction >> 21) & 31];
++  const u32 rhs = CPU::g_state.regs.r[(instruction >> 16) & 31];
++  switch (op)
++  {
++    case 4: return lhs == rhs;
++    case 5: return lhs != rhs;
++    case 6: return static_cast<s32>(lhs) <= 0;
++    case 7: return static_cast<s32>(lhs) > 0;
++    case 1:
++      return ((instruction >> 16) & 1) ? static_cast<s32>(lhs) >= 0 : static_cast<s32>(lhs) < 0;
++    default: return true;
++  }
++}
+ 
+-  CommitGlobalTicks(s_state.event_run_tick_counter);
++void TimingEvents::BeforeInstruction(u32 pc)
++{
++  if (!s_state.servicing_pc)
++  {
++    if (CPU::g_state.next_instruction_is_branch_delay_slot || !IsBlockingPollTaken() ||
++        !std::binary_search(s_state.wait_points.begin(), s_state.wait_points.end(), pc) ||
++        std::find(s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end(), pc) !=
++          s_state.serviced_wait_points.end())
++      return;
++
++    // Retain this poll across debugger stops and its interrupt handler
++    s_state.serviced_wait_points.push_back(pc);
++    s_state.servicing_pc = pc;
++    s_state.servicing_target = (!CPU::HasPendingInterrupt() && s_state.active_events_head) ?
++                                s_state.active_events_head->m_next_run_time : s_state.global_tick_counter;
++  }
+ 
++  // Complete the same event batch after a FrameDone stop
++  if (s_state.active_events_head)
++    CommitGlobalTicks(s_state.servicing_target);
++  GPU::SynchronizeCRTC();
++  Timers::Synchronize();
++  SPU::GeneratePendingSamples();
++  s_state.servicing_pc = 0;
+   if (CPU::HasPendingInterrupt())
+     CPU::DispatchInterrupt();
++  UpdateCPUDowncount();
++}
+ 
++std::vector<u32> TimingEvents::CaptureWaitState()
++{
++  std::vector<u32> state{s_state.servicing_pc, static_cast<u32>(s_state.servicing_target),
++                         static_cast<u32>(s_state.servicing_target >> 32)};
++  state.insert(state.end(), s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end());
++  return state;
++}
++
++void TimingEvents::RestoreWaitState(std::span<const u32> state)
++{
++  Assert(state.size() >= 3);
++  s_state.servicing_pc = state[0];
++  s_state.servicing_target = static_cast<GlobalTicks>(state[1]) | (static_cast<GlobalTicks>(state[2]) << 32);
++  s_state.serviced_wait_points.assign(state.begin() + 3, state.end());
+   UpdateCPUDowncount();
+ }
+ 
++void TimingEvents::AfterInstruction(u32 pc)
++{
++  const auto it = std::find(s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end(), pc);
++  if (it != s_state.serviced_wait_points.end())
++    s_state.serviced_wait_points.erase(it);
++}
++
+ bool TimingEvents::DoState(StateWrapper& sw)
+ {
++  if (sw.IsReading())
++  {
++    s_state.serviced_wait_points.clear();
++    s_state.servicing_pc = 0;
++    s_state.servicing_target = 0;
++  }
+   if (sw.GetVersion() < 71) [[unlikely]]
+   {
+     u32 old_global_tick_counter = 0;
+diff --git a/src/core/timing_event.h b/src/core/timing_event.h
+index 1d7bc8e..4ad29ff 100644
+--- a/src/core/timing_event.h
++++ b/src/core/timing_event.h
+@@ -6,6 +6,8 @@
+ #include "types.h"
+ 
+ #include <string_view>
++#include <span>
++#include <vector>
+ 
+ class StateWrapper;
+ 
+@@ -90,6 +92,13 @@ void CancelRunningEvent();
+ void RunEvents();
+ void CommitLeftoverTicks();
+ 
++// Device time advances only at registered blocking polls
++void SetWaitPoints(std::span<const u32> pcs);
++void BeforeInstruction(u32 pc);
++void AfterInstruction(u32 pc);
++std::vector<u32> CaptureWaitState();
++void RestoreWaitState(std::span<const u32> state);
++
+ void UpdateCPUDowncount();
+ 
+ TimingEvent** GetHeadEventPtr();
 diff --git a/src/core/xport_lockstep_mips.h b/src/core/xport_lockstep_mips.h
 new file mode 100644
 index 0000000..0bc171c

@@ -255,7 +255,6 @@ def package_runtime(workspace, source, manifest, manifest_identity, build_comman
         'compatibility_executable_name': target_exe,
         'exe_sha256': executable_hash,
         'lockstep_protocol_version': manifest['runtime']['lockstep_protocol_version'],
-        'lockstep_record_version': manifest['runtime']['lockstep_record_version'],
         'data_root_environment': manifest['runtime']['data_root_environment'],
         'runtime_files': hashes,
         'validation': {

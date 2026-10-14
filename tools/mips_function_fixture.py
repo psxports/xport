@@ -110,6 +110,12 @@ class MipsFunctionFixture:
                             quotient = -quotient
                         self.lo = quotient & 0xffffffff
                         self.hi = (dividend - quotient * divisor) & 0xffffffff
+                elif fn in (32, 34):
+                    left, right = self.signed(r[rs]), self.signed(r[rt])
+                    value = left + right if fn == 32 else left - right
+                    if not -0x80000000 <= value <= 0x7fffffff:
+                        raise ValueError(f'Guest MIPS arithmetic overflow at {pc:08x}')
+                    destination, r[rd] = rd, value
                 elif fn in (33, 35, 36, 37, 38, 39, 42, 43):
                     destination = rd
                     r[rd] = {33: lambda: r[rs] + r[rt], 35: lambda: r[rs] - r[rt],

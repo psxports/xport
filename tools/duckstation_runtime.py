@@ -88,19 +88,17 @@ def runtime_identity(path):
         'upstream_commit': receipt.get('upstream_commit'),
         'patch_sha256': receipt.get('patch_sha256'),
         'lockstep_protocol_version': receipt.get('lockstep_protocol_version'),
-        'lockstep_record_version': receipt.get('lockstep_record_version'),
     }
     lengths = {'manifest_identity': 64, 'upstream_commit': 40, 'patch_sha256': 64}
     if (any(not isinstance(identity[key], str) or len(identity[key]) != length or
             any(character not in '0123456789abcdef' for character in identity[key])
             for key, length in lengths.items()) or
-            type(identity['lockstep_protocol_version']) is not int or
-            type(identity['lockstep_record_version']) is not int):
+            type(identity['lockstep_protocol_version']) is not int):
         raise ValueError('DuckStation runtime identity is incomplete')
     manifest = json.loads((Path(__file__).parent / 'duckstation' /
                            'duckstation-manifest.json').read_text(encoding='utf-8'))
     if any(identity[key] != manifest['runtime'][key]
-           for key in ('lockstep_protocol_version', 'lockstep_record_version')):
+           for key in ('lockstep_protocol_version',)):
         raise ValueError('DuckStation runtime protocol differs from the current toolset')
     return identity
 

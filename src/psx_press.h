@@ -31,6 +31,7 @@ extern "C"
     DecDCTCallback DecDCToutCallback(DecDCTCallback callback);
     /* Advance native decoder clocks and deliver completed DMA callbacks */
     void mdec_psyq_pump(uint32 ticks);
+    sint32 mdec_psyq_checkpoint_io(FILE *file, sint32 load);
     sint32 DecDCTvlc(uint32 *bs, uint32 *buf);
 #if MDEC_CUSTOM
     sint32 DecDCTvlc2(uint32 *bs, uint32 *buf, DECDCTTAB table);

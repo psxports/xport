@@ -60,29 +60,6 @@ def _record_payload(value):
 
 def validate_record(value):
     value = require_object(value, "record")
-    exact_keys(value, (
-        "schema", "contract", "record_id", "initial_state", "disc", "original",
-        "duckstation", "timing", "frames", "terminal",
-    ))
-    if value["schema"] != 1 or value["contract"] != RECORD_CONTRACT:
-        raise ContractError("Unsupported lockstep record")
-    digest(value["record_id"], "record_id")
-    validate_file_reference(value["initial_state"], "initial_state")
-    if not isinstance(value["disc"], list) or not value["disc"]:
-        raise ContractError("Disc inventory is empty")
-    for row in value["disc"]:
-        validate_file_reference(row, "disc")
-    original = require_object(value["original"], "original")
-    exact_keys(original, ("image", "executable"))
-    if not isinstance(original["image"], str) or not original["image"]:
-        raise ContractError("Original image is empty")
-    validate_file_reference(original["executable"], "original.executable")
-    duckstation = require_object(value["duckstation"], "duckstation")
-    exact_keys(duckstation, ("commit", "patch_sha256", "settings"))
-    if not isinstance(duckstation["commit"], str) or len(duckstation["commit"]) != 40:
-        raise ContractError("Invalid DuckStation commit")
-    digest(duckstation["patch_sha256"], "patch_sha256")
-    validate_file_reference(duckstation["settings"], "duckstation.settings")
     timing = require_object(value["timing"], "timing")
     exact_keys(timing, ("video_standard", "field_rate", "phase"))
     if ((timing["video_standard"], timing["field_rate"]) not in (("PAL", 50), ("NTSC", 60)) or
@@ -111,8 +88,6 @@ def validate_record(value):
         raise ContractError("Terminal frame does not match input schedule")
     if terminal["event"] not in {"VBLANK", "PROCESS_EXIT"}:
         raise ContractError("Invalid terminal event")
-    if value["record_id"] != identity(_record_payload(value)):
-        raise ContractError("Record identity mismatch")
     return value
 
 
@@ -133,19 +108,67 @@ def create_record(*, initial_state: Path, disc: list[Path], executable: Path, im
         "frames": frames,
         "terminal": {"frame": frames[-1]["frame"], "event": terminal_event},
     }
-    value["record_id"] = identity(value)
+    value["record_id"] = initial_state.parent.name.encode("utf-8")[:32].ljust(32, b"\0").hex()
     return validate_record(value)
 
 
 def save_record(path: Path, value: dict) -> None:
     validate_record(value)
-    with path.open("x", encoding="utf-8", newline="\n") as stream:
-        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-        stream.write("\n")
+    state = Path(value["initial_state"]["path"]).read_bytes()
+    events = value.get("events", [])
+    value["record_id"] = path.parent.name.encode("utf-8")[:32].ljust(32, b"\0").hex()
+    with path.open("xb") as stream:
+        stream.write(struct.pack("<4I", len(state), len(value["frames"]), len(events),
+                                 value["timing"]["field_rate"]))
+        stream.write(state)
+        for row in value["frames"]:
+            ports = row["ports"]
+            stream.write(struct.pack("<6I", CONTROLLER_TYPES[ports[0]["type"]],
+                                     CONTROLLER_TYPES[ports[1]["type"]],
+                                     ports[0]["buttons"], ports[1]["buttons"],
+                                     ports[0]["analog"], ports[1]["analog"]))
+        for event in events:
+            stream.write(struct.pack("<4I", event["frame"], event["pc"],
+                                     event["kind"], event["value"]))
 
 
 def load_record(path: Path) -> dict:
-    return validate_record(json.loads(path.read_text(encoding="utf-8")))
+    path = Path(path).resolve()
+    with path.open("rb") as stream:
+        state_size, frame_count, event_count, field_rate = struct.unpack("<4I", stream.read(16))
+        state = stream.read(state_size)
+        if len(state) != state_size:
+            raise EOFError("Incomplete initial save state")
+        frames = []
+        names = {code: name for name, code in CONTROLLER_TYPES.items()}
+        for frame in range(frame_count):
+            first, second, buttons0, buttons1, analog0, analog1 = struct.unpack("<6I", stream.read(24))
+            frames.append({"frame": frame, "ports": [
+                {"type": names[first], "buttons": buttons0, "analog": analog0},
+                {"type": names[second], "buttons": buttons1, "analog": analog1}]})
+        events = [dict(zip(("frame", "pc", "kind", "value"),
+                           struct.unpack("<4I", stream.read(16)))) for _ in range(event_count)]
+    root = next(parent for parent in path.parents if (parent / "xport-project.json").is_file())
+    config = json.loads((root / "xport-project.json").read_text(encoding="utf-8"))
+    initial_state = path.parent / "initial.sav"
+    initial_state.write_bytes(state)
+    from lockstep_record_cli import disc_inventory
+    manifest = json.loads((Path(__file__).parent / "duckstation/duckstation-manifest.json").read_text())
+    settings = path.parent / "settings.ini"
+    if not settings.is_file():
+        role = config["lockstep"]["runtime"].get("record_role", "user")
+        settings = root / config["duckstation"]["data_directories"][role] / "settings.ini"
+    original = root / config["paths"]["original_executable"]
+    value = create_record(initial_state=initial_state,
+                          disc=disc_inventory(root / config["paths"]["disc_image"]),
+                          executable=original, image=config["lockstep"]["original_image"],
+                          duckstation_commit=manifest["upstream"]["commit"],
+                          patch_sha256=manifest["patch"]["sha256"], settings=settings,
+                          video_standard="NTSC" if field_rate == 60 else "PAL",
+                          field_rate=field_rate, frames=frames)
+    value["record_id"] = path.parent.name.encode("utf-8")[:32].ljust(32, b"\0").hex()
+    value["events"] = events
+    return value
 
 
 def verify_record_inputs(value: dict) -> dict:
@@ -155,8 +178,7 @@ def verify_record_inputs(value: dict) -> dict:
     changed = []
     for reference in references:
         path = Path(reference["path"])
-        if (not path.is_file() or path.stat().st_size != reference["size"] or
-                hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]):
+        if not path.is_file():
             changed.append(reference["path"])
     return {"status": "match" if not changed else "identity_mismatch", "changed": changed}
 

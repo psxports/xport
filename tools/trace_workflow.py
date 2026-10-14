@@ -70,7 +70,7 @@ def record(root, config, state_value, name, frames, timeout):
     if not 1 <= frames <= 1_000_000:
         raise ValueError("FRAMES_REQUIRED: frames must be in 1..1000000")
     state = resolve_state(root, state_value)
-    output = root / "status" / "lockstep-records" / name / "record.json"
+    output = root / "status" / "lockstep-records" / name / "record.bin"
     if output.exists():
         raise ValueError("LOCKSTEP_RECORD_EXISTS: choose a new recording name")
     from lockstep_record_cli import record as record_lockstep
@@ -108,7 +108,7 @@ def converge(name, wait, telemetry, reprobe=False, run_name=None):
     run_name = name_check(run_name or name)
     root, config = load_project()
     require_lockstep(config)
-    record_path = root / "status" / "lockstep-records" / name / "record.json"
+    record_path = root / "status" / "lockstep-records" / name / "record.bin"
     if not record_path.is_file():
         raise ValueError("LOCKSTEP_RECORD_REQUIRED: record the scenario before converge")
     state_path = root / "status" / "lockstep-converge" / run_name / "state.json"

@@ -32,7 +32,7 @@ def main() -> int:
     name_check(args.source_run)
     name_check(args.name)
     root, config = load_project(args.project)
-    record = load_record(root / "status" / "lockstep-records" / args.record / "record.json")
+    record = load_record(root / "status" / "lockstep-records" / args.record / "record.bin")
     source_dir = root / "status" / "lockstep-converge" / args.source_run
     output_dir = root / "status" / "lockstep-converge" / args.name
     if output_dir.exists():

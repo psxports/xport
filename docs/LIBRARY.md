@@ -24,6 +24,14 @@ For a consuming project that supplies `xport_gpu_guest_dispatch`, define `XPORT_
 
 ## Graphics presentation
 
+### Color and alpha fog
+
+- `vid_fog(fog)` enables two-stage fog for subsequent custom-shader draws in the active frame. Supply `VID_FOG` with radial world distances `0 < near_dist < far_dist < horizon_dist`, normalized RGB `color`, and positive `focal[2]` matching the current projection (`clip.x = camera.x * focal[0]`, `clip.y = -camera.y * focal[1]`, `clip.w = camera.z`). `vid_fog(NULL)` disables it. Each draw snapshots the parameters
+- The vertex shader reconstructs camera-space position and computes its length. It clamps logarithmic coefficients `log(max(d,near)/near)/log(far/near)` and `log(max(d,far)/far)/log(horizon/far)`, then squares each to reduce early fog density. Rasterization interpolates the coefficients; the fragment shader performs no distance, logarithm or smoothstep calculation. This approximation depends on polygon tessellation
+- Custom fragment shaders call `vidFog(color)` after computing their surface color. Opaque/alpha RGB first blends into the supplied fog color; alpha then fades to zero using the second coefficient. Fully transparent fragments are discarded before depth writes. Additive/subtractive materials fade RGB toward zero using the first coefficient. Default VID shaders do not apply fog
+- Fog-enabled opaque custom-shader materials use ordinary source-alpha blending; other blend modes and depth-write policies remain intact. Render horizon first and disable fog before UI. The second range reveals existing framebuffer contents, including any earlier geometry; no background texture, GPU copy or extra texture sample is used
+- Rapid Racer implementation and native/WebGL pixel evidence: `RapidRacer-xport/status/audits/hd-fog/report.json`
+
 ### HD float transforms
 
 `xport.h` defines `VEC3F` (`x/y/z`, `v[3]`) and `QUATF` (`x/y/z/w`, `v[4]`). `psx.h` defines `VECTORF` (`vx/vy/vz`) and `MATRIXF` (`float m[3][3]`, `float t[3]`). These types and the float operations in `psx.c` serve HD rendering only. Consuming projects retain their integer physics, collision, AI and simulation state; HD reads a simulation sample and must never write float transform results back to it.
@@ -212,7 +220,7 @@ Canonical Windows template and RapidRacer share Debug/Release compiler, linker a
 
 ## Analog gamepad input
 
-Windows XInput and web Gamepad input latch both sticks when xport_input_read is called. xport_input_analog returns the availability flag and four PS1 bytes in RX,RY,LX,LY order: left/up=0, center=128, right/down=255. Keyboard, missing devices and input overrides return centered axes with no live analog device. Windows inverts XInput Y; browser axes already point down. The left stick also ORs digital D-pad directions above 40% per axis, allowing diagonals and preserving physical D-pad/keyboard buttons. Right-stick motion never generates D-pad buttons.
+Windows XInput and web Gamepad input latch both sticks when xport_input_read is called. xport_input_analog returns the availability flag and four PS1 bytes in RX,RY,LX,LY order: left/up=0, center=128, right/down=255. Physical D-pad and mapped keyboard directions on both ports override only the pressed left-stick axes; web touch directions do the same on P1. Opposite directions on one axis produce 128; untouched axes retain their sampled analog values. Right-stick values and analog-device availability are unchanged. Missing devices otherwise center the axes, and input overrides return centered axes with no live analog device. Windows inverts XInput Y; browser axes already point down. The left stick also ORs digital D-pad directions above 40% per axis, allowing diagonals and preserving physical D-pad/keyboard buttons. Keep these synthesized bits separate from physical directions so ordinary analog movement never becomes full-scale. Right-stick motion never generates D-pad buttons.
 
 Native direct PAD buffers, owner packets and serial read replies publish 0x73 and all four axes for analog gamepads in analog mode, or 0x41 in digital mode or for keyboard input. Serial replies latch a single report at command 0x42. Replay-bound packets retain their recorded analog values and bypass native publishing.
 

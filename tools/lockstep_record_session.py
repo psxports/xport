@@ -51,13 +51,13 @@ def run(root: Path, state: Path, name: str, timeout: float) -> int:
     directory = root / config["duckstation"]["data_directories"][role]
     recording_settings = configure_recording_settings(directory, port, hidden=False)
     cue = (root / config["paths"]["disc_image"]).resolve()
-    original = (root / "orig" / lockstep["original_image"]).resolve()
+    original = (root / config["paths"]["original_executable"]).resolve()
     manifest_path = Path(__file__).resolve().parent / "duckstation" / "duckstation-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     output = root / "status" / "lockstep-records" / name
     session_path = output / "session.json"
     stop_path = output / "stop.request"
-    record_path = output / "record.json"
+    record_path = output / "record.bin"
     initial_state = output / "initial.sav"
     settings_snapshot = output / "settings.ini"
     session = {
@@ -84,6 +84,7 @@ def run(root: Path, state: Path, name: str, timeout: float) -> int:
         stop = adapter.remote.packet("?")
         if not stop.startswith(("S", "T")):
             raise RuntimeError("DuckStation did not start paused")
+        adapter.configure_wait_points(config["duckstation"]["wait_points"])
         adapter.start_record()
         recorder = FrameDoneRecorder()
         update(session_path, session, status="recording", started=time.time())

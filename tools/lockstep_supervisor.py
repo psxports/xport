@@ -1338,11 +1338,12 @@ class LockstepSupervisor:
                     pending_signature = diagnostic["pending_signature"]
                     pending_target_frame = diagnostic["pending_target_frame"]
                     pending_watch_target = None
+            cold_diagnostic = False
             for attempt_number in itertools.count(len(self.state["attempts"])):
                 if self.max_repairs is not None and attempt_number > self.max_repairs:
                     raise LockstepSupervisorError("Repair attempt limit reached")
-                # Standalone attempts are always full-record prefix scans
-                target_frame = self.scan_target_frame
+                # An initial-state replay can diagnose divergence before the first checkpoint
+                target_frame = 0 if cold_diagnostic else self.scan_target_frame
                 self.hooks.set_target_frame(target_frame)
                 set_watch_target = getattr(self.hooks, "set_watch_target", None)
                 if set_watch_target is not None:
@@ -1635,6 +1636,12 @@ class LockstepSupervisor:
                     attempt["status"] = "prefix_divergence"
                     attempt["provisional"] = True
                     self._save()
+                    if checkpoint_frame is None and not cold_diagnostic:
+                        cold_diagnostic = True
+                        pending_watch_target = watch_target_from_result(result)
+                        attempt["cold_diagnostic_requested"] = True
+                        self._save()
+                        continue
                     raise LockstepSupervisorError(
                         "Prefix divergence has no reproducible detailed checkpoint replay")
                 diagnostic = self._diagnose_and_repair(attempt, current_source, pending_signature)

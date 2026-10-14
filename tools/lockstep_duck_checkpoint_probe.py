@@ -15,6 +15,7 @@ import uuid
 from duckstation_runtime import launch_process, runtime_identity
 from gdb_remote import Remote
 from lockstep_contract import mapping_name
+from lockstep_record import load_record
 from xport_process import normalized_environment
 
 
@@ -61,7 +62,7 @@ def probe(project, emulator, frame, rolling_captures=False, record_name="warmup"
     if not record_name or Path(record_name).name != record_name or record_name in (".", ".."):
         raise ValueError("Record name must be one directory component")
     record_dir = project / "status" / "lockstep-records" / record_name
-    record = json.loads((record_dir / "record.json").read_text(encoding="utf-8"))
+    record = load_record(record_dir / "record.bin")
     if frame < 0 or frame + 1 >= len(record["frames"]):
         raise ValueError("Probe frame must precede another recorded frame")
     with socket.socket() as check:
@@ -103,6 +104,8 @@ def probe(project, emulator, frame, rolling_captures=False, record_name="warmup"
         if not remote.packet("?").startswith(("S", "T")):
             raise RuntimeError("DuckStation did not start paused")
         expect(remote, f"qXportLockstepAttach:{run_id}:{dram}:{scratchpad}:{deferred}", f"OK:{run_id}")
+        wait_points = ":".join(f"{int(pc, 0):x}" for pc in config["duckstation"]["wait_points"])
+        expect(remote, f"qXportWaitPoints:{wait_points}", "OK:wait")
         record_id = record["record_id"]
         expect(remote, f"qXportLockstepReplay:{record_id}", f"OK:{record_id}")
         expect(remote, f"qXportLockstepSeed:{record_id}", f"OK:{record_id}")

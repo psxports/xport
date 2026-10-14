@@ -122,8 +122,10 @@ class ProgressWindow:
             count = int(latest["frame_count"])
             maximum = int(latest["maximum_match"])
             current = int(latest["current"])
-            self.maximum.update_value(f"Recorded interval MATCH: {maximum}/{count}", maximum, count)
-            self.current.update_value(f"Current converge: {current}/{count}", current, count)
+            maximum_label = latest.get("maximum_label", "Recorded interval MATCH")
+            current_label = latest.get("current_label", "Current converge")
+            self.maximum.update_value(f"{maximum_label}: {maximum}/{count}", maximum, count)
+            self.current.update_value(f"{current_label}: {current}/{count}", current, count)
             self.status.configure(text=progress_status_text(latest))
             if not self.active:
                 self.root.destroy()

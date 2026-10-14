@@ -35,7 +35,7 @@ def main() -> int:
     config = diagnostic_config(config)
     if args.name == args.record:
         raise ValueError("Benchmark name must differ from the source record")
-    record_path = root / "status" / "lockstep-records" / args.record / "record.json"
+    record_path = root / "status" / "lockstep-records" / args.record / "record.bin"
     record = load_record(record_path)
     directory = root / "status" / "lockstep-converge" / args.name
     if directory.exists():

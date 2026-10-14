@@ -17,6 +17,75 @@ static uint32 output_left;
 static uint32 initialized, input_busy, output_busy, input_pending, output_pending;
 static uint32 input_masked, output_masked;
 
+static void mdec_wait_service(void)
+{
+    mdec_psyq_pump(0);
+}
+
+typedef struct MDEC_CHECKPOINT
+{
+    MdecState decoder;
+    uint32 input_snapshot[65535];
+    uint32 input_pos, input_left, output_address, output_left;
+    uint32 initialized, input_busy, output_busy, input_pending, output_pending;
+} MDEC_CHECKPOINT;
+
+sint32 mdec_psyq_checkpoint_io(FILE *file, sint32 load)
+{
+    MDEC_CHECKPOINT *saved;
+    uint32 *restored_output = NULL;
+    sint32 ok;
+    if (!file)
+        return 0;
+    saved = (MDEC_CHECKPOINT *)calloc(1, sizeof(*saved));
+    if (!saved)
+        return 0;
+    if (load)
+    {
+        ok = fread(saved, sizeof(*saved), 1, file) == 1;
+        if (ok && saved->output_busy)
+        {
+            restored_output = (uint32 *)xport_guest_ptr(saved->output_address, (size_t)saved->output_left * 4);
+            ok = restored_output != NULL;
+        }
+        if (ok)
+        {
+            decoder = saved->decoder;
+            memcpy(input_snapshot, saved->input_snapshot, sizeof(input_snapshot));
+            input = saved->initialized ? input_snapshot : NULL;
+            input_pos = saved->input_pos;
+            input_left = saved->input_left;
+            output = restored_output;
+            output_left = saved->output_left;
+            initialized = saved->initialized;
+            input_busy = saved->input_busy;
+            output_busy = saved->output_busy;
+            input_pending = saved->input_pending;
+            output_pending = saved->output_pending;
+            input_masked = output_masked = 0;
+            psx_wait_bind_service(0, initialized ? mdec_wait_service : NULL);
+        }
+    }
+    else
+    {
+        saved->decoder = decoder;
+        memcpy(saved->input_snapshot, input_snapshot, sizeof(input_snapshot));
+        saved->input_pos = input_pos;
+        saved->input_left = input_left;
+        saved->output_left = output_left;
+        saved->initialized = initialized;
+        saved->input_busy = input_busy;
+        saved->output_busy = output_busy;
+        saved->input_pending = input_pending;
+        saved->output_pending = output_pending;
+        if (output_busy)
+            saved->output_address = xport_guest_buffer_address(output, (size_t)output_left * 4);
+        ok = (!output_busy || saved->output_address) && fwrite(saved, sizeof(*saved), 1, file) == 1;
+    }
+    free(saved);
+    return ok;
+}
+
 static void ensure_initialized(void)
 {
     if (!initialized)
@@ -25,6 +94,7 @@ static void ensure_initialized(void)
 
 void DecDCTReset(sint32 mode)
 {
+    psx_wait_bind_service(0, mdec_wait_service);
     if (!initialized)
         mdec_initialize(&decoder);
     mdec_control(&decoder, 0xE0000000u);
@@ -117,11 +187,10 @@ void mdec_psyq_pump(uint32 ticks)
             input_pending = 1;
             progress = 1;
         }
-        if (decoder.copy_ticks && ticks)
+        if (decoder.copy_ticks)
         {
-            uint32 used = ticks < decoder.copy_ticks ? ticks : decoder.copy_ticks;
-            mdec_advance(&decoder, used);
-            ticks -= used;
+            ticks = decoder.copy_ticks;
+            mdec_advance(&decoder, ticks);
             progress = 1;
         }
         /* A completion callback still owns its completed buffer until it returns */
@@ -139,7 +208,7 @@ void mdec_psyq_pump(uint32 ticks)
             progress = 1;
         }
         /* Mask only the matching completion callback while allowing the opposite DMA to progress */
-        if (input_pending && !input_masked)
+        if (input_pending && !input_masked && psx_callbacks_allowed())
         {
             DecDCTCallback callback = psx_dma_callback_native(0u);
             input_pending = 0;
@@ -151,7 +220,7 @@ void mdec_psyq_pump(uint32 ticks)
             }
             progress = 1;
         }
-        if (output_pending && !output_masked)
+        if (output_pending && !output_masked && psx_callbacks_allowed())
         {
             DecDCTCallback callback = psx_dma_callback_native(1u);
             output_pending = 0;

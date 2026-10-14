@@ -873,6 +873,8 @@ sint32 psx_dma_halt(PsxDmaScheduler *scheduler, uint32 ticks)
 }
 
 static PsxVBlankWait vblank_wait;
+static uint32 cooperative_wait_depth;
+static PsxInterruptCallback cooperative_services[7];
 static void *vblank_wait_context;
 static sint32 vblank_wait_failed;
 static uint32 *vblank_guest_counter;
@@ -1025,6 +1027,7 @@ sint32 psx_crtc_advance(PsxCrtcState *state, uint32 cpu_ticks, PsxCrtcStep *resu
 void psx_vblank_bind(PsxVBlankWait wait, void *context, uint32 initial_count)
 {
     vblank_wait = wait;
+    cooperative_wait_depth = 0u;
     vblank_wait_context = context;
     vblank_count = initial_count;
     vblank_wait_failed = 0;
@@ -1032,9 +1035,46 @@ void psx_vblank_bind(PsxVBlankWait wait, void *context, uint32 initial_count)
     native_vblank_fraction = 0u;
 }
 
+sint32 psx_wait_events(void)
+{
+    sint32 ok;
+    if (!vblank_wait || vblank_wait_failed)
+        return 0;
+    ++cooperative_wait_depth;
+    if (bios_vblank_pending && bios_interrupts_enabled)
+    {
+        bios_vblank_pending = 0u;
+        psx_vblank_signal();
+        ok = !vblank_wait_failed;
+    }
+    else
+        ok = vblank_wait(vblank_wait_context);
+    if (ok && !vblank_wait_failed)
+        bios_native_irq_dispatch();
+    --cooperative_wait_depth;
+    return ok && !vblank_wait_failed;
+}
+
+sint32 psx_callbacks_allowed(void)
+{
+    return bios_interrupts_enabled && (!vblank_wait || cooperative_wait_depth);
+}
+
+void psx_wait_bind_service(uint32 slot, PsxInterruptCallback service)
+{
+    if (slot >= 7)
+        abort();
+    cooperative_services[slot] = service;
+}
+
 void psx_vblank_signal(void)
 {
     uint32 index;
+    if (vblank_wait && !cooperative_wait_depth)
+    {
+        bios_vblank_pending = 1u;
+        return;
+    }
     psx_root_counter_poll();
     if (!bios_interrupts_enabled)
     {
@@ -1175,7 +1215,7 @@ static sint32 psx_vsync_wait_target(uint32 target, uint32 *waited)
         if (*waited >= vsync_wait_budget)
             return 0;
         ++*waited;
-        if (!vblank_wait(vblank_wait_context) || vblank_wait_failed || *vblank_guest_counter - before != 1u)
+        if (!psx_wait_events() || vblank_wait_failed || *vblank_guest_counter - before != 1u)
             return 0;
     }
     return 1;
@@ -1196,7 +1236,7 @@ static sint32 psx_vsync_wait_field(uint32 initial_status, uint32 *waited)
             return 0;
         before = *vblank_guest_counter;
         ++*waited;
-        if (!vblank_wait(vblank_wait_context) || vblank_wait_failed || *vblank_guest_counter - before != 1u)
+        if (!psx_wait_events() || vblank_wait_failed || *vblank_guest_counter - before != 1u)
             return 0;
     }
 }
@@ -1565,7 +1605,7 @@ static uint32 native_irq_dispatching;
 static void bios_native_irq_dispatch(void)
 {
     uint32 interrupt;
-    if (!bios_interrupts_enabled || native_irq_dispatching)
+    if (!bios_interrupts_enabled || native_irq_dispatching || (vblank_wait && !cooperative_wait_depth))
         return;
     native_irq_dispatching = 1u;
     for (interrupt = 0u; interrupt < 11u && bios_interrupts_enabled; ++interrupt)
@@ -1584,7 +1624,12 @@ static void bios_native_irq_dispatch(void)
         psx_irq_write(&native_root_irq, 0u, ~bit);
     }
     if (bios_interrupts_enabled)
+    {
+        for (interrupt = 0; interrupt < 7 && psx_callbacks_allowed(); ++interrupt)
+            if (cooperative_services[interrupt])
+                cooperative_services[interrupt]();
         cd_dispatch_ready_event();
+    }
     native_irq_dispatching = 0u;
 }
 
@@ -3936,7 +3981,7 @@ sint32 VSync(sint32 mode)
         if (vblank_wait)
         {
             uint32 before = vblank_count;
-            if (!vblank_wait(vblank_wait_context) || vblank_wait_failed || vblank_count - before != 1u)
+            if (!psx_wait_events() || vblank_wait_failed || vblank_count - before != 1u)
             {
                 vblank_wait_failed = 1;
                 return -1;
@@ -3977,6 +4022,15 @@ int psx_state_io(FILE *f, int load)
     }
     else if (!psx_state_block(f, &timers, sizeof(timers), 0))
         return 0;
+    if (!psx_state_block(f, &native_root_irq, sizeof(native_root_irq), load) || !psx_state_block(f, native_timer_irq_fired, sizeof(native_timer_irq_fired), load) || !psx_state_block(f, &native_root_last_tick, sizeof(native_root_last_tick), load) || !psx_state_block(f, &bios_vblank_pending, sizeof(bios_vblank_pending), load) || !psx_state_block(f, &bios_interrupts_enabled, sizeof(bios_interrupts_enabled), load) || !psx_state_block(f, &bios_callbacks_running, sizeof(bios_callbacks_running), load))
+        return 0;
+    if (load)
+    {
+        cooperative_wait_depth = 0u;
+        native_irq_dispatching = 0u;
+        native_root_polling = 0u;
+        vblank_dispatching = 0;
+    }
     return pad_state_io(f, load);
 }
 

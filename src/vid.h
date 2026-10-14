@@ -27,6 +27,13 @@ typedef struct VID_RECT
     sint32 x, y, w, h;
 } VID_RECT;
 
+typedef struct VID_FOG
+{
+    float near_dist, far_dist, horizon_dist;
+    float color[3];
+    float focal[2];
+} VID_FOG;
+
 enum
 {
     VID_BLEND_NONE,
@@ -82,6 +89,8 @@ extern "C"
     sint32 vid_draw(VID_GEOMETRY *geometry, uint32 first, uint32 count, VID_MATERIAL *material);
     // Queue one color probe at normalized coordinates within the current viewport
     sint32 vid_sample(VID_SAMPLE *sample, float x, float y);
+    // Fade subsequent custom-shader draws through a fog color into transparency
+    void vid_fog(const VID_FOG *fog);
     sint32 vid_end(void);
     void vid_cancel(void);
     void vid_resize(sint32 *width, sint32 *height);

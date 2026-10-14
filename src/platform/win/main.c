@@ -125,8 +125,8 @@ static sint32 platform_game_exit_active;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
 static uint8 platform_hd_pressed[2];
-/* Four PS1 axes followed by the analog-controller availability flag */
-static uint8 platform_pad_analog[2][5];
+/* Four PS1 axes, analog availability and physical D-pad bits */
+static uint8 platform_pad_analog[2][6];
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static LARGE_INTEGER platform_timer_frequency;
@@ -390,12 +390,13 @@ static uint8 xinput_axis(SHORT value, sint32 invert)
     return (uint8)(scaled > 65535 ? 255 : scaled >> 8);
 }
 
-static uint32 xinput_read(sint32 player, uint8 axes[5])
+static uint32 xinput_read(sint32 player, uint8 axes[6])
 {
     DWORD controller;
     XINPUT_STATE state;
     memset(axes, 128, 4);
     axes[4] = 0;
+    axes[5] = 0;
     if (_XInputGetState == NULL)
         return 0;
     for (controller = 0; controller < XUSER_MAX_COUNT; ++controller)
@@ -410,6 +411,7 @@ static uint32 xinput_read(sint32 player, uint8 axes[5])
             axes[2] = xinput_axis(state.Gamepad.sThumbLX, 0);
             axes[3] = xinput_axis(state.Gamepad.sThumbLY, 1);
             axes[4] = 1;
+            axes[5] = (uint8)(state.Gamepad.wButtons & 15u);
             return xinput_to_pad(&state.Gamepad);
         }
     }
@@ -517,6 +519,7 @@ sint32 xport_input_init(void)
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
     platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
+    platform_pad_analog[0][5] = platform_pad_analog[1][5] = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
     if (_XInputGetState == NULL)
@@ -547,6 +550,16 @@ uint32 xport_input_read(sint32 controller)
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
     uint32 buttons = xinput_read(controller, platform_pad_analog[controller]);
+    uint8 *axes = platform_pad_analog[controller];
+    uint32 directions = platform_pad_buttons[controller];
+    if (axes[5] & 1u) directions |= PADLup;
+    if (axes[5] & 2u) directions |= PADLdown;
+    if (axes[5] & 4u) directions |= PADLleft;
+    if (axes[5] & 8u) directions |= PADLright;
+    if (directions & (PADLleft | PADLright))
+        axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
+    if (directions & (PADLup | PADLdown))
+        axes[3] = (directions & PADLup) ? ((directions & PADLdown) ? 128 : 0) : 255;
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;
@@ -817,7 +830,9 @@ sint32 xport_audio_init(void)
     sint32 index;
 #ifdef _DEBUG
     const char *audible = getenv("XPORT_AUDIO_OUTPUT");
+    #if !defined(LOCKSTEP_DEBUG)
     const char *backend = getenv("XPORT_AUDIO_BACKEND");
+    #endif
 #endif
     if (InterlockedCompareExchange(&output.running, 1, 1) != 0)
         return 1;
@@ -832,7 +847,7 @@ sint32 xport_audio_init(void)
     g_xport_audio_peak = 0;
     g_xport_audio_callback_overruns = 0;
     if (xport_is_headless()
-#ifdef _DEBUG
+#if defined(_DEBUG) && !defined(LOCKSTEP_DEBUG)
         && (backend == NULL || strcmp(backend, "waveout") != 0)
 #endif
     )

@@ -163,6 +163,7 @@ extern "C"
     sint32 spu_upload(uint32 byte_address, const void *source, uint32 byte_count);
     sint32 spu_download(uint32 byte_address, void *destination, uint32 byte_count);
     sint32 spu_load_ram_file(const char *path);
+    sint32 spu_load_handoff_file(const char *path);
     sint32 spu_mmio_read(void *user, uint32 physical_address, uint32 width, uint32 *value);
     sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 value, uint32 byte_mask);
     void spu_dispatch_pending_irq(void);
@@ -188,6 +189,10 @@ extern "C"
     /* END GENERATED MODULE API */
 
     sint32 cd_stream_pop_sector_native(uint8 output[2352]);
+    sint32 cd_restore_fifo_native(const uint8 *bytes, uint32 count, uint32 mode, uint32 next_sector);
+    sint32 cd_read_sector_fifo_native(uint32 sector, uint32 mode);
+    void cd_bind_command_native(void (*command)(uint8 command, uint32 next_sector, uint32 mode));
+    void cd_set_reading_native(sint32 reading);
     void cd_stream_consumer_native(sint32 enabled);
 
 #if defined(__cplusplus)

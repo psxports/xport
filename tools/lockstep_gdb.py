@@ -31,14 +31,15 @@ class DuckStationLockstep:
         self.argument_registers: dict[int, tuple[int, ...]] = {}
         self.runtime_identity = runtime_identity
 
+    def configure_wait_points(self, pcs: list[str]) -> None:
+        addresses = [int(pc, 0) for pc in pcs]
+        command = "qXportWaitPoints:" + ":".join(f"{pc:x}" for pc in addresses)
+        self._expect(self.remote.packet(command), "OK:wait", "wait points")
+
     def _bind_event_image(self, event: dict) -> dict:
         runtime = self.runtime_identity
         # Protocol 23 emits a fixed transport label rather than an executable identity
-        if not runtime or runtime.get("patch_sha256") not in {
-                "25a99c8a66cd7af93bd052414b1e96f8d5ef9b75be0d3176a347b3f0d234ba2b",
-                "0c3155d5f8ad2854e87d9e2393b45f67cf2785b88a949f76b941561b4cddb069",
-                "1c625bb0b3e7016945eb9f9f1ed72439ca3cce1d80abf4cb55bb3b21abd28207",
-                "e53eb603936c6cf69505c85dceb65660992e798cdb7f5f48a991bff184c72c29"}:
+        if not runtime:
             return event
         if runtime.get("lockstep_protocol_version") != 23:
             raise LockstepGdbError("Fixed image label has an incompatible protocol")
@@ -112,6 +113,10 @@ class DuckStationLockstep:
             raise LockstepGdbError("Invalid DuckStation timer registers")
         return {"serializer_version": version, "cpu_clock": clock,
                 "pending_sysclk_ticks": pending, **state}
+
+    def crtc_state(self) -> tuple[int, ...]:
+        data = bytes.fromhex(self.remote.packet("qXportCRTCState"))
+        return struct.unpack("<13I", data)
 
     def beam_state(self) -> dict:
         if self.mode != "replay" or not self.remote.stopped:
@@ -255,7 +260,17 @@ class DuckStationLockstep:
     def wait_record_limit(self, timeout: float) -> None:
         if self.mode != "record" or not self.remote.stopped:
             raise LockstepGdbError("DuckStation record mode is not ready")
-        reply = self.remote.packet("c", timeout=timeout)
+        try:
+            reply = self.remote.packet("c", timeout=timeout)
+        except TimeoutError as error:
+            self.remote.interrupt()
+            registers = decode_registers(self.remote.packet("g"))
+            pc = int(registers["pc"], 0)
+            instructions = self.remote.packet(f"m{pc:x},20")
+            progress = self.remote.packet("qXportLockstepRecordRead:0:1")
+            raise LockstepGdbError(
+                f"Record wait timed out at {registers['pc']}; progress={progress}; "
+                f"instructions={instructions}") from error
         if not reply.startswith(("S", "T")):
             raise LockstepGdbError(f"Unexpected DuckStation record stop reply: {reply}")
 
