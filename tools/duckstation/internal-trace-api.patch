@@ -37,10 +37,25 @@ index 832539a..7f57f0d 100644
    void ResetTransferState() override;
    bool Transfer(const u8 data_in, u8* data_out) override;
 diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
-index 13e90aa..0f78bde 100644
+index 13e90aa..590a74d 100644
 --- a/src/core/cdrom.cpp
 +++ b/src/core/cdrom.cpp
-@@ -570,9 +570,7 @@ void CDROM::Initialize()
+@@ -567,12 +567,22 @@ const char* CDROM::GetCommandName(Command command)
+ 
+ void CDROM::Initialize()
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    s_state.disc_region = DiscRegion::NonPS1;
++    s_state.manual_lid_control = MANUAL_LID_CONTROL_DISABLED;
++
++    if (g_settings.cdrom_readahead_sectors > 0)
++      s_reader.StartThread(g_settings.cdrom_readahead_sectors);
++
++    Reset();
++    return;
++  }
++
    s_state.disc_region = DiscRegion::NonPS1;
    s_state.manual_lid_control = MANUAL_LID_CONTROL_DISABLED;
  
@@ -51,23 +66,469 @@ index 13e90aa..0f78bde 100644
    Reset();
  }
  
-@@ -1113,15 +1111,7 @@ TinyString CDROM::LBAToMSFString(CDImage::LBA lba)
+@@ -1113,15 +1123,23 @@ TinyString CDROM::LBAToMSFString(CDImage::LBA lba)
  
  void CDROM::SetReadaheadSectors(u32 readahead_sectors)
  {
 -  const bool want_thread = (readahead_sectors > 0);
 -  if (want_thread == s_reader.IsUsingThread() && s_reader.GetReadaheadCount() == readahead_sectors)
 -    return;
--
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    const bool want_thread = (readahead_sectors > 0);
++    if (want_thread == s_reader.IsUsingThread() && s_reader.GetReadaheadCount() == readahead_sectors)
++      return;
+ 
 -  if (want_thread)
 -    s_reader.StartThread(readahead_sectors);
 -  else
 -    s_reader.StopThread();
--
++    if (want_thread)
++      s_reader.StartThread(readahead_sectors);
++    else
++      s_reader.StopThread();
++
++    if (HasMedia())
++      s_reader.QueueReadSector(s_state.requested_lba);
++    return;
++  }
+ 
 +  s_reader.StopThread();
    if (HasMedia())
      s_reader.QueueReadSector(s_state.requested_lba);
  }
+@@ -1458,35 +1476,72 @@ void CDROM::ClearAsyncInterrupt()
+ 
+ void CDROM::QueueDeliverAsyncInterrupt()
+ {
+-  // Why do we need this mess? A few games, such as Ogre Battle, like to spam GetlocL or GetlocP while
+-  // XA playback is going. The problem is, when that happens and an INT1 also comes in. Instead of
+-  // reading the interrupt flag, reading the FIFO, and then clearing the interrupt, they clear the
+-  // interrupt, then read the FIFO. If an INT1 comes in during that time, it'll read the INT1 response
+-  // instead of the INT3 response, and the game gets confused. So, we just delay INT1s a bit, if there
+-  // has been any recent INT3s - give it enough time to read the response out. The real console does
+-  // something similar anyway, the INT1 task won't run immediately after the INT3 is cleared.
+-  DebugAssert(HasPendingAsyncInterrupt());
+-
+-  const u32 diff = static_cast<u32>(System::GetGlobalTickCounter() - s_state.last_interrupt_time);
+-  if (diff >= MINIMUM_INTERRUPT_DELAY)
++  if (TimingEvents::IsCPUClockEnabled())
+   {
+-    DeliverAsyncInterrupt(nullptr, 0);
+-  }
+-  else
+-  {
+-    DEV_LOG("Delaying async interrupt {} because it's been {} cycles since last interrupt",
+-            s_state.pending_async_interrupt, diff);
+-    s_state.async_interrupt_event.Schedule(INTERRUPT_DELAY_CYCLES);
++    // Why do we need this mess? A few games, such as Ogre Battle, like to spam GetlocL or GetlocP while
++    // XA playback is going. The problem is, when that happens and an INT1 also comes in. Instead of
++    // reading the interrupt flag, reading the FIFO, and then clearing the interrupt, they clear the
++    // interrupt, then read the FIFO. If an INT1 comes in during that time, it'll read the INT1 response
++    // instead of the INT3 response, and the game gets confused. So, we just delay INT1s a bit, if there
++    // has been any recent INT3s - give it enough time to read the response out. The real console does
++    // something similar anyway, the INT1 task won't run immediately after the INT3 is cleared.
++    DebugAssert(HasPendingAsyncInterrupt());
++
++    const u32 diff = static_cast<u32>(System::GetGlobalTickCounter() - s_state.last_interrupt_time);
++    if (diff >= MINIMUM_INTERRUPT_DELAY)
++    {
++      DeliverAsyncInterrupt(nullptr, 0);
++    }
++    else
++    {
++      DEV_LOG("Delaying async interrupt {} because it's been {} cycles since last interrupt",
++              s_state.pending_async_interrupt, diff);
++      s_state.async_interrupt_event.Schedule(INTERRUPT_DELAY_CYCLES);
++    }
++    return;
+   }
++
++  DebugAssert(HasPendingAsyncInterrupt());
++  s_state.async_interrupt_event.Deactivate();
++  if (!HasPendingInterrupt())
++    DeliverAsyncInterrupt(nullptr, 0);
+ }
+ 
+ void CDROM::DeliverAsyncInterrupt(void*, TickCount ticks)
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    if (HasPendingInterrupt())
++    {
++      // This shouldn't really happen, because we should block command execution.. but just in case.
++      if (!s_state.async_interrupt_event.IsActive())
++        s_state.async_interrupt_event.Schedule(INTERRUPT_DELAY_CYCLES);
++    }
++    else
++    {
++      s_state.async_interrupt_event.Deactivate();
++
++      Assert(s_state.pending_async_interrupt != 0 && !HasPendingInterrupt());
++      DEBUG_LOG("Delivering async interrupt {}", s_state.pending_async_interrupt);
++
++      // This is the HC05 setting the read position from the decoder.
++      if (s_state.pending_async_interrupt == static_cast<u8>(Interrupt::DataReady))
++        s_state.current_read_sector_buffer = s_state.current_write_sector_buffer;
++
++      s_state.response_fifo.Clear();
++      s_state.response_fifo.PushFromQueue(&s_state.async_response_fifo);
++      s_state.interrupt_flag_register = s_state.pending_async_interrupt;
++      s_state.pending_async_interrupt = 0;
++      UpdateInterruptRequest();
++      UpdateStatusRegister();
++      UpdateCommandEvent();
++    }
++    return;
++  }
++
+   if (HasPendingInterrupt())
+   {
+-    // This shouldn't really happen, because we should block command execution.. but just in case.
+-    if (!s_state.async_interrupt_event.IsActive())
+-      s_state.async_interrupt_event.Schedule(INTERRUPT_DELAY_CYCLES);
++    s_state.async_interrupt_event.Deactivate();
+   }
+   else
+   {
+@@ -1888,6 +1943,7 @@ void CDROM::EndCommand()
+ 
+   s_state.command = Command::None;
+   s_state.command_event.Deactivate();
++  CompleteSynchronousOperations();
+   UpdateStatusRegister();
+ }
+ 
+@@ -2005,51 +2061,64 @@ void CDROM::ExecuteCommand(void*, TickCount ticks)
+ 
+     case Command::Setmode:
+     {
+-      const u8 mode = s_state.param_fifo.Peek(0);
+-      const bool speed_change = (mode & 0x80) != (s_state.mode.bits & 0x80);
+-      DEV_COLOR_LOG(StrongOrange, "Setmode    0x{:02X}", ZeroExtend32(mode));
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++        const u8 mode = s_state.param_fifo.Peek(0);
++        const bool speed_change = (mode & 0x80) != (s_state.mode.bits & 0x80);
++        DEV_COLOR_LOG(StrongOrange, "Setmode    0x{:02X}", ZeroExtend32(mode));
+ 
+-      s_state.mode.bits = mode;
+-      SendACKAndStat();
+-      EndCommand();
++        s_state.mode.bits = mode;
++        SendACKAndStat();
++        EndCommand();
+ 
+-      if (speed_change)
+-      {
+-        if (s_state.drive_state == DriveState::ChangingSpeedOrTOCRead)
++        if (speed_change)
+         {
+-          // cancel the speed change if it's less than a quarter complete
+-          if (s_state.drive_event.GetTicksUntilNextExecution() >= (GetTicksForSpeedChange() / 4))
++          if (s_state.drive_state == DriveState::ChangingSpeedOrTOCRead)
+           {
+-            DEV_LOG("Cancelling speed change event");
+-            ClearDriveState();
++            // cancel the speed change if it's less than a quarter complete
++            if (s_state.drive_event.GetTicksUntilNextExecution() >= (GetTicksForSpeedChange() / 4))
++            {
++              DEV_LOG("Cancelling speed change event");
++              ClearDriveState();
++            }
+           }
+-        }
+-        else if (s_state.drive_state != DriveState::SeekingImplicit && s_state.drive_state != DriveState::ShellOpening)
+-        {
+-          // if we're seeking or reading, we need to add time to the current seek/read
+-          const TickCount change_ticks = GetTicksForSpeedChange();
+-          if (s_state.drive_state != DriveState::Idle)
++          else if (s_state.drive_state != DriveState::SeekingImplicit && s_state.drive_state != DriveState::ShellOpening)
+           {
+-            DEV_LOG("Drive is {}, delaying event by {} ticks for speed change to {}-speed",
+-                    s_drive_state_names[static_cast<u8>(s_state.drive_state)], change_ticks,
+-                    s_state.mode.double_speed ? "double" : "single");
+-            s_state.drive_event.Delay(change_ticks);
++            // if we're seeking or reading, we need to add time to the current seek/read
++            const TickCount change_ticks = GetTicksForSpeedChange();
++            if (s_state.drive_state != DriveState::Idle)
++            {
++              DEV_LOG("Drive is {}, delaying event by {} ticks for speed change to {}-speed",
++                      s_drive_state_names[static_cast<u8>(s_state.drive_state)], change_ticks,
++                      s_state.mode.double_speed ? "double" : "single");
++              s_state.drive_event.Delay(change_ticks);
+ 
+-            if (IsReadingOrPlaying())
++              if (IsReadingOrPlaying())
++              {
++                WARNING_LOG("Speed change while reading/playing, reads will be temporarily delayed.");
++                s_state.drive_event.SetInterval(GetTicksForRead());
++              }
++            }
++            else
+             {
+-              WARNING_LOG("Speed change while reading/playing, reads will be temporarily delayed.");
+-              s_state.drive_event.SetInterval(GetTicksForRead());
++              DEV_LOG("Drive is idle, speed change takes {} ticks", change_ticks);
++              s_state.drive_state = DriveState::ChangingSpeedOrTOCRead;
++              s_state.drive_event.Schedule(change_ticks);
+             }
+           }
+-          else
+-          {
+-            DEV_LOG("Drive is idle, speed change takes {} ticks", change_ticks);
+-            s_state.drive_state = DriveState::ChangingSpeedOrTOCRead;
+-            s_state.drive_event.Schedule(change_ticks);
+-          }
+         }
+-      }
+ 
++        return;
++
++  }
++
++      const u8 mode = s_state.param_fifo.Peek(0);
++      const bool speed_change = (mode & 0x80) != (s_state.mode.bits & 0x80);
++      s_state.mode.bits = mode;
++      if (speed_change && IsReadingOrPlaying())
++        s_state.drive_event.SetInterval(GetTicksForRead());
++      SendACKAndStat();
++      EndCommand();
+       return;
+     }
+ 
+@@ -2744,17 +2813,25 @@ void CDROM::ClearCommandSecondResponse()
+ 
+ void CDROM::UpdateCommandEvent()
+ {
+-  // if there's a pending interrupt, we can't execute the command yet
+-  // so deactivate it until the interrupt is acknowledged
+-  if (!HasPendingCommand() || HasPendingInterrupt() || HasPendingAsyncInterrupt())
++  if (TimingEvents::IsCPUClockEnabled())
+   {
+-    s_state.command_event.Deactivate();
++    // if there's a pending interrupt, we can't execute the command yet
++    // so deactivate it until the interrupt is acknowledged
++    if (!HasPendingCommand() || HasPendingInterrupt() || HasPendingAsyncInterrupt())
++    {
++      s_state.command_event.Deactivate();
++      return;
++    }
++    else if (HasPendingCommand())
++    {
++      s_state.command_event.Activate();
++    }
+     return;
+   }
+-  else if (HasPendingCommand())
+-  {
+-    s_state.command_event.Activate();
+-  }
++
++  s_state.command_event.Deactivate();
++  if (HasPendingCommand() && !HasPendingInterrupt() && !HasPendingAsyncInterrupt())
++    ExecuteCommand(nullptr, 0);
+ }
+ 
+ void CDROM::ExecuteDrive(void*, TickCount ticks)
+@@ -2829,6 +2906,55 @@ void CDROM::ExecuteDrive(void*, TickCount ticks)
+   }
+ }
+ 
++void CDROM::CompleteSynchronousOperations()
++{
++  if (TimingEvents::IsCPUClockEnabled())
++    return;
++  static bool completing = false;
++  if (completing)
++    return;
++  completing = true;
++  for (;;)
++  {
++    switch (s_state.drive_state)
++    {
++      case DriveState::ShellOpening:
++      case DriveState::SeekingPhysical:
++      case DriveState::SeekingLogical:
++      case DriveState::SeekingImplicit:
++      case DriveState::ChangingSession:
++      case DriveState::SpinningUp:
++      case DriveState::ChangingSpeedOrTOCRead:
++      case DriveState::UNUSED_ReadingID:
++      case DriveState::UNUSED_Resetting:
++      case DriveState::UNUSED_ReadingTOC:
++      case DriveState::UNUSED_Pausing:
++      case DriveState::UNUSED_Stopping:
++        ExecuteDrive(nullptr, 0);
++        continue;
++      default:
++        break;
++    }
++    if (s_state.command_second_response != Command::None && !HasPendingAsyncInterrupt())
++    {
++      ExecuteCommandSecondResponse(nullptr, 0);
++      continue;
++    }
++    if (HasPendingAsyncInterrupt() && !HasPendingInterrupt())
++    {
++      DeliverAsyncInterrupt(nullptr, 0);
++      continue;
++    }
++    if (HasPendingCommand() && !HasPendingInterrupt() && !HasPendingAsyncInterrupt())
++    {
++      UpdateCommandEvent();
++      continue;
++    }
++    break;
++  }
++  completing = false;
++}
++
+ void CDROM::ClearDriveState()
+ {
+   s_state.drive_state = DriveState::Idle;
+@@ -2837,6 +2963,58 @@ void CDROM::ClearDriveState()
+ 
+ void CDROM::BeginReading(bool after_seek)
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    if (!after_seek && s_state.setloc_pending)
++    {
++      BeginSeeking(true, true, false);
++      return;
++    }
++
++    // If we were seeking, we want to start reading from the seek target, not the current sector
++    // Fixes crash in Disney's The Lion King - Simba's Mighty Adventure.
++    if (IsSeeking())
++    {
++      DEV_LOG("Read command while seeking, scheduling read after seek {} -> {} finishes in {} ticks",
++              s_state.seek_start_lba, s_state.seek_end_lba, s_state.drive_event.GetTicksUntilNextExecution());
++
++      // Implicit seeks won't trigger the read, so swap it for a logical.
++      if (s_state.drive_state == DriveState::SeekingImplicit)
++        s_state.drive_state = DriveState::SeekingLogical;
++
++      s_state.read_after_seek = true;
++      s_state.play_after_seek = false;
++      return;
++    }
++
++    DEBUG_LOG("Starting reading @ LBA {}", s_state.current_lba);
++
++    const TickCount ticks = GetTicksForRead();
++    const TickCount first_sector_ticks = ticks + (after_seek ? 0 : GetTicksForSeek(s_state.current_lba));
++
++    ClearCommandSecondResponse();
++    ClearAsyncInterrupt();
++    ClearSectorBuffers();
++    ResetAudioDecoder();
++
++    // Even though this isn't "officially" a seek, we still need to jump back to the target sector unless we're
++    // immediately following a seek from Play/Read. The seeking bit will get cleared after the first sector is
++    // processed.
++    if (!after_seek)
++      s_state.secondary_status.SetSeeking();
++
++    s_state.drive_state = DriveState::Reading;
++    s_state.drive_event.SetInterval(ticks);
++    s_state.drive_event.Schedule(first_sector_ticks);
++    s_state.last_sector_read_ticks = ticks;
++
++    s_state.requested_lba = s_state.current_lba;
++    s_state.seek_start_lba = 0;
++    s_state.seek_end_lba = 0;
++    s_reader.QueueReadSector(s_state.requested_lba);
++    return;
++  }
++
+   if (!after_seek && s_state.setloc_pending)
+   {
+     BeginSeeking(true, true, false);
+@@ -2862,7 +3040,7 @@ void CDROM::BeginReading(bool after_seek)
+   DEBUG_LOG("Starting reading @ LBA {}", s_state.current_lba);
+ 
+   const TickCount ticks = GetTicksForRead();
+-  const TickCount first_sector_ticks = ticks + (after_seek ? 0 : GetTicksForSeek(s_state.current_lba));
++  const TickCount first_sector_ticks = ticks;
+ 
+   ClearCommandSecondResponse();
+   ClearAsyncInterrupt();
+@@ -2888,6 +3066,52 @@ void CDROM::BeginReading(bool after_seek)
+ 
+ void CDROM::BeginPlaying(u8 track, bool after_seek)
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    DEBUG_LOG("Starting playing CDDA track {}", track);
++    s_state.play_track_number_bcd = track;
++    s_state.fast_forward_rate = 0;
++
++    // if track zero, start from current position
++    if (track != 0)
++    {
++      // play specific track?
++      if (track > s_reader.GetMedia()->GetTrackCount())
++      {
++        // restart current track
++        track = Truncate8(s_reader.GetMedia()->GetTrackNumber());
++      }
++
++      s_state.setloc_position = s_reader.GetMedia()->GetTrackStartMSFPosition(track);
++      s_state.setloc_pending = true;
++    }
++
++    if (s_state.setloc_pending)
++    {
++      BeginSeeking(false, false, true);
++      return;
++    }
++
++    const TickCount ticks = GetTicksForRead();
++    const TickCount first_sector_ticks = ticks + (after_seek ? 0 : GetTicksForSeek(s_state.current_lba, true));
++
++    ClearCommandSecondResponse();
++    ClearAsyncInterrupt();
++    ClearSectorBuffers();
++    ResetAudioDecoder();
++
++    s_state.cdda_report_start_delay = CDDA_REPORT_START_DELAY;
++    s_state.last_cdda_report_frame_nibble = 0xFF;
++
++    s_state.drive_state = DriveState::Playing;
++    s_state.drive_event.SetInterval(ticks);
++    s_state.drive_event.Schedule(first_sector_ticks);
++
++    s_state.requested_lba = s_state.current_lba;
++    s_reader.QueueReadSector(s_state.requested_lba);
++    return;
++  }
++
+   DEBUG_LOG("Starting playing CDDA track {}", track);
+   s_state.play_track_number_bcd = track;
+   s_state.fast_forward_rate = 0;
+@@ -2913,7 +3137,7 @@ void CDROM::BeginPlaying(u8 track, bool after_seek)
+   }
+ 
+   const TickCount ticks = GetTicksForRead();
+-  const TickCount first_sector_ticks = ticks + (after_seek ? 0 : GetTicksForSeek(s_state.current_lba, true));
++  const TickCount first_sector_ticks = ticks;
+ 
+   ClearCommandSecondResponse();
+   ClearAsyncInterrupt();
+diff --git a/src/core/cdrom.h b/src/core/cdrom.h
+index 134413a..65f98ed 100644
+--- a/src/core/cdrom.h
++++ b/src/core/cdrom.h
+@@ -40,6 +40,7 @@ bool HasNonStandardOrReplacementSubQ();
+ void SetLidState(bool manual_control, bool manual_state);
+ 
+ void CPUClockChanged();
++void CompleteSynchronousOperations();
+ 
+ // I/O
+ u8 ReadRegister(u32 offset);
 diff --git a/src/core/core.cpp b/src/core/core.cpp
 index c4ca720..2e80169 100644
 --- a/src/core/core.cpp
@@ -167,19 +628,27 @@ index d729042..ab70dd4 100644
        if constexpr (debug)
        {
 diff --git a/src/core/cpu_core_private.h b/src/core/cpu_core_private.h
-index 19613e9..c3d8881 100644
+index 19613e9..4d90ae0 100644
 --- a/src/core/cpu_core_private.h
 +++ b/src/core/cpu_core_private.h
-@@ -35,8 +35,7 @@ ALWAYS_INLINE bool HasPendingInterrupt()
+@@ -5,6 +5,7 @@
+ 
+ #include "bus.h"
+ #include "cpu_core.h"
++#include "timing_event.h"
+ 
+ struct fastjmp_buf;
+ 
+@@ -35,7 +36,8 @@ ALWAYS_INLINE bool HasPendingInterrupt()
  
  ALWAYS_INLINE void CheckForPendingInterrupt()
  {
 -  if (HasPendingInterrupt())
--    g_state.downcount = 0;
-+  // Pending IRQ flags are delivered by the cooperative wait scheduler
++  // CPU-driven execution services pending IRQs through the normal dispatcher
++  if (TimingEvents::IsCPUClockEnabled() && HasPendingInterrupt())
+     g_state.downcount = 0;
  }
  
- void DispatchInterrupt();
 diff --git a/src/core/dma.cpp b/src/core/dma.cpp
 index 4774d16..4c680fc 100644
 --- a/src/core/dma.cpp
@@ -388,7 +857,7 @@ index 4774d16..4c680fc 100644
        CompleteTransfer(channel, cs);
        return true;
 diff --git a/src/core/gdb_server.cpp b/src/core/gdb_server.cpp
-index ca45889..f097280 100644
+index ca45889..17f59fc 100644
 --- a/src/core/gdb_server.cpp
 +++ b/src/core/gdb_server.cpp
 @@ -10,9 +10,23 @@
@@ -428,7 +897,7 @@ index ca45889..f097280 100644
  #include <optional>
  #include <utility>
  
-@@ -312,6 +329,41 @@ template<bool add_breakpoint>
+@@ -312,6 +329,42 @@ template<bool add_breakpoint>
  static bool Cmd$z(ClientSocket* client, std::string_view data);
  static bool Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data);
  static bool Cmd$qSupported(ClientSocket* client, std::string_view data);
@@ -452,6 +921,7 @@ index ca45889..f097280 100644
 +static bool Cmd$qXportFunctionCoverageRead(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportLockstepReplay(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportWaitPoints(ClientSocket* client, std::string_view data);
++static bool Cmd$qXportSioDelay(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportSpuRAMRead(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportFastForward(ClientSocket* client, std::string_view data);
 +static bool Cmd$qXportCRTCState(ClientSocket* client, std::string_view data);
@@ -470,7 +940,7 @@ index ca45889..f097280 100644
  static bool Cmd$qXferFeaturesRead(ClientSocket* client, std::string_view data);
  static bool Cmd$qXferMemoryMapRead(ClientSocket* client, std::string_view data);
  
-@@ -403,6 +455,55 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
+@@ -403,6 +456,56 @@ static constexpr std::pair<std::string_view, bool (*)(ClientSocket*, std::string
    {"qXfer:features:read:", Cmd$qXferFeaturesRead},
    {"qXfer:memory-map:read:", Cmd$qXferMemoryMapRead},
    {"qSupported", Cmd$qSupported},
@@ -495,6 +965,7 @@ index ca45889..f097280 100644
 +  {"qXportFunctionCoverageRead:", Cmd$qXportFunctionCoverageRead},
 +  {"qXportLockstepReplay:", Cmd$qXportLockstepReplay},
 +  {"qXportWaitPoints:", Cmd$qXportWaitPoints},
++  {"qXportSioDelay:", Cmd$qXportSioDelay},
 +  {"qXportSpuRAMRead:", Cmd$qXportSpuRAMRead},
 +  {"qXportFastForward:", Cmd$qXportFastForward},
 +  {"qXportCRTCState", Cmd$qXportCRTCState},
@@ -526,7 +997,7 @@ index ca45889..f097280 100644
  };
  
  namespace {
-@@ -412,6 +513,36 @@ struct Locals
+@@ -412,6 +515,36 @@ struct Locals
    std::shared_ptr<ListenSocket> listen_socket;
    std::vector<std::shared_ptr<ClientSocket>> clients;
    std::vector<ManagedBreakpoint> breakpoints;
@@ -563,7 +1034,7 @@ index ca45889..f097280 100644
    u8 pending_stop_signal = GDB_SIGNAL_TRAP;
    bool resume_on_last_disconnect = false;
  };
-@@ -940,10 +1071,1062 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
+@@ -940,10 +1073,1073 @@ bool GDBServer::Cmd$vMustReplyEmpty(ClientSocket* client, std::string_view data)
    return true;
  }
  
@@ -1123,6 +1594,17 @@ index ca45889..f097280 100644
 +  return true;
 +}
 +
++bool GDBServer::Cmd$qXportSioDelay(ClientSocket* client, std::string_view data)
++{
++  const auto pc = StringUtil::FromChars<u32>(TakeLockstepField(&data), 16);
++  const auto start_pc = StringUtil::FromChars<u32>(data, 16);
++  if (!pc.has_value() || !start_pc.has_value() || (*pc & 3) || (*start_pc & 3) || System::IsExecuting())
++    return SendLockstepError(client, "sio", "invalid_delay_entry");
++  TimingEvents::SetSioDelay(*pc, *start_pc);
++  client->SendReplyWithAck("OK:sio");
++  return true;
++}
++
 +bool GDBServer::Cmd$qXportWaitPoints(ClientSocket* client, std::string_view data)
 +{
 +  if (System::IsExecuting())
@@ -1290,7 +1772,7 @@ index ca45889..f097280 100644
 +    g_bus.ram, CPU::g_state.scratchpad.data(), reinterpret_cast<const u8*>(g_vram));
 +  if (error != XportLockstep::Error::None)
 +    return SendLockstepError(client, data, LockstepErrorName(error));
-+  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter());
++  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter(), TimingEvents::GetGlobalTickCounter());
 +  client->SendReplyWithAck(TinyString::from_format("OK:{}", data));
 +  return true;
 +}
@@ -1361,7 +1843,7 @@ index ca45889..f097280 100644
 +    client->SendReplyWithAck("NONE");
 +    return true;
 +  }
-+  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter());
++  s_locals.lockstep_peer.PublishDeviceTicks(SPU::GetXportSampleCounter(), TimingEvents::GetGlobalTickCounter());
 +  const XportLockstep::MipsEvent& event = s_locals.lockstep_event;
 +  const std::string_view mode = s_locals.lockstep_prefix_guard ? "PREFIX_GUARD" : "DETAILED";
 +  if (event.kind == XportLockstep::MipsEventKind::ModeTransition)
@@ -1627,7 +2109,7 @@ index ca45889..f097280 100644
    return true;
  }
  
-@@ -1516,6 +2699,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
+@@ -1516,6 +2712,20 @@ void GDBServer::PollUntil(u64 max_poll_time)
  
  void GDBServer::Shutdown()
  {
@@ -1751,7 +2233,7 @@ index 6c43ac0..9adf762 100644
  void UpdateDisplay(bool submit_frame);
  
 diff --git a/src/core/mdec.cpp b/src/core/mdec.cpp
-index c7fdf7a..041bfcb 100644
+index c7fdf7a..05591cb 100644
 --- a/src/core/mdec.cpp
 +++ b/src/core/mdec.cpp
 @@ -15,11 +15,13 @@
@@ -1784,7 +2266,23 @@ index c7fdf7a..041bfcb 100644
  } // namespace MDEC
  
  void MDEC::Initialize()
-@@ -414,12 +416,16 @@ void MDEC::WriteCommandRegister(u32 value)
+@@ -308,6 +310,7 @@ void MDEC::DMARead(u32* words, u32 word_count)
+   DEBUG_LOG("DMA read complete, {} bytes left", s_state.data_out_fifo.GetSize() * sizeof(u32));
+   if (s_state.data_out_fifo.IsEmpty())
+     Execute();
++  UpdateStatus();
+ }
+ 
+ void MDEC::DMAWrite(const u32* words, u32 word_count)
+@@ -320,6 +323,7 @@ void MDEC::DMAWrite(const u32* words, u32 word_count)
+   const u32 halfwords_to_write = std::min(word_count * 2, s_state.data_in_fifo.GetSpace() & ~u32(2));
+   s_state.data_in_fifo.PushRange(reinterpret_cast<const u16*>(words), halfwords_to_write);
+   Execute();
++  UpdateStatus();
+ }
+ 
+ bool MDEC::HasPendingBlockCopyOut()
+@@ -414,12 +418,16 @@ void MDEC::WriteCommandRegister(u32 value)
  
  void MDEC::Execute()
  {
@@ -1801,7 +2299,7 @@ index c7fdf7a..041bfcb 100644
    for (;;)
    {
      switch (s_state.state)
-@@ -479,7 +485,7 @@ void MDEC::Execute()
+@@ -479,7 +487,7 @@ void MDEC::Execute()
          {
            // we should be writing out now
            DebugAssert(s_state.state == State::WritingMacroblock);
@@ -1810,7 +2308,7 @@ index c7fdf7a..041bfcb 100644
          }
  
          if (s_state.remaining_halfwords == 0 && s_state.current_block != NUM_BLOCKS)
-@@ -495,8 +501,9 @@ void MDEC::Execute()
+@@ -495,8 +503,9 @@ void MDEC::Execute()
  
        case State::WritingMacroblock:
        {
@@ -1822,7 +2320,7 @@ index c7fdf7a..041bfcb 100644
        }
  
        case State::SetIqTable:
-@@ -542,8 +549,11 @@ void MDEC::Execute()
+@@ -542,8 +551,11 @@ void MDEC::Execute()
    }
  
  finished:
@@ -1835,7 +2333,7 @@ index c7fdf7a..041bfcb 100644
  }
  
  bool MDEC::HandleDecodeMacroblockCommand()
-@@ -581,7 +591,6 @@ bool MDEC::DecodeMonoMacroblock()
+@@ -581,7 +593,6 @@ bool MDEC::DecodeMonoMacroblock()
  
    YUVToMono(s_state.blocks[0]);
  
@@ -1843,7 +2341,7 @@ index c7fdf7a..041bfcb 100644
  
  #if defined(_DEBUG) || defined(_DEVEL)
    s_state.total_blocks_decoded++;
-@@ -644,18 +653,9 @@ bool MDEC::DecodeColoredMacroblock()
+@@ -644,18 +655,9 @@ bool MDEC::DecodeColoredMacroblock()
    s_state.total_blocks_decoded += 4;
  #endif
  
@@ -1862,6 +2360,474 @@ index c7fdf7a..041bfcb 100644
  void MDEC::CopyOutBlock(void* param, TickCount ticks)
  {
    Assert(s_state.state == State::WritingMacroblock);
+diff --git a/src/core/pad.cpp b/src/core/pad.cpp
+index d7eef67..24f0899 100644
+--- a/src/core/pad.cpp
++++ b/src/core/pad.cpp
+@@ -365,6 +365,148 @@ void Pad::RestoreMemoryCardState()
+ 
+ bool Pad::DoState(StateWrapper& sw, bool is_memory_state)
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    if (is_memory_state && ShouldAvoidSavingToState())
++    {
++      // We do a bit of trickery for memory states here to avoid writing 128KB * num_cards to the state.
++      // Profiling shows that the card write scan be up to 17% of overall CPU time, so it's definitely worth skipping.
++      // However, we can't roll back past a transfer boundary, because that'll corrupt our cards. So, we have to be smart
++      // about this.
++      //
++      // There's three main scenarios:
++      //  (1) No transfers occurring before or after the rollback point.
++      //  (2) A transfer was started before the rollback point.
++      //  (3) A transfer was started after the rollback point.
++      //
++      // For (1), it's easy, we don't have to do anything. Just skip saving and continue on our merry way.
++      //
++      // For (2), we serialize the state whenever there's a transfer within the last N_ROLLBACK frames. Easy-ish.
++      //
++      // For (3), it gets messy. We didn't know that a transfer was going to start, and our rollback state doesn't
++      // contain the state of the memory cards, because we were cheeky and skipped it. So, instead, we back up
++      // the state of memory cards when any transfer begins, assuming it's not within the last N_ROLLBACK frames, in
++      // DoTransfer(). That way, when we do have to roll back past this boundary, we can just restore the known good "pre
++      // transfer" state. Any memory saves created after the transfer begun will go through the same path as (2), so we
++      // don't risk corrupting that way.
++      //
++      // Hopefully that's everything.
++      //
++      bool process_memcard_state = true;
++
++      const u32 frame_number = System::GetFrameNumber();
++      const u32 frames_since_transfer = frame_number - s_state.last_memory_card_transfer_frame;
++      const u32 prev_transfer_frame = s_state.last_memory_card_transfer_frame;
++      bool state_has_memcards = false;
++
++      sw.Do(&s_state.last_memory_card_transfer_frame);
++
++      // If there's been a transfer within the last N_ROLLBACK frames, include the memory card state when saving.
++      state_has_memcards = (frames_since_transfer <= GetMaximumRollbackFrames());
++      sw.Do(&state_has_memcards);
++
++      if (sw.IsReading())
++      {
++        // If no transfers have occurred, no need to reload state.
++        if (s_state.last_memory_card_transfer_frame != frame_number &&
++            s_state.last_memory_card_transfer_frame == prev_transfer_frame)
++        {
++          process_memcard_state = false;
++        }
++        else if (!state_has_memcards)
++        {
++          // If the memory state doesn't have card data (i.e. rolling back past a transfer start), reload the backed up
++          // state created when the transfer initially begun.
++          RestoreMemoryCardState();
++          process_memcard_state = false;
++        }
++      }
++
++      // Still have to parse through the data if it's present.
++      if (state_has_memcards)
++      {
++        MemoryCard* dummy_card = process_memcard_state ? nullptr : GetDummyMemcard();
++        for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
++        {
++          if (s_state.memory_cards[i])
++          {
++            MemoryCard* const mc = process_memcard_state ? s_state.memory_cards[i].get() : dummy_card;
++            mc->DoState(sw);
++          }
++        }
++      }
++
++      // Always save controller state.
++      for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
++      {
++        if (s_state.controllers[i])
++        {
++          // Ignore input state, use the current. I think we want this?
++          s_state.controllers[i]->DoState(sw, false);
++        }
++      }
++    }
++    else
++    {
++      for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
++      {
++        if ((sw.GetVersion() < 50) && (i >= 2)) [[unlikely]]
++        {
++          // loading from old savestate which only had max 2 controllers.
++          // honoring load_devices_from_save_states in this case seems debatable, but might as well...
++          if (s_state.controllers[i])
++          {
++            if (g_settings.load_devices_from_save_states)
++              s_state.controllers[i].reset();
++            else
++              s_state.controllers[i]->Reset();
++          }
++
++          if (s_state.memory_cards[i])
++          {
++            if (g_settings.load_devices_from_save_states)
++              s_state.memory_cards[i].reset();
++            else
++              s_state.memory_cards[i]->Reset();
++          }
++
++          // and make sure to skip trying to read controller_type / card_present flags which don't exist in old states.
++          continue;
++        }
++
++        if (!DoStateController(sw, i))
++          return false;
++
++        if (!DoStateMemcard(sw, i, is_memory_state))
++          return false;
++      }
++    }
++
++    if (sw.GetVersion() >= 50) [[likely]]
++    {
++      for (u32 i = 0; i < NUM_MULTITAPS; i++)
++      {
++        if (!s_state.multitaps[i].DoState(sw))
++          return false;
++      }
++    }
++
++    sw.Do(&s_state.state, State::WaitingForACK);
++    sw.Do(&s_state.JOY_CTRL.bits);
++    sw.Do(&s_state.JOY_STAT.bits);
++    sw.Do(&s_state.JOY_MODE.bits);
++    sw.Do(&s_state.JOY_BAUD);
++    sw.Do(&s_state.receive_buffer);
++    sw.Do(&s_state.transmit_buffer);
++    sw.Do(&s_state.receive_buffer_full);
++    sw.Do(&s_state.transmit_buffer_full);
++
++    if (sw.IsReading() && IsTransmitting())
++      s_state.transfer_event.Activate();
++
++    return !sw.HasError();
++  }
++
+   if (is_memory_state && ShouldAvoidSavingToState())
+   {
+     // We do a bit of trickery for memory states here to avoid writing 128KB * num_cards to the state.
+@@ -499,8 +641,11 @@ bool Pad::DoState(StateWrapper& sw, bool is_memory_state)
+   sw.Do(&s_state.receive_buffer_full);
+   sw.Do(&s_state.transmit_buffer_full);
+ 
+-  if (sw.IsReading() && IsTransmitting())
+-    s_state.transfer_event.Activate();
++  if (sw.IsReading())
++  {
++    s_state.transfer_event.Deactivate();
++    s_state.JOY_STAT.ACKINPUT = false;
++  }
+ 
+   return !sw.HasError();
+ }
+@@ -550,12 +695,55 @@ void Pad::TriggerIRQ(const char* type)
+ 
+ u32 Pad::ReadRegister(u32 offset)
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    switch (offset)
++    {
++      case 0x00: // JOY_DATA
++      {
++        if (IsTransmitting())
++          s_state.transfer_event.InvokeEarly();
++
++        const u8 value = s_state.receive_buffer_full ? s_state.receive_buffer : 0xFF;
++        DEBUG_LOG("JOY_DATA (R) -> 0x{:02X}{}", value, s_state.receive_buffer_full ? "" : "(EMPTY)");
++        s_state.receive_buffer_full = false;
++        UpdateJoyStat();
++
++        return (ZeroExtend32(value) | (ZeroExtend32(value) << 8) | (ZeroExtend32(value) << 16) |
++                (ZeroExtend32(value) << 24));
++      }
++
++      case 0x04: // JOY_STAT
++      {
++        if (IsTransmitting())
++          s_state.transfer_event.InvokeEarly();
++
++        const u32 bits = s_state.JOY_STAT.bits;
++        s_state.JOY_STAT.ACKINPUT = false;
++        return bits;
++      }
++
++      case 0x08: // JOY_MODE
++        return ZeroExtend32(s_state.JOY_MODE.bits);
++
++      case 0x0A: // JOY_CTRL
++        return ZeroExtend32(s_state.JOY_CTRL.bits);
++
++      case 0x0E: // JOY_BAUD
++        return ZeroExtend32(s_state.JOY_BAUD);
++
++      [[unlikely]] default:
++        ERROR_LOG("Unknown register read: 0x{:X}", offset);
++        return UINT32_C(0xFFFFFFFF);
++    }
++  }
++
+   switch (offset)
+   {
+     case 0x00: // JOY_DATA
+     {
+-      if (IsTransmitting())
+-        s_state.transfer_event.InvokeEarly();
++      while (IsTransmitting())
++        TransferEvent(nullptr, 0);
+ 
+       const u8 value = s_state.receive_buffer_full ? s_state.receive_buffer : 0xFF;
+       DEBUG_LOG("JOY_DATA (R) -> 0x{:02X}{}", value, s_state.receive_buffer_full ? "" : "(EMPTY)");
+@@ -568,8 +756,8 @@ u32 Pad::ReadRegister(u32 offset)
+ 
+     case 0x04: // JOY_STAT
+     {
+-      if (IsTransmitting())
+-        s_state.transfer_event.InvokeEarly();
++      if (s_state.state == State::Transmitting)
++        DoTransfer();
+ 
+       const u32 bits = s_state.JOY_STAT.bits;
+       s_state.JOY_STAT.ACKINPUT = false;
+@@ -717,6 +905,35 @@ void Pad::TransferEvent(void*, TickCount ticks)
+ 
+ void Pad::BeginTransfer()
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    DebugAssert(s_state.state == State::Idle && CanTransfer());
++    DEBUG_LOG("Starting transfer");
++
++    s_state.JOY_CTRL.RXEN = true;
++    s_state.transmit_value = s_state.transmit_buffer;
++    s_state.transmit_buffer_full = false;
++
++    // The transfer or the interrupt must be delayed, otherwise the BIOS thinks there's no device detected.
++    // It seems to do something resembling the following:
++    //  1) Sets the control register up for transmitting, interrupt on ACK.
++    //  2) Writes 0x01 to the TX FIFO.
++    //  3) Delays for a bit.
++    //  4) Writes ACK to the control register, clearing the interrupt flag.
++    //  5) Clears IRQ7 in the interrupt controller.
++    //  6) Waits until the RX FIFO is not empty, reads the first byte to $zero.
++    //  7) Checks if the interrupt status register had IRQ7 set. If not, no device connected.
++    //
++    // Performing the transfer immediately will result in both the INTR bit and the bit in the interrupt
++    // controller being discarded in (4)/(5), but this bit was set by the *new* transfer. Therefore, the
++    // test in (7) will fail, and it won't send any more data. So, the transfer/interrupt must be delayed
++    // until after (4) and (5) have been completed.
++
++    s_state.state = State::Transmitting;
++    s_state.transfer_event.SetPeriodAndSchedule(GetTransferTicks());
++    return;
++  }
++
+   DebugAssert(s_state.state == State::Idle && CanTransfer());
+   DEBUG_LOG("Starting transfer");
+ 
+@@ -724,27 +941,139 @@ void Pad::BeginTransfer()
+   s_state.transmit_value = s_state.transmit_buffer;
+   s_state.transmit_buffer_full = false;
+ 
+-  // The transfer or the interrupt must be delayed, otherwise the BIOS thinks there's no device detected.
+-  // It seems to do something resembling the following:
+-  //  1) Sets the control register up for transmitting, interrupt on ACK.
+-  //  2) Writes 0x01 to the TX FIFO.
+-  //  3) Delays for a bit.
+-  //  4) Writes ACK to the control register, clearing the interrupt flag.
+-  //  5) Clears IRQ7 in the interrupt controller.
+-  //  6) Waits until the RX FIFO is not empty, reads the first byte to $zero.
+-  //  7) Checks if the interrupt status register had IRQ7 set. If not, no device connected.
+-  //
+-  // Performing the transfer immediately will result in both the INTR bit and the bit in the interrupt
+-  // controller being discarded in (4)/(5), but this bit was set by the *new* transfer. Therefore, the
+-  // test in (7) will fail, and it won't send any more data. So, the transfer/interrupt must be delayed
+-  // until after (4) and (5) have been completed.
+-
++  // Publish data immediately and ACK when RX is consumed after the preceding IRQ is cleared
+   s_state.state = State::Transmitting;
+-  s_state.transfer_event.SetPeriodAndSchedule(GetTransferTicks());
++  s_state.transfer_event.Deactivate();
++  DoTransfer();
+ }
+ 
+ void Pad::DoTransfer()
+ {
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    DEBUG_LOG("Transferring slot {}", s_state.JOY_CTRL.SLOT.GetValue());
++
++    const u8 device_index = s_state.multitaps[s_state.JOY_CTRL.SLOT].IsEnabled() ? 4u : s_state.JOY_CTRL.SLOT;
++    Controller* const controller = s_state.controllers[device_index].get();
++    MemoryCard* const memory_card = s_state.memory_cards[device_index].get();
++
++    // set rx?
++    s_state.JOY_CTRL.RXEN = true;
++
++    const u8 data_out = s_state.transmit_value;
++
++    u8 data_in = 0xFF;
++    bool ack = false;
++
++    switch (s_state.active_device)
++    {
++      case ActiveDevice::None:
++      {
++        if (s_state.multitaps[s_state.JOY_CTRL.SLOT].IsEnabled())
++        {
++          if ((ack = s_state.multitaps[s_state.JOY_CTRL.SLOT].Transfer(data_out, &data_in)) == true)
++          {
++            TRACE_LOG("Active device set to tap {}, sent 0x{:02X}, received 0x{:02X}",
++                      static_cast<int>(s_state.JOY_CTRL.SLOT), data_out, data_in);
++            s_state.active_device = ActiveDevice::Multitap;
++          }
++        }
++        else
++        {
++          if (!controller || (ack = controller->Transfer(data_out, &data_in)) == false)
++          {
++            if (!memory_card || (ack = memory_card->Transfer(data_out, &data_in)) == false)
++            {
++              // nothing connected to this port
++              TRACE_LOG("Nothing connected or ACK'ed");
++            }
++            else
++            {
++              // memory card responded, make it the active device until non-ack
++              TRACE_LOG("Transfer to memory card, data_out=0x{:02X}, data_in=0x{:02X}", data_out, data_in);
++              s_state.active_device = ActiveDevice::MemoryCard;
++
++              // back up memory card state in case we roll back to before this transfer begun
++              const u32 frame_number = System::GetFrameNumber();
++
++              // consider u32 overflow case
++              if (ShouldAvoidSavingToState() &&
++                  (frame_number - s_state.last_memory_card_transfer_frame) > GetMaximumRollbackFrames())
++                BackupMemoryCardState();
++
++              s_state.last_memory_card_transfer_frame = frame_number;
++            }
++          }
++          else
++          {
++            // controller responded, make it the active device until non-ack
++            TRACE_LOG("Transfer to controller, data_out=0x{:02X}, data_in=0x{:02X}", data_out, data_in);
++            s_state.active_device = ActiveDevice::Controller;
++          }
++        }
++      }
++      break;
++
++      case ActiveDevice::Controller:
++      {
++        if (controller)
++        {
++          ack = controller->Transfer(data_out, &data_in);
++          TRACE_LOG("Transfer to controller, data_out=0x{:02X}, data_in=0x{:02X}", data_out, data_in);
++        }
++      }
++      break;
++
++      case ActiveDevice::MemoryCard:
++      {
++        if (memory_card)
++        {
++          s_state.last_memory_card_transfer_frame = System::GetFrameNumber();
++          ack = memory_card->Transfer(data_out, &data_in);
++          TRACE_LOG("Transfer to memory card, data_out=0x{:02X}, data_in=0x{:02X}", data_out, data_in);
++        }
++      }
++      break;
++
++      case ActiveDevice::Multitap:
++      {
++        if (s_state.multitaps[s_state.JOY_CTRL.SLOT].IsEnabled())
++        {
++          ack = s_state.multitaps[s_state.JOY_CTRL.SLOT].Transfer(data_out, &data_in);
++          TRACE_LOG("Transfer tap {}, sent 0x{:02X}, received 0x{:02X}, acked: {}",
++                    static_cast<int>(s_state.JOY_CTRL.SLOT), data_out, data_in, ack ? "true" : "false");
++        }
++      }
++      break;
++    }
++
++    s_state.receive_buffer = data_in;
++    s_state.receive_buffer_full = true;
++    if (s_state.JOY_CTRL.RXINTEN)
++      TriggerIRQ("RX");
++
++    // device no longer active?
++    if (!ack)
++    {
++      s_state.active_device = ActiveDevice::None;
++      EndTransfer();
++    }
++    else
++    {
++      const bool memcard_transfer = s_state.active_device == ActiveDevice::MemoryCard ||
++                                    (s_state.active_device == ActiveDevice::Multitap &&
++                                     s_state.multitaps[s_state.JOY_CTRL.SLOT].IsReadingMemoryCard());
++
++      const TickCount ack_timer = GetACKTicks(memcard_transfer);
++      DEBUG_LOG("Delaying ACK for {} ticks", ack_timer);
++      s_state.state = State::WaitingForACK;
++      s_state.transfer_event.SetPeriodAndSchedule(ack_timer);
++    }
++
++    UpdateJoyStat();
++    return;
++  }
++
+   DEBUG_LOG("Transferring slot {}", s_state.JOY_CTRL.SLOT.GetValue());
+ 
+   const u8 device_index = s_state.multitaps[s_state.JOY_CTRL.SLOT].IsEnabled() ? 4u : s_state.JOY_CTRL.SLOT;
+@@ -854,14 +1183,7 @@ void Pad::DoTransfer()
+   }
+   else
+   {
+-    const bool memcard_transfer = s_state.active_device == ActiveDevice::MemoryCard ||
+-                                  (s_state.active_device == ActiveDevice::Multitap &&
+-                                   s_state.multitaps[s_state.JOY_CTRL.SLOT].IsReadingMemoryCard());
+-
+-    const TickCount ack_timer = GetACKTicks(memcard_transfer);
+-    DEBUG_LOG("Delaying ACK for {} ticks", ack_timer);
+     s_state.state = State::WaitingForACK;
+-    s_state.transfer_event.SetPeriodAndSchedule(ack_timer);
+   }
+ 
+   UpdateJoyStat();
+@@ -869,7 +1191,23 @@ void Pad::DoTransfer()
+ 
+ void Pad::DoACK()
+ {
+-  s_state.JOY_STAT.ACKINPUT = true;
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    s_state.JOY_STAT.ACKINPUT = true;
++
++    if (s_state.JOY_CTRL.ACKINTEN)
++      TriggerIRQ("ACK");
++
++    EndTransfer();
++    UpdateJoyStat();
++
++    if (CanTransfer())
++      BeginTransfer();
++    return;
++  }
++
++  // The synchronous pulse has ended while its completion IRQ remains latched
++  s_state.JOY_STAT.ACKINPUT = false;
+ 
+   if (s_state.JOY_CTRL.ACKINTEN)
+     TriggerIRQ("ACK");
 diff --git a/src/core/settings.cpp b/src/core/settings.cpp
 index f0ff209..c807235 100644
 --- a/src/core/settings.cpp
@@ -2061,7 +3027,7 @@ index a38e618..e3c2eeb 100644
  const std::array<u8, RAM_SIZE>& GetRAM();
  std::array<u8, RAM_SIZE>& GetWritableRAM();
 diff --git a/src/core/system.cpp b/src/core/system.cpp
-index 06e64d0..bff6830 100644
+index 06e64d0..51feed0 100644
 --- a/src/core/system.cpp
 +++ b/src/core/system.cpp
 @@ -416,6 +416,15 @@ void System::CancelPendingStartup()
@@ -2080,7 +3046,7 @@ index 06e64d0..bff6830 100644
  void System::InterruptExecution()
  {
    if (s_state.system_executing)
-@@ -500,10 +509,7 @@ void System::UpdateOverclock()
+@@ -500,10 +509,15 @@ void System::UpdateOverclock()
  
  GlobalTicks System::GetGlobalTickCounter()
  {
@@ -2088,11 +3054,19 @@ index 06e64d0..bff6830 100644
 -  // So, we need to return the counter with all pending ticks added in such cases.
 -  return TimingEvents::IsRunningEvents() ? TimingEvents::GetEventRunTickCounter() :
 -                                           (TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks());
++  if (TimingEvents::IsCPUClockEnabled())
++  {
++    // When running events, the counter actually goes backwards, because the pending ticks are added in chunks.
++    // So, we need to return the counter with all pending ticks added in such cases.
++    return TimingEvents::IsRunningEvents() ? TimingEvents::GetEventRunTickCounter() :
++                                             (TimingEvents::GetGlobalTickCounter() + CPU::GetPendingTicks());
++  }
++
 +  return TimingEvents::GetGlobalTickCounter();
  }
  
  u32 System::GetFrameNumber()
-@@ -2140,6 +2146,10 @@ void System::FrameDone()
+@@ -2140,6 +2154,10 @@ void System::FrameDone()
      InputManager::PollSources();
    }
  
@@ -2103,7 +3077,7 @@ index 06e64d0..bff6830 100644
    // Frame step can still trigger exit
    CheckForAndExitExecution();
  
-@@ -3340,6 +3350,27 @@ bool System::SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error*
+@@ -3340,6 +3358,27 @@ bool System::SaveStateDataToBuffer(std::span<u8> data, size_t* data_size, Error*
    return true;
  }
  
@@ -2186,20 +3160,24 @@ index 3d37c1a..8518228 100644
  void SetGate(u32 timer, bool state);
  
 diff --git a/src/core/timing_event.cpp b/src/core/timing_event.cpp
-index a0fbc06..ff0c3e0 100644
+index a0fbc06..9b2b2ab 100644
 --- a/src/core/timing_event.cpp
 +++ b/src/core/timing_event.cpp
-@@ -5,6 +5,9 @@
+@@ -3,8 +3,13 @@
+ 
+ #include "timing_event.h"
  #include "cpu_core.h"
++#include "cdrom.h"
  #include "cpu_core_private.h"
  #include "system.h"
 +#include "gpu.h"
++#include "interrupt_controller.h"
 +#include "spu.h"
 +#include "timers.h"
  
  #include "util/state_wrapper.h"
  
-@@ -13,6 +16,9 @@
+@@ -13,6 +18,9 @@
  #include "common/small_string.h"
  #include "common/thirdparty/SmallVector.h"
  
@@ -2209,29 +3187,56 @@ index a0fbc06..ff0c3e0 100644
  LOG_CHANNEL(TimingEvents);
  
  namespace TimingEvents {
-@@ -38,6 +44,10 @@ struct TimingEventsState
+@@ -38,13 +46,30 @@ struct TimingEventsState
    GlobalTicks current_event_next_run_time = 0;
    GlobalTicks global_tick_counter = 0;
    GlobalTicks event_run_tick_counter = 0;
 +  std::vector<u32> wait_points;
++  u32 sio_delay_pc = 0;
++  u32 sio_delay_start_pc = 0;
 +  std::vector<u32> serviced_wait_points;
 +  u32 servicing_pc = 0;
 +  GlobalTicks servicing_target = 0;
  };
  } // namespace
  
-@@ -52,9 +62,7 @@ GlobalTicks TimingEvents::GetGlobalTickCounter()
+ ALIGN_TO_CACHE_LINE static TimingEventsState s_state;
++static bool s_cpu_clock_enabled = true;
+ 
+ } // namespace TimingEvents
+ 
++void TimingEvents::SetCPUClockEnabled(bool enabled)
++{
++  s_cpu_clock_enabled = enabled;
++}
++
++bool TimingEvents::IsCPUClockEnabled()
++{
++  return s_cpu_clock_enabled;
++}
++
+ GlobalTicks TimingEvents::GetGlobalTickCounter()
+ {
+   return s_state.global_tick_counter;
+@@ -52,9 +77,14 @@ GlobalTicks TimingEvents::GetGlobalTickCounter()
  
  GlobalTicks TimingEvents::GetTimestampForNewEvent()
  {
 -  // we want to schedule relative to the currently-being processed event, but if we haven't run events in a while, it
 -  // needs to include the pending time. so explicitly add the two.
 -  return s_state.global_tick_counter + CPU::GetPendingTicks();
++  if (s_cpu_clock_enabled)
++  {
++    // we want to schedule relative to the currently-being processed event, but if we haven't run events in a while, it
++    // needs to include the pending time. so explicitly add the two.
++    return s_state.global_tick_counter + CPU::GetPendingTicks();
++  }
++
 +  return s_state.global_tick_counter;
  }
  
  GlobalTicks TimingEvents::GetEventRunTickCounter()
-@@ -71,6 +79,9 @@ void TimingEvents::Reset()
+@@ -71,6 +101,9 @@ void TimingEvents::Reset()
  {
    s_state.global_tick_counter = 0;
    s_state.event_run_tick_counter = 0;
@@ -2241,7 +3246,7 @@ index a0fbc06..ff0c3e0 100644
  }
  
  void TimingEvents::Shutdown()
-@@ -80,10 +91,8 @@ void TimingEvents::Shutdown()
+@@ -80,10 +113,17 @@ void TimingEvents::Shutdown()
  
  void TimingEvents::UpdateCPUDowncount()
  {
@@ -2249,12 +3254,21 @@ index a0fbc06..ff0c3e0 100644
 -  const u32 event_downcount =
 -    static_cast<u32>(s_state.active_events_head->m_next_run_time - s_state.global_tick_counter);
 -  CPU::g_state.downcount = CPU::HasPendingInterrupt() ? 0 : event_downcount;
++  if (s_cpu_clock_enabled)
++  {
++    DebugAssert(s_state.active_events_head->m_next_run_time >= s_state.global_tick_counter);
++    const u32 event_downcount =
++      static_cast<u32>(s_state.active_events_head->m_next_run_time - s_state.global_tick_counter);
++    CPU::g_state.downcount = CPU::HasPendingInterrupt() ? 0 : event_downcount;
++    return;
++  }
++
 +  // This budget yields the host dispatcher without advancing devices
 +  CPU::g_state.downcount = 4096;
  }
  
  TimingEvent** TimingEvents::GetHeadEventPtr()
-@@ -96,15 +105,21 @@ void TimingEvents::SetGlobalTickCounter(GlobalTicks ticks)
+@@ -96,15 +136,21 @@ void TimingEvents::SetGlobalTickCounter(GlobalTicks ticks)
    s_state.global_tick_counter = ticks;
  }
  
@@ -2279,7 +3293,7 @@ index a0fbc06..ff0c3e0 100644
        current = current->prev;
  
      // unlink
-@@ -141,11 +156,11 @@ void TimingEvents::SortEvent(TimingEvent* event)
+@@ -141,11 +187,11 @@ void TimingEvents::SortEvent(TimingEvent* event)
          UpdateCPUDowncount();
      }
    }
@@ -2293,7 +3307,7 @@ index a0fbc06..ff0c3e0 100644
        current = current->next;
  
      // unlink
-@@ -200,10 +215,9 @@ void TimingEvents::AddActiveEvent(TimingEvent* event)
+@@ -200,10 +246,9 @@ void TimingEvents::AddActiveEvent(TimingEvent* event)
    DebugAssert(!event->prev && !event->next);
    s_state.active_event_count++;
  
@@ -2305,7 +3319,7 @@ index a0fbc06..ff0c3e0 100644
    {
      current = next;
      next = next->next;
-@@ -371,43 +385,105 @@ ALWAYS_INLINE_RELEASE void TimingEvents::CommitGlobalTicks(const GlobalTicks new
+@@ -371,43 +416,179 @@ ALWAYS_INLINE_RELEASE void TimingEvents::CommitGlobalTicks(const GlobalTicks new
  
  void TimingEvents::RunEvents()
  {
@@ -2313,45 +3327,80 @@ index a0fbc06..ff0c3e0 100644
 -  DebugAssert(CPU::GetPendingTicks() >= CPU::g_state.downcount);
 -
 -  do
--  {
++  if (s_cpu_clock_enabled)
+   {
 -    const GlobalTicks new_global_ticks =
 -      s_state.event_run_tick_counter + static_cast<GlobalTicks>(CPU::GetPendingTicks());
 -    if (new_global_ticks >= s_state.active_events_head->m_next_run_time)
--    {
++    DebugAssert(!s_state.current_event);
++    DebugAssert(CPU::GetPendingTicks() >= CPU::g_state.downcount);
++
++    do
+     {
 -      CPU::ResetPendingTicks();
 -      CommitGlobalTicks(new_global_ticks);
 -    }
++      const GlobalTicks new_global_ticks =
++        s_state.event_run_tick_counter + static_cast<GlobalTicks>(CPU::GetPendingTicks());
++      if (new_global_ticks >= s_state.active_events_head->m_next_run_time)
++      {
++        CPU::ResetPendingTicks();
++        CommitGlobalTicks(new_global_ticks);
++      }
++
++      if (CPU::HasPendingInterrupt())
++        CPU::DispatchInterrupt();
++
++      UpdateCPUDowncount();
++    } while (CPU::GetPendingTicks() >= CPU::g_state.downcount);
++    return;
++  }
++
 +  // Preserve CPU completion latencies when recycling its local budget
 +  CPU::ResetPendingTicks();
 +  UpdateCPUDowncount();
 +  System::PollCooperativeHost();
 +}
- 
--    if (CPU::HasPendingInterrupt())
--      CPU::DispatchInterrupt();
++
 +void TimingEvents::CommitLeftoverTicks()
 +{
++  if (s_cpu_clock_enabled)
++  {
++  #if defined(_DEBUG) || defined(_DEVEL)
++    if (s_state.event_run_tick_counter > s_state.global_tick_counter)
++      DEV_LOG("Late-running {} ticks before execution", s_state.event_run_tick_counter - s_state.global_tick_counter);
++  #endif
++
++    CommitGlobalTicks(s_state.event_run_tick_counter);
+ 
+     if (CPU::HasPendingInterrupt())
+       CPU::DispatchInterrupt();
+ 
+     UpdateCPUDowncount();
+-  } while (CPU::GetPendingTicks() >= CPU::g_state.downcount);
++    return;
++  }
++
 +  // Pausing or resuming the host must not advance guest devices
 +  UpdateCPUDowncount();
-+}
- 
--    UpdateCPUDowncount();
--  } while (CPU::GetPendingTicks() >= CPU::g_state.downcount);
-+void TimingEvents::SetWaitPoints(std::span<const u32> pcs)
-+{
-+  s_state.wait_points.assign(pcs.begin(), pcs.end());
-+  std::sort(s_state.wait_points.begin(), s_state.wait_points.end());
-+  s_state.wait_points.erase(std::unique(s_state.wait_points.begin(), s_state.wait_points.end()),
-+                           s_state.wait_points.end());
  }
  
 -void TimingEvents::CommitLeftoverTicks()
-+static bool IsBlockingPollTaken()
++void TimingEvents::SetWaitPoints(std::span<const u32> pcs)
  {
 -#if defined(_DEBUG) || defined(_DEVEL)
 -  if (s_state.event_run_tick_counter > s_state.global_tick_counter)
 -    DEV_LOG("Late-running {} ticks before execution", s_state.event_run_tick_counter - s_state.global_tick_counter);
 -#endif
++  s_state.wait_points.assign(pcs.begin(), pcs.end());
++  std::sort(s_state.wait_points.begin(), s_state.wait_points.end());
++  s_state.wait_points.erase(std::unique(s_state.wait_points.begin(), s_state.wait_points.end()),
++                           s_state.wait_points.end());
++}
+ 
+-  CommitGlobalTicks(s_state.event_run_tick_counter);
++static bool IsBlockingPollTaken()
++{
 +  const u32 instruction = CPU::g_state.next_instruction.bits;
 +  const u32 op = instruction >> 26;
 +  const u32 lhs = CPU::g_state.regs.r[(instruction >> 21) & 31];
@@ -2364,16 +3413,48 @@ index a0fbc06..ff0c3e0 100644
 +    case 7: return static_cast<s32>(lhs) > 0;
 +    case 1:
 +      return ((instruction >> 16) & 1) ? static_cast<s32>(lhs) >= 0 : static_cast<s32>(lhs) < 0;
-+    default: return true;
++    case 2: return true;
++    default: return false;
 +  }
 +}
  
--  CommitGlobalTicks(s_state.event_run_tick_counter);
++void TimingEvents::SetSioDelay(u32 ready_pc, u32 start_pc)
++{
++  s_state.sio_delay_pc = ready_pc;
++  s_state.sio_delay_start_pc = start_pc;
++}
++
 +void TimingEvents::BeforeInstruction(u32 pc)
 +{
++  if (s_cpu_clock_enabled)
++    return;
++  CDROM::CompleteSynchronousOperations();
++  // An absent device completes with no ACK instead of waiting for a serial timeout
++  if (pc && pc == s_state.sio_delay_start_pc)
++    CPU::g_state.regs.r[4] = 0;
++  if (pc && pc == s_state.sio_delay_pc && !CPU::g_state.next_instruction_is_branch_delay_slot)
++  {
++    // The audited PsyQ serial settling predicate is ready with synchronous SIO
++    CPU::g_state.regs.r[2] = 1;
++    CPU::SetPC(CPU::g_state.regs.r[31]);
++    return;
++  }
++  // Deliver completed device operations without advancing virtual time
++  constexpr u32 completion_irqs = (1u << static_cast<u32>(InterruptController::IRQ::GPU)) |
++                                  (1u << static_cast<u32>(InterruptController::IRQ::CDROM)) |
++                                  (1u << static_cast<u32>(InterruptController::IRQ::DMA)) |
++                                  (1u << static_cast<u32>(InterruptController::IRQ::SPU));
++  if (!s_state.servicing_pc && !CPU::g_state.next_instruction_is_branch_delay_slot &&
++      CPU::HasPendingInterrupt() &&
++      (InterruptController::ReadRegister(0) & InterruptController::ReadRegister(4) & completion_irqs))
++  {
++    CPU::DispatchInterrupt();
++    return;
++  }
 +  if (!s_state.servicing_pc)
 +  {
-+    if (CPU::g_state.next_instruction_is_branch_delay_slot || !IsBlockingPollTaken() ||
++    // A masked IRQ wait runs its guest timeout without generating more device time
++    if (!CPU::g_state.cop0_regs.sr.IEc || CPU::g_state.next_instruction_is_branch_delay_slot || !IsBlockingPollTaken() ||
 +        !std::binary_search(s_state.wait_points.begin(), s_state.wait_points.end(), pc) ||
 +        std::find(s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end(), pc) !=
 +          s_state.serviced_wait_points.end())
@@ -2385,7 +3466,7 @@ index a0fbc06..ff0c3e0 100644
 +    s_state.servicing_target = (!CPU::HasPendingInterrupt() && s_state.active_events_head) ?
 +                                s_state.active_events_head->m_next_run_time : s_state.global_tick_counter;
 +  }
- 
++
 +  // Complete the same event batch after a FrameDone stop
 +  if (s_state.active_events_head)
 +    CommitGlobalTicks(s_state.servicing_target);
@@ -2397,7 +3478,7 @@ index a0fbc06..ff0c3e0 100644
      CPU::DispatchInterrupt();
 +  UpdateCPUDowncount();
 +}
- 
++
 +std::vector<u32> TimingEvents::CaptureWaitState()
 +{
 +  std::vector<u32> state{s_state.servicing_pc, static_cast<u32>(s_state.servicing_target),
@@ -2405,7 +3486,7 @@ index a0fbc06..ff0c3e0 100644
 +  state.insert(state.end(), s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end());
 +  return state;
 +}
-+
+ 
 +void TimingEvents::RestoreWaitState(std::span<const u32> state)
 +{
 +  Assert(state.size() >= 3);
@@ -2417,6 +3498,8 @@ index a0fbc06..ff0c3e0 100644
  
 +void TimingEvents::AfterInstruction(u32 pc)
 +{
++  if (s_cpu_clock_enabled)
++    return;
 +  const auto it = std::find(s_state.serviced_wait_points.begin(), s_state.serviced_wait_points.end(), pc);
 +  if (it != s_state.serviced_wait_points.end())
 +    s_state.serviced_wait_points.erase(it);
@@ -2434,7 +3517,7 @@ index a0fbc06..ff0c3e0 100644
    {
      u32 old_global_tick_counter = 0;
 diff --git a/src/core/timing_event.h b/src/core/timing_event.h
-index 1d7bc8e..4ad29ff 100644
+index 1d7bc8e..0de885c 100644
 --- a/src/core/timing_event.h
 +++ b/src/core/timing_event.h
 @@ -6,6 +6,8 @@
@@ -2446,12 +3529,24 @@ index 1d7bc8e..4ad29ff 100644
  
  class StateWrapper;
  
-@@ -90,6 +92,13 @@ void CancelRunningEvent();
+@@ -79,6 +81,10 @@ namespace TimingEvents {
+ GlobalTicks GetGlobalTickCounter();
+ GlobalTicks GetEventRunTickCounter();
+ 
++// Select CPU-driven device time before boot
++void SetCPUClockEnabled(bool enabled);
++bool IsCPUClockEnabled();
++
+ void Initialize();
+ void Reset();
+ void Shutdown();
+@@ -90,6 +96,14 @@ void CancelRunningEvent();
  void RunEvents();
  void CommitLeftoverTicks();
  
 +// Device time advances only at registered blocking polls
 +void SetWaitPoints(std::span<const u32> pcs);
++void SetSioDelay(u32 ready_pc, u32 start_pc);
 +void BeforeInstruction(u32 pc);
 +void AfterInstruction(u32 pc);
 +std::vector<u32> CaptureWaitState();
@@ -2460,6 +3555,13 @@ index 1d7bc8e..4ad29ff 100644
  void UpdateCPUDowncount();
  
  TimingEvent** GetHeadEventPtr();
+@@ -97,4 +111,4 @@ TimingEvent** GetHeadEventPtr();
+ // Tick counter injection, only for GPU dump replayer.
+ void SetGlobalTickCounter(GlobalTicks ticks);
+ 
+-} // namespace TimingEvents
+\ No newline at end of file
++} // namespace TimingEvents
 diff --git a/src/core/xport_lockstep_mips.h b/src/core/xport_lockstep_mips.h
 new file mode 100644
 index 0000000..0bc171c
@@ -3049,10 +4151,10 @@ index 0000000..0bc171c
 +} // Namespace XportLockstep
 diff --git a/src/core/xport_lockstep_peer.h b/src/core/xport_lockstep_peer.h
 new file mode 100644
-index 0000000..6432bb7
+index 0000000..e55f50f
 --- /dev/null
 +++ b/src/core/xport_lockstep_peer.h
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,699 @@
 +// SPDX-FileCopyrightText: 2026 xport contributors
 +// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 +
@@ -3174,6 +4276,8 @@ index 0000000..6432bb7
 +  volatile u32 spu_timeline_read;
 +  volatile u32 spu_timeline_error;
 +  SpuEvent spu_events[SPU_EVENT_CAPACITY];
++  volatile u32 device_clock_low;
++  volatile u32 device_clock_high;
 +};
 +
 +class Peer final
@@ -3192,7 +4296,7 @@ index 0000000..6432bb7
 +  Error Seed(const u8* original_dram, const u8* original_scratchpad, const u8* original_vram);
 +  Error Compare(std::string_view stack_identity, const u8* original_dram, const u8* original_scratchpad,
 +                Difference* difference, u32* deferred_generation);
-+  void PublishDeviceTicks(u64 ticks);
++  void PublishDeviceTicks(u64 ticks, u64 clock);
 +  void ResetSpuTimeline();
 +  void PublishSpuEvent(SpuEventKind kind, u32 address, u32 value, u64 ticks);
 +
@@ -3240,7 +4344,7 @@ index 0000000..6432bb7
 +  std::array<DeferredRange, DEFERRED_MAX_CANONICAL_RANGES> m_deferred_canonical{};
 +};
 +
-+inline void Peer::PublishDeviceTicks(u64 ticks)
++inline void Peer::PublishDeviceTicks(u64 ticks, u64 clock)
 +{
 +#ifdef _WIN32
 +  if (!m_deferred)
@@ -3249,10 +4353,13 @@ index 0000000..6432bb7
 +  MemoryBarrier();
 +  m_deferred->device_ticks_low = static_cast<u32>(ticks);
 +  m_deferred->device_ticks_high = static_cast<u32>(ticks >> 32);
++  m_deferred->device_clock_low = static_cast<u32>(clock);
++  m_deferred->device_clock_high = static_cast<u32>(clock >> 32);
 +  MemoryBarrier();
 +  InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_deferred->device_sequence));
 +#else
 +  (void)ticks;
++  (void)clock;
 +#endif
 +}
 +
@@ -3297,6 +4404,7 @@ index 0000000..6432bb7
 +  (void)address;
 +  (void)value;
 +  (void)ticks;
++  (void)clock;
 +#endif
 +}
 +
@@ -3746,3 +4854,43 @@ index 0000000..6432bb7
 +}
 +
 +} // Namespace XportLockstep
+diff --git a/src/duckstation-qt/qthost.cpp b/src/duckstation-qt/qthost.cpp
+index ef4b14b..73d5281 100644
+--- a/src/duckstation-qt/qthost.cpp
++++ b/src/duckstation-qt/qthost.cpp
+@@ -31,6 +31,7 @@
+ #include "core/host.h"
+ #include "core/performance_counters.h"
+ #include "core/system.h"
++#include "core/timing_event.h"
+ #include "core/system_private.h"
+ #include "core/video_presenter.h"
+ #include "core/video_thread.h"
+@@ -3453,6 +3454,8 @@ void QtHost::PrintCommandLineHelp(const char* progname)
+   std::fprintf(stderr, "  -help: Displays this information and exits.\n");
+   std::fprintf(stderr, "  -version: Displays version information and exits.\n");
+   std::fprintf(stderr, "  -batch: Enables batch mode (exits after powering off).\n");
++  std::fprintf(stderr, "  -lockstep-timing: Use cooperative device time at project wait points.\n");
++  std::fprintf(stderr, "  -standard-timing: Use CPU-driven device time (default).\n");
+   std::fprintf(stderr, "  -fastboot: Force fast boot for provided filename.\n");
+   std::fprintf(stderr, "  -slowboot: Force slow boot for provided filename.\n");
+   std::fprintf(stderr, "  -bios: Boot into the BIOS shell.\n");
+@@ -3529,6 +3532,18 @@ bool QtHost::ParseCommandLineParametersAndInitializeConfig(QApplication& app,
+         starting_bios = true;
+         continue;
+       }
++      else if (CHECK_ARG("-lockstep-timing"))
++      {
++        TimingEvents::SetCPUClockEnabled(false);
++        INFO_LOG("Command Line: Using cooperative lockstep device time.");
++        continue;
++      }
++      else if (CHECK_ARG("-standard-timing"))
++      {
++        TimingEvents::SetCPUClockEnabled(true);
++        INFO_LOG("Command Line: Using CPU-driven device time.");
++        continue;
++      }
+       else if (CHECK_ARG("-fastboot"))
+       {
+         INFO_LOG("Command Line: Forcing fast boot.");

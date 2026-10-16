@@ -27,9 +27,20 @@ class StartupSupervisorTests(unittest.TestCase):
 
     def test_readme_escapes_display_names_and_encodes_repository(self):
         text = startup.render_project_readme('Game & <Two>', 'G2')
-        self.assertIn('Game &amp; &lt;Two&gt;-xport', text)
-        self.assertIn('repo=Game%20%26%20%3CTwo%3E-xport', text)
+        self.assertIn('>Game&amp;&lt;Two&gt;-xport</h1>', text)
+        self.assertIn('repo=Game%26%3CTwo%3E-xport', text)
+        self.assertIn('Game &amp; &lt;Two&gt; (PSX)', text)
         self.assertIn('https://psxports.to/G2/', text)
+
+    def test_readme_removes_spaces_only_from_project_identity(self):
+        text = startup.render_project_readme('Pandemonium 2', 'P2')
+        self.assertIn('>Pandemonium2-xport</h1>', text)
+        self.assertIn('Pandemonium 2 (PSX)', text)
+        self.assertIn('repo=Pandemonium2-xport&label=decomp', text)
+        self.assertIn('https://github.com/psxports/Pandemonium2-xport/issues?', text)
+        self.assertIn('<img src="cover.png" alt="cover">', text)
+        self.assertNotIn('width=', text)
+        self.assertNotIn('height=', text)
 
     def test_initializer_preserves_existing_readme_without_scaffold(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -52,6 +63,58 @@ class StartupSupervisorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid project README template tokens'):
                     startup.initialize_project(root, 'Example', 'EX', 45420)
             self.assertFalse(root.exists())
+
+    def test_generated_project_embeds_local_default_icon(self):
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'IconProject'
+            startup.initialize_project(root, 'Icon Game', 'IC', 45430)
+            platform = root/'src/platform/win'
+            tree = ET.parse(platform/'IC.vcxproj')
+            ns = {'p': 'http://schemas.microsoft.com/developer/msbuild/2003'}
+            resources = tree.findall('.//p:ResourceCompile', ns)
+            self.assertEqual(len(resources), 1)
+            resource = resources[0]
+            path = (platform/resource.attrib['Include'].replace('\\', '/')).resolve()
+            self.assertEqual(path, platform/'icon.rc')
+            self.assertEqual(resource.find('p:AdditionalIncludeDirectories', ns).text,
+                             '$(ProjectDir);%(AdditionalIncludeDirectories)')
+            self.assertIsNone(resource.find('p:ExcludedFromBuild', ns))
+            icon = tree.find('.//p:Image', ns)
+            self.assertEqual((platform/icon.attrib['Include'].replace('\\', '/')).resolve(),
+                             platform/'icon.ico')
+            for filename in ('icon.ico', 'icon.rc'):
+                self.assertEqual((platform/filename).read_bytes(),
+                                 (startup.NATIVE_TEMPLATE_DIR/filename).read_bytes())
+
+    def test_initializer_preserves_existing_icon_files(self):
+        for filename in ('icon.ico', 'icon.rc'):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)/'Project'
+                platform = root/'src/platform/win'
+                platform.mkdir(parents=True)
+                existing = platform/filename
+                existing.write_bytes(b'User icon')
+                with self.assertRaisesRegex(ValueError, 'STARTUP_ROOT_NOT_EMPTY'):
+                    startup.initialize_project(root, 'Icon Game', 'IC', 45450)
+                self.assertEqual(existing.read_bytes(), b'User icon')
+                self.assertFalse((root/'xport-project.json').exists())
+                self.assertFalse((root/'README.md').exists())
+
+    def test_initializer_rejects_missing_default_icon_before_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            native = Path(directory)/'templates'
+            native.mkdir()
+            for missing in ('icon.rc', 'icon.ico'):
+                for path in native.iterdir():
+                    path.unlink()
+                other = 'icon.ico' if missing == 'icon.rc' else 'icon.rc'
+                (native/other).touch()
+                root = Path(directory)/'Project'
+                with mock.patch.object(startup, 'NATIVE_TEMPLATE_DIR', native):
+                    with self.assertRaisesRegex(ValueError, 'Missing default Windows icon resource'):
+                        startup.initialize_project(root, 'Icon Game', 'IC', 45440)
+                self.assertFalse(root.exists())
 
     def test_generated_gitignore_matches_shared_template(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,7 +143,8 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertNotIn('$(OutDir)SY_debug.pdb', project)
 
     def start_to_image_review(self, root):
-        with mock.patch.object(startup, 'run_shared', return_value='ok'):
+        with mock.patch.object(startup, 'run_shared', return_value='ok'), \
+                mock.patch.object(startup.startup_github, 'sync_project', return_value={'repository': 'psxports/ExampleGame-xport'}):
             return startup.start(root, 'Example Game', 'EX', 45000)
 
     def test_start_runs_deterministic_steps_until_attention(self):
@@ -511,14 +575,18 @@ class StartupSupervisorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'differs from the unique runtime initializer'):
                 startup.validate_gp_config(root, profile)
 
-    def test_ida_export_applies_reviewed_gp_before_waiting_for_analysis(self):
+    def test_ida_export_assigns_gp_after_segments_and_before_function_analysis(self):
         script = (Path(startup.__file__).resolve().parent / 'ida' /
                   'ida_analyze_export.py').read_text(encoding='utf-8')
-        gp = script.index("directive('MIPS_GP=0x%X'%cfg['gp'])")
-        first_wait = script.index('ida_auto.auto_wait()', gp)
-        export = script.index('records=[]', first_wait)
-        self.assertLess(gp, first_wait)
-        self.assertLess(first_wait, export)
+        main = script[script.index('def main():'):]
+        segments = main.index("for part in cfg['segments']")
+        assignment = main.index('apply_gp(cfg)', segments)
+        seeds = main.index("for ea in cfg['seeds']", assignment)
+        verification = main.index('gp_verification=verify_gp(cfg)', seeds)
+        export = main.index('records=[]', verification)
+        self.assertLess(segments, assignment)
+        self.assertLess(assignment, seeds)
+        self.assertLess(verification, export)
 
     def test_trace_workflow_requires_the_lockstep_project_contract(self):
         config = {'lockstep': {'schema': 1, 'enabled': True}}

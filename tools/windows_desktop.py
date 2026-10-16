@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import re
+import uuid
 
 
 def process_desktop(environment=None):
@@ -22,6 +23,63 @@ CREATE_NO_WINDOW = 0x08000000
 STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
 SW_SHOWNORMAL = 1
+
+
+def open_worker_desktop():
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
+                                   wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    user.CreateDesktopW.restype = wintypes.HANDLE
+    user.CloseDesktop.argtypes = [wintypes.HANDLE]
+    handle = user.CreateDesktopW("XportConverge", None, None, 0, 0x01FF, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return user, handle
+
+
+_worker_desktop_lease = None
+
+
+def signal_worker_ready():
+    global _worker_desktop_lease
+    name = os.environ.get("XPORT_WORKER_READY_EVENT")
+    if not name:
+        return
+    _worker_desktop_lease = open_worker_desktop()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.OpenEventW.restype = wintypes.HANDLE
+    kernel.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    event = kernel.OpenEventW(2, False, name)
+    if not event or not kernel.SetEvent(event):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.CloseHandle(event)
+
+
+def launch_worker_desktop(command, directory: Path, *, environment):
+    user, handle = open_worker_desktop()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateEventW.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    name = "Local\\xport-worker-ready-" + uuid.uuid4().hex
+    event = kernel.CreateEventW(None, True, False, name)
+    if not event:
+        user.CloseDesktop(handle)
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        worker_environment = dict(environment, XPORT_WINDOWS_DESKTOP="WinSta0\\XportConverge",
+                                  XPORT_WORKER_READY_EVENT=name)
+        process = launch_default_desktop_process(command, directory, visible=False,
+                                                environment=worker_environment)
+        if kernel.WaitForSingleObject(event, 10000) != 0:
+            raise RuntimeError("Hidden converge worker did not initialize")
+        return process.pid
+    finally:
+        kernel.CloseHandle(event)
+        user.CloseDesktop(handle)
 
 
 class StartupInfo(ctypes.Structure):

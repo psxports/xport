@@ -31,10 +31,14 @@ class DuckStationLockstep:
         self.argument_registers: dict[int, tuple[int, ...]] = {}
         self.runtime_identity = runtime_identity
 
-    def configure_wait_points(self, pcs: list[str]) -> None:
+    def configure_wait_points(self, pcs: list[str], sio_delay: list[str] | None = None) -> None:
         addresses = [int(pc, 0) for pc in pcs]
         command = "qXportWaitPoints:" + ":".join(f"{pc:x}" for pc in addresses)
         self._expect(self.remote.packet(command), "OK:wait", "wait points")
+        if sio_delay:
+            delay = ":".join(f"{int(pc, 0):x}" for pc in sio_delay)
+            self._expect(self.remote.packet(f"qXportSioDelay:{delay}"),
+                         "OK:sio", "synchronous SIO settling delay")
 
     def _bind_event_image(self, event: dict) -> dict:
         runtime = self.runtime_identity
@@ -157,7 +161,7 @@ class DuckStationLockstep:
         record_id = self.record["record_id"]
         self._expect(self.remote.packet(f"qXportLockstepSeed:{record_id}"),
                      f"OK:{record_id}", "handoff memory seed")
-        mode = "PREFIX_GUARD" if target_frame > start_frame else "DETAILED"
+        mode = "PREFIX_GUARD" if target_frame else "DETAILED"
         mode_target = target_frame if mode == "PREFIX_GUARD" else 0
         self._expect(self.remote.packet(f"qXportLockstepMode:{mode}:{mode_target:x}"),
                      f"OK:{mode}:{mode_target:x}", "handoff mode")
@@ -189,6 +193,15 @@ class DuckStationLockstep:
         if portable_frame is not None:
             if not 0 <= portable_frame + 1 < len(record["frames"]):
                 raise LockstepGdbError("Portable checkpoint frame is outside the record")
+            if self.mode == "replay":
+                reply = self.remote.packet(
+                    f"qXportLockstepAttach:{peer['run_id']}:{peer['dram']}:{peer['scratchpad']}:{peer['deferred']}"
+                )
+                self._expect(reply, f"OK:{peer['run_id']}", "initial handoff attach")
+                self._expect(self.remote.packet(f"qXportLockstepDetach:{peer['run_id']}"),
+                             f"OK:{peer['run_id']}", "initial handoff reset")
+                self.mode = None
+                self.record = None
             self._expect(self.remote.packet(
                 f"qXportLockstepCheckpointImport:{portable_frame:x}:prepare"),
                 f"OK:{portable_frame:x}:prepared", "checkpoint preparation")
@@ -375,6 +388,14 @@ class DuckStationLockstep:
             command += f":{target_frame:x}"
         reply = self.remote.packet(command)
         self._expect(reply, f"OK:{frame:x}", "checkpoint restore")
+        previous = self.record["frames"][frame]
+        ports = [
+            f"{CONTROLLER_TYPES[port['type']]:x},{port['buttons']:x},{port['analog']:x}"
+            for port in previous["ports"]
+        ]
+        self._expect(self.remote.packet(
+            f"qXportLockstepPadRestore:{frame:x}:{ports[0]}:{ports[1]}"),
+            f"OK:{frame:x}", "checkpoint controller restore")
         self.input_index = frame + 1
         self._queue_next_input()
 
@@ -574,22 +595,51 @@ class DuckStationLockstep:
         self.remote.close()
 
 
+DEFERRED_ORIGINAL_BOUNDARY_OFFSET = (10 + 3 + 32 * 3 + 511 * 3 + 7 + 4096 * 5 + 2) * 4
+
+
 class NativeCdbParticipant:
     def __init__(self, controller, *, initially_stopped: bool = False):
         self.controller = controller
         self.first = not initially_stopped
         self.watch_hits = []
 
+    def publish_original_boundary(self, event: dict, original=None) -> None:
+        if not getattr(self.controller, 'original_boundary_metadata', False):
+            return
+        name = next(value for key, value in self.controller.environment.items()
+                    if key.upper() == 'XPORT_LOCKSTEP_DEFERRED_MAPPING')
+        offset = DEFERRED_ORIGINAL_BOUNDARY_OFFSET
+        boundary = 2
+        if event['kind'] == 'VBLANK':
+            pending = original.beam_state()['irq']['status'] & 1
+            boundary = 1 if pending else 3
+        with mmap.mmap(-1, offset + 4, tagname=name, access=mmap.ACCESS_WRITE) as view:
+            view.seek(offset)
+            view.write(struct.pack('<I', boundary))
+
     def advance(self, timeout: float) -> dict:
         if self.first:
             self.first = False
         else:
             self.controller.continue_execution()
-        for _ in range(2):
+        for _ in range(66):
             event = self.controller.next_event(timeout)
             if event.get("stop") != "watchpoint":
                 return event
+            if getattr(self.controller, "diagnostic_watch_values", None):
+                event["stack"] = self.controller.stack()
+                event["diagnostic_values"] = self.controller.diagnostic_values(
+                    self.controller.diagnostic_watch_values)
+            if getattr(self.controller, "diagnostic_watch_stack", False):
+                event["call_stack"] = self.controller.capture_call_stack()
+            if getattr(self.controller, "diagnostic_watch_locals", False):
+                event["writer_locals"] = self.controller.capture_writer_locals()
             self.watch_hits.append({**event, "source": "cdb_prearmed_watchpoint"})
+            remaining = getattr(self.controller, "diagnostic_watch_remaining", 0)
+            if remaining:
+                self.controller.diagnostic_watch_remaining = remaining - 1
+                self.controller.set_data_watchpoint(event["region"], event["offset"], event["width"])
             self.controller.continue_execution()
         raise LockstepGdbError("Native target did not reach a boundary after its watchpoint")
 
@@ -607,7 +657,7 @@ class NativeCdbParticipant:
                      if key.upper() == "XPORT_LOCKSTEP_DEFERRED_MAPPING"), None)
         if not name:
             raise LockstepGdbError("Native deferred mapping identity is unavailable")
-        size = (10 + 3 + 32 * 3 + 512 * 3 + 4 + 4096 * 5) * 4
+        size = (10 + 3 + 32 * 3 + 511 * 3 + 7 + 4096 * 5 + 2) * 4
         with mmap.mmap(-1, size, tagname=name, access=mmap.ACCESS_READ) as view:
             for _ in range(32):
                 view.seek(0)

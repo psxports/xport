@@ -90,7 +90,7 @@ def validate_build(value):
 def mapping_name(run_id, region):
     if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
         raise ContractError("run_id must contain 32 lowercase hex digits")
-    if region not in {*REGION_SIZES, "deferred"}:
+    if region not in {*REGION_SIZES, "deferred", "vram"}:
         raise ContractError("Unknown lockstep memory region")
     return f"Local\\xport-lockstep-{run_id}-{region}"
 

@@ -12,6 +12,7 @@ import socket
 import subprocess
 import time
 
+from duckstation_runtime import lockstep_timing_arguments
 from duckstation_runtime import (DATA_ROOT_VARIABLE, configure_recording_settings,
                                  executable as duckstation_executable, launch_process)
 from lockstep_gdb import DuckStationLockstep
@@ -72,7 +73,7 @@ def run(root: Path, state: Path, name: str, timeout: float) -> int:
     process = None
     adapter = None
     try:
-        command = [str(duckstation_executable()), "-fastboot", "-statefile",
+        command = [str(duckstation_executable()), *lockstep_timing_arguments(duckstation_executable()), "-fastboot", "-statefile",
                    str(initial_state), str(cue)]
         process = launch_process(
             command, directory,
@@ -84,7 +85,7 @@ def run(root: Path, state: Path, name: str, timeout: float) -> int:
         stop = adapter.remote.packet("?")
         if not stop.startswith(("S", "T")):
             raise RuntimeError("DuckStation did not start paused")
-        adapter.configure_wait_points(config["duckstation"]["wait_points"])
+        adapter.configure_wait_points(config["duckstation"]["wait_points"], config["duckstation"].get("sio_delay"))
         adapter.start_record()
         recorder = FrameDoneRecorder()
         update(session_path, session, status="recording", started=time.time())

@@ -17,6 +17,8 @@ Execute the start command as:
 X function_coverage start --image IMAGE --name NAME
 ```
 
+The launcher uses DuckStation's default CPU-driven timing. `-standard-timing` remains an explicit emulator alias for this default; do not append it to the xport `function_coverage start` command. The cooperative `-lockstep-timing` flag belongs to record/replay launchers and is not used for function discovery. Function coverage uses CPU-driven device time and ordinary disc/BIOS boot without `duckstation.wait_points`, `sio_delay`, save states or project-specific executable injection. GDB registers targets and drains results; it does not configure device time.
+
 Resolve `IMAGE` from `xport-project.json` key `analysis.default_image`. Do not assume `MAIN.EXE`. Wait for JSON status `running` before asking the user to play. DuckStation must be visible on `WinSta0\Default`. Do not launch it hidden and do not move it between desktops.
 
 The exact user command `stop` following `function_converge NAME` means:

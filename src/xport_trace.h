@@ -540,6 +540,9 @@ typedef struct XportLockstepDeferredState
     volatile uint32 spu_timeline_read;
     volatile uint32 spu_timeline_error;
     XportLockstepSpuEvent spu_events[XPORT_LOCKSTEP_SPU_EVENT_CAPACITY];
+    volatile uint32 device_clock_low;
+    volatile uint32 device_clock_high;
+    volatile uint32 original_frame_boundary;
 } XportLockstepDeferredState;
 
 typedef enum XportLockstepMemoryError
@@ -582,6 +585,8 @@ __attribute__((visibility("default"), noinline)) void xport_lockstep_memory_read
     size_t xport_lockstep_device_checkpoint_size(void);
     sint32 xport_lockstep_device_checkpoint_capture(void *data, size_t size);
     sint32 xport_lockstep_device_checkpoint_restore(const void *data, size_t size);
+    sint32 xport_lockstep_device_clock(uint64 *ticks);
+    sint32 xport_lockstep_device_frame_boundary(void);
     sint32 xport_lockstep_spu_timeline_active(void);
     sint32 xport_lockstep_spu_event_consume(XportLockstepSpuEventKind kind, uint32 address, uint32 *value, sint32 validate_value, uint64 *ticks);
     sint32 xport_lockstep_deferred_begin(void);
@@ -722,6 +727,8 @@ extern "C"
     extern XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_checkpoint_valid;
     XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE sint32 xport_lockstep_checkpoint_capture(void);
     XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_checkpoint_jump(void);
+    void xport_lockstep_checkpoint_bind(sint32 (*prepare)(void));
+    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_checkpoint_committed_break(void);
     void xport_lockstep_checkpoint_invalidate(void);
     void xport_lockstep_checkpoint_resumed(void);
     sint32 xport_lockstep_checkpoint_save_portable(const char *path);

@@ -33,6 +33,25 @@ def render():
             for row in db.execute('SELECT * FROM function_reuse ORDER BY image,address,peer_image,peer_address'):
                 peers.setdefault((row['image'], row['address']), []).append(dict(row))
         sdk = {(r['image'], r['address']): dict(r) for r in db.execute('SELECT * FROM library_classification')} if 'library_classification' in tables else {}
+        scopes = {}
+        scope_path = config.get('analysis', {}).get('function_scope')
+        if scope_path:
+            scope_file = (root / scope_path).resolve()
+            if not scope_file.is_relative_to(root.resolve()):
+                raise ValueError('Function scope must be project-local')
+            scope_document = json.loads(scope_file.read_text(encoding='utf-8-sig'))
+            if scope_document.get('schema') != 'xport-function-scope-v1':
+                raise ValueError('Unsupported function scope schema')
+            for item in scope_document['rows']:
+                key = (scope_document['image'], int(item['address'], 16))
+                original = db.execute('SELECT sha256 FROM functions WHERE image=? AND address=?', key).fetchone()
+                if key in scopes or not original or original[0] != item['original_sha256']:
+                    raise ValueError('Duplicate or stale function scope identity: %s:%08X' % key)
+                if item['category'] not in ('needed', 'possibly_needed', 'replaced', 'dead_code_candidate'):
+                    raise ValueError('Unknown function scope category')
+                scopes[key] = dict(category=item['category'], reason=item['reason'], evidence=scope_path)
+        implementation_columns = {r['name'] for r in db.execute('PRAGMA table_info(implementations)')}
+        implementations = {(r['image'], r['address']): dict(r) for r in db.execute("SELECT * FROM implementations WHERE mapping_status='mapped'")} if {'image', 'address', 'source_path', 'symbol', 'mapping_status'} <= implementation_columns else {}
         functions = []
         counts = dict.fromkeys(('TODO','WIP','DONE','SKIP'), 0)
         for row in db.execute('SELECT * FROM functions ORDER BY bytes,image,address'):
@@ -50,11 +69,17 @@ def render():
                 note += '; '+classification['reason']
             if peers.get(key):
                 note += '; MIPS reuse candidates: audit constants, calls and layouts before reuse'
+            implementation = implementations.get(key)
+            if implementation:
+                note += '; Native source mapped: '+implementation['source_path']+' :: '+implementation['symbol']+'; source presence is not correctness'
+            if key in scopes:
+                note += '; Static queue scope: '+scopes[key]['category']+'; '+scopes[key]['reason']
             functions.append({'id': '%s:%08X'%key, 'module': 'PSYQ/BIOS' if classification else row['image'],
                               'image':row['image'], 'address':'0x%08X'%row['address'],
                               'name':row['name'], 'status':status, 'comments':note,
                               'listing':row['listing'], 'pseudocode':row['pseudocode'],
-                              'size':row['bytes'], 'reuse':peers.get(key, [])})
+                              'size':row['bytes'], 'reuse':peers.get(key, []), 'scope':scopes.get(key),
+                              'native_source':dict(path=implementation['source_path'], symbol=implementation['symbol']) if implementation else None})
         data = [dict(module=r['image'], address='0x%08X'%r['address'], name=r['name'],
                      description=r['confidence']) for r in db.execute("SELECT * FROM symbols WHERE kind='data' ORDER BY image,address")]
         edges = [dict(source='%s:%08X'%(r['source_image'],r['source_function']),

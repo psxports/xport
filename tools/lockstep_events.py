@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import socket
 from dataclasses import dataclass
 
@@ -238,15 +237,13 @@ class LockstepScheduler:
         if self.native_backlog:
             original = self.original_stream.accept(self.original.advance(self.timeout))
             return original, self.native_backlog.pop(0)
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="xport-lockstep") as executor:
-            original_future = executor.submit(self.original.advance, self.timeout)
-            native_future = executor.submit(self.native.advance, self.timeout)
-            original = self.original_stream.accept(
-                original_future.result(timeout=self.timeout + 1))
-            native = self.native_stream.accept(
-                native_future.result(timeout=self.timeout + 1))
-            return original, native
+        # Publish the original device state before Native consumes this boundary
+        original = self.original_stream.accept(self.original.advance(self.timeout))
+        publish = getattr(self.native, 'publish_original_boundary', None)
+        if publish is not None:
+            publish(original, self.original)
+        native = self.native_stream.accept(self.native.advance(self.timeout))
+        return original, native
 
     def _drain_native_deferred(self, generation: int) -> None:
         state = self.native.deferred_state()

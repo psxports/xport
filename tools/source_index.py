@@ -444,8 +444,8 @@ def format_sources(root,relative_paths):
     for relative in paths:
         path=root/relative;raw=path.read_bytes();clean=re.sub(rb'[ \t]+(?=\r?$)',b'',raw,flags=re.M)
         if clean!=raw:path.write_bytes(clean);trimmed.append(relative)
-    formatter=find_formatter();version=subprocess.check_output([str(formatter),'--version'],text=True).strip()
-    subprocess.run([str(formatter),'-i','--style=file:'+str(style),'--',*[str((root/path).resolve()) for path in paths]],check=True)
+    formatter=find_formatter();version=subprocess.check_output([str(formatter),'--version'],text=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)).strip()
+    subprocess.run([str(formatter),'-i','--style=file:'+str(style),'--',*[str((root/path).resolve()) for path in paths]],check=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     return dict(files=paths,trimmed_files=trimmed,formatter=version,style_sha256=sha(style.read_bytes()))
 
 

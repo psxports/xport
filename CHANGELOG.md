@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-15 01:59:41 UTC
+
+- Implemented native GP0(02) VRAM fill in DrawPrim and OT command execution: RGB555, 16-pixel X/width alignment, zero dimensions, wrapping and existing interlace/frame-skip policy. GPU/device observers retain original commands and exact VRAM writes; API, bindings and snapshot layouts are unchanged. Debug GPU observer and FF display integration pass; Rapid Racer Debug compiles. Agent Armstrong compilation is blocked by old packet fields and Gran Turismo linking by unrelated missing vid symbols. Evidence: FightingForce-xport/status/implementation-completion/display-initialize-review.json. Consumers require a rebuild only
+
 ## 2026-10-07 16:20:02 UTC
 
 - Corrected SetDefDrawEnv graph-type word read, signed full-height threshold and ordered store widths; GetGraphType now requires the game-owned xport_gpu_graph_type_address data binding. Evidence: AutoDestruct-xport/status/audits/SetDefDrawEnv-static.json; guest ABI and dynamic proof pending

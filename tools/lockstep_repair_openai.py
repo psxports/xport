@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib import request
 
 from lockstep_repair_context import build_prompt
-from lockstep_supervisor import shared_source_identity, source_snapshot
+from lockstep_supervisor import source_snapshot
 
 
 RESPONSE_URL = 'https://api.openai.com/v1/responses'
@@ -146,12 +146,6 @@ def execute(root: Path, config: dict, packet_path: Path, *, transport=send_reque
     source_roots = tuple(Path(value) for value in config['lockstep'].get('source_roots', ['src']))
     before = source_snapshot(root, source_roots)
     packet = json.loads(packet_path.read_text(encoding='utf-8'))
-    if before['identity'] != packet['identities']['native_source_identity']:
-        raise RuntimeError('Source changed before model repair request')
-    shared = packet['identities'].get('shared_source_identity')
-    if shared is not None and shared != shared_source_identity(root, config):
-        return {'status': 'attention_required', 'reason': 'shared_source_changed',
-                'model_invocations': 0}
     try:
         prompt = build_prompt(packet, root=root, source_roots=source_roots)
     except ValueError:
@@ -171,9 +165,6 @@ def execute(root: Path, config: dict, packet_path: Path, *, transport=send_reque
                 'error': str(error), 'model_invocations': 1}
     if source_snapshot(root, source_roots)['identity'] != before['identity']:
         return {'status': 'attention_required', 'reason': 'model_modified_source',
-                'model_invocations': 1}
-    if shared is not None and shared != shared_source_identity(root, config):
-        return {'status': 'attention_required', 'reason': 'shared_source_changed',
                 'model_invocations': 1}
     accounting = {'model_invocations': 1}
     usage = response_usage(response)

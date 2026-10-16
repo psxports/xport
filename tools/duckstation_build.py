@@ -256,6 +256,7 @@ def package_runtime(workspace, source, manifest, manifest_identity, build_comman
         'exe_sha256': executable_hash,
         'lockstep_protocol_version': manifest['runtime']['lockstep_protocol_version'],
         'data_root_environment': manifest['runtime']['data_root_environment'],
+        'timing': manifest['runtime']['timing'],
         'runtime_files': hashes,
         'validation': {
             'build': 'passed',
@@ -294,15 +295,29 @@ def validate_package(package, manifest):
         raise RuntimeError('Built executable lacks xport markers: ' + ', '.join(missing_markers))
 
 
-def running_executable(name):
-    result = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {name}', '/FO', 'CSV', '/NH'],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    return result.returncode == 0 and name.lower() in result.stdout.lower()
+def running_executable(path):
+    path = Path(path).resolve()
+    result = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-Command',
+         'Get-CimInstance Win32_Process | Select-Object Name,ExecutablePath | ConvertTo-Json -Compress'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        raise RuntimeError('Cannot inspect DuckStation executable paths before publishing')
+    processes = json.loads(result.stdout or '[]')
+    if isinstance(processes, dict):
+        processes = [processes]
+    for process in processes:
+        if str(process.get('Name', '')).lower() != path.name.lower():
+            continue
+        executable_path = process.get('ExecutablePath')
+        if not executable_path or Path(executable_path).resolve() == path:
+            return True
+    return False
 
 
 def publish(package, destination, manifest):
     executable = manifest['build']['distribution_executable']
-    if running_executable(executable):
+    if running_executable(destination / executable):
         raise RuntimeError(f'{executable} is running; close the emulator before publishing')
     parent = destination.parent
     parent.mkdir(parents=True, exist_ok=True)

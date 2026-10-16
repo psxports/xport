@@ -128,9 +128,10 @@
   Module.preRun.push(() => {
     Module.addRunDependency('startup');
     withRetry(async () => {
-      await loadPackage(0, true);
-      for (const [path, entry] of Object.entries(manifest.files))
-        if (entry.parts.every(part => part[0] === 0)) await mountFile(path);
+      for (const index of manifest.startupPackages || [0]) await loadPackage(index, true);
+      const startupFiles = manifest.startupFiles || Object.keys(manifest.files).filter(
+        path => manifest.files[path].parts.every(part => part[0] === 0));
+      for (const path of startupFiles) await mountFile(path);
     }).then(() => {
       document.getElementById('loading').hidden = true;
       Module.removeRunDependency('startup');

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""In-process Tk progress window owned by the lockstep supervisor"""
+"""Default-desktop progress UI with a pipe to the hidden supervisor"""
 
 from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-import gc
+import json
 import os
 from pathlib import Path
 import queue
 import threading
+import sys
+import uuid
+from multiprocessing.connection import Client, Listener
 
 
 _TCL_ROOT = Path(__file__).resolve().parent / "runtime" / "tcl"
@@ -17,26 +20,6 @@ os.environ["TCL_LIBRARY"] = str(_TCL_ROOT / "tcl8.6")
 os.environ["TK_LIBRARY"] = str(_TCL_ROOT / "tk8.6")
 
 import tkinter as tk
-
-
-def _attach_default_desktop():
-    user = ctypes.WinDLL("user32", use_last_error=True)
-    user.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
-    user.OpenWindowStationW.restype = wintypes.HANDLE
-    user.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
-    user.SetProcessWindowStation.restype = wintypes.BOOL
-    user.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    user.OpenDesktopW.restype = wintypes.HANDLE
-    user.SetThreadDesktop.argtypes = [wintypes.HANDLE]
-    user.SetThreadDesktop.restype = wintypes.BOOL
-    user.CloseDesktop.argtypes = [wintypes.HANDLE]
-    station = user.OpenWindowStationW("WinSta0", False, 0x0001 | 0x0002 | 0x0004 | 0x0100)
-    if not station or not user.SetProcessWindowStation(station):
-        raise OSError(ctypes.get_last_error(), "Cannot attach supervisor to WinSta0")
-    desktop = user.OpenDesktopW("Default", 0, False, 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100)
-    if not desktop or not user.SetThreadDesktop(desktop):
-        raise OSError(ctypes.get_last_error(), "Cannot attach progress thread to Default desktop")
-    return user, desktop
 
 
 class Bar(tk.Canvas):
@@ -64,6 +47,8 @@ def progress_status_text(update: dict) -> str:
         return f"Fast forward to frame {int(target)}"
     if mode == "DETAILED":
         return f"Checking frame {current}"
+    if mode == "FAILED":
+        return f"Replay stopped at frame {current} · diagnosis required"
     return str(mode or "")
 
 
@@ -117,6 +102,9 @@ class ProgressWindow:
                 latest = self.updates.get_nowait()
             except queue.Empty:
                 break
+        if latest is not None and latest.get("close"):
+            self.root.destroy()
+            return
         if latest is not None:
             self.active = bool(latest.get("active", False))
             count = int(latest["frame_count"])
@@ -142,39 +130,57 @@ class SupervisorProgress:
     def __init__(self, enabled: bool):
         self.enabled = enabled and os.name == "nt"
         self.snapshot: dict = {}
+        self.receipt_path = None
         self._updates = queue.SimpleQueue()
         self._thread = None
         self._ready = threading.Event()
         self._error = None
-        self._main_thread_window = False
+        self._process = None
 
     def start(self) -> None:
-        if not self.enabled or self._thread is not None or self._main_thread_window:
+        if not self.enabled or self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._run, name="xport-progress", daemon=True)
+        address = r"\\.\pipe\xport-progress-" + uuid.uuid4().hex
+        key = os.urandom(32)
+        listener = Listener(address, family="AF_PIPE", authkey=key)
+        from windows_desktop import launch_default_desktop_process
+        from xport_process import normalized_environment
+        interpreter = Path(sys.executable).with_name("pythonw.exe")
+        self._process = launch_default_desktop_process(
+            [str(interpreter), "-B", str(Path(__file__).resolve()), address, key.hex()],
+            Path.cwd(), visible=True,
+            environment=normalized_environment(updates={"XPORT_WINDOWS_DESKTOP": "WinSta0\\Default"}))
+
+        def relay():
+            try:
+                with listener.accept() as connection:
+                    ready = json.loads(connection.recv_bytes())
+                    if ready != {"ready": self._process.pid}:
+                        raise RuntimeError("Progress UI identity mismatch")
+                    if self.receipt_path is not None:
+                        from trace_worker import process_identity, write_receipt
+                        write_receipt(self.receipt_path, {
+                            "supervisor": process_identity(os.getpid()),
+                            "process": process_identity(self._process.pid),
+                            "desktop": "WinSta0\\Default"})
+                    self._ready.set()
+                    while True:
+                        value = self._updates.get()
+                        connection.send_bytes(json.dumps(value).encode("utf-8"))
+                        if not value.get("active", False):
+                            break
+            except Exception as error:
+                self._error = error
+                self._ready.set()
+            finally:
+                listener.close()
+
+        self._thread = threading.Thread(target=relay, name="xport-progress-pipe", daemon=True)
         self._thread.start()
-        if not self._ready.wait(5):
+        if not self._ready.wait(10):
             raise RuntimeError("Progress window did not initialize")
         if self._error is not None:
             raise RuntimeError("Progress window failed: " + str(self._error))
-
-    def _run(self) -> None:
-        desktop = None
-        window = None
-        try:
-            desktop = _attach_default_desktop()
-            window = ProgressWindow(self._updates)
-            self._ready.set()
-            window.run()
-        except Exception as error:
-            self._error = error
-            self._ready.set()
-        finally:
-            window = None
-            gc.collect()
-            if desktop is not None:
-                user, handle = desktop
-                user.CloseDesktop(handle)
 
     def update(self, value: dict) -> None:
         self.snapshot = dict(value)
@@ -184,37 +190,35 @@ class SupervisorProgress:
     def close(self) -> None:
         if not self.snapshot:
             return
-        value = dict(self.snapshot)
-        value["active"] = False
-        self.update(value)
-        if self._thread is not None and not self._main_thread_window:
+        self.update(dict(self.snapshot, active=False))
+        if self._thread is not None:
             self._thread.join(2)
             self._thread = None
 
     def run_action(self, action):
-        if not self.enabled:
-            return action()
-        window = ProgressWindow(self._updates)
-        outcome = {}
-        self._main_thread_window = True
+        result = action()
+        if self.enabled and result.get("status") == "FAILED":
+            self._thread.join()
+        return result
 
-        def worker():
-            try:
-                outcome["result"] = action()
-            except BaseException as error:
-                outcome["error"] = error
-            finally:
-                if self.snapshot.get("active", False):
-                    self.close()
 
-        self._thread = threading.Thread(target=worker, name="xport-supervisor", daemon=False)
-        self._thread.start()
-        window.run()
-        self._thread.join()
-        self._thread = None
-        self._main_thread_window = False
-        window = None
-        gc.collect()
-        if "error" in outcome:
-            raise outcome["error"]
-        return outcome.get("result")
+def main():
+    updates = queue.SimpleQueue()
+    window = ProgressWindow(updates)
+    connection = Client(sys.argv[1], family="AF_PIPE", authkey=bytes.fromhex(sys.argv[2]))
+    connection.send_bytes(json.dumps({"ready": os.getpid()}).encode("utf-8"))
+
+    def receive():
+        try:
+            while True:
+                updates.put(json.loads(connection.recv_bytes()))
+        except (EOFError, OSError):
+            updates.put({"close": True})
+
+    threading.Thread(target=receive, name="xport-progress-input", daemon=True).start()
+    window.run()
+    connection.close()
+
+
+if __name__ == "__main__":
+    main()

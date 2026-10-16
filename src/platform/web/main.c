@@ -215,8 +215,6 @@ EM_JS(void, xport_audio_push, (const float *samples, uint32 frames), {
         Module.xportAudioPush(HEAPF32.slice(samples >> 2, (samples >> 2) + frames * 2));
 });
 
-EM_JS(void, xport_canvas_title, (const char *title), { document.title = UTF8ToString(title); });
-
 EM_JS(void, xport_error, (const char *title, const char *message), {
     const text = UTF8ToString(title) + ': ' + UTF8ToString(message);
     const status = document.getElementById('status');
@@ -395,10 +393,14 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
     uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller]);
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0);
-    if (axes[5] & 1u) directions |= PADLup;
-    if (axes[5] & 2u) directions |= PADLdown;
-    if (axes[5] & 4u) directions |= PADLleft;
-    if (axes[5] & 8u) directions |= PADLright;
+    if (axes[5] & 1u)
+        directions |= PADLup;
+    if (axes[5] & 2u)
+        directions |= PADLdown;
+    if (axes[5] & 4u)
+        directions |= PADLleft;
+    if (axes[5] & 8u)
+        directions |= PADLright;
     if (directions & (PADLleft | PADLright))
         axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
     if (directions & (PADLup | PADLdown))
@@ -427,7 +429,6 @@ void xport_input_override(sint32 enabled, uint32 buttons)
 
 sint32 xport_window_init(void)
 {
-    xport_canvas_title(WND_TITLE);
     if (platform_headless)
         return 1;
     if (!vid_init(NULL))
@@ -441,8 +442,7 @@ sint32 xport_window_init(void)
 sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title)
 {
     VID_RECT src = {source_x, source_y, source_width, source_height};
-    if (title)
-        xport_canvas_title(title);
+    (void)title;
     if (platform_headless)
         return 1;
     return vid_blit(pixels, bitmap_width, bitmap_height, src);

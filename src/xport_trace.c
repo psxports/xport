@@ -194,7 +194,7 @@ sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byt
     if (!xport_map(&memory_context, address, width, 1, &mapped))
         return 0;
     before = xport_bytes_load(mapped.pointer, width);
-#if defined(LOCKSTEP_DEBUG) && defined(_M_IX86)
+#if defined(LOCKSTEP_DEBUG) && defined(AP_X86)
     if (width == 4u && byte_mask == 15u && ((uintptr_t)mapped.pointer & 3u) == 0u)
         *(volatile uint32 *)mapped.pointer = value;
     else
@@ -1042,7 +1042,7 @@ sint32 xport_device_trace_enabled(void)
 
 #if defined(LOCKSTEP_DEBUG)
     /* Lockstep shared memory */
-    #if !defined(_WIN32) || !defined(_M_IX86)
+    #if !defined(AP_WIN) || !defined(AP_X86)
         #error LOCKSTEP_DEBUG requires Windows x86
     #endif
 
@@ -1286,7 +1286,7 @@ const XportLockstepMemoryIdentity *xport_lockstep_memory_identity(void)
 
 size_t xport_lockstep_device_checkpoint_size(void)
 {
-    return GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT * sizeof(uint16) + sizeof(XportLockstepDeferredState);
+    return GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT * sizeof(uint16) + offsetof(XportLockstepDeferredState, original_frame_boundary);
 }
 
 sint32 xport_lockstep_device_checkpoint_capture(void *data, size_t size)
@@ -1298,7 +1298,7 @@ sint32 xport_lockstep_device_checkpoint_capture(void *data, size_t size)
         return 0;
     memcpy(bytes, *xport_lockstep_vram, vram_size);
     _ReadWriteBarrier();
-    memcpy(bytes + vram_size, deferred_state, sizeof(*deferred_state));
+    memcpy(bytes + vram_size, deferred_state, offsetof(XportLockstepDeferredState, original_frame_boundary));
     _ReadWriteBarrier();
     return 1;
 }
@@ -1316,7 +1316,8 @@ sint32 xport_lockstep_device_checkpoint_restore(const void *data, size_t size)
         return 0;
     memcpy(*xport_lockstep_vram, bytes, vram_size);
     _ReadWriteBarrier();
-    memcpy(deferred_state, saved, sizeof(*deferred_state));
+    memcpy(deferred_state, saved, offsetof(XportLockstepDeferredState, original_frame_boundary));
+    deferred_state->original_frame_boundary = 0u;
     _ReadWriteBarrier();
     return 1;
 }
@@ -1346,6 +1347,39 @@ sint32 xport_lockstep_device_ticks(uint64 *ticks)
         }
     }
     return 0;
+}
+
+sint32 xport_lockstep_device_clock(uint64 *ticks)
+{
+    uint32 attempt;
+
+    if (!deferred_state || !ticks)
+        return 0;
+    for (attempt = 0u; attempt < 32u; ++attempt)
+    {
+        uint32 before = deferred_state->device_sequence;
+        uint32 low;
+        uint32 high;
+
+        if (!before || (before & 1u))
+            continue;
+        _ReadWriteBarrier();
+        low = deferred_state->device_clock_low;
+        high = deferred_state->device_clock_high;
+        _ReadWriteBarrier();
+        if (before == deferred_state->device_sequence && !(before & 1u))
+        {
+            *ticks = ((uint64)high << 32) | low;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+sint32 xport_lockstep_device_frame_boundary(void)
+{
+    uint32 boundary = deferred_state ? deferred_state->original_frame_boundary : 0u;
+    return boundary == 1u ? 1 : boundary == 3u ? 3 : boundary == 2u ? 0 : -1;
 }
 
 sint32 xport_lockstep_spu_timeline_active(void)
@@ -1689,6 +1723,8 @@ void xport_lockstep_boundary_resume_from_checkpoint(uint32 next_frame)
     xport_lockstep_transition_break(&hit);
 }
 
+static sint32 xport_lockstep_checkpoint_commit(void);
+
 void xport_lockstep_boundary_frame(const char *image, uint32 frame, const uint32 type[2], const uint32 buttons[2], const uint32 analog[2])
 {
     LOCKSTEP_BOUNDARY_HIT hit;
@@ -1710,6 +1746,8 @@ void xport_lockstep_boundary_frame(const char *image, uint32 frame, const uint32
     psx_gte_snapshot(&hit.gte);
     xport_lockstep_deferred_boundary();
     xport_lockstep_vblank_break(&hit);
+    if (!xport_lockstep_checkpoint_commit())
+        ExitProcess(78u);
     if (xport_lockstep_mode == LOCKSTEP_MODE_PREFIX_GUARD && frame >= xport_lockstep_target_frame)
     {
         memset(&hit, 0, sizeof(hit));
@@ -1989,6 +2027,20 @@ void xport_lockstep_frame_shutdown(void)
     frame_error = NULL;
 }
 
+static sint32 (*checkpoint_prepare)(void);
+XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_checkpoint_requested;
+
+XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_checkpoint_committed_break(void)
+{
+    volatile uint32 captured = xport_lockstep_checkpoint_valid;
+    (void)captured;
+}
+
+void xport_lockstep_checkpoint_bind(sint32 (*prepare)(void))
+{
+    checkpoint_prepare = prepare;
+}
+
 sint32 xport_lockstep_frame_done(void)
 {
     const LOCKSTEP_INPUT_ENTRY *entry;
@@ -2010,17 +2062,33 @@ sint32 xport_lockstep_frame_done(void)
     }
     frame_entry_index++;
     xport_lockstep_boundary_set_frame(frame + 1u);
-    xport_lockstep_boundary_frame(frame_image, frame, entry->type, entry->buttons, entry->analog);
-    #if defined(XPORT_MEMORY_DIAGNOSTICS)
-    if (xport_lockstep_write_ring_armed)
-        xport_memory_write_ring_init(&xport_lockstep_write_ring);
-    #endif
     for (port = 0; port < 2u; ++port)
         if (!pad_lockstep_apply((sint32)port, entry->type[port], entry->buttons[port], entry->analog[port]))
         {
             frame_error = "controller_apply_failed";
             return 0;
         }
+    xport_lockstep_boundary_frame(frame_image, frame, entry->type, entry->buttons, entry->analog);
+    #if defined(XPORT_MEMORY_DIAGNOSTICS)
+    if (xport_lockstep_write_ring_armed)
+        xport_memory_write_ring_init(&xport_lockstep_write_ring);
+    #endif
+    return 1;
+}
+
+static sint32 xport_lockstep_checkpoint_commit(void)
+{
+    if (xport_lockstep_checkpoint_requested)
+    {
+        const char *path = getenv("XPORT_LOCKSTEP_PORTABLE_EXPORT_PATH");
+        xport_lockstep_checkpoint_requested = 0u;
+        if (!checkpoint_prepare || xport_lockstep_mode != LOCKSTEP_MODE_PREFIX_GUARD || !checkpoint_prepare() || !xport_lockstep_checkpoint_capture() || !path || !xport_lockstep_checkpoint_save_portable(path))
+        {
+            frame_error = "checkpoint_capture_failed";
+            return 0;
+        }
+        xport_lockstep_checkpoint_committed_break();
+    }
     return 1;
 }
 
@@ -2030,6 +2098,13 @@ sint32 xport_lockstep_frame_begin_at(uint32 next_frame)
     {
         frame_error = "handoff_input_cursor_invalid";
         return 0;
+    }
+    {
+        const LOCKSTEP_INPUT_ENTRY *input = frame_entries + next_frame - 1u;
+        uint32 port;
+        for (port = 0u; port < 2u; ++port)
+            if (!pad_lockstep_apply((sint32)port, input->type[port], input->buttons[port], input->analog[port]))
+                return 0;
     }
     frame_entry_index = next_frame;
     frame_error = NULL;
@@ -2219,11 +2294,6 @@ XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE sint32 xport_lockstep_checkpoint_c
     size_t device_size = xport_lockstep_device_checkpoint_size();
     if (!xport_lockstep_dram || !xport_lockstep_scratchpad || !writable_section(&section, &size))
         return 0;
-    if (!spu_lockstep_checkpoint_synchronize())
-    {
-        xport_lockstep_checkpoint_valid = 0u;
-        return 0;
-    }
     candidate = checkpoint;
     if (candidate && (candidate->section != section || candidate->section_size != size || candidate->spu_size != spu_size || candidate->device_size != device_size))
         return 0;

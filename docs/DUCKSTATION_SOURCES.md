@@ -26,6 +26,6 @@ The historical `ReleaseLTCG` executable suffix is retained for project compatibi
 
 Source, expanded dependencies, build workspaces and distribution are generated artifacts and are excluded from Git. The default cache and workspace are under `%LOCALAPPDATA%\xport`, outside the repository. A successful build removes its generated default workspace. A failed build preserves its workspace for diagnosis. `--keep-workspace` preserves a successful default workspace. An explicit `--workspace PATH` is preserved unless `--clean-workspace` is also passed. `--offline` permits only already verified cache content. `--verify-only` validates the manifest, patch and required host tools without downloading or building.
 
-Close all xport DuckStation processes before publishing. The bootstrap never terminates an emulator and preserves the existing distribution if build, validation or atomic replacement fails.
+Close processes executing the shared distribution executable before publishing. The publisher checks the resolved executable path; a retained runtime in another directory does not block replacement. If a matching process name has no readable executable path, publication fails closed. The bootstrap never terminates an emulator and preserves the existing distribution if build, validation or atomic replacement fails.
 
 Preserve the upstream `LICENSE`, contributor attribution and third-party notices when distributing the binary. Runtime BIOS, settings, memory cards, logs, saves and traces remain project-owned and are never part of the shared distribution.

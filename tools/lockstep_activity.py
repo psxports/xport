@@ -27,13 +27,19 @@ def show_activity(receipt_path: Path, frame: int, activity: str) -> str:
     if os.name != "nt":
         raise RuntimeError("The converge window is available only on Windows")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    process = receipt["process"]
+    from trace_worker import alive
+    if not alive(receipt["process"]):
+        raise RuntimeError("Supervisor process is not running")
+    progress = json.loads(receipt_path.with_name("progress-process.json").read_text(encoding="utf-8"))
+    if progress.get("supervisor") != receipt["process"]:
+        raise ValueError("Progress process belongs to another supervisor")
+    process = progress["process"]
     pid = int(process["pid"])
     created = int(process["created"])
     if receipt.get("contract") != "xport-lockstep-supervisor-process-v1" or pid <= 0:
         raise ValueError("Invalid supervisor process receipt")
-    if receipt.get("desktop") != "WinSta0\\Default":
-        raise ValueError("Supervisor is not on the Default desktop")
+    if receipt.get("progress_desktop", receipt.get("desktop")) != "WinSta0\\Default":
+        raise ValueError("Supervisor progress window is not on the Default desktop")
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]

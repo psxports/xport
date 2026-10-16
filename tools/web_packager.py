@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import gzip
 import hashlib
 import html
@@ -8,6 +9,20 @@ from pathlib import Path
 
 
 PACKAGE_LIMIT = 25 * 1024 * 1024
+
+
+def exclusion_patterns(values):
+    patterns = []
+    for value in values:
+        parts = [part for part in value.replace('\\', '/').strip('/').split('/') if part and part != '.']
+        if not parts or '..' in parts or any(':' in part for part in parts):
+            raise ValueError(f'Invalid exclusion path: {value}')
+        patterns.append('/' + '/'.join(parts).lower())
+    return patterns
+
+
+def is_excluded(target, patterns):
+    return any(fnmatch.fnmatchcase(target.as_posix().lower(), pattern) for pattern in patterns)
 
 
 def collect_files(project_root):
@@ -31,6 +46,7 @@ def main():
     parser.add_argument("--full-name", required=True)
     parser.add_argument("--index-template", required=True, type=Path)
     parser.add_argument("--extra-file", nargs=2, action="append", default=[], metavar=("SOURCE", "TARGET"))
+    parser.add_argument("--exclude", action="append", default=[], metavar="VIRTUAL_PATH_GLOB")
     args = parser.parse_args()
 
     output = args.output.resolve()
@@ -40,6 +56,7 @@ def main():
 
 def build_lazy(args, output):
     project = args.project.resolve()
+    excluded = exclusion_patterns(getattr(args, 'exclude', []))
     files = collect_files(project)
     for source_text, target_text in getattr(args, 'extra_file', []):
         source = Path(source_text).resolve()
@@ -52,6 +69,7 @@ def build_lazy(args, output):
         target = Path('/') / Path(*target_parts)
         files.append((source, target, source.stat().st_size))
     known = {item[1].as_posix().lower(): item for item in files}
+    files = [item for item in files if not is_excluded(item[1], excluded)]
     startup = []
     log = project / 'src/platform/web/collect.log'
     if log.exists():
@@ -62,6 +80,8 @@ def build_lazy(args, output):
                 continue
             if Path(name).suffix.lower() == '.str':
                 continue
+            if is_excluded(Path('/') / name, excluded):
+                continue
             item = known.get('/' + name.lower())
             if item is None:
                 suffix = '/' + name.lower()
@@ -69,28 +89,35 @@ def build_lazy(args, output):
                 if len(matches) != 1:
                     raise ValueError(f'Unknown or ambiguous collected file: {line}')
                 item = matches[0]
+            if is_excluded(item[1], excluded):
+                continue
             if item not in startup:
                 startup.append(item)
     limit = PACKAGE_LIMIT - 65536
-    if sum(item[2] for item in startup) > limit:
-        raise ValueError('Collected startup files exceed one 25 MiB package')
-    groups = [[(source, target, 0, size) for source, target, size in startup]]
-    group, used = [], 0
-    for source, target, size in sorted(files, key=lambda item: item[1].as_posix()):
-        if (source, target, size) in startup:
-            continue
-        offset = 0
-        while offset < max(size, 1):
-            if group and used == limit:
-                groups.append(group)
-                group, used = [], 0
-            length = min(size - offset, limit - used)
-            group.append((source, target, offset, length))
-            used += length
-            offset += max(length, 1)
-    if group:
-        groups.append(group)
-    manifest = {'name': args.short_name, 'packages': [], 'files': {}, 'music': {}}
+    groups = []
+
+    def pack(items):
+        first = len(groups)
+        group, used = [], 0
+        for source, target, size in items:
+            offset = 0
+            while offset < max(size, 1):
+                if group and used == limit:
+                    groups.append(group)
+                    group, used = [], 0
+                length = min(size - offset, limit - used)
+                group.append((source, target, offset, length))
+                used += length
+                offset += max(length, 1)
+        if group or first == 0:
+            groups.append(group)
+
+    pack(startup)
+    startup_packages = list(range(len(groups)))
+    pack(item for item in sorted(files, key=lambda item: item[1].as_posix()) if item not in startup)
+    manifest = {'name': args.short_name, 'packages': [], 'files': {}, 'music': {},
+                'startupPackages': startup_packages,
+                'startupFiles': [target.as_posix() for _, target, _ in startup]}
     for index, group in enumerate(groups):
         payload = bytearray()
         for source, target, offset, length in group:
@@ -109,6 +136,8 @@ def build_lazy(args, output):
     music_output = output / 'MUSIC'
     music_output.mkdir(exist_ok=True)
     for path in sorted((project / 'bin/MUSIC').glob('*.WAV')):
+        if is_excluded(Path('/MUSIC') / path.name, excluded):
+            continue
         data = path.read_bytes()
         if len(data) > PACKAGE_LIMIT:
             raise ValueError(f'Music exceeds hosting limit: {path}')

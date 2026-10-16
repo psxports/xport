@@ -12,6 +12,11 @@
     #undef w_masked_u32
 #endif
 
+size_t xport_fread(void *data, size_t size, size_t count, FILE *stream)
+{
+    return fread(data, size, count, stream);
+}
+
 uint32 GsSortOtPSX(uint32 source_ot, uint32 destination_ot)
 {
     uint32 current = r_u32(source_ot + 4u);
@@ -130,6 +135,7 @@ static sint32 native_video_mode;
 void psx_root_counter_poll(void);
 static void mc_poll(void);
 static void bios_native_irq_dispatch(void);
+static sint32 bios_native_irq_ready(void);
 
 static uint32 bios_interrupts_enabled = 1u;
 static uint32 bios_vblank_pending;
@@ -711,6 +717,7 @@ static uint64 native_vblank_last_us;
 static uint64 native_vblank_fraction;
 static uint32 native_vblank_clock_started;
 static uint32 native_vblank_polling;
+static uint32 native_vsync_count;
 
 sint32 psx_dma_ready(const PsxDmaState *state, uint32 channel, uint32 halted, uint32 ignore_halt)
 {
@@ -874,7 +881,9 @@ sint32 psx_dma_halt(PsxDmaScheduler *scheduler, uint32 ticks)
 
 static PsxVBlankWait vblank_wait;
 static uint32 cooperative_wait_depth;
+static uint32 cooperative_sync_depth;
 static PsxInterruptCallback cooperative_services[7];
+static uint32 cooperative_pending_services;
 static void *vblank_wait_context;
 static sint32 vblank_wait_failed;
 static uint32 *vblank_guest_counter;
@@ -1028,36 +1037,76 @@ void psx_vblank_bind(PsxVBlankWait wait, void *context, uint32 initial_count)
 {
     vblank_wait = wait;
     cooperative_wait_depth = 0u;
+    cooperative_sync_depth = 0u;
     vblank_wait_context = context;
-    vblank_count = initial_count;
+    vblank_count = native_vsync_count = initial_count;
     vblank_wait_failed = 0;
     native_vblank_clock_started = 0u;
     native_vblank_fraction = 0u;
 }
 
-sint32 psx_wait_events(void)
+static sint32 psx_wait_events_internal(sint32 *provider_called)
 {
     sint32 ok;
+    *provider_called = 0;
     if (!vblank_wait || vblank_wait_failed)
         return 0;
     ++cooperative_wait_depth;
-    if (bios_vblank_pending && bios_interrupts_enabled)
+    if (bios_interrupts_enabled && (cooperative_pending_services || bios_native_irq_ready()))
+        ok = 1;
+    else if (bios_vblank_pending && bios_interrupts_enabled)
     {
         bios_vblank_pending = 0u;
         psx_vblank_signal();
         ok = !vblank_wait_failed;
     }
     else
+    {
+        *provider_called = 1;
         ok = vblank_wait(vblank_wait_context);
+    }
     if (ok && !vblank_wait_failed)
         bios_native_irq_dispatch();
     --cooperative_wait_depth;
     return ok && !vblank_wait_failed;
 }
 
+sint32 psx_wait_events(void)
+{
+    sint32 provider_called;
+    return psx_wait_events_internal(&provider_called);
+}
+
+#if defined(LOCKSTEP_DEBUG)
+sint32 psx_wait_events_resume(void)
+{
+    sint32 ok;
+    if (!vblank_wait || vblank_wait_failed)
+        return 0;
+    ++cooperative_wait_depth;
+    ok = vblank_wait(vblank_wait_context);
+    if (ok && !vblank_wait_failed)
+        bios_native_irq_dispatch();
+    --cooperative_wait_depth;
+    return ok && !vblank_wait_failed;
+}
+#endif
+
 sint32 psx_callbacks_allowed(void)
 {
-    return bios_interrupts_enabled && (!vblank_wait || cooperative_wait_depth);
+    return bios_interrupts_enabled && (!vblank_wait || cooperative_wait_depth || cooperative_sync_depth);
+}
+
+static sint32 psx_wait_one_vblank(uint32 *counter)
+{
+    uint32 before = *counter;
+    do
+    {
+        sint32 provider_called;
+        if (!psx_wait_events_internal(&provider_called) || vblank_wait_failed || (provider_called && *counter == before))
+            return 0;
+    } while (*counter == before);
+    return *counter - before == 1;
 }
 
 void psx_wait_bind_service(uint32 slot, PsxInterruptCallback service)
@@ -1065,6 +1114,14 @@ void psx_wait_bind_service(uint32 slot, PsxInterruptCallback service)
     if (slot >= 7)
         abort();
     cooperative_services[slot] = service;
+    cooperative_pending_services &= ~(1u << slot);
+}
+
+void psx_wait_signal_service(uint32 slot)
+{
+    if (slot >= 7)
+        abort();
+    cooperative_pending_services |= 1u << slot;
 }
 
 void psx_vblank_signal(void)
@@ -1215,7 +1272,7 @@ static sint32 psx_vsync_wait_target(uint32 target, uint32 *waited)
         if (*waited >= vsync_wait_budget)
             return 0;
         ++*waited;
-        if (!psx_wait_events() || vblank_wait_failed || *vblank_guest_counter - before != 1u)
+        if (!psx_wait_one_vblank(vblank_guest_counter) || *vblank_guest_counter - before != 1u)
             return 0;
     }
     return 1;
@@ -1236,7 +1293,7 @@ static sint32 psx_vsync_wait_field(uint32 initial_status, uint32 *waited)
             return 0;
         before = *vblank_guest_counter;
         ++*waited;
-        if (!psx_wait_events() || vblank_wait_failed || *vblank_guest_counter - before != 1u)
+        if (!psx_wait_one_vblank(vblank_guest_counter) || *vblank_guest_counter - before != 1u)
             return 0;
     }
 }
@@ -1555,6 +1612,15 @@ void *psx_addr(uint32 address, size_t count)
 
 static PsxInterruptCallback native_irq_callbacks[11];
 
+static sint32 bios_native_irq_ready(void)
+{
+    uint32 interrupt, pending = native_root_irq.status & native_root_irq.mask;
+    for (interrupt = 0; interrupt < 11; ++interrupt)
+        if ((pending & (1u << interrupt)) && (native_irq_callbacks[interrupt] || interrupt == 0 || (interrupt >= 4 && interrupt <= 6)))
+            return 1;
+    return 0;
+}
+
 uint16 psx_irq_native_mask_exchange(uint16 mask)
 {
     uint16 previous = (uint16)native_root_irq.mask;
@@ -1605,12 +1671,14 @@ static uint32 native_irq_dispatching;
 static void bios_native_irq_dispatch(void)
 {
     uint32 interrupt;
-    if (!bios_interrupts_enabled || native_irq_dispatching || (vblank_wait && !cooperative_wait_depth))
+    if (!bios_interrupts_enabled || native_irq_dispatching || (vblank_wait && !cooperative_wait_depth && !cooperative_sync_depth))
         return;
     native_irq_dispatching = 1u;
     for (interrupt = 0u; interrupt < 11u && bios_interrupts_enabled; ++interrupt)
     {
         uint32 bit = 1u << interrupt;
+        if (cooperative_sync_depth && !cooperative_wait_depth && !(bit & 0x20eu))
+            continue;
         if (!(native_root_irq.status & native_root_irq.mask & bit))
             continue;
         if (native_irq_callbacks[interrupt])
@@ -1625,12 +1693,32 @@ static void bios_native_irq_dispatch(void)
     }
     if (bios_interrupts_enabled)
     {
-        for (interrupt = 0; interrupt < 7 && psx_callbacks_allowed(); ++interrupt)
-            if (cooperative_services[interrupt])
-                cooperative_services[interrupt]();
+        uint32 services = 0x7f;
+        while (services && psx_callbacks_allowed())
+        {
+            for (interrupt = 0; interrupt < 7 && psx_callbacks_allowed(); ++interrupt)
+            {
+                if (!(services & (1u << interrupt)))
+                    continue;
+                cooperative_pending_services &= ~(1u << interrupt);
+                if (cooperative_services[interrupt])
+                    cooperative_services[interrupt]();
+            }
+            /* A completion handler can submit another synchronous transfer */
+            services = cooperative_pending_services;
+        }
         cd_dispatch_ready_event();
     }
     native_irq_dispatching = 0u;
+}
+
+void psx_sync_callbacks(void)
+{
+    if (!bios_interrupts_enabled || cooperative_sync_depth)
+        return;
+    ++cooperative_sync_depth;
+    bios_native_irq_dispatch();
+    --cooperative_sync_depth;
 }
 
 void psx_interrupt_raise(uint32 interrupt)
@@ -1653,11 +1741,11 @@ sint32 ResetCallback(void)
     return 0;
 }
 
-sint32 VSyncCallback(PsxInterruptCallback callback)
+intptr VSyncCallback(PsxInterruptCallback callback)
 {
     PsxInterruptCallback previous = vsync_callback;
     vsync_callback = callback;
-    return (sint32)(intptr)previous;
+    return (intptr)previous;
 }
 
 /* Fixed-point trigonometry and PsyQ GTE implementation. */
@@ -3976,12 +4064,13 @@ sint32 VSync(sint32 mode)
     frames = mode > 1 ? (uint32)mode : 1;
     if (!vblank_wait && gpu_frame_sync(frames))
         return (sint32)frames;
-    for (frame = 0; frame < frames; ++frame)
+    // Count fields elapsed since the preceding blocking native VSync
+    for (frame = vblank_wait ? 0 : vblank_count - native_vsync_count; frame < frames; ++frame)
     {
         if (vblank_wait)
         {
             uint32 before = vblank_count;
-            if (!psx_wait_events() || vblank_wait_failed || vblank_count - before != 1u)
+            if (!psx_wait_one_vblank(&vblank_count) || vblank_count - before != 1u)
             {
                 vblank_wait_failed = 1;
                 return -1;
@@ -3999,6 +4088,8 @@ sint32 VSync(sint32 mode)
         if (vblank_wait_failed)
             return -1;
     }
+    if (!vblank_wait)
+        native_vsync_count = vblank_count;
     return (sint32)frames;
 }
 
@@ -4013,6 +4104,8 @@ static int psx_state_block(FILE *file, void *data, size_t size, int load)
 int psx_state_io(FILE *f, int load)
 {
     PsxTimerState restored_timers;
+    if (!psx_state_block(f, &cooperative_pending_services, sizeof(cooperative_pending_services), load))
+        return 0;
     if (!psx_state_block(f, &gte, sizeof(gte), load) || !psx_state_block(f, &matrix_stack, sizeof(matrix_stack), load) || !psx_state_block(f, &matrix_stack_depth, sizeof(matrix_stack_depth), load) || !psx_state_block(f, &vblank_count, sizeof(vblank_count), load))
         return 0;
     if (load)
@@ -4027,9 +4120,11 @@ int psx_state_io(FILE *f, int load)
     if (load)
     {
         cooperative_wait_depth = 0u;
+        cooperative_sync_depth = 0u;
         native_irq_dispatching = 0u;
         native_root_polling = 0u;
         vblank_dispatching = 0;
+        native_vsync_count = vblank_count;
     }
     return pad_state_io(f, load);
 }
@@ -4049,9 +4144,14 @@ static sint32 pad_main_mode[2] = {1, 1};
 static uint8 pad_main_mode_lock[2];
 static uint8 pad_current_id[2];
 static uint32 native_pad_packet_owners[2];
+static uint32 native_pad_cleanup_callback;
+static uint32 native_pad_delay_cache;
+static uint32 native_pad_multitap_enable;
+static uint32 native_pad_actuator_budget;
 static uint32 pad_buttons;
 static sint32 pad_replay_bound;
 static sint32 pad_replay_failure;
+static uint32 pad_replay_inputs[2][3];
 static uint32 bios_pad_initialized;
 static uint32 bios_pad_clear_mode;
 
@@ -4107,34 +4207,22 @@ sint32 pad_replay_failed(void)
     return pad_replay_failure;
 }
 
+sint32 pad_replay_is_bound(void)
+{
+    return pad_replay_bound;
+}
+
 sint32 pad_lockstep_apply(sint32 controller, uint32 type, uint32 buttons, uint32 analog)
 {
-    uint8 report[8];
     if (controller < 0 || controller >= 2 || type > 2u || buttons > 0xffffu)
         return 0;
     if (controller == 0)
         xport_input_override(1, buttons);
-    if (!pad_packets[controller])
-        return type != 2u;
-    if (!type)
-    {
-        memset(pad_packets[controller], 0, 8);
-        pad_packets[controller][0] = 0xffu;
-        return 1;
-    }
-    report[0] = 0u;
-    report[1] = type == 2u ? 0x73u : 0x41u;
-    report[2] = (uint8)~buttons;
-    report[3] = (uint8)(~buttons >> 8);
-    if (type == 2u)
-    {
-        report[4] = (uint8)analog;
-        report[5] = (uint8)(analog >> 8);
-        report[6] = (uint8)(analog >> 16);
-        report[7] = (uint8)(analog >> 24);
-    }
-    memmove(pad_packets[controller], report, type == 2u ? 8u : 4u);
-    pad_current_id[controller] = report[1] >> 4;
+    if (!pad_packets[controller] && type == 2u)
+        return 0;
+    pad_replay_inputs[controller][0] = type;
+    pad_replay_inputs[controller][1] = buttons;
+    pad_replay_inputs[controller][2] = analog;
     return 1;
 }
 
@@ -4336,16 +4424,328 @@ sint32 psx_pad_serial_transfer(uint32 owner, sint32 value, uint32 port, uint32 s
     return (sint32)previous;
 }
 
-void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1)
+void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1, uint32 cleanup_callback, uint32 delay_cache, uint32 multitap_enable, uint32 actuator_budget)
 {
     if ((owner0 && !psx_addr(owner0, 240u)) || (owner1 && !psx_addr(owner1, 240u)))
         abort();
     native_pad_packet_owners[0] = owner0;
     native_pad_packet_owners[1] = owner1;
+    native_pad_cleanup_callback = cleanup_callback;
+    native_pad_delay_cache = delay_cache;
+    native_pad_multitap_enable = multitap_enable;
+    native_pad_actuator_budget = actuator_budget;
 }
 
 static void bios_native_pad_poll(void)
 {
+    if (pad_replay_bound && pad_active)
+    {
+        if (native_pad_delay_cache)
+        {
+            w_u32(native_pad_delay_cache, r_u16(0x1F801120));
+            w_u32(native_pad_delay_cache + 4, 0);
+        }
+        uint32 port;
+        uint32 budget_pending = native_pad_actuator_budget;
+        for (port = 0; port < 2; ++port)
+        {
+            typedef struct PAD_ERROR_FRAME
+            {
+                uint32 owner, id, children, next_child, entered;
+                struct PAD_ERROR_FRAME *previous;
+            } PAD_ERROR_FRAME;
+
+            PAD_ERROR_FRAME root = {0}, *frame;
+            uint32 packet_owner = native_pad_packet_owners[port];
+            if (!packet_owner || !pad_packets[port])
+                continue;
+            if (pad_replay_inputs[port][0])
+            {
+                uint32 received = r_u32(packet_owner + 60u);
+                uint32 output = r_u32(packet_owner + 48u);
+                uint32 parent = r_u32(packet_owner + 16u);
+                uint32 id = r_u8(received) >> 4;
+                uint32 previous_id = r_u8(packet_owner + 232u);
+                uint32 length;
+                uint32 index;
+
+                /* Publish the completed exchange before starting the next */
+                if (!(r_u8(received) & 0xf0u))
+                {
+                    w_u8(output, 0xffu);
+                    w_u8(output + 1u, 0u);
+                    w_u8(packet_owner + 232u, 0u);
+                    w_u8(packet_owner + 53u, 0u);
+                    xport_missing_pad_cleanup_callback(native_pad_cleanup_callback, packet_owner);
+                }
+                else if (packet_owner != parent && ((r_u8(received + 1u) && r_u8(received + 1u) != 0x5au) || id == 8u))
+                {
+                    xport_missing_pad_owner_callback(0u, packet_owner);
+                }
+                else
+                {
+                    if (r_u8(received + 1u) == 0x5au)
+                    {
+                        if (previous_id == 8u)
+                            w_u8(output, 0u);
+                        else if (id != 15u)
+                        {
+                            w_u8(packet_owner + 232u, id);
+                            w_u8(output, 0u);
+                            w_u8(output + 1u, r_u8(received));
+                            length = packet_owner != parent ? 8u : id == 8u ? 2u : r_u8(packet_owner + 68u);
+                            w_u8(packet_owner + 53u, length);
+                            for (index = 2u; index < length; ++index)
+                                w_u8(output + index, r_u8(received + index));
+                        }
+                    }
+                    if ((!r_u8(received + 1u) && (r_u8(packet_owner + 70u) != 1u || r_u32(packet_owner + 20u)) && !r_u8(packet_owner + 80u)) || r_u8(packet_owner + 232u) != previous_id)
+                        xport_missing_pad_cleanup_callback(native_pad_cleanup_callback, packet_owner);
+                    if (r_u32(packet_owner + 12u) || !r_u8(packet_owner + 55u))
+                        w_u8(packet_owner + 74u, 0u);
+                    if (r_u8(packet_owner + 70u) != 0xffu)
+                    {
+                        uint32 state = r_u8(packet_owner + 70u);
+                        if ((uint8)(state - 2u) < 0xfcu && r_u8(received) != 0xf3u)
+                            xport_missing_pad_cleanup_callback(native_pad_cleanup_callback, packet_owner);
+                        else if (r_u8(packet_owner + 232u) == 8u && state)
+                            w_u8(packet_owner + 70u, state + 1u);
+                        else if (r_u8(packet_owner + 232u) == 8u || !state || r_u8(packet_owner + (packet_owner == parent ? 55u : 56u)))
+                        {
+                            if (!state)
+                            {
+                                uint32 children = r_u32(packet_owner + 12u);
+                                if (children || !r_u8(packet_owner + 55u))
+                                {
+                                    if (r_u8(packet_owner + 232u) == 8u && children && r_u8(r_u32(children + 60u)) == 0xffu)
+                                        w_u8(packet_owner + 73u, 2u);
+                                    else
+                                    {
+                                        w_u8(packet_owner + 73u, 1u);
+                                        w_u8(packet_owner + 70u, state + 1u);
+                                    }
+                                }
+                            }
+                            else if (state == 1u)
+                            {
+                                w_u8(packet_owner + 71u, 0u);
+                                w_u8(packet_owner + 70u, state + 1u);
+                            }
+                            else if (state == 0xfeu)
+                                w_u8(packet_owner + 70u, 0xffu);
+                            else
+                            {
+                                uint32 result = xport_missing_pad_owner_callback(r_u32(packet_owner + 24u), packet_owner);
+                                w_u8(packet_owner + 70u, r_u8(packet_owner + 70u) + result);
+                            }
+                        }
+                    }
+                }
+                pad_current_id[port] = r_u8(output + 1u) >> 4;
+
+                if (budget_pending)
+                {
+                    w_u32(budget_pending, 0);
+                    budget_pending = 0;
+                }
+                if (native_pad_actuator_budget && !(native_pad_multitap_enable && r_u32(native_pad_multitap_enable) && (r_u8(received) >> 4) == 8 && !r_u8(packet_owner + 55)))
+                {
+                    uint32 owner = packet_owner;
+                    uint32 budget = native_pad_actuator_budget;
+                    uint32 slot, motor, count, mode, packet;
+
+                    for (slot = 0; slot < 6; ++slot)
+                        w_u8(owner + 87 + slot, 0);
+                    mode = r_u16(owner + 230);
+                    packet = r_u32(owner + 40);
+                    if (mode && packet)
+                    {
+                        count = r_u8(owner + 52);
+                        if (count > 6)
+                            count = 6;
+                        for (motor = 0; motor < r_u8(owner + 233); ++motor)
+                        {
+                            uint32 descriptor = r_u32(owner + 4) + motor * 5;
+                            uint32 mask = r_u8(descriptor + 2) ? 255 : 1;
+                            uint32 active = 0;
+                            for (slot = 0; slot < count; ++slot)
+                                if (r_u8(owner + 93 + slot) == motor && (r_u8(packet + slot) & mask))
+                                {
+                                    active = 1;
+                                    break;
+                                }
+                            if (active)
+                            {
+                                uint32 total = r_u32(budget) + r_u8(descriptor + 3);
+                                if ((sint32)total < 61)
+                                {
+                                    w_u32(budget, total);
+                                    for (slot = 0; slot < count; ++slot)
+                                        if (r_u8(owner + 93 + slot) == motor)
+                                            w_u8(owner + 87 + slot, 1);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        uint32 type = r_u8(owner + 232);
+                        if ((type == 4 || type == 5 || type == 7) && !mode && r_u8(owner + 52) >= 2)
+                        {
+                            if ((r_u8(packet) & 0xc0) == 0x40 && (r_u8(packet + 1) & 1) && (sint32)(r_u32(budget) + 10) < 61)
+                            {
+                                w_u8(owner + 88, 1);
+                                w_u8(owner + 87, 1);
+                                w_u32(budget, r_u32(budget) + 10);
+                            }
+                        }
+                        else if (type == 3)
+                            w_u8(owner + 87, 1);
+                        else if (!mode)
+                            for (slot = 6; slot != 0; --slot)
+                                w_u8(owner + 86 + slot, 1);
+                    }
+                }
+
+                /* The next synchronous exchange samples physical input */
+                w_u8(received, pad_replay_inputs[port][0] == 2u ? 0x73u : 0x41u);
+                w_u8(received + 1u, 0x5au);
+                w_u8(received + 2u, (uint8)~pad_replay_inputs[port][1]);
+                w_u8(received + 3u, (uint8)(~pad_replay_inputs[port][1] >> 8));
+                if (pad_replay_inputs[port][0] == 2u)
+                    for (index = 0u; index < 4u; ++index)
+                        w_u8(received + 4u + index, (uint8)(pad_replay_inputs[port][2] >> (8u * index)));
+                continue;
+            }
+            pad_packets[port][0] = 0xffu;
+            root.owner = native_pad_packet_owners[port];
+            frame = &root;
+            while (frame)
+            {
+                uint32 owner = frame->owner, parent, children, state, retry, previous;
+                sint32 aggregate_error = 0;
+                if (!frame->entered)
+                {
+                    frame->id = r_u8(r_u32(owner + 60)) >> 4;
+                    if (r_u8(owner + 232) != 8 && frame->id == 8 && r_u32(owner + 16) == owner)
+                    {
+                        w_u8(owner + 232, 8);
+                        w_u8(r_u32(owner + 48), 0xff);
+                        w_u8(r_u32(owner + 48) + 1, 0x80);
+                        w_u8(owner + 53, 2);
+                    }
+                    if (r_u8(owner + 232) == 8)
+                        frame->children = r_u32(owner + 12);
+                    frame->entered = 1;
+                }
+                if (frame->children && frame->next_child < 4)
+                {
+                    PAD_ERROR_FRAME *child = (PAD_ERROR_FRAME *)calloc(1, sizeof(*child));
+                    if (!child)
+                        abort();
+                    child->owner = frame->children + 240 * frame->next_child++;
+                    child->previous = frame;
+                    frame = child;
+                    continue;
+                }
+                parent = r_u32(owner + 16);
+                children = r_u32(parent + 12);
+                if ((r_u32(owner + 12) && !r_u8(owner + 55)) || (!r_u32(owner + 12) && !r_u8(owner + 56)))
+                {
+                    uint32 index;
+                    if (!r_u32(owner + 12))
+                        aggregate_error = r_u8(parent + 55) != 0;
+                    for (index = 0; index < 4 && !aggregate_error; ++index)
+                        aggregate_error = r_u8(children + 240 * index + 56) != 0;
+                    if (aggregate_error)
+                    {
+                        if (!r_u8(owner + 74))
+                            w_u8(owner + 74, 1);
+                        goto pad_error_return;
+                    }
+                }
+                previous = r_u8(owner + 55);
+                state = r_u8(owner + 70);
+                w_u8(owner + 55, 0);
+                w_u32(owner + 76, r_u32(owner + 76) + 1);
+                w_u8(owner + 57, r_u8(owner + 56));
+                w_u8(owner + 56, previous);
+                if (state)
+                {
+                    retry = r_u8(owner + 74);
+                    if (state == 1)
+                    {
+                        if (retry < 11 && r_u8(owner + 232) != 8)
+                        {
+                            w_u8(owner + 74, retry + 1);
+                            goto pad_error_return;
+                        }
+                        if (r_u16(owner + 230))
+                        {
+                            retry = r_u8(owner + 74);
+                            if (retry < 21)
+                            {
+                                w_u8(owner + 74, retry + 1);
+                                goto pad_error_return;
+                            }
+                            xport_missing_pad_cleanup_callback(native_pad_cleanup_callback, owner);
+                        }
+                        w_u8(owner + 73, 2);
+                        if (r_u8(owner + 232) == 8)
+                            w_u8(owner + 70, 0xfe);
+                        else
+                        {
+                            if (r_u32(owner + 12))
+                            {
+                                w_u8(owner + 56, 0);
+                                w_u8(owner + 55, 0);
+                            }
+                            w_u8(owner + 70, 0xff);
+                        }
+                        goto pad_error_return;
+                    }
+                    if (retry < 11)
+                    {
+                        w_u8(owner + 74, retry + 1);
+                        goto pad_error_return;
+                    }
+                }
+                if (r_u8(owner + 73))
+                {
+                    w_u8(r_u32(owner + 48), 0xff);
+                    w_u8(r_u32(owner + 48) + 1, 0);
+                    w_u8(owner + 232, 0);
+                    w_u8(owner + 53, 0);
+                    xport_missing_pad_cleanup_callback(native_pad_cleanup_callback, owner);
+                }
+                if (frame->id == 8)
+                {
+                    if (r_u32(owner + 12))
+                    {
+                        w_u8(owner + 232, 8);
+                        w_u8(r_u32(owner + 48) + 1, 0x80);
+                    }
+                }
+                else if (r_u8(owner + 232) == 8)
+                {
+                    w_u8(owner + 232, 0);
+                    w_u8(r_u32(owner + 48) + 1, 0);
+                }
+            pad_error_return:
+            {
+                PAD_ERROR_FRAME *previous_frame = frame->previous;
+                if (frame != &root)
+                    free(frame);
+                frame = previous_frame;
+            }
+            }
+            if (budget_pending)
+            {
+                w_u32(budget_pending, 0);
+                budget_pending = 0;
+            }
+        }
+    }
     if (!pad_replay_bound && pad_active)
     {
         uint32 port;
@@ -4390,10 +4790,21 @@ sint32 PadGetState(sint32 port)
     sint32 index;
     if (owner)
     {
-        uint32 error = r_u32(owner + 0x34u) & 0xFFFF0000u;
+        uint32 error;
+        if (native_pad_multitap_enable && r_u32(native_pad_multitap_enable) && ((r_u8(owner + 0xE8) == 8 && !((uint32)port & 0xF)) || ((uint32)port & 3)))
+            owner = r_u32(owner + 0xC) + 240 * ((uint32)port & 3);
         uint32 state;
+#if defined(XPORT_PAD_STATE_PSYQ43)
+        error = r_u32(owner + 0x34u) & 0xFFFF0000;
         if (!error && r_u32(owner + 0x10u) != owner)
             error = r_u8(owner + 0x38u);
+#else
+        error = r_u8(owner + 0x37u);
+        if (!error)
+            error = r_u8(owner + 0x38u);
+        if (!error && r_u32(owner + 0x10u) != owner)
+            error = r_u8(owner + 0x39u);
+#endif
         if (!error)
             error = r_u8(r_u32(owner + 0x30u));
         state = r_u8(owner + 0x49u);
@@ -4417,7 +4828,7 @@ sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset)
     uint32 index = ((uint32)port & 0xF0u) != 0u;
     uint32 owner = native_pad_packet_owners[index];
 #if !defined(LOCKSTEP_DEBUG)
-    if (!pad_replay_bound)
+    if (!pad_replay_bound && !owner)
     {
         uint8 axes[4];
         sint32 capable;
@@ -4550,7 +4961,7 @@ sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
     uint8 requested_mode = (uint8)mode;
     uint8 requested_lock = (uint8)lock;
 #if !defined(LOCKSTEP_DEBUG)
-    if (!pad_replay_bound)
+    if (!pad_replay_bound && !owner)
     {
         uint8 axes[4];
         if ((port != 0 && port != 0x10) || (mode != 0 && mode != 1) || lock < 0 || lock > 3 || !pad_active || (!pad_packets[index] && !owner))
@@ -4589,6 +5000,8 @@ sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
 int pad_state_io(FILE *file, int load)
 {
     uint32 size = (uint32)sizeof(pad_buttons);
+    if (!psx_state_block(file, pad_replay_inputs, sizeof(pad_replay_inputs), load))
+        return 0;
     if (load)
         return fread(&size, 4, 1, file) == 1 && size == sizeof(pad_buttons) && fread(&pad_buttons, 1, sizeof(pad_buttons), file) == sizeof(pad_buttons);
     return fwrite(&size, 4, 1, file) == 1 && fwrite(&pad_buttons, 1, sizeof(pad_buttons), file) == sizeof(pad_buttons);
@@ -5244,6 +5657,7 @@ sint32 xport_bios_enter_critical(void)
 void xport_bios_exit_critical(void)
 {
     bios_interrupts_enabled = 1u;
+    psx_sync_callbacks();
     bios_native_irq_dispatch();
     if (bios_vblank_pending)
     {

@@ -14,7 +14,8 @@ from lockstep_record import load_record
 from lockstep_supervisor import source_snapshot
 from lockstep_writer_timeline import correlate_writers
 from trace_workflow import name_check
-from windows_desktop import launch_default_desktop
+from windows_desktop import launch_worker_desktop, signal_worker_ready
+from xport_process import normalized_environment
 from xport_project import load_project
 
 
@@ -28,6 +29,8 @@ def main() -> int:
     parser.add_argument("--stop-after-writes", type=int, default=0)
     parser.add_argument("--desktop-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.desktop_child:
+        signal_worker_ready()
     name_check(args.record)
     name_check(args.source_run)
     name_check(args.name)
@@ -69,19 +72,21 @@ def main() -> int:
             command.extend(("--attempt", str(args.attempt)))
         if args.stop_after_writes:
             command.extend(("--stop-after-writes", str(args.stop_after_writes)))
-        pid = launch_default_desktop(command, root, visible=True)
+        pid = launch_worker_desktop(command, root, environment=normalized_environment())
         print(json.dumps({"status": "started", "pid": pid,
-                          "desktop": "WinSta0\\Default", "output": str(output_dir)}))
+                          "desktop": "WinSta0\\XportConverge", "output": str(output_dir)}))
         return 0
     output_dir.mkdir(parents=True)
     hooks = ProjectLockstepHooks(root, config, args.name, record, telemetry="none")
     started = time.monotonic()
     try:
+        build = hooks.build_debug(identity)
         evidence = hooks.refine(
             result, record, stop_after_writes=args.stop_after_writes)
         report = {"schema": 1, "source_run": args.source_run,
                   "source_attempt": selected.get("attempt"),
                   "source_identity": identity,
+                  "build": build,
                   "comparison": result.get("comparison"),
                   "seconds": round(time.monotonic() - started, 3),
                   "evidence": evidence,

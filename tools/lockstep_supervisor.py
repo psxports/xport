@@ -196,6 +196,7 @@ class LockstepSupervisor:
         self._retained_checkpoint = None
         self.path = self.directory / "state.json"
         self.progress = SupervisorProgress(getattr(self.hooks, "progress_window", False))
+        self.progress.receipt_path = self.directory / "progress-process.json"
         if self.path.exists():
             self.state = json.loads(self.path.read_text(encoding="utf-8"))
             if self.state.get("contract") != SUPERVISOR_CONTRACT:
@@ -312,14 +313,6 @@ class LockstepSupervisor:
         identity = getattr(self.hooks, "implementation_identity", None)
         return identity() if identity else None
 
-    def _verify_packet_shared_source(self, packet: dict) -> None:
-        expected = (packet.get("identities") or {}).get("shared_source_identity")
-        if expected is None:
-            return
-        identity = getattr(self.hooks, "shared_source_identity", None)
-        if identity is None or identity() != expected:
-            raise LockstepSupervisorError("Shared xport source changed after attention packet")
-
     def _transition(self, status: str, **fields) -> None:
         current = self.state["status"]
         if status != current and status not in TRANSITIONS[current]:
@@ -379,6 +372,12 @@ class LockstepSupervisor:
                 clear()
             self._save()
             return None
+
+    def _prepare_durable_diagnostic(self, target_frame: int) -> dict | None:
+        saved = self.state.get("durable_checkpoint") or {}
+        if self._retained_checkpoint is not None or saved.get("frame") != target_frame:
+            return None
+        return self._prepare_durable_resume(target_frame)
 
     def _launch(self, run_id: str):
         retained = self._retained_checkpoint
@@ -468,7 +467,6 @@ class LockstepSupervisor:
         if source_snapshot(self.root, self.source_roots)['identity'] != before['identity']:
             raise LockstepSupervisorError('Source changed outside supervisor repair')
         packet = json.loads(packet_path.read_text(encoding='utf-8'))
-        self._verify_packet_shared_source(packet)
         repair_ranges = proposal.get('memory_exceptions')
         if repair_ranges is not None:
             validate_repair_ranges(
@@ -480,7 +478,6 @@ class LockstepSupervisor:
                          if shared_root is not None else None)
         applied = apply_proposal(self.root, self.source_roots, packet_path,
                                  before, proposal, audit_validator=validator,
-                                 shared_validator=lambda: self._verify_packet_shared_source(packet),
                                  build_validator=self._preflight_repair_build,
                                  shared_root=shared_root, shared_before=shared_before,
                                  post_apply=(lambda after: activate_repair_ranges(
@@ -557,8 +554,6 @@ class LockstepSupervisor:
         shared_root = shared_root_method() if shared_root_method is not None else None
         shared_before = (source_snapshot(shared_root, (Path('src'),))
                          if shared_root is not None else None)
-        if packet_path is not None:
-            self._verify_packet_shared_source(json.loads(Path(packet_path).read_text(encoding="utf-8")))
         next_full_check = time.monotonic() + 5.0
         while True:
             causal_path = self.directory / "causal-request.json"
@@ -571,7 +566,12 @@ class LockstepSupervisor:
                     prior = json.loads(Path(packet_path).read_text(encoding="utf-8"))
                     request = json.loads(causal_path.read_text(encoding="utf-8"))
                     attempt = self.state["attempts"][-1]
-                    if request.get("kind") == "trig_table":
+                    if request.get("kind") == "audit_cluster":
+                        from lockstep_causal_cluster import read_cluster_request
+                        packet = read_cluster_request(
+                            self.root, self.directory, request, prior, self.source_roots)
+                        suffix = "cluster"
+                    elif request.get("kind") == "trig_table":
                         from lockstep_causal_trig import read_trig_request
                         packet = read_trig_request(self.root, self.directory, request, prior)
                         suffix = "trig"
@@ -634,6 +634,7 @@ class LockstepSupervisor:
                     attempt.pop("repair_attention", None)
                     packet_path = new_path
                     self._transition("ATTENTION_REQUIRED", reason=(
+                        "audit_cluster_transition" if suffix == "cluster" else
                         "trig_table_transition" if suffix == "trig" else
                         "writer_refinement_transition" if suffix == "refined" else
                         "library_reference_transition" if suffix == "reference" else
@@ -660,6 +661,7 @@ class LockstepSupervisor:
             if request_path.is_file():
                 result_path = self.directory / "diagnostic-result.json"
                 used_checkpoint = False
+                durable_diagnostic = None
                 request = {}
                 try:
                     request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -672,9 +674,6 @@ class LockstepSupervisor:
                         raise ValueError("Unknown diagnostic probe kind")
                     attempt = self.state["attempts"][-1]
                     current_source = source_snapshot(self.root, self.source_roots)
-                    if current_source["identity"] != attempt.get("source_identity"):
-                        raise LockstepSupervisorError(
-                            "Project source changed before diagnostic probe")
                     attempt["build"] = self._preflight_repair_build(current_source)
                     probe = getattr(self.hooks, "paired_memory_probe" if kind == "paired_memory"
                                     else "instruction_probe")
@@ -686,6 +685,8 @@ class LockstepSupervisor:
                         if target_frame < checkpoint["frame"]:
                             raise LockstepSupervisorError("Diagnostic target precedes retained checkpoint")
                         used_checkpoint = True
+                    elif checkpoint is None:
+                        durable_diagnostic = self._prepare_durable_diagnostic(target_frame)
                     self._write_progress(active=True, current=0, mode="DIAGNOSTIC",
                                          target_frame=target_frame)
                     result = self._timed(kind + "_probe", probe,
@@ -697,10 +698,18 @@ class LockstepSupervisor:
                     if used_checkpoint:
                         checkpoint["sha256"] = file_digest(checkpoint["path"])
                         result["checkpoint_pair_resumed"] = checkpoint["frame"]
+                    elif durable_diagnostic is not None:
+                        result["checkpoint_pair_resumed"] = durable_diagnostic["frame"]
+                        result["durable_checkpoint_pair_resumed"] = True
                 except Exception as error:
                     result = {"schema": 1, "complete": False, "error": str(error)}
                     if used_checkpoint:
                         self._discard_retained_checkpoint()
+                finally:
+                    if durable_diagnostic is not None:
+                        clear = getattr(self.hooks, "clear_restart_checkpoint", None)
+                        if clear is not None:
+                            clear()
                 temporary = result_path.with_suffix(".tmp")
                 temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
                 temporary.replace(result_path)
@@ -787,9 +796,6 @@ class LockstepSupervisor:
                             'changed_shared_files': sorted(changed_shared),
                             'audit_verified': True,
                         }
-                if packet_path is not None:
-                    self._verify_packet_shared_source(
-                        json.loads(Path(packet_path).read_text(encoding="utf-8")))
             time.sleep(0.25)
 
     def _recover_interrupted_run(self, status: str) -> None:
@@ -1141,9 +1147,6 @@ class LockstepSupervisor:
                 current_status = "VALIDATING"
             if current_status == "ATTENTION_REQUIRED" and self.reprobe:
                 previous = self.state["attempts"][-1]
-                current_source = source_snapshot(self.root, self.source_roots)
-                if current_source["identity"] != previous["source_identity"]:
-                    raise LockstepSupervisorError("Cannot reprobe after an external source edit")
                 if (self.directory / 'repair-proposal.json').exists():
                     raise LockstepSupervisorError("Cannot reprobe with a pending repair proposal")
                 result = previous.get("result") or {}
@@ -1266,6 +1269,7 @@ class LockstepSupervisor:
                     previous.get("status") == "launching" and not previous_result)
                 retryable_failure = any(marker in str(self.state.get("error", "")) for marker in (
                     "already_attached", "No project-owned process receipt for this endpoint",
+                    "Shared xport source changed after Debug build",
                     "Endpoint, creation identity or project data directory differs",
                 )) or launch_access_failure or launch_infrastructure_failure
                 if (current_source["identity"] == failed_identity and
@@ -1338,12 +1342,14 @@ class LockstepSupervisor:
                     pending_signature = diagnostic["pending_signature"]
                     pending_target_frame = diagnostic["pending_target_frame"]
                     pending_watch_target = None
-            cold_diagnostic = False
+            diagnostic_frame = None
             for attempt_number in itertools.count(len(self.state["attempts"])):
                 if self.max_repairs is not None and attempt_number > self.max_repairs:
                     raise LockstepSupervisorError("Repair attempt limit reached")
                 # An initial-state replay can diagnose divergence before the first checkpoint
-                target_frame = 0 if cold_diagnostic else self.scan_target_frame
+                target_frame = (self.scan_target_frame if diagnostic_frame is None
+                                else diagnostic_frame)
+                diagnostic_frame = None
                 self.hooks.set_target_frame(target_frame)
                 set_watch_target = getattr(self.hooks, "set_watch_target", None)
                 if set_watch_target is not None:
@@ -1500,6 +1506,15 @@ class LockstepSupervisor:
                             raise
                         except Exception as error:
                             attempt["checkpoint_error"] = str(error)
+                            attempt["status"] = "checkpoint_diagnostic_failed"
+                            attempt["result"] = result
+                            attempt["result_status"] = result.get("status")
+                            save_transcript = getattr(self.hooks, "save_native_transcript", None)
+                            if save_transcript is not None:
+                                attempt["native_transcript"] = save_transcript(
+                                    f"checkpoint-{attempt_number}")
+                            attempt["finished_at"] = time.time()
+                            self._save()
                             raise LockstepSupervisorError(
                                 "Checkpoint detailed replay failed: " + str(error)) from error
                     if (retained_frame is None and checkpoint_frame is not None and
@@ -1636,8 +1651,8 @@ class LockstepSupervisor:
                     attempt["status"] = "prefix_divergence"
                     attempt["provisional"] = True
                     self._save()
-                    if checkpoint_frame is None and not cold_diagnostic:
-                        cold_diagnostic = True
+                    if checkpoint_frame is None and target_frame == self.scan_target_frame:
+                        diagnostic_frame = replay_target_frame(result)
                         pending_watch_target = watch_target_from_result(result)
                         attempt["cold_diagnostic_requested"] = True
                         self._save()
@@ -1653,11 +1668,11 @@ class LockstepSupervisor:
                 pending_watch_target = None
         except Exception as error:
             try:
-                failed_source_identity = source_snapshot(self.root, self.source_roots)["identity"]
+                failed_source_identity = getattr(error, "failed_source_identity", None) or source_snapshot(self.root, self.source_roots)["identity"]
             except Exception:
                 failed_source_identity = None
             self._transition("FAILED", error=str(error), failed_source_identity=failed_source_identity,
-                             failed_implementation_identity=self._implementation_identity())
+                             failed_implementation_identity=getattr(error, "failed_implementation_identity", None) or self._implementation_identity())
             return {"status": "FAILED", "error": str(error), "state": str(self.path)}
         finally:
             self._discard_retained_checkpoint()
@@ -1666,8 +1681,106 @@ class LockstepSupervisor:
                                      target_frame=replay_target_frame(
                                          (self.state["attempts"][-1].get("result")
                                           if self.state["attempts"] else {}) or {}))
+            elif self.state["status"] == "FAILED":
+                self._write_progress(active=True, mode="FAILED")
             else:
                 self._stop_progress_window()
 
     def run_interactive(self) -> dict:
-        return self.progress.run_action(self.run)
+        def action():
+            while True:
+                result = self.run()
+                if result.get("status") != "FAILED" or not self.progress.enabled:
+                    return result
+                if not self._wait_failed_diagnostics():
+                    return result
+        return self.progress.run_action(action)
+
+    def _wait_failed_diagnostics(self) -> bool:
+        while True:
+            if (source_snapshot(self.root, self.source_roots)["identity"] ==
+                    self.state.get("failed_source_identity") and
+                    (self.state.get("error") == "Shared xport source changed after Debug build" or
+                     self._implementation_identity() != self.state.get("failed_implementation_identity"))):
+                return True
+            proposal_path = self.directory / "repair-proposal.json"
+            packet_path = self.directory / "failed-prefix-runtime.json"
+            if proposal_path.is_file() and packet_path.is_file():
+                try:
+                    proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+                    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+                    if (proposal.get("memory_exceptions") != [] or
+                            not proposal.get("adapter_audits") or
+                            any(not any(edit.get('path') == audit.get('path') and
+                                        edit.get('before', '') and
+                                        edit['before'] in audit.get('function_before', '')
+                                        for audit in proposal['adapter_audits'])
+                                for edit in proposal.get('edits', [])) or
+                            packet.get("identities", {}).get("native_source_identity") !=
+                                self.state.get("failed_source_identity")):
+                        raise ValueError("Failed prefix accepts only audited runtime adapter edits")
+                    self._apply_repair_proposal(source_snapshot(self.root, self.source_roots),
+                                                packet_path, proposal)
+                except Exception as error:
+                    write_receipt(self.directory / "repair-proposal.result.json",
+                                  {"status": "rejected", "error": str(error)})
+                    proposal_path.unlink(missing_ok=True)
+                else:
+                    proposal_path.unlink(missing_ok=True)
+                    return True
+            request_path = self.directory / "diagnostic-request.json"
+            if not request_path.is_file():
+                time.sleep(0.2)
+                continue
+            try:
+                current = source_snapshot(self.root, self.source_roots)
+                if current["identity"] != self.state.get("failed_source_identity"):
+                    raise LockstepSupervisorError("Source changed after failed replay")
+                attempt = next(row for row in reversed(self.state["attempts"])
+                               if (row.get("result") or {}).get("status") == "memory_divergence"
+                               and (row["result"].get("original") or {}).get("mode") == "PREFIX_GUARD"
+                               and row.get("source_identity") == current["identity"])
+                request = bind_diagnostic_request(
+                    json.loads(request_path.read_text(encoding="utf-8")), attempt["result"])
+                request["prefix_only"] = True
+                kind = request.get("kind", "instruction")
+                if kind not in {"instruction", "paired_memory", "writer_refinement"}:
+                    raise ValueError("Unknown failed replay diagnostic kind")
+                build = self._preflight_repair_build(current)
+                if kind == "writer_refinement":
+                    target_frame = int(attempt['result']['original']['frame']) - 1
+                    durable = self._prepare_durable_diagnostic(target_frame)
+                    try:
+                        result = self._timed("failed_prefix_writer_refinement", self.hooks.refine,
+                                             attempt["result"], self.record, prefix_only=True)
+                    finally:
+                        if durable is not None:
+                            self.hooks.clear_restart_checkpoint()
+                    if durable is not None:
+                        result['checkpoint_pair_resumed'] = durable['frame']
+                    result['complete'] = bool(result.get('interval_complete'))
+                    result['target_frame'] = target_frame
+                    write_receipt(self.directory / 'failed-prefix-writer-last.json', result)
+                    if not result.get("interval_complete"):
+                        raise RuntimeError("Failed prefix writer interval is incomplete")
+                    refinement = {key: value for key, value in result.items()
+                                  if key not in {'complete', 'target_frame', 'checkpoint_pair_resumed'}}
+                    packet = self.hooks.build_packet(attempt["result"], refinement, build)
+                    write_receipt(packet_path, packet)
+                    result["runtime_repair_packet"] = str(packet_path)
+                    write_receipt(self.directory / "diagnostic-result.json", result)
+                    request_path.unlink(missing_ok=True)
+                    continue
+                probe = getattr(self.hooks, "paired_memory_probe" if kind == "paired_memory"
+                                else "instruction_probe")
+                result = self._timed("failed_prefix_diagnostic", probe, request, self.record,
+                    progress=lambda frame: self._write_progress(
+                        active=True, current=frame, mode="DIAGNOSTIC",
+                        target_frame=request["target_frame"]))
+                result["proof_scope"] = "read_only_failed_prefix_diagnostic"
+                result["acceptance_eligible"] = False
+            except Exception as error:
+                result = {"schema": 1, "complete": False, "error": str(error)}
+            write_receipt(self.directory / "diagnostic-result.json", result)
+            request_path.unlink(missing_ok=True)
+            self._write_progress(active=True, mode="FAILED")

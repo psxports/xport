@@ -189,7 +189,8 @@ sint32 gpu_frame_sync(uint32 fields)
     // Rebase after a pause instead of replaying an unbounded backlog
     if (!frame_skip.started || now < frame_skip.last_time || now - frame_skip.last_time > 1000000)
     {
-        frame_skip.deadline = now;
+        // The first requested field ends after the initial VSync wait
+        frame_skip.deadline = now + span;
         frame_skip.fraction = 0;
         frame_skip.started = 1;
     }
@@ -973,7 +974,11 @@ uint32 *ClearOTagR(uint32 *ot, sint32 count)
     sint32 index;
     uint32 address;
     if (!gpu_packet_range_address(ot, &address) && !gpu_guest_address(ot, &address))
+#if defined(AP_X64)
+        abort();
+#else
         address = (uint32)(intptr)ot;
+#endif
     if (count <= 0)
         return ot;
     xport_store_le32(ot, 0x00ffffffu);
@@ -987,7 +992,11 @@ uint32 *ClearOTag(uint32 *ot, sint32 count)
     sint32 index;
     uint32 address;
     if (!gpu_packet_range_address(ot, &address) && !gpu_guest_address(ot, &address))
+#if defined(AP_X64)
+        abort();
+#else
         address = (uint32)(intptr)ot;
+#endif
     if (count <= 0)
         return ot;
     for (index = 0; index + 1 < count; ++index)
@@ -1005,7 +1014,11 @@ void AddPrim(void *ot, void *prim)
     uint32 ot_value;
 
     if (!gpu_packet_range_address(prim, &address) && !gpu_guest_address(prim, &address))
+#if defined(AP_X64)
+        abort();
+#else
         address = (uint32)(intptr)prim;
+#endif
     prim_value = *prim_tag;
     ot_value = *ot_tag;
     *prim_tag = (prim_value & 0xff000000u) | (ot_value & 0x00ffffffu);
@@ -1019,7 +1032,11 @@ void AddPrims(void *ot, void *first, void *last)
     uint32 *last_tag = (uint32 *)last;
     uint32 address;
     if (!gpu_packet_range_address(first, &address) && !gpu_guest_address(first, &address))
+#if defined(AP_X64)
+        abort();
+#else
         address = (uint32)(intptr)first;
+#endif
     *last_tag = (*last_tag & 0xff000000u) | (*ot_tag & 0x00ffffffu);
     *ot_tag = address & 0x00ffffffu;
 }
@@ -1105,6 +1122,19 @@ static sint32 gpu_guest_address(const void *pointer, uint32 *address)
         return 1;
     }
     return 0;
+}
+
+uint32 gpu_packet_link(uintptr_t value)
+{
+    uint32 address;
+    if (gpu_packet_range_address((const void *)value, &address) || gpu_guest_address((const void *)value, &address))
+        return address & 0x00ffffffu;
+#if defined(AP_X64)
+    // Numeric guest links and the chain terminator do not contain host pointers
+    if (value > UINT32_MAX || (value > 0x00ffffffu && value != UINT32_MAX && (value & 0xff000000u) != 0x80000000u && (value & 0xff000000u) != 0xa0000000u && (value & 0xfffffc00u) != 0x1f800000u))
+        abort();
+#endif
+    return (uint32)value & 0x00ffffffu;
 }
 
 static uint32 gpu_u32(uint32 address)
@@ -1532,7 +1562,7 @@ static void pxc(sint32 x, sint32 y, uint32 color)
     sint32 vram_x = x + raster_surface_x;
     sint32 vram_y = y + raster_surface_y;
     if (x >= raster_clip_x0 && x < raster_clip_x1 && y >= raster_clip_y0 && y < raster_clip_y1 && (uint32)vram_x < VRAM_W && (uint32)vram_y < VRAM_H)
-        VRAM[vram_y * VRAM_W + vram_x] = (uint16)(((color >> 19) & 31u) | ((color >> 6) & 0x3e0u) | ((color << 7) & 0x7c00u));
+        VRAM[vram_y * VRAM_W + vram_x] = (uint16)(((color >> 19) & 31u) | ((color >> 6) & 0x3e0u) | ((color << 7) & 0x7c00u) | ((color >> 16) & 0x8000u));
 }
 
 static uint32 rgb555(uint16 c)
@@ -1543,35 +1573,26 @@ static uint32 rgb555(uint16 c)
 
 static uint16 texel_indexed(sint32 u, sint32 v, uint16 tpage, uint16 clut, sint32 *transparent)
 {
-    sint32 tp = (tpage >> 7) & 3, tx = (tpage & 15) * 64, ty = ((tpage >> 4) & 1) * 256, cx = (clut & 63) * 16, cy = (clut >> 6) & 0x1ff, index;
-    uint16 w, color;
-    u = ((u & ~(((sint32)texture_window & 31) << 3)) | ((((sint32)texture_window >> 10) & 31) & ((sint32)texture_window & 31)) << 3) & 255;
-    v = ((v & ~((((sint32)texture_window >> 5) & 31) << 3)) | ((((sint32)texture_window >> 15) & 31) & (((sint32)texture_window >> 5) & 31)) << 3) & 255;
-    *transparent = 1;
-    if ((uint32)(ty + v) >= VRAM_H || (uint32)cy >= VRAM_H)
-        return 0;
-    if (tp == 0)
+    uint32 mode = (tpage >> 7) & 3u;
+    uint32 tx = (tpage & 15u) * 64u, ty = ((tpage >> 4) & 1u) * 256u;
+    uint32 cx = (clut & 63u) * 16u, cy = (clut >> 6) & 511u;
+    uint32 mask_x = (texture_window & 31u) * 8u, mask_y = ((texture_window >> 5) & 31u) * 8u;
+    uint32 offset_x = ((texture_window >> 10) & 31u) * 8u, offset_y = ((texture_window >> 15) & 31u) * 8u;
+    uint32 x = (((uint32)u & ~mask_x) | (offset_x & mask_x)) & 255u;
+    uint32 y = (((uint32)v & ~mask_y) | (offset_y & mask_y)) & 255u;
+    uint16 word, color;
+    if (mode < 2u)
     {
-        w = VRAM[(ty + v) * VRAM_W + tx + (u >> 2)];
-        index = (w >> ((u & 3) * 4)) & 15;
-    }
-    else if (tp == 1)
-    {
-        w = VRAM[(ty + v) * VRAM_W + tx + (u >> 1)];
-        index = (w >> ((u & 1) * 8)) & 255;
+        uint32 shift = mode ? 1u : 2u;
+        uint32 bits = mode ? 8u : 4u;
+        uint32 index;
+        word = VRAM[((ty + y) & 511u) * VRAM_W + ((tx + (x >> shift)) & 1023u)];
+        index = (word >> ((x & ((1u << shift) - 1u)) * bits)) & ((1u << bits) - 1u);
+        color = VRAM[cy * VRAM_W + ((cx + index) & 1023u)];
     }
     else
-    {
-        if ((uint32)(tx + u) >= VRAM_W)
-            return 0;
-        color = VRAM[(ty + v) * VRAM_W + tx + u];
-        *transparent = color == 0;
-        return color;
-    }
-    if ((uint32)(cx + index) >= VRAM_W)
-        return 0;
-    color = VRAM[cy * VRAM_W + cx + index];
-    *transparent = color == 0;
+        color = VRAM[((ty + y) & 511u) * VRAM_W + ((tx + x) & 1023u)];
+    *transparent = color == 0u;
     return color;
 }
 
@@ -1583,19 +1604,21 @@ static uint16 texel(sint32 u, sint32 v, uint16 tpage, uint16 clut)
 
 static uint32 modulate(uint16 c, sint32 r, sint32 g, sint32 b, sint32 raw)
 {
-    uint32 q = rgb555(c), tr = (q >> 16) & 255, tg = (q >> 8) & 255, tb = q & 255;
+    uint32 tr = c & 31u, tg = (c >> 5) & 31u, tb = (c >> 10) & 31u;
+    uint32 mask = (uint32)(c & 0x8000u) << 16;
     if (raw)
-        return q;
-    tr = tr * r / 128;
-    tg = tg * g / 128;
-    tb = tb * b / 128;
-    if (tr > 255)
-        tr = 255;
-    if (tg > 255)
-        tg = 255;
-    if (tb > 255)
-        tb = 255;
-    return tr << 16 | tg << 8 | tb;
+        return rgb555(c) | mask;
+    tr = (tr * (uint32)r) >> 4;
+    tg = (tg * (uint32)g) >> 4;
+    tb = (tb * (uint32)b) >> 4;
+    if (tr > 255u)
+        tr = 255u;
+    if (tg > 255u)
+        tg = 255u;
+    if (tb > 255u)
+        tb = 255u;
+    /* Carry the texture STP bit beside the RGB channels */
+    return tr << 16 | tg << 8 | tb | mask;
 }
 
 static uint32 semi_blend(uint32 back, uint32 front, sint32 abr)
@@ -1640,7 +1663,7 @@ static uint32 semi_blend(uint32 back, uint32 front, sint32 abr)
     r = (r << 3) | (r >> 2);
     g = (g << 3) | (g >> 2);
     b = (b << 3) | (b >> 2);
-    return (uint32)(r << 16 | g << 8 | b);
+    return (uint32)(r << 16 | g << 8 | b) | (front & 0x80000000u);
 }
 
 static uint32 packet_rgb(uint8 *p, sint32 o)
@@ -1686,56 +1709,60 @@ static sint32 scan_clamp_channel(sint32 value)
     return value > 255 ? 255 : value;
 }
 
-static void scan_triangle(RV va, RV vb, RV vc, uint16 tp, uint16 cl, uint32 ca, uint32 cb, uint32 cc, sint32 textured, sint32 raw, sint32 semi)
+static void scan_triangle(RV va, RV vb, RV vc, uint16 tp, uint16 cl, uint32 ca, uint32 cb, uint32 cc, sint32 textured, sint32 raw, sint32 semi, sint32 shaded)
 {
-    ScanVertex a = {va.x, va.y, va.u, va.v, (sint32)((ca >> 16) & 255), (sint32)((ca >> 8) & 255), (sint32)(ca & 255)};
-    ScanVertex b = {vb.x, vb.y, vb.u, vb.v, (sint32)((cb >> 16) & 255), (sint32)((cb >> 8) & 255), (sint32)(cb & 255)};
-    ScanVertex c = {vc.x, vc.y, vc.u, vc.v, (sint32)((cc >> 16) & 255), (sint32)((cc >> 8) & 255), (sint32)(cc & 255)};
-    sint64 denominator;
-    sint32 dudx, dvdx, drdx, dgdx, dbdx;
-    sint32 dudy, dvdy, drdy, dgdy, dbdy;
-    sint64 ubase, vbase, rbase, gbase, bbase;
-    sint32 min_y, max_y, y;
-    sint32 min_x = a.x < b.x ? a.x : b.x;
-    sint32 max_x = a.x > b.x ? a.x : b.x;
-    sint32 min_vertex_y = a.y < b.y ? a.y : b.y;
-    sint32 max_vertex_y = a.y > b.y ? a.y : b.y;
-    if (c.x < min_x)
-        min_x = c.x;
-    if (c.x > max_x)
-        max_x = c.x;
-    if (c.y < min_vertex_y)
-        min_vertex_y = c.y;
-    if (c.y > max_vertex_y)
-        max_vertex_y = c.y;
-    if (max_x - min_x > 1023 || max_vertex_y - min_vertex_y > 511)
+    static const sint32 dither[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
+    RV vertex[3] = {va, vb, vc}, sorted[3] = {va, vb, vc};
+    uint32 colors[3] = {ca, cb, cc};
+    uint32 start[5], step_x[5], step_y[5];
+    sint32 attribute[3][5];
+    sint32 anchor, i, j, y, min_x, max_x, min_y, max_y;
+    sint64 determinant, long_step;
+    min_x = max_x = va.x;
+    min_y = max_y = va.y;
+    for (i = 0; i < 3; ++i)
+    {
+        if (vertex[i].x < min_x)
+            min_x = vertex[i].x;
+        if (vertex[i].x > max_x)
+            max_x = vertex[i].x;
+        if (vertex[i].y < min_y)
+            min_y = vertex[i].y;
+        if (vertex[i].y > max_y)
+            max_y = vertex[i].y;
+        attribute[i][0] = vertex[i].u;
+        attribute[i][1] = vertex[i].v;
+        attribute[i][2] = (colors[i] >> 16) & 255u;
+        attribute[i][3] = (colors[i] >> 8) & 255u;
+        attribute[i][4] = colors[i] & 255u;
+    }
+    if (max_x - min_x > 1023 || max_y - min_y > 511)
         return;
-    if (a.y > b.y)
-        scan_swap(&a, &b);
-    if (b.y > c.y)
-        scan_swap(&b, &c);
-    if (a.y > b.y)
-        scan_swap(&a, &b);
-    denominator = (sint64)(b.x - a.x) * (c.y - a.y) - (sint64)(c.x - a.x) * (b.y - a.y);
-    if (!denominator || a.y == c.y)
+    determinant = (sint64)(vb.x - va.x) * (vc.y - va.y) - (sint64)(vc.x - va.x) * (vb.y - va.y);
+    if (!determinant || min_y == max_y)
         return;
-    dudx = scan_gradient(a.u, b.u, c.u, &a, &b, &c, denominator, 1);
-    dvdx = scan_gradient(a.v, b.v, c.v, &a, &b, &c, denominator, 1);
-    drdx = scan_gradient(a.r, b.r, c.r, &a, &b, &c, denominator, 1);
-    dgdx = scan_gradient(a.g, b.g, c.g, &a, &b, &c, denominator, 1);
-    dbdx = scan_gradient(a.b, b.b, c.b, &a, &b, &c, denominator, 1);
-    dudy = scan_gradient(a.u, b.u, c.u, &a, &b, &c, denominator, 0);
-    dvdy = scan_gradient(a.v, b.v, c.v, &a, &b, &c, denominator, 0);
-    drdy = scan_gradient(a.r, b.r, c.r, &a, &b, &c, denominator, 0);
-    dgdy = scan_gradient(a.g, b.g, c.g, &a, &b, &c, denominator, 0);
-    dbdy = scan_gradient(a.b, b.b, c.b, &a, &b, &c, denominator, 0);
-    ubase = ((sint64)a.u << 16) - (sint64)dudx * a.x - (sint64)dudy * a.y + (dudx + dudy) / 2;
-    vbase = ((sint64)a.v << 16) - (sint64)dvdx * a.x - (sint64)dvdy * a.y + (dvdx + dvdy) / 2;
-    rbase = ((sint64)a.r << 16) - (sint64)drdx * a.x - (sint64)drdy * a.y + (drdx + drdy) / 2;
-    gbase = ((sint64)a.g << 16) - (sint64)dgdx * a.x - (sint64)dgdy * a.y + (dgdx + dgdy) / 2;
-    bbase = ((sint64)a.b << 16) - (sint64)dbdx * a.x - (sint64)dbdy * a.y + (dbdx + dbdy) / 2;
-    min_y = a.y;
-    max_y = c.y;
+    anchor = vb.x <= va.x ? (vc.x <= vb.x ? 2 : 1) : (vc.x < va.x ? 2 : 0);
+    for (i = 0; i < 5; ++i)
+    {
+        sint64 numerator_x = (sint64)(attribute[1][i] - attribute[0][i]) * (vc.y - va.y) - (sint64)(attribute[2][i] - attribute[0][i]) * (vb.y - va.y);
+        sint64 numerator_y = (sint64)(vb.x - va.x) * (attribute[2][i] - attribute[0][i]) - (sint64)(vc.x - va.x) * (attribute[1][i] - attribute[0][i]);
+        /* Quantize gradients before placing them in the wrapping accumulator */
+        step_x[i] = (uint32)(numerator_x * 4096 / determinant) * 4096u;
+        step_y[i] = (uint32)(numerator_y * 4096 / determinant) * 4096u;
+        start[i] = (uint32)attribute[anchor][i] * 0x1000000u + 0x800000u - step_x[i] * (uint32)vertex[anchor].x - step_y[i] * (uint32)vertex[anchor].y;
+    }
+    for (i = 1; i < 3; ++i)
+        for (j = i; j > 0 && sorted[j].y < sorted[j - 1].y; --j)
+        {
+            RV temporary = sorted[j];
+            sorted[j] = sorted[j - 1];
+            sorted[j - 1] = temporary;
+        }
+    {
+        sint64 dx = sorted[2].x - sorted[0].x;
+        sint64 dy = sorted[2].y - sorted[0].y;
+        long_step = (dx * 0x100000000LL + (dx < 0 ? -(dy - 1) : dx > 0 ? dy - 1 : 0)) / dy;
+    }
     if (min_y < raster_clip_y0)
         min_y = raster_clip_y0;
     if (min_y < -raster_surface_y)
@@ -1746,71 +1773,91 @@ static void scan_triangle(RV va, RV vb, RV vc, uint16 tp, uint16 cl, uint32 ca, 
         max_y = VRAM_H - raster_surface_y;
     for (y = min_y; y < max_y; ++y)
     {
-        const ScanVertex *short_a = y < b.y ? &a : &b;
-        const ScanVertex *short_b = y < b.y ? &b : &c;
-        sint32 left = scan_edge_x(&a, &c, y);
-        sint32 right = scan_edge_x(short_a, short_b, y);
-        sint32 x, end, u, v, r, g, blue;
+        sint32 lower = y < sorted[1].y ? 0 : 1;
+        sint64 dx = sorted[lower + 1].x - sorted[lower].x;
+        sint64 dy = sorted[lower + 1].y - sorted[lower].y;
+        sint64 short_step = (dx * 0x100000000LL + (dx < 0 ? -(dy - 1) : dx > 0 ? dy - 1 : 0)) / dy;
+        sint64 edge0 = (sint64)sorted[0].x * 0x100000000LL + 0xfffff800LL + long_step * (y - sorted[0].y);
+        sint64 edge1 = (sint64)sorted[lower].x * 0x100000000LL + 0xfffff800LL + short_step * (y - sorted[lower].y);
+        sint32 left = (sint32)(edge0 >> 32), right = (sint32)(edge1 >> 32), x;
+        uint32 value[5];
         if (left > right)
         {
-            sint32 swap = left;
+            sint32 temporary = left;
             left = right;
-            right = swap;
+            right = temporary;
         }
-        x = scan_ceil_center(left);
-        end = scan_ceil_center(right);
-        if (x < raster_clip_x0)
-            x = raster_clip_x0;
-        if (x < -raster_surface_x)
-            x = -raster_surface_x;
-        if (end > raster_clip_x1)
-            end = raster_clip_x1;
-        if (end > VRAM_W - raster_surface_x)
-            end = VRAM_W - raster_surface_x;
-        u = (sint32)(ubase + (sint64)dudx * x + (sint64)dudy * y);
-        v = (sint32)(vbase + (sint64)dvdx * x + (sint64)dvdy * y);
-        r = (sint32)(rbase + (sint64)drdx * x + (sint64)drdy * y);
-        g = (sint32)(gbase + (sint64)dgdx * x + (sint64)dgdy * y);
-        blue = (sint32)(bbase + (sint64)dbdx * x + (sint64)dbdy * y);
-        for (; x < end; ++x)
+        if (left < raster_clip_x0)
+            left = raster_clip_x0;
+        if (left < -raster_surface_x)
+            left = -raster_surface_x;
+        if (right > raster_clip_x1)
+            right = raster_clip_x1;
+        if (right > VRAM_W - raster_surface_x)
+            right = VRAM_W - raster_surface_x;
+        for (i = 0; i < 5; ++i)
+            value[i] = start[i] + step_x[i] * (uint32)left + step_y[i] * (uint32)y;
+        for (x = left; x < right; ++x)
         {
-            uint32 color;
+            sint32 channel[3], shade, transparent = 0;
+            sint32 physical_x = x + raster_surface_x, physical_y = y + raster_surface_y;
+            uint16 texture = 0, foreground = 0, background = VRAM[physical_y * VRAM_W + physical_x];
+            uint16 mask = 0;
+            shade = ((active_draw_flags & 0x200u) && (shaded || (textured && !raw))) ? dither[physical_y & 3][physical_x & 3] : 0;
             if (textured)
             {
-                sint32 transparent;
-                uint16 texel = texel_indexed(u >> 16, v >> 16, tp, cl, &transparent);
-                if (!transparent)
-                {
-                    color = modulate(texel, raw ? 128 : scan_clamp_channel(r), raw ? 128 : scan_clamp_channel(g), raw ? 128 : scan_clamp_channel(blue), 0);
-                    if (semi && (texel & 0x8000))
-                        color = semi_blend(gpu_raster_pixel(x, y), color, (tp >> 5) & 3);
-                    pxc(x, y, color);
-                }
+                texture = texel_indexed((uint8)(value[0] >> 24), (uint8)(value[1] >> 24), tp, cl, &transparent);
+                mask = texture & 0x8000u;
             }
-            else
+            if (!transparent)
             {
-                color = (uint32)scan_clamp_channel(r) << 16 | (uint32)scan_clamp_channel(g) << 8 | (uint32)scan_clamp_channel(blue);
-                if (semi)
-                    color = semi_blend(gpu_raster_pixel(x, y), color, (active_tpage >> 5) & 3);
-                pxc(x, y, color);
+                for (i = 0; i < 3; ++i)
+                {
+                    sint32 color = (uint8)(value[i + 2] >> 24);
+                    if (textured)
+                    {
+                        sint32 sample = (texture >> (i * 5)) & 31u;
+                        color = raw ? sample * 8 : ((sample * color) >> 4) + shade;
+                    }
+                    else
+                        color += shade;
+                    color >>= 3;
+                    channel[i] = color < 0 ? 0 : color > 31 ? 31 : color;
+                }
+                if (semi && (!textured || mask))
+                {
+                    sint32 mode = ((textured ? tp : active_tpage) >> 5) & 3;
+                    for (i = 0; i < 3; ++i)
+                    {
+                        sint32 back = (background >> (i * 5)) & 31u, color;
+                        if (!mode)
+                            color = (back + channel[i]) >> 1;
+                        else if (mode == 1)
+                            color = back + channel[i];
+                        else if (mode == 2)
+                            color = back - channel[i];
+                        else
+                            color = back + (channel[i] >> 2);
+                        channel[i] = color < 0 ? 0 : color > 31 ? 31 : color;
+                    }
+                }
+                foreground = mask | (uint16)(channel[0] | channel[1] << 5 | channel[2] << 10);
+                VRAM[physical_y * VRAM_W + physical_x] = foreground;
             }
-            u += dudx;
-            v += dvdx;
-            r += drdx;
-            g += dgdx;
-            blue += dbdx;
+            for (i = 0; i < 5; ++i)
+                value[i] += step_x[i];
         }
     }
 }
 
 static void textured_triangle(RV a, RV b, RV c, uint16 tp, uint16 cl, uint32 ca, uint32 cb, uint32 cc, sint32 raw, sint32 semi)
 {
-    scan_triangle(a, b, c, tp, cl, ca, cb, cc, 1, raw, semi);
+    scan_triangle(a, b, c, tp, cl, ca, cb, cc, 1, raw, semi, 1);
 }
 
-static void colored_triangle(RV a, RV b, RV c, uint32 ca, uint32 cb, uint32 cc, sint32 semi)
+static void colored_triangle(RV a, RV b, RV c, uint32 ca, uint32 cb, uint32 cc, sint32 semi, sint32 shaded)
 {
-    scan_triangle(a, b, c, active_tpage, 0, ca, cb, cc, 0, 0, semi);
+    scan_triangle(a, b, c, active_tpage, 0, ca, cb, cc, 0, 0, semi, shaded);
 }
 
 static sint32 gpu_sign_extend_11(uint32 value)
@@ -1979,6 +2026,42 @@ static void gpu_draw_command(void *raw)
     /* GP0 NOP has no drawing or state effect */
     if (p[7] == 0x00)
         return;
+    if (p[7] == 2)
+    {
+        XportDeviceOperation operation = {0};
+        uint32 x = w[2] & 0x3f0;
+        uint32 y = (w[2] >> 16) & 511;
+        uint32 width = ((w[3] & 1023) + 15) & ~15;
+        uint32 height = (w[3] >> 16) & 511;
+        uint16 color = (uint16)(((w[1] >> 3) & 31) | ((w[1] >> 6) & 0x3e0) | ((w[1] >> 9) & 0x7c00));
+        uint32 row, column, interlaced, active_field;
+        if (!width || !height || gpu_frame_skipped())
+            return;
+        gpu_scanout_poll();
+        interlaced = (native_scanout.mode & 0x24) == 0x24 && !(active_draw_flags & 0x400);
+        active_field = (native_scanout.disp_y + native_scanout.disp_field) & 1;
+        if (xport_device_trace_enabled())
+        {
+            xport_device_trace_begin(&operation, 0, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_FILL, XPORT_DEVICE_DIRECTION_INTERNAL, 2, 2);
+            xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_VRAM, (y * GPU_VRAM_WIDTH + x) * 2, width * height * 2, 0xffffffff);
+        }
+        gpu_vram_invalidate();
+        for (row = 0; row < height; ++row)
+        {
+            uint32 destination_y = (y + row) & 511;
+            if (interlaced && (destination_y & 1) == active_field)
+                continue;
+            for (column = 0; column < width; ++column)
+                VRAM[destination_y * GPU_VRAM_WIDTH + ((x + column) & 1023)] = color;
+            gpu_trace_vram_row(&operation, XPORT_DEVICE_REGION_NONE, 0, (sint32)x, (sint32)destination_y, (sint32)width);
+        }
+        if (operation.active)
+        {
+            xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_VRAM, 0, 0, 0);
+            xport_device_trace_complete(&operation, 1);
+        }
+        return;
+    }
     if ((p[7] & 0xe0u) == 0x80u)
     {
         PSX_RECT source;
@@ -2017,6 +2100,12 @@ static void gpu_draw_command(void *raw)
             draw_prim(remainder);
         }
         return;
+    }
+    if (code >= 0x20 && code <= 0x3c && (code & 4))
+    {
+        uint16 mode = (uint16)read_s16_le_at(p, (code & 0x10) ? 26 : 22);
+        /* Polygon texture attributes also select the page for following sprites */
+        active_tpage = (uint16)((active_tpage & ~0x09ffu) | (mode & 0x09ffu));
     }
     if (gpu_frame_skipped() || !raster_enabled())
         return;
@@ -2061,17 +2150,59 @@ static void gpu_draw_command(void *raw)
         }
         return;
     }
+    if (code == 0x50)
+    {
+        RV a = rv(p, 8, 0), b = rv(p, 16, 0);
+        sint32 dx = abs(b.x - a.x), dy = -abs(b.y - a.y);
+        sint32 sx = a.x < b.x ? 1 : -1, sy = a.y < b.y ? 1 : -1;
+        sint32 steps = dx > -dy ? dx : -dy, step = 0;
+        sint32 err = dx + dy, e;
+        cb = packet_rgb(p, 12);
+        for (;;)
+        {
+            uint32 color = 0u, channel;
+            for (channel = 0u; channel < 3u; ++channel)
+            {
+                uint32 shift = channel * 8u;
+                sint32 first = (sint32)((ca >> shift) & 255u);
+                sint32 last = (sint32)((cb >> shift) & 255u);
+                sint32 value = steps ? (first * (steps - step) + last * step) / steps : first;
+                color |= (uint32)value << shift;
+            }
+            if ((uint32)(a.x + raster_surface_x) < VRAM_W && (uint32)(a.y + raster_surface_y) < VRAM_H)
+            {
+                if (p[7] & 2u)
+                    color = semi_blend(gpu_raster_pixel(a.x, a.y), color, (active_tpage >> 5) & 3);
+                pxc(a.x, a.y, color);
+            }
+            if (a.x == b.x && a.y == b.y)
+                break;
+            e = 2 * err;
+            if (e >= dy)
+            {
+                err += dy;
+                a.x += sx;
+            }
+            if (e <= dx)
+            {
+                err += dx;
+                a.y += sy;
+            }
+            ++step;
+        }
+        return;
+    }
     if (code == 0x20)
     {
         RV a = rv(p, 8, 0), b = rv(p, 12, 0), c = rv(p, 16, 0);
-        colored_triangle(a, b, c, ca, ca, ca, (p[7] & 2) != 0);
+        colored_triangle(a, b, c, ca, ca, ca, (p[7] & 2) != 0, 0);
         return;
     }
     if (code == 0x28)
     {
         RV a = rv(p, 8, 0), b = rv(p, 12, 0), c = rv(p, 16, 0), d = rv(p, 20, 0);
-        colored_triangle(a, b, c, ca, ca, ca, (p[7] & 2) != 0);
-        colored_triangle(b, c, d, ca, ca, ca, (p[7] & 2) != 0);
+        colored_triangle(a, b, c, ca, ca, ca, (p[7] & 2) != 0, 0);
+        colored_triangle(b, c, d, ca, ca, ca, (p[7] & 2) != 0, 0);
         return;
     }
     if (code == 0x30)
@@ -2079,7 +2210,7 @@ static void gpu_draw_command(void *raw)
         RV a = rv(p, 8, 0), b = rv(p, 16, 0), c = rv(p, 24, 0);
         cb = packet_rgb(p, 12);
         cc = packet_rgb(p, 20);
-        colored_triangle(a, b, c, ca, cb, cc, (p[7] & 2) != 0);
+        colored_triangle(a, b, c, ca, cb, cc, (p[7] & 2) != 0, 1);
         return;
     }
     if (code == 0x38)
@@ -2088,8 +2219,8 @@ static void gpu_draw_command(void *raw)
         cb = packet_rgb(p, 12);
         cc = packet_rgb(p, 20);
         cd = packet_rgb(p, 28);
-        colored_triangle(a, b, c, ca, cb, cc, (p[7] & 2) != 0);
-        colored_triangle(b, c, d, cb, cc, cd, (p[7] & 2) != 0);
+        colored_triangle(a, b, c, ca, cb, cc, (p[7] & 2) != 0, 1);
+        colored_triangle(b, c, d, cb, cc, cd, (p[7] & 2) != 0, 1);
         return;
     }
     if (code == 0x24)
@@ -2505,7 +2636,12 @@ static void gpu_draw_linked_dma(uint32 *ot)
             native = 0;
         else
         {
+#if defined(AP_X64)
+            // Native chains must use explicit registered ranges on x64
+            abort();
+#else
             head = (uint32)(intptr)ot;
+#endif
             native_segment = head & 0xff000000u;
         }
     }
@@ -2642,6 +2778,8 @@ PsxInterruptCallback DrawSyncCallback(PsxInterruptCallback callback)
     PsxInterruptCallback previous = native_draw_sync_callback;
     native_draw_sync_callback = callback;
     psx_wait_bind_service(2, gpu_wait_service);
+    if (native_draw_sync_pending)
+        psx_wait_signal_service(2);
     return previous;
 }
 
@@ -2673,6 +2811,7 @@ void DrawOTag(uint32 *ot)
     if (!transfer_observation_failed && !linked_submit_failed && native_draw_sync_callback)
     {
         ++native_draw_sync_pending;
+        psx_wait_signal_service(2);
         if (psx_callbacks_allowed())
             gpu_wait_service();
     }
@@ -2681,6 +2820,7 @@ void DrawOTag(uint32 *ot)
         xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
         xport_device_trace_complete(&operation, transfer_observation_failed ? 0 : 1);
     }
+    psx_sync_callbacks();
 }
 
 sint32 gpu_execute_linked_dma(uint32 physical_address)
@@ -3199,6 +3339,8 @@ int gpu_state_io(FILE *f, int load)
             return 0;
         native_scanout = scalars.scanout;
         native_draw_sync_pending = scalars.draw_sync_pending;
+        if (native_draw_sync_pending)
+            psx_wait_signal_service(2);
         scanout_fraction = scalars.scanout_fraction;
         native_disp_cache = scalars.native_disp_cache;
         native_disp_cached = scalars.native_disp_cached;
@@ -3220,7 +3362,8 @@ int gpu_state_io(FILE *f, int load)
         frame_skip.started = frame_skip.skipped = 0;
         return 1;
     }
-    if (native_dma_range_count || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)
+    /* The full guest DRAM binding is recreated by platform initialization */
+    if ((native_dma_range_count && (native_dma_range_count != 1 || native_dma_ranges[0].begin != (uintptr_t)DRAM || native_dma_ranges[0].end != (uintptr_t)DRAM + PSX_DRAM_SIZE)) || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)
         return 0;
     scalars.scanout = native_scanout;
     scalars.draw_sync_pending = native_draw_sync_pending;
@@ -3259,6 +3402,7 @@ int gpu_lockstep_portable_selftest(void)
     const char *import_path = getenv("XPORT_LOCKSTEP_GPU_IMPORT_PATH");
     FILE *file;
     int ok;
+    gpu_register_dma_range(DRAM, PSX_DRAM_SIZE);
     queue_binding.last_callback = 0x80006000u;
     queue_binding.last_argument = 0x80006004u;
     queue_binding.last_aux = 0x80006008u;
@@ -3287,9 +3431,9 @@ int gpu_lockstep_portable_selftest(void)
         file = tmpfile();
         if (!file)
             return 0;
-        native_dma_range_count = 1;
+        gpu_register_dma_range(&queue_binding, sizeof(queue_binding));
         ok = !gpu_state_io(file, 0);
-        native_dma_range_count = 0;
+        native_dma_range_count = 1;
         fclose(file);
         return ok;
     }

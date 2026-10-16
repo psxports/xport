@@ -25,7 +25,7 @@ def msbuild_path():
     base=os.environ.get('ProgramFiles(x86)')
     if not base:raise ValueError('ProgramFiles(x86) is unavailable')
     vswhere=Path(base)/'Microsoft Visual Studio/Installer/vswhere.exe'
-    installation=subprocess.check_output([str(vswhere),'-latest','-version','[17.0,18.0)','-products','*','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath'],text=True,env=normalized_environment()).strip()
+    installation=subprocess.check_output([str(vswhere),'-latest','-version','[17.0,18.0)','-products','*','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath'],text=True,env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)).strip()
     path=Path(installation)/'MSBuild/Current/Bin/MSBuild.exe'
     if not path.is_file():raise ValueError('VS2022 MSBuild was not found')
     return path
@@ -33,13 +33,13 @@ def msbuild_path():
 
 def process_running(name):
     if os.name!='nt' or not name:return False
-    result=subprocess.run(['tasklist','/FI','IMAGENAME eq '+name,'/FO','CSV','/NH'],capture_output=True,text=True,env=normalized_environment())
+    result=subprocess.run(['tasklist','/FI','IMAGENAME eq '+name,'/FO','CSV','/NH'],capture_output=True,text=True,env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     return result.returncode==0 and any(line.lower().startswith(('"'+name+'"').lower()) for line in result.stdout.splitlines())
 
 
 def run_command(argv,root,log,environment=None):
     started=time.perf_counter();env=normalized_environment(updates=environment)
-    result=subprocess.run(argv,cwd=root,env=env,capture_output=True,text=True,errors='replace')
+    result=subprocess.run(argv,cwd=root,env=env,capture_output=True,text=True,errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     log.append('$ '+' '.join(str(x) for x in argv)+'\n'+result.stdout+result.stderr)
     if result.returncode:raise RuntimeError('Command failed with exit code '+str(result.returncode)+': '+str(argv[0]))
     return dict(seconds=round(time.perf_counter()-started,3),exit_code=result.returncode)
@@ -87,7 +87,7 @@ def source_hygiene(root):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--no-build',action='store_true');parser.add_argument('--no-tests',action='store_true');parser.add_argument('--no-format',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--no-build',action='store_true');parser.add_argument('--no-tests',action='store_true');parser.add_argument('--no-format',action='store_true');parser.add_argument('--architecture',choices=('x86','x64'));args=parser.parse_args()
     root,project=load_project();settings=project.get('code_refresh',{});started=time.perf_counter();steps={};logs=[];failure=None
     report_path=artifact_path(settings.get('report','status/code-refresh-latest.json'));log_path=artifact_path(settings.get('log','status/code-refresh-latest.log'))
     try:
@@ -102,9 +102,9 @@ def main():
             process=build.get('process_name',executable.name)
             if process_running(process):raise RuntimeError(process+' is running; close the manual game before rebuilding')
             solution=(root/build.get('solution',project['paths']['native_solution'])).resolve()
-            command=[str(msbuild_path()),str(solution),'/m','/t:Build','/p:Configuration='+configuration,'/p:Platform='+build.get('platform','Win32'),'/nologo','/verbosity:minimal']
+            command=[str(msbuild_path()),str(solution),'/m','/t:Build','/p:Configuration='+configuration,'/p:Platform='+(args.architecture or build.get('platform','x86')),'/nologo','/verbosity:minimal']
             steps['build']=run_command(command,root,logs)
-            steps['build'].update(executable=executable.relative_to(root).as_posix(),sha256=digest(executable))
+            steps['build'].update(architecture=args.architecture or build.get('platform','x86'),executable=executable.relative_to(root).as_posix(),sha256=digest(executable))
         if not args.no_tests:
             tests=[]
             for test in settings.get('tests',[]):

@@ -7,6 +7,7 @@ import hashlib
 import json
 import mmap
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -15,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
+from duckstation_runtime import lockstep_timing_arguments
 from duckstation_runtime import (data_directory, environment as duckstation_environment,
                                  executable as duckstation_executable, launch_process,
                                  record_owner, runtime_identity, stop_owned_endpoint,
@@ -33,7 +35,8 @@ GTE_CONTROL_NAMES = (
     "gte_flag",
 )
 from gdb_remote import decode_registers
-from lockstep_gdb import DuckStationLockstep, NativeCdbParticipant
+from lockstep_gdb import (DEFERRED_ORIGINAL_BOUNDARY_OFFSET, DuckStationLockstep,
+                          NativeCdbParticipant)
 from lockstep_packet import build_packet
 from lockstep_packet import refinement_request
 from lockstep_portable_checkpoint import extract_checkpoint, write_checkpoint
@@ -102,7 +105,7 @@ def refinement_target_frame(result: dict) -> int:
     last_match = (result.get("last_match") or {}).get("original")
     if isinstance(last_match, dict) and isinstance(last_match.get("frame"), int):
         frame = last_match["frame"]
-        return max(0, frame if last_match.get("kind") == "VBLANK" else frame - 1)
+        return max(0, frame if last_match.get("kind") in {"VBLANK", "MODE_TRANSITION"} else frame - 1)
     events = (result.get("original"), result.get("native"))
     frame = next((event["frame"] for event in events
                   if isinstance(event, dict) and isinstance(event.get("frame"), int)), 0)
@@ -124,6 +127,17 @@ def _same_boundary(event: dict, expected: dict) -> bool:
                ("kind", "frame", "function", "invocation"))
 
 
+def diagnostic_detail_frame(request: dict, frame_count: int) -> int:
+    if request.get("prefix_only"):
+        return frame_count - 1
+    frame = int(request.get("target_frame", 0))
+    for event in (request.get("until") or {}, request.get("anchor") or {}):
+        candidate = event.get("frame")
+        if type(candidate) is int and frame <= candidate < frame_count:
+            return candidate
+    return frame
+
+
 def _matches_refinement_anchor(event: dict, anchor: dict) -> bool:
     identity_matches = all(event.get(key) == anchor.get(key) for key in (
         "kind", "frame", "image", "function", "callsite", "target",
@@ -137,9 +151,11 @@ def _matches_refinement_anchor(event: dict, anchor: dict) -> bool:
 
 
 def align_refinement(session, anchor: dict, target_frame: int, max_steps: int = 100_000,
-                     progress=None, allow_ranged=False) -> dict:
+                     progress=None, allow_ranged=False, prefix_only=False) -> dict:
     last_step = None
-    if anchor.get("kind") == "START":
+    if (anchor.get("kind") == "START" or
+            (prefix_only and getattr(session, 'checkpoint_frame', None) == target_frame and
+             anchor.get('kind') in {None, 'VBLANK'})):
         comparison = session.original_adapter.compare("refine-begin")
         return {
             "aligned": comparison.get("status") == "match" or
@@ -155,6 +171,9 @@ def align_refinement(session, anchor: dict, target_frame: int, max_steps: int = 
         if last_step["status"] != "matched":
             return {"aligned": False, "last_step": last_step, "comparison": None}
         original = last_step.get("original") or {}
+        if (prefix_only and original.get("kind") == "VBLANK" and
+                original.get("frame") == target_frame):
+            break
         if progress is not None and original.get("kind") == "VBLANK":
             progress(int(original.get("frame", 0)) + 1)
         if original.get("kind") == "MODE_TRANSITION":
@@ -231,7 +250,8 @@ class AttachedSession:
         if (getattr(self, "timer_observation", False) and result.get("status") == "memory_divergence" and
                 (result.get("original") or {}).get("kind") == "VBLANK"):
             result["original_timer_state"] = self.original_adapter.timer_state()
-        if (result.get("native") or {}).get("kind") in {"PROCESS_EXIT", "FAULT"}:
+        if ((result.get("native") or {}).get("kind") in {"PROCESS_EXIT", "FAULT"} or
+                result.get("status") == "runtime_divergence"):
             result["native_debugger_output"] = controller.output[-32768:]
         if (result.get("status") in {
                 "memory_divergence", "control_flow_divergence", "runtime_divergence"} or
@@ -246,9 +266,14 @@ class AttachedSession:
         return result
 
     def run(self, max_steps: int) -> dict:
-        return self._with_writer_ring(self.scheduler.run(max_steps))
+        return self.run_with_progress(max_steps, lambda result: None)
 
     def run_with_progress(self, max_steps: int, progress) -> dict:
+        class RecordBoundaryReached(Exception):
+            def __init__(self, result, frame_count):
+                self.result = result
+                self.frame_count = frame_count
+
         class DiagnosticBoundaryReached(Exception):
             def __init__(self, result):
                 self.result = result
@@ -259,11 +284,12 @@ class AttachedSession:
                     result.get("status") == "matched" and event.get("kind") == "VBLANK" and
                     result.get("full_memory_compared") is True and
                     event.get("mode") == "PREFIX_GUARD" and
-                    event["frame"] < self.checkpoint_target_frame and self.original_adapter.record and
+                    event["frame"] <= self.checkpoint_target_frame and self.original_adapter.record and
                     event["frame"] + 1 < len(self.original_adapter.record["frames"])):
                 try:
                     started = time.perf_counter()
                     self.checkpoint_bytes = self.original_adapter.capture_checkpoint(event["frame"])
+                    self.native_adapter.controller.capture_checkpoint(event["frame"])
                     self.checkpoint_frame = event["frame"]
                     self.checkpoint_path = self.native_checkpoint_path
                     self.checkpoint_captures += 1
@@ -274,6 +300,18 @@ class AttachedSession:
                     self.checkpoint_capture_seconds += time.perf_counter() - started
             progress(result)
             event = result.get("original") or {}
+            record = getattr(getattr(self, "original_adapter", None), "record", None)
+            frames = record.get("frames") if record else None
+            if (frames and result.get("status") == "matched" and
+                    result.get("full_memory_compared") is True and
+                    event.get("kind") == "VBLANK" and
+                    event.get("mode") == "PREFIX_GUARD" and
+                    event.get("frame") == len(frames) - 1 and
+                    self.original_adapter.input_index == len(frames) and
+                    not self.scheduler.native_backlog and
+                    self.scheduler.deferred_generation is None and
+                    not self.scheduler.ranged_memory_pending):
+                raise RecordBoundaryReached(result, len(frames))
             if (self.diagnostic_stop_frame is not None and
                     result.get("status") == "matched" and
                     result.get("memory_compared") is True and
@@ -282,6 +320,15 @@ class AttachedSession:
                 raise DiagnosticBoundaryReached(result)
         try:
             return self._with_writer_ring(self.scheduler.run(max_steps, observed))
+        except RecordBoundaryReached as reached:
+            return self._with_writer_ring({
+                **reached.result,
+                "status": "match_complete",
+                "kind": "record_interval_complete",
+                "last_match": reached.result,
+                "record_frame_count": reached.frame_count,
+                "proof_scope": "recorded_framedone_interval",
+            })
         except DiagnosticBoundaryReached as reached:
             return {
                 **reached.result,
@@ -316,6 +363,9 @@ class AttachedSession:
                                     "error": transition.get("error")}))
         if progress is not None:
             progress(transition)
+        baseline = self.original_adapter.compare("checkpoint-restored")
+        if baseline["status"] != "match":
+            raise RuntimeError(f"Restored checkpoint memory mismatch: {baseline}")
         ring_error = None
         if watch_target is not None:
             try:
@@ -502,9 +552,6 @@ class ProjectLockstepHooks:
 
     def validate_saved_diagnostic(self, attempt: dict, source_identity: str) -> bool:
         build = attempt.get("build") or {}
-        if (build.get("source_identity") != source_identity or
-                build.get("shared_source_identity") != self.shared_source_identity()):
-            return False
         executable = self.native_executable("Debug")
         pdb = self.root / "_build" / "x86" / "Debug" / (executable.stem + ".pdb")
         if (build.get("binary") != str(executable) or build.get("pdb") != str(pdb) or
@@ -581,20 +628,21 @@ class ProjectLockstepHooks:
                 executable.is_file() and pdb.is_file() and
                 digest(executable) == previous["binary_sha256"] and
                 digest(pdb) == previous["pdb_sha256"]):
-            if self.shared_source_identity() != shared_identity:
-                raise RuntimeError("Shared xport source changed during Debug build reuse")
             self._last_debug_build = previous
             self._last_debug_build_key = build_key
             return {**previous, "reused": True}
         self._last_debug_build_was_invoked = True
-        result = subprocess.run(command, cwd=self.root, env=environment, capture_output=True, text=True)
+        build_implementation_identity = self.implementation_identity()
+        result = subprocess.run(command, cwd=self.root, env=environment, capture_output=True, text=True,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         log = self.root / "status" / "lockstep-converge" / self.name / "debug-build.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(result.stdout + result.stderr, encoding="utf-8")
         if result.returncode or not executable.is_file() or not pdb.is_file():
-            raise RuntimeError("Lockstep Debug x86 build failed")
-        if self.shared_source_identity() != shared_identity:
-            raise RuntimeError("Shared xport source changed during Debug build")
+            error = RuntimeError("Lockstep Debug x86 build failed")
+            error.failed_source_identity = source_identity
+            error.failed_implementation_identity = build_implementation_identity
+            raise error
         build = {
             "configuration": "Debug", "platform": "x86", "lockstep_debug": True,
             "source_identity": source_identity, "binary": str(executable), "pdb": str(pdb),
@@ -633,9 +681,10 @@ class ProjectLockstepHooks:
             raise ValueError('DuckStation upstream commit differs from the record')
         state = Path(record["initial_state"]["path"])
         disc = Path(record["disc"][0]["path"])
-        command = [str(executable), "-batch", "-fastboot", "-statefile", str(state), str(disc)]
+        command = [str(executable), *lockstep_timing_arguments(executable), "-batch", "-fastboot", "-statefile", str(state), str(disc)]
         environment = duckstation_environment(directory)
-        if self.lockstep.get("same_revision_checkpoint"):
+        # Initial device handoff needs an export even without paired replay checkpoints
+        if self.lockstep.get("same_revision_checkpoint") or self.lockstep.get("handoff"):
             environment["XPORT_LOCKSTEP_CHECKPOINT_FILE"] = str(
                 self.root / "status" / "lockstep-converge" / self.name /
                 "last-match.duck.raw")
@@ -707,7 +756,7 @@ class ProjectLockstepHooks:
             stop = adapter.remote.packet("?")
             if not stop.startswith(("S", "T")):
                 raise RuntimeError("DuckStation did not start paused at the record state")
-            adapter.configure_wait_points(self.config["duckstation"]["wait_points"])
+            adapter.configure_wait_points(self.config["duckstation"]["wait_points"], self.config["duckstation"].get("sio_delay"))
             adapter.start_prelude(record)
             armed = set(all_addresses)
             for address in all_addresses:
@@ -862,7 +911,8 @@ class ProjectLockstepHooks:
                 self.native_checkpoint_path)
         if self.portable_load_path is not None:
             environment["XPORT_LOCKSTEP_PORTABLE_LOAD_PATH"] = str(self.portable_load_path)
-            environment["XPORT_LOCKSTEP_REUSE_MAPPING"] = "1"
+            if self.portable_duck_frame is None:
+                environment["XPORT_LOCKSTEP_REUSE_MAPPING"] = "1"
             if (self.duckstation_runtime and
                     self.duckstation_runtime.get("lockstep_protocol_version", 0) >= 4 and
                     self.target_frame > 0):
@@ -876,6 +926,9 @@ class ProjectLockstepHooks:
         try:
             controller.start()
             controller.wait_memory_ready()
+            sizes = controller.diagnostic_values(['memory_identity.deferred_size'])
+            controller.original_boundary_metadata = (
+                sizes['memory_identity.deferred_size'] == DEFERRED_ORIGINAL_BOUNDARY_OFFSET + 4)
         except Exception:
             log = self.root / "status" / "lockstep-converge" / self.name / \
                 "native-launch-failure.log"
@@ -900,7 +953,7 @@ class ProjectLockstepHooks:
             if not stop.startswith(("S", "T")):
                 original_adapter.close()
                 raise RuntimeError("DuckStation did not start paused at the record state")
-            original_adapter.configure_wait_points(self.config["duckstation"]["wait_points"])
+            original_adapter.configure_wait_points(self.config["duckstation"]["wait_points"], self.config["duckstation"].get("sio_delay"))
         peer = {
             "schema": 1, "contract": "xport-lockstep-peer-v1", "run_id": run_id,
             "dram": mapping_name(run_id, "dram"),
@@ -913,7 +966,7 @@ class ProjectLockstepHooks:
         validate_exceptions(self.exceptions)
         restored_frame = self.portable_duck_frame
         restored_native_path = self.portable_load_path
-        if self.handoff_adapter is not None:
+        if self.handoff_adapter is not None and restored_frame is None:
             original_adapter.attach_handoff(
                 peer, self.exceptions, self.boundary_targets, self.handoff_frame,
                 self.target_frame, self.tail_calls, self.argument_registers)
@@ -922,6 +975,7 @@ class ProjectLockstepHooks:
             original_adapter.attach(peer, self.exceptions, record, self.boundary_targets,
                                     self.tail_calls, self.target_frame, self.argument_registers,
                                     portable_frame=restored_frame)
+            self.handoff_adapter = None
         if restored_frame is None and self.handoff_config and self.handoff_config.get("gpu_state"):
             from lockstep_gpu_handoff import export_gpu_handoff
             receipt = export_gpu_handoff(
@@ -934,12 +988,14 @@ class ProjectLockstepHooks:
             os.replace(self.input_path.parent / f"handoff-gpu-{run_id}.spu.bin",
                        self.input_path.parent / f"handoff-spu-{run_id}.bin")
         if restored_frame is None and self.handoff_config and not self.handoff_config.get("gpu_state"):
-            from lockstep_gpu_handoff import capture_handoff_state, export_cd_handoff, export_spu_handoff
+            from lockstep_gpu_handoff import (capture_handoff_state, export_cd_handoff,
+                                             export_spu_handoff, handoff_sample_counter)
             state, unused = capture_handoff_state(
                 original_adapter, self.input_path.parent / "last-match.duck.raw",
                 self.input_path.parent / f"handoff-cd-{run_id}.bin", self.handoff_frame)
             export_cd_handoff(state, self.input_path.parent / f"handoff-cd-{run_id}.bin")
-            export_spu_handoff(state, self.input_path.parent / f"handoff-spu-{run_id}.bin")
+            export_spu_handoff(state, self.input_path.parent / f"handoff-spu-{run_id}.bin",
+                               handoff_sample_counter(original_adapter))
         if restored_frame is not None:
             (self.root / "status" / "lockstep-converge" / self.name /
              "last-match.duck.raw").unlink(missing_ok=True)
@@ -947,6 +1003,7 @@ class ProjectLockstepHooks:
             self.set_portable_load(None)
         native_adapter = NativeCdbParticipant(native, initially_stopped=True)
         if restored_frame is not None:
+            native.capture_checkpoint(restored_frame, restored=True)
             baseline = original_adapter.compare("checkpoint-baseline")
             if baseline["status"] != "match":
                 raise RuntimeError(f"Portable checkpoint memory mismatch: {baseline}")
@@ -987,6 +1044,10 @@ class ProjectLockstepHooks:
                              self.duckstation_runtime.get("lockstep_protocol_version", 0) >= 4 and
                              self.target_frame > frame + 1 else None)
             original_adapter.restore_checkpoint(frame, prefix_target)
+            native.capture_checkpoint(frame, restored=True)
+            baseline = original_adapter.compare("checkpoint-baseline")
+            if baseline["status"] != "match":
+                raise RuntimeError(f"Portable checkpoint memory mismatch: {baseline}")
             native_adapter = NativeCdbParticipant(native, initially_stopped=True)
             scheduler = LockstepScheduler(original_adapter, native_adapter,
                                           initial_mode="PREFIX_GUARD",
@@ -1038,6 +1099,9 @@ class ProjectLockstepHooks:
         if native_entry is not None:
             if not isinstance(native_entry, dict) or not isinstance(native_entry.get("symbol"), str):
                 raise ValueError("Native entry probe request is invalid")
+            if any(type(native_entry.get(key, False)) is not bool
+                   for key in ("after_original", "capture_stack", "capture_locals")):
+                raise ValueError("Native entry probe ordering, stack or locals option is invalid")
             entry_size = int(native_entry.get("size", 16))
             if not 1 <= entry_size <= 256:
                 raise ValueError("Native entry probe size is invalid")
@@ -1053,7 +1117,7 @@ class ProjectLockstepHooks:
             if entry_second_storage not in {"guest", "host", "none"} or (entry_second_storage == "host" and entry_size != 16):
                 raise ValueError("Native entry second storage is invalid")
         previous_target = self.target_frame
-        self.set_target_frame(target_frame)
+        self.set_target_frame(diagnostic_detail_frame(request, len(record["frames"])))
         run_id = uuid.uuid4().hex
         original_process = native_process = session = None
         installed_addresses = []
@@ -1074,12 +1138,23 @@ class ProjectLockstepHooks:
                 original_process = self.launch_original(run_id, record)
                 native_process = self.launch_native(run_id, record)
                 session = self.attach(original_process, native_process, run_id, record)
-            alignment = align_refinement(session, anchor, target_frame, progress=progress)
+            alignment = align_refinement(session, anchor, target_frame, progress=progress,
+                                         prefix_only=bool(request.get("prefix_only")))
             result["alignment"] = alignment
+            if request.get("export_original_state") and alignment["aligned"]:
+                frame = alignment["last_step"]["original"]["frame"]
+                result["original_state_bytes"] = session.original_adapter.capture_checkpoint(frame)
+                session.original_adapter.export_checkpoint(frame)
+                snapshot = self.input_path.parent / f"diagnostic-original-{run_id}.raw"
+                shutil.copyfile(self.input_path.parent / "last-match.duck.raw", snapshot)
+                result["original_state_path"] = str(snapshot)
             if capture_gte and alignment["aligned"]:
                 result["original_gte_control_at_alignment"] = \
                     session.original_adapter.gte_control_registers()
                 result["native_gte_at_alignment"] = native_process.gte_snapshot()
+            if request.get("native_values") and alignment["aligned"]:
+                result["native_values_at_alignment"] = native_process.diagnostic_values(
+                    request["native_values"])
             if memory_reads:
                 mappings = {}
                 try:
@@ -1113,12 +1188,27 @@ class ProjectLockstepHooks:
                 finally:
                     for mapping in mappings.values():
                         mapping.close()
-            if native_entry is not None and alignment["aligned"]:
+            def capture_native_entry():
                 entry = native_process.probe_function_entry(
                     native_entry["symbol"], entry_address, max_hits=entry_max_hits,
                     second_storage=entry_second_storage,
+                    first_storage=native_entry.get("first_storage", "scalar"),
                     caller_stack_offsets=entry_caller_offsets,
                     match_occurrence=entry_match_occurrence)
+                if native_entry.get("capture_stack"):
+                    entry["call_stack"] = native_process.capture_call_stack()
+                if native_entry.get("capture_locals"):
+                    entry["locals"] = native_process.capture_writer_locals()
+                if request.get("ot_entry"):
+                    if (native_entry["symbol"] != "DrawOTag" or
+                            native_entry.get("first_storage") != "guest" or
+                            not native_entry.get("after_original") or
+                            len(result["hits"]) != 1 or
+                            result["hits"][0]["registers"]["r4"] != entry["output_address"]):
+                        raise ValueError("OT entry probe requires the same paired DrawOTag input")
+                    from lockstep_ot_probe import compare_ot
+                    entry["ot"] = compare_ot(session.original_adapter.remote,
+                                              run_id, int(entry["output_address"], 16))
                 if capture_gte:
                     result["native_gte_at_entry"] = native_process.gte_snapshot()
                 views = {}
@@ -1164,6 +1254,8 @@ class ProjectLockstepHooks:
                 finally:
                     for view in views.values():
                         view.close()
+            if native_entry is not None and alignment["aligned"] and not native_entry.get("after_original"):
+                capture_native_entry()
             if not alignment["aligned"] and request.get("continue_native_to_until_on_divergence"):
                 for _ in range(max_stops):
                     native_event = session.native_adapter.advance(30.0)
@@ -1278,6 +1370,9 @@ class ProjectLockstepHooks:
                     break
             else:
                 result["error"] = "probe_stop_limit"
+            if (native_entry is not None and native_entry.get("after_original") and
+                    alignment["aligned"] and result.get("complete")):
+                capture_native_entry()
             if capture_gte and native_entry is not None:
                 result["gte_entry_comparison"] = compare_paired_gte_entry(result)
         finally:
@@ -1349,7 +1444,7 @@ class ProjectLockstepHooks:
             raise ValueError("Paired memory probe exceeds 4096 bytes")
 
         previous_target = self.target_frame
-        self.set_target_frame(target_frame)
+        self.set_target_frame(diagnostic_detail_frame(request, len(record["frames"])))
         run_id = checkpoint["run_id"] if checkpoint is not None else uuid.uuid4().hex
         original_process = native_process = session = None
         try:
@@ -1363,10 +1458,34 @@ class ProjectLockstepHooks:
                 original_process = self.launch_original(run_id, record)
                 native_process = self.launch_native(run_id, record)
                 session = self.attach(original_process, native_process, run_id, record)
+            if request.get("native_watch"):
+                session.scheduler.watch_target = None
             alignment = align_refinement(session, anchor, target_frame, progress=progress,
-                                         allow_ranged=True)
+                                         allow_ranged=True, prefix_only=bool(request.get("prefix_only")))
             if not alignment["aligned"]:
                 return {"schema": 1, "complete": False, "alignment": alignment}
+            gpu_checkpoint = None
+            if request.get("gpu_pixels") is not None:
+                if (request.get("capture_spu") or checkpoint is None or
+                        anchor.get("kind") != "MODE_TRANSITION" or
+                        anchor.get("frame") != checkpoint["frame"] + 1):
+                    raise ValueError("GPU pixels require the retained frame-entry checkpoint")
+                from lockstep_gpu_probe import checkpoint_pixels
+                gpu_checkpoint = checkpoint_pixels(
+                    session.original_adapter, run_id,
+                    self.input_path.parent / "last-match.duck.raw",
+                    checkpoint["frame"], request["gpu_pixels"])
+            if request.get("native_watch"):
+                watch = request["native_watch"]
+                count = watch.get("count", 1)
+                if type(count) is not int or not 1 <= count <= 64:
+                    raise ValueError("Native diagnostic watch count is invalid")
+                native_process.diagnostic_watch_remaining = count - 1
+                native_process.diagnostic_watch_stack = bool(watch.get("capture_stack", False))
+                native_process.diagnostic_watch_locals = bool(watch.get("capture_locals", False))
+                native_process.set_data_watchpoint(watch["region"], int(watch["offset"]),
+                                                   int(watch.get("width", 1)))
+                native_process.diagnostic_watch_values = request.get("watch_values") or ["vblank_count"]
             for steps in range(1, max_steps + 1):
                 step = session.scheduler.step()
                 event = step.get("original") or {}
@@ -1398,9 +1517,33 @@ class ProjectLockstepHooks:
                     finally:
                         for mapping in mappings.values():
                             mapping.close()
+                    diagnostic = {}
+                    if request.get("native_values"):
+                        diagnostic["native_values"] = native_process.diagnostic_values(
+                            request["native_values"])
+                    if request.get("capture_spu"):
+                        from lockstep_gpu_handoff import capture_handoff_state
+                        state, unused = capture_handoff_state(
+                            session.original_adapter, self.input_path.parent / "last-match.duck.raw",
+                            self.input_path.parent / "diagnostic-spu", int(event["frame"]) + 1)
+                        diagnostic["original_spu"] = {
+                            key: value for key, value in state["spu"].items()
+                            if not isinstance(value, (bytes, bytearray))}
+                    if request.get("gpu_pixels") is not None:
+                        from lockstep_gpu_probe import capture_pixels
+                        diagnostic["checkpoint_gpu_pixels"] = gpu_checkpoint
+                        gpu_metadata = {} if request.get("gpu_metadata") else None
+                        diagnostic["gpu_pixels"] = capture_pixels(
+                            session.original_adapter, run_id,
+                            self.input_path.parent / "last-match.duck.raw",
+                            int(event["frame"]) - 1, request["gpu_pixels"], metadata=gpu_metadata)
+                        if gpu_metadata is not None:
+                            diagnostic["original_gpu"] = gpu_metadata
                     return {"schema": 1, "complete": True, "target_frame": target_frame,
                             "alignment": alignment, "terminal": step, "steps": steps,
-                            "samples": samples}
+                            "samples": samples,
+                            "native_writes": session.native_adapter.take_watch_hits()
+                                if request.get("native_watch") else [], **diagnostic}
                 if step.get("status") != "matched":
                     return {"schema": 1, "complete": False, "target_frame": target_frame,
                             "alignment": alignment, "earlier_divergence": step,
@@ -1417,7 +1560,8 @@ class ProjectLockstepHooks:
             self.set_target_frame(previous_target)
 
     def refine(self, result: dict, record: dict, progress=None,
-               checkpoint: dict | None = None, stop_after_writes: int = 0) -> dict:
+               checkpoint: dict | None = None, stop_after_writes: int = 0,
+               prefix_only=False) -> dict:
         if stop_after_writes < 0 or stop_after_writes > 16:
             raise ValueError("Refinement writer stop limit is invalid")
         if self.native_controller is not None:
@@ -1432,7 +1576,7 @@ class ProjectLockstepHooks:
         interval_complete = False
         refinement_target = refinement_target_frame(result)
         previous_target = self.target_frame
-        self.set_target_frame(refinement_target)
+        self.set_target_frame(len(record["frames"]) - 1 if prefix_only else refinement_target)
         if request.kind == "control":
             branch_slice.append({
                 "address": original.get("callsite"),
@@ -1453,7 +1597,7 @@ class ProjectLockstepHooks:
                     session = self.attach(original_process, native_process, run_id, record)
                 anchor = ((result.get("last_match") or {}).get("original") or {})
                 alignment = align_refinement(
-                    session, anchor, refinement_target, progress=progress)
+                    session, anchor, refinement_target, progress=progress, prefix_only=prefix_only)
                 pointer_evidence["refinement_alignment"] = alignment
                 if alignment["aligned"]:
                     pointer_evidence["original_gte_control"] = \
@@ -1497,7 +1641,7 @@ class ProjectLockstepHooks:
                 anchor = ((result.get("last_match") or {}).get("original") or {})
                 alignment = align_refinement(
                     session, anchor, refinement_target, progress=progress,
-                    allow_ranged=True)
+                    allow_ranged=True, prefix_only=prefix_only)
                 pointer_evidence["refinement_alignment"] = alignment
                 if alignment["aligned"]:
                     pointer_evidence["original_dma_begin"] = session.original_adapter.dma_registers()
@@ -1589,6 +1733,9 @@ class ProjectLockstepHooks:
                     else:
                         pointer_evidence["original_stop_reason"] = "boundary_limit"
                     pointer_evidence["original_dma_end"] = session.original_adapter.dma_registers()
+                    if original_complete:
+                        pointer_evidence['original_beam_at_terminal'] = session.original_adapter.beam_state()
+                        session.native_adapter.publish_original_boundary(original_terminal, session.original_adapter)
                     for _ in range(100_000):
                         native_process.continue_execution()
                         native_stop = native_process.next_event(30.0)
@@ -1681,8 +1828,6 @@ class ProjectLockstepHooks:
         if self.duckstation_runtime is None:
             raise RuntimeError('DuckStation runtime identity is unavailable')
         shared_identity = build["shared_source_identity"]
-        if shared_identity != self.shared_source_identity():
-            raise RuntimeError("Shared xport source changed after Debug build")
         identities = {
             "record_id": self.record["record_id"],
             "original_executable_sha256": self.record["original"]["executable"]["sha256"],
@@ -1701,10 +1846,6 @@ class ProjectLockstepHooks:
         return build_packet(result, refinement, identities, self.exceptions, reproduce)
 
     def request_repair(self, packet: dict, packet_path: Path) -> dict:
-        shared = (packet.get("identities") or {}).get("shared_source_identity")
-        if shared is not None and shared != self.shared_source_identity():
-            return {"status": "attention_required", "reason": "shared_source_changed",
-                    "model_invocations": 0}
         if self.lockstep.get("repair_executor") == "openai_api":
             from lockstep_repair_openai import execute
             return execute(self.root, self.config, packet_path)
@@ -1874,6 +2015,7 @@ class ProjectLockstepHooks:
                    "--rebuild", "--no-format"]
         result = subprocess.run(
             command, cwd=self.root, env=normalized_environment(), capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         log = self.root / "status" / "lockstep-converge" / self.name / "source-index.log"
         log.write_text(result.stdout + result.stderr, encoding="utf-8")
@@ -1899,18 +2041,24 @@ class ProjectLockstepHooks:
         msbuild = self._msbuild_executable()
         command = [str(msbuild), str(solution), "/t:Rebuild", "/p:Configuration=Release",
                    "/p:Platform=x86", "/m:1", "/nr:false", "/v:minimal", "/nologo"]
+        use_xcrt = next((value for key, value in os.environ.items()
+                         if key.upper() == "USEXCRT"), None)
+        if use_xcrt is not None:
+            if use_xcrt.lower() not in {"true", "false"}:
+                raise ValueError("UseXcrt must be true or false")
+            command.append("/p:UseXcrt=" + use_xcrt.lower())
         shared_identity = self.shared_source_identity()
         result = subprocess.run(command, cwd=self.root, env=normalized_environment(),
-                                capture_output=True, text=True)
+                                capture_output=True, text=True,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         log = self.root / "status" / "lockstep-converge" / self.name / "release-build.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(result.stdout + result.stderr, encoding="utf-8")
         if result.returncode or not executable.is_file():
             raise RuntimeError("Final Release x86 build failed")
-        if self.shared_source_identity() != shared_identity:
-            raise RuntimeError("Shared xport source changed during Release build")
         return {
             "configuration": "Release", "platform": "x86", "lockstep_debug": False,
             "binary": str(executable), "binary_sha256": digest(executable), "log": str(log),
             "shared_source_identity": shared_identity,
+            "command": command,
         }

@@ -64,6 +64,8 @@ sint32 mdec_psyq_checkpoint_io(FILE *file, sint32 load)
             output_pending = saved->output_pending;
             input_masked = output_masked = 0;
             psx_wait_bind_service(0, initialized ? mdec_wait_service : NULL);
+            if (input_pending || output_pending)
+                psx_wait_signal_service(0);
         }
     }
     else
@@ -185,6 +187,7 @@ void mdec_psyq_pump(uint32 ticks)
         {
             input_busy = 0;
             input_pending = 1;
+            psx_wait_signal_service(0);
             progress = 1;
         }
         if (decoder.copy_ticks)
@@ -205,6 +208,7 @@ void mdec_psyq_pump(uint32 ticks)
         {
             output_busy = 0;
             output_pending = 1;
+            psx_wait_signal_service(0);
             progress = 1;
         }
         /* Mask only the matching completion callback while allowing the opposite DMA to progress */
@@ -285,6 +289,7 @@ void DecDCTin(uint32 *buf, sint32 mode)
     input_left = (command & 0xFFFFu) * 2u;
     input_busy = 1;
     mdec_psyq_pump(0);
+    psx_sync_callbacks();
 }
 
 void DecDCTout(uint32 *buf, sint32 size)
@@ -300,6 +305,7 @@ void DecDCTout(uint32 *buf, sint32 size)
     /* Complete native output synchronously after queued callbacks release their buffers */
     if (!output_masked)
         mdec_psyq_pump(0xFFFFFFFFu);
+    psx_sync_callbacks();
 }
 
 DecDCTCallback DecDCTinCallback(DecDCTCallback callback)

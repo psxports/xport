@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+import startup_github
 from urllib.parse import quote
 
 from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
@@ -164,10 +165,11 @@ def render_project_readme(name, short_name):
     if not PROJECT_README_TEMPLATE.is_file():
         raise ValueError('Missing project README template: '+str(PROJECT_README_TEMPLATE))
     text = PROJECT_README_TEMPLATE.read_text(encoding='utf-8-sig')
+    project_name = ''.join(name.split())+'-xport'
     replacements = {
         '@@FULL_NAME@@': html.escape(name, quote=True),
-        '@@PROJECT_NAME@@': html.escape(name+'-xport', quote=True),
-        '@@REPOSITORY@@': quote(name+'-xport', safe=''),
+        '@@PROJECT_NAME@@': html.escape(project_name, quote=True),
+        '@@REPOSITORY@@': quote(project_name, safe=''),
         '@@SHORT_NAME@@': quote(short_name, safe=''),
     }
     tokens = set(re.findall(r'@@[A-Z_]+@@', text))
@@ -252,7 +254,7 @@ def initialize_project(root, name, short_name, first_port=2400):
     validate_names(name, short_name)
     platform = root/'src/platform/win'
     targets = [root/CONFIG_NAME, root/'README.md', root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
-               platform/(short_name+'.vcxproj'), root/'status/translation-ledger.json']
+               platform/(short_name+'.vcxproj'), platform/'icon.ico', platform/'icon.rc', root/'status/translation-ledger.json']
     existing = [str(path) for path in targets if path.exists()]
     if existing:
         raise ValueError('STARTUP_ROOT_NOT_EMPTY: project initialization would overwrite '+', '.join(existing))
@@ -261,6 +263,9 @@ def initialize_project(root, name, short_name, first_port=2400):
     full_name = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     native_replacements = {'@@PROJECT_GUID@@': project_guid, '@@SHORT_NAME@@': short_name,
                            '@@FULL_NAME@@': full_name, '@@SHARED_SOURCE@@': shared_source}
+    for resource in ('icon.rc', 'icon.ico'):
+        if not (NATIVE_TEMPLATE_DIR/resource).is_file():
+            raise ValueError('Missing default Windows icon resource: '+str(NATIVE_TEMPLATE_DIR/resource))
     readme = render_project_readme(name, short_name)
     solution = render_native_template('xport.sln', native_replacements)
     native_project = render_native_template('xport.vcxproj', native_replacements)
@@ -291,6 +296,7 @@ def initialize_project(root, name, short_name, first_port=2400):
                                   'status/ida/runs', 'status/ida/accepted', 'status/ghidra/runs', 'tools/ida/databases'):
                 (root/relative_path).mkdir(parents=True, exist_ok=True)
             config = {'schema': 1, 'name': name, 'short_name': short_name, 'toolset': str(TOOLS),
+                      'github': {'repository': 'psxports/'+''.join(name.split())+'-xport'},
                       'paths': {'status': 'status', 'project_tools': 'tools', 'analysis_database': 'status/analysis.sqlite',
                                 'native_executable': 'bin/'+short_name+'.exe',
                                 'native_debug_executable': 'bin/'+short_name+'_debug.exe',
@@ -321,6 +327,12 @@ def initialize_project(root, name, short_name, first_port=2400):
 /* Unresolved until the original PsyQ graph type storage is audited */
 const uint32 xport_gpu_graph_type_address = 0u;
 
+/* Unresolved CD bindings until original storage is audited */
+const uint32 xport_cd_sync_callback_address = 0u;
+const uint32 xport_cd_ready_callback_address = 0u;
+const uint32 xport_cd_status_address = 0u;
+const uint32 xport_cd_setloc_table_address = 0u;
+
 void xport_main(void)
 {
     return;
@@ -329,6 +341,8 @@ void xport_main(void)
             (root/'src/game_main.c').write_text(main_text, encoding='utf-8', newline='')
             with (root/'README.md').open('x', encoding='utf-8', newline='') as stream:
                 stream.write(readme)
+            for resource in ('icon.rc', 'icon.ico'):
+                shutil.copyfile(NATIVE_TEMPLATE_DIR/resource, platform/resource)
             shutil.copyfile(PROJECT_GITIGNORE_TEMPLATE, root/'.gitignore')
             (root/'AGENTS.md').write_text(agents_text(name, short_name), encoding='utf-8', newline='')
             (root/'status/translation-ledger.json').write_text(json.dumps({'version': 1, 'entries': []}, indent=2)+'\n', encoding='utf-8')
@@ -653,7 +667,7 @@ def prepare_ida_export(root, ida, label, images=None, export_existing=False, pla
             if output:
                 append_log(root, 'IDA export process', output)
             if result.returncode:
-                if 'Fatal registry error' in output or 'Отказано в доступе' in output:
+                if 'Fatal registry error' in output or 'Р С›РЎвЂљР С”Р В°Р В·Р В°Р Р…Р С• Р Р† Р Т‘Р С•РЎРѓРЎвЂљРЎС“Р С—Р Вµ' in output:
                     raise RuntimeError('XPORT_IDA_HOST_ACCESS_REQUIRED: IDA lost registry access; '
                                        'retry the startup revision with host access outside the workspace sandbox')
                 raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout,
@@ -1118,6 +1132,11 @@ def advance(root, state):
                 result = initialize_project(root, state['name'], state['short_name'], state.get('first_port', 2400))
                 os.environ['XPORT_PROJECT'] = str(root)
                 record_step(state, step, {'name': result['name'], 'short_name': result['short_name']}, started)
+                state = publish(root, state, step='github')
+            elif step == 'github':
+                result = startup_github.sync_project(root)
+                atomic_json(root/'status/startup-github.json', result)
+                record_step(state, step, result, started)
                 state = publish(root, state, step='build')
             elif step == 'build':
                 doctor = run_shared(root, 'doctor')
@@ -1160,17 +1179,20 @@ def advance(root, state):
             elif step == 'ida_export':
                 state = publish_progress(root, state, 'Running IDA export and independent byte verification')
                 tools = state['decisions']['tools']
-                plan = prepare_ida_export(root, tools['ida'], 'startup-ida-plan', plan=True)
-                actual = prepare_ida_export(root, tools['ida'], 'startup-ida-v1')
-                canonical = canonicalize_ida(root, 'status/ida/runs/startup-ida-v1', 'tools/ida')
-                accepted = accept_ida(root, 'startup-ida-v1')
+                labels = state.get('analysis_labels', {})
+                plan = prepare_ida_export(root, tools['ida'], labels.get('ida_plan', 'startup-ida-plan'), plan=True)
+                label = labels.get('ida', 'startup-ida-v1')
+                actual = prepare_ida_export(root, tools['ida'], label)
+                canonical = canonicalize_ida(root, 'status/ida/runs/'+label, 'tools/ida')
+                accepted = accept_ida(root, label)
                 record_step(state, step, {'plan': plan, 'actual': actual, 'canonical': canonical, 'accepted': accepted}, started)
                 state = publish(root, state, step='psyq')
             elif step == 'psyq':
                 state = publish_progress(root, state, 'Running Ghidra PsyQ recognition')
                 tools = state['decisions']['tools']
-                recognition = run_ghidra(root, tools['ghidra'], tools['plugin'], 'startup-psyq-v1')
-                classification = classify_psyq(root, 'status/ghidra/runs/startup-psyq-v1')
+                label = state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1')
+                recognition = run_ghidra(root, tools['ghidra'], tools['plugin'], label)
+                classification = classify_psyq(root, 'status/ghidra/runs/'+label)
                 record_step(state, step, {'recognition': recognition, 'classification': classification}, started)
                 state = set_attention(root, state, 'psyq_review', 'Review accepted and pending PsyQ classifications',
                                       ['decision.approved'], psyq_review_summary(root, classification))
@@ -1268,9 +1290,10 @@ def archive_failed_artifacts(root, state):
         config = project(root)
         targets.extend(root/path for path in config['duckstation']['data_directories'].values())
     if step == 'ida_export':
-        targets.extend(root/'status/ida/runs'/name for name in ('startup-ida-plan', 'startup-ida-v1'))
+        labels = state.get('analysis_labels', {})
+        targets.extend(root/'status/ida/runs'/name for name in (labels.get('ida_plan', 'startup-ida-plan'), labels.get('ida', 'startup-ida-v1')))
     if step in ('psyq', 'database', 'verify_frontier'):
-        targets.append(root/'status/ghidra/runs/startup-psyq-v1')
+        targets.append(root/'status/ghidra/runs'/state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1'))
     recovery = root/'status/startup-recovery';blobs = recovery/'blobs';blobs.mkdir(parents=True, exist_ok=True)
     manifest = {'revision': state['revision'], 'step': step, 'files': []}
     for target in targets:
@@ -1337,6 +1360,46 @@ class StartupLock:
                 self.path.unlink()
         except FileNotFoundError:
             pass
+
+
+def reexport(root, expected_revision, label, exports, advance_now=True):
+    """Supersede a reviewed faulty export without modifying accepted evidence"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        if state['revision'] != expected_revision:
+            raise ValueError('STARTUP_STALE_REEXPORT')
+        if state.get('status') != 'attention' or state.get('attention', {}).get('kind') not in ('psyq_review', 'frontier_translation'):
+            raise ValueError('STARTUP_REEXPORT_REQUIRES_PSYQ_ATTENTION_OR_UNTRANSLATED_FRONTIER')
+        ledger = read_json(root/'status/translation-ledger.json') if (root/'status/translation-ledger.json').exists() else {}
+        if ledger.get('entries'):
+            raise ValueError('STARTUP_REEXPORT_REQUIRES_EMPTY_TRANSLATION_LEDGER')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label):
+            raise ValueError('STARTUP_INVALID_REEXPORT_LABEL')
+        destination = (root/exports).resolve()
+        if not destination.is_relative_to(root/'orig') or destination == root/'orig':
+            raise ValueError('STARTUP_REEXPORT_REQUIRES_NEW_ORIG_ROOT')
+        if destination.exists():
+            raise ValueError('STARTUP_REEXPORT_DESTINATION_EXISTS')
+        labels = {'ida': label, 'ida_plan': label+'-plan', 'psyq': label+'-psyq'}
+        for key, value in labels.items():
+            base = 'status/ghidra/runs' if key == 'psyq' else 'status/ida/runs'
+            if (root/base/value).exists() or (root/'status/ida/accepted'/(value+'.json')).exists():
+                raise ValueError('STARTUP_REEXPORT_LABEL_EXISTS')
+        config = project(root)
+        receipt = root/'status/startup-recovery'/('reexport-revision-'+str(expected_revision)+'.json')
+        if receipt.exists():raise ValueError('STARTUP_REEXPORT_RECEIPT_EXISTS')
+        atomic_json(receipt, {'state': state, 'config': config, 'new_export_root': relative(root,destination), 'labels': labels})
+        config['paths']['ida_exports'] = relative(root,destination)
+        atomic_json(root/CONFIG_NAME, config)
+        state.setdefault('recoveries', []).append({'revision': expected_revision, 'step': 'ida_export',
+                                                  'receipt': relative(root,receipt), 'preserved_accepted_exports': True})
+        state['analysis_labels'] = labels
+        state.get('steps', {}).pop('ida_export', None)
+        state.get('steps', {}).pop('psyq', None)
+        state = publish(root,state,status='running',step='ida_export',attention=None,failure=None,
+                        progress={'detail': 'Re-exporting into a new immutable evidence root'})
+        return advance(root,state) if advance_now else state
 
 
 def refresh_frontier(root, expected_revision):
@@ -1511,6 +1574,11 @@ def main():
     completion_parser.add_argument('--expected-revision', required=True, type=int)
     reopen_parser = subparsers.add_parser('reopen-convergence')
     reopen_parser.add_argument('--project', type=Path, default=Path.cwd())
+    reexport_parser = subparsers.add_parser('reexport')
+    reexport_parser.add_argument('--project', type=Path, default=Path.cwd())
+    reexport_parser.add_argument('--expected-revision', required=True, type=int)
+    reexport_parser.add_argument('--label', required=True)
+    reexport_parser.add_argument('--exports', required=True)
     args = parser.parse_args()
     try:
         if args.action == 'start':
@@ -1531,6 +1599,10 @@ def main():
             if pending.get('failure', {}).get('step') == 'ida_export':
                 validate_runtime_access()
             result = compact(retry(args.project, args.expected_revision, advance_now=False))
+            dispatch_worker(args.project)
+        elif args.action == 'reexport':
+            validate_runtime_access()
+            result = compact(reexport(args.project, args.expected_revision, args.label, args.exports, advance_now=False))
             dispatch_worker(args.project)
         elif args.action == 'work':
             result = compact(work(args.project))

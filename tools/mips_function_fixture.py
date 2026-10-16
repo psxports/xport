@@ -139,6 +139,11 @@ class MipsFunctionFixture:
             elif op == 1 and rt in (0, 1):
                 taken = (self.signed(r[rs]) < 0) == (rt == 0)
                 pending_branch = pc + 4 + displacement * 4 if taken else pc + 8
+            elif op == 8:
+                value = self.signed(r[rs]) + displacement
+                if not -0x80000000 <= value <= 0x7fffffff:
+                    raise ValueError(f'Guest MIPS arithmetic overflow at {pc:08x}')
+                destination, r[rt] = rt, value
             elif op == 9:
                 destination, r[rt] = rt, r[rs] + displacement
             elif op == 15:

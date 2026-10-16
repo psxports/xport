@@ -11,6 +11,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - Resolve project identity and paths from `xport-project.json`; never infer them from a source path or game name
 - For an existing consuming project, use the nearest ancestor of the current working directory that contains `xport-project.json`, or an explicit project path from the user. If neither identifies one project, ask for its path; never select a sibling from its name, prior status or available artifacts
 - Preserve unrelated work, original inputs, third-party licenses, upstream identities and source hashes
+- Use standard xport `r_u8/r_u16/r_u32`, `r_s8/r_s16/r_s32` and `w_u8/w_u16/w_u32` for scalar guest-memory access; do not introduce project-local replacement accessors or lvalue macros such as `P2_U32`; use `psx_addr` only for an explicit native pointer ABI boundary with the required mapped span
 - Treat original MIPS bytes as semantic authority. Use IDA pseudocode as a structural baseline only when it exists and is complete. Missing or partial pseudocode is normal: record `pseudocode_complete: false` and `pseudocode_used_as_baseline: false`, then audit the complete MIPS
 - During converge, reject hacks: no frame, time, address, input, value or observed-case compensation; no difference masking, event suppression or reproducer special case; edit only required audited functions whose complete original evidence proves the replacement
 - Start native refactoring only on explicit user request after explicit user confirmation of full main-functionality coverage; refactored code is outside converge acceptance. Follow [docs/REFACTORING.md](docs/REFACTORING.md); never initiate this transition during translation, coverage or converge
@@ -29,6 +30,8 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - Lockstep protocols and repair artifacts: read [docs/LOCKSTEP.md](docs/LOCKSTEP.md)
 - Device evidence: read [docs/DEVICE_PROVENANCE.md](docs/DEVICE_PROVENANCE.md)
 - DuckStation deployment and provenance: read [docs/DUCKSTATION.md](docs/DUCKSTATION.md) and [docs/DUCKSTATION_SOURCES.md](docs/DUCKSTATION_SOURCES.md)
+- Graphics enhancement, OG/HD migration and GitHub `enhance` tasks: read [docs/ENHANCE.md](docs/ENHANCE.md), then [docs/VID.md](docs/VID.md) for exact API contracts
+- Windows x86/x64, AP platform flags, architecture selection and x86-only converge constraints: read [docs/PLATFORMS.md](docs/PLATFORMS.md)
 - Shared library structure: read [docs/LIBRARY.md](docs/LIBRARY.md)
 - Web builds and packaging: read [docs/WEB.md](docs/WEB.md)
 

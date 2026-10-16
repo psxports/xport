@@ -103,6 +103,23 @@ def runtime_identity(path):
     return identity
 
 
+def lockstep_timing_arguments(path=None):
+    """Select cooperative timing while preserving verified legacy runtime launches"""
+    path = Path(path or executable()).resolve()
+    identity = runtime_identity(path)
+    receipt = json.loads((path.parent / 'xport-runtime.json').read_text(encoding='utf-8'))
+    timing = receipt.get('timing')
+    if timing is None:
+        # Protocol 23 runtimes predating launch-time selection default to cooperative time
+        if identity['lockstep_protocol_version'] != 23:
+            raise ValueError('Legacy DuckStation timing contract is unsupported')
+        return []
+    if timing != {'default': 'standard', 'lockstep_argument': '-lockstep-timing',
+                  'standard_argument': '-standard-timing'}:
+        raise ValueError('DuckStation launch-time timing contract is unsupported')
+    return [timing['lockstep_argument']]
+
+
 def data_directory(override=None, role=None):
     root, project = load_project()
     duck = project['duckstation']

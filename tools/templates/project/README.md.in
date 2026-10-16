@@ -1,6 +1,6 @@
 <p align="center">
   <a href="cover.png">
-    <img src="cover.png" alt="cover" width="280">
+    <img src="cover.png" alt="cover">
   </a>
 </p>
 

@@ -7,7 +7,7 @@
   },
   "patch": {
     "path": "internal-trace-api.patch",
-    "sha256": "b1e6224e09adf93b314ae241cd32b45f8659309a730c4aa080290c0d4c1ca7d9"
+    "sha256": "65cdf2fe7d4b9a9f630eaf069147a08567117fb221e41d0f83d5a48a5405ea95"
   },
   "dependencies": {
     "windows-x64": {
@@ -59,8 +59,14 @@
       "qXportWaitPoints",
       "qXportSpuRAMRead",
       "qXportFastForward",
-      "qXportCRTCState"
+      "qXportCRTCState",
+      "-lockstep-timing"
     ],
-    "lockstep_protocol_version": 23
+    "lockstep_protocol_version": 23,
+    "timing": {
+      "default": "standard",
+      "lockstep_argument": "-lockstep-timing",
+      "standard_argument": "-standard-timing"
+    }
   }
 }

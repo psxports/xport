@@ -1,6 +1,8 @@
 #ifndef XPORT_H
 #define XPORT_H
 
+#include "ap.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -128,6 +130,7 @@ extern "C"
     sint32 xport_audio_is_running(void);
     sint32 xport_file_size(const char *path, size_t *size);
     FILE *xport_fopen(const char *path, const char *mode);
+    size_t xport_fread(void *data, size_t size, size_t count, FILE *stream);
     sint32 xport_file_read(const char *path, void *data, size_t capacity, size_t *size);
     sint32 xport_save(const void *data, sint32 size);
     sint32 xport_load(void *data, sint32 capacity);

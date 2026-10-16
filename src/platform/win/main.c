@@ -448,6 +448,11 @@ static void switch_window_mode(void)
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
     uint32 button;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wparam == VK_RETURN && GetKeyState(VK_MENU) < 0)
+    {
+        switch_window_mode();
+        return 0;
+    }
     switch (message)
     {
         case WM_CLOSE:
@@ -480,12 +485,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         case WM_SYSKEYDOWN:
             if (wparam == VK_MENU)
                 return 0;
-            if (wparam == VK_RETURN && (lparam & (1L << 29)))
-            {
-                if (!(lparam & (1L << 30)))
-                    switch_window_mode();
-                return 0;
-            }
             return DefWindowProc(window, message, wparam, lparam);
         case WM_SYSKEYUP:
             if (wparam == VK_RETURN || wparam == VK_MENU)
@@ -495,7 +494,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         case WM_KEYUP:
             if (wparam == VK_TAB)
             {
-                if (message == WM_KEYDOWN && !(lparam & (1L << 30)))
+                if (message == WM_KEYDOWN)
                     xport_hd = !xport_hd;
                 return 0;
             }
@@ -552,10 +551,14 @@ uint32 xport_input_read(sint32 controller)
     uint32 buttons = xinput_read(controller, platform_pad_analog[controller]);
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller];
-    if (axes[5] & 1u) directions |= PADLup;
-    if (axes[5] & 2u) directions |= PADLdown;
-    if (axes[5] & 4u) directions |= PADLleft;
-    if (axes[5] & 8u) directions |= PADLright;
+    if (axes[5] & 1u)
+        directions |= PADLup;
+    if (axes[5] & 2u)
+        directions |= PADLdown;
+    if (axes[5] & 4u)
+        directions |= PADLleft;
+    if (axes[5] & 8u)
+        directions |= PADLright;
     if (directions & (PADLleft | PADLright))
         axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
     if (directions & (PADLup | PADLdown))
@@ -918,13 +921,17 @@ sint32 xport_audio_is_running(void)
 /* Advance the null sink on guest VBlank time without a host worker */
 void xport_audio_vblank(uint32 before, uint32 rate)
 {
-    sint16 samples[2048];
+    sint16 *samples;
     uint32 remaining, count;
     if (!null_active || !rate)
     {
         spu_dispatch_pending_irq();
         return;
     }
+    // Keep the null-sink buffer off the probe-free Release stack
+    samples = malloc(2048 * sizeof(*samples));
+    if (!samples)
+        abort();
     remaining = (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate);
     while (remaining)
     {
@@ -946,6 +953,7 @@ void xport_audio_vblank(uint32 before, uint32 rate)
         null_frames += count;
         remaining -= count;
     }
+    free(samples);
     spu_dispatch_pending_irq();
 }
 
@@ -972,6 +980,9 @@ FILE *xport_fopen(const char *path, const char *mode)
                 buffer[length++] = *resource == '\\' ? '/' : *resource;
             buffer[length++] = '\n';
             fwrite(buffer, 1, length, collect_log);
+#if defined(_DEBUG)
+            fflush(collect_log);
+#endif
         }
     }
     return file;

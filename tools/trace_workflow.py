@@ -10,7 +10,7 @@ import sys
 import time
 
 from trace_worker import alive, process_identity, write_receipt
-from windows_desktop import launch_default_desktop, process_desktop
+from windows_desktop import launch_worker_desktop
 from xport_process import normalized_environment
 from xport_project import load_project
 
@@ -148,15 +148,14 @@ def launch_converge(root, name, wait, telemetry, reprobe=False, run_name=None):
         command.extend(("--run-name", run_name))
     if reprobe:
         command.append("--reprobe")
-    pid = launch_default_desktop(
-        command, root, visible=True, environment=normalized_environment())
+    pid = launch_worker_desktop(command, root, environment=normalized_environment())
     identity = process_identity(pid)
     if identity is None:
         raise RuntimeError("Lockstep supervisor exited during desktop launch")
     receipt = {
         "schema": 1, "contract": "xport-lockstep-supervisor-process-v1",
         "name": run_name, "record": name, "process": identity,
-        "desktop": process_desktop(),
+        "desktop": "WinSta0\\XportConverge", "progress_desktop": "WinSta0\\Default",
     }
     write_receipt(receipt_path, receipt)
     return {"status": "running", "name": run_name, "record": name, "process": identity,
@@ -190,6 +189,9 @@ def main():
     parser.add_argument("--run-name")
     parser.add_argument("--desktop-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.desktop_child:
+        from windows_desktop import signal_worker_ready
+        signal_worker_ready()
     root, config = load_project()
     if not 0 <= args.wait <= 60:
         parser.error("--wait must be in 0..60")

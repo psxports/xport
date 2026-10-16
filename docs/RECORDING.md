@@ -1,5 +1,7 @@
 # Lockstep recording
 
+The recorder launches DuckStation with `-lockstep-timing` through the shared runtime helper. Ordinary DuckStation startup uses CPU-driven time. Install the project's wait/SIO registry before capture in cooperative mode. For verified retained protocol-23 runtimes without a receipt `timing` field, the helper preserves their implicit cooperative default and omits the unsupported flag.
+
 The public recorder writes `record.bin` with one fixed little-endian layout:
 
 - Four `uint32` values: save-state byte count, frame count, event count, field rate

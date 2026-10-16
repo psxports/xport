@@ -1,5 +1,13 @@
 # Function coverage: native-first delivery
 
+## Original function recording and timing
+
+Collect the original function list through [FUNCTION_COVERAGE.md](FUNCTION_COVERAGE.md). The `function_coverage start` launcher uses DuckStation's default CPU-driven timing without an extra timing flag. `-standard-timing` remains an explicit emulator alias for this default; it is not an argument to `coverage NAME` or the xport CLI.
+
+`-standard-timing` selects CPU-driven device time before boot, including ordinary interrupt dispatch and scheduled CD/SIO operations. Function discovery uses ordinary disc/BIOS boot and requires no project `duckstation.wait_points`, `sio_delay` or executable injection. GDB registers function targets and drains the first-entry list; it does not select timing through commands.
+
+`coverage NAME` consumes the completed function recording and does not launch DuckStation. Record and converge explicitly select cooperative time through their launchers with `-lockstep-timing`; function discovery does not use that flag.
+
 ## Current execution policy
 
 This section supersedes the default execution order, proof-before-source requirement, indivisible admission pacing, reporting and goal completion rules in the legacy strict-audit reference below. That reference remains the contract of existing proof commands; this documentation does not change their implementation or make draft C a proof.

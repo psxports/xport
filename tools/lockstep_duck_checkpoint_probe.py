@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 
+from duckstation_runtime import lockstep_timing_arguments
 from duckstation_runtime import launch_process, runtime_identity
 from gdb_remote import Remote
 from lockstep_contract import mapping_name
@@ -74,7 +75,7 @@ def probe(project, emulator, frame, rolling_captures=False, record_name="warmup"
     scratchpad = mapping_name(run_id, "scratchpad")
     deferred = mapping_name(run_id, "deferred")
     vram = f"Local\\xport-lockstep-{run_id}-vram"
-    deferred_size = (10 + 3 + 32 * 3 + 511 * 3 + 7 + 4096 * 5) * 4
+    deferred_size = (10 + 3 + 32 * 3 + 511 * 3 + 7 + 4096 * 5 + 2) * 4
     mappings = [mmap.mmap(-1, 0x200000, tagname=dram),
                 mmap.mmap(-1, 0x400, tagname=scratchpad),
                 mmap.mmap(-1, deferred_size, tagname=deferred),
@@ -82,7 +83,7 @@ def probe(project, emulator, frame, rolling_captures=False, record_name="warmup"
     mappings[2][:8] = struct.pack("<II", 0x44504C58, 12)
     disc = Path(record["disc"][0]["path"])
     state = Path(record["initial_state"]["path"])
-    command = [str(emulator), "-batch", "-fastboot", "-statefile", str(state), str(disc)]
+    command = [str(emulator), *lockstep_timing_arguments(emulator), "-batch", "-fastboot", "-statefile", str(state), str(disc)]
     environment = normalized_environment(updates={
         "XPORT_DUCKSTATION_DATA_ROOT": str(data),
         "XPORT_GDB_RAM_BACKEND": "rsp",
@@ -106,6 +107,9 @@ def probe(project, emulator, frame, rolling_captures=False, record_name="warmup"
         expect(remote, f"qXportLockstepAttach:{run_id}:{dram}:{scratchpad}:{deferred}", f"OK:{run_id}")
         wait_points = ":".join(f"{int(pc, 0):x}" for pc in config["duckstation"]["wait_points"])
         expect(remote, f"qXportWaitPoints:{wait_points}", "OK:wait")
+        if config["duckstation"].get("sio_delay"):
+            delay = ":".join(f"{int(pc, 0):x}" for pc in config['duckstation']['sio_delay'])
+            expect(remote, f"qXportSioDelay:{delay}", "OK:sio")
         record_id = record["record_id"]
         expect(remote, f"qXportLockstepReplay:{record_id}", f"OK:{record_id}")
         expect(remote, f"qXportLockstepSeed:{record_id}", f"OK:{record_id}")

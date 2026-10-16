@@ -37,6 +37,15 @@ only when the original and native entry inputs match byte-for-byte and every unm
 write resolves uniquely to that function in the captured native call stack. The repair still
 requires a complete audit of the corresponding original MIPS function and its direct helpers.
 
+A repair spanning callers and a retained game-local value may use `causal-request.json` with
+`kind: "audit_cluster"`, the current `failure_signature`, `image`, one to eight additional
+`functions` addresses and one to eight `evidence` entries containing `path` and `sha256`.
+Every diagnostic must be complete and aligned in the divergent frame. Require a matching
+Original/Native owner entry with equal sampled bytes and an observed dependency. The complete
+original call graph must connect every added function to the current owner. The supervisor
+adds exact complete C, MIPS and audit bindings for every function; this expands the required
+audit scope and does not waive any repair or memory-comparison rule.
+
 A boundary divergence may prove a defect in a project-owned firmware or device adapter rather
 than in a translated MIPS function. Submit that repair through `adapter_audits`; never edit the
 adapter outside the supervisor. Each adapter audit must bind the packet failure signature, the
@@ -71,7 +80,30 @@ failure as a terminal result.
 
 For each attempt the supervisor performs these steps:
 
-1. Verify the record and source identity
+When the project explicitly sets `lockstep.same_revision_checkpoint: false`, replay each
+prefix from the record's initial save state instead of restoring a paired checkpoint. After
+the first VBlank difference, repeat that prefix and enable detailed comparison only in the
+identified bad frame. The difference must reproduce; retain the ordinary PRE_CALL/POST_CALL
+and writer evidence requirements. After a repair, repeat the VBlank scan from the initial
+state. The checkpoint-origin requirements below apply to projects with checkpoints enabled.
+Full-record MATCH still requires every recorded frame to pass the complete memory comparison.
+
+If detailed replay does not reproduce a prefix difference, keep status FAILED and the
+visible progress window. The supervisor may consume read-only `diagnostic-request.json`
+probes bound to the latest failed prefix of the same source revision. Keep that probe in
+PREFIX_GUARD through the requested boundary; write `acceptance_eligible: false` and
+`proof_scope: read_only_failed_prefix_diagnostic`. These probes cannot accept a repair,
+advance MATCH progress or waive the requirement to reproduce a detailed divergence.
+A separate `writer_refinement` request must capture the complete failed prefix writer
+interval before creating `failed-prefix-runtime.json`. That packet may accept only
+audited runtime adapter repairs with empty `memory_exceptions`. Every edit must be
+inside an exact adapter body bound to the failure and its complete diagnostic.
+Project-owned device adapters follow the same gate as shared adapters; this path
+does not authorize game-function edits. After applying
+such a repair, rerun the ordinary prefix and detailed gates; read-only probe results
+remain ineligible for acceptance.
+
+1. Verify the record; keep source hashes as build-cache and evidence metadata without blocking replay or diagnostics when sources change
 2. Build Debug x86 with `LOCKSTEP_DEBUG`
 3. Start native mapped DRAM and scratchpad, then start paused DuckStation
 4. Seed both mappings from the restored original state exactly once
@@ -154,12 +186,48 @@ to diagnose that false result. DuckStation also restores the controller binding 
 the checkpoint FrameDone, which is outside its emulated save-state buffer. A matching checkpoint suffix remains provisional until a full-record scan from
 the initial state completes after a source repair.
 
-After the final recorded FrameDone, record exhaustion becomes a matching terminal event only when both sides reached the next identical event sequence. Missing input before the declared frame count remains a replay fault.
+Finish the recorded interval immediately after both sides match the final recorded
+FrameDone, its controller input and the full memory comparison in PREFIX_GUARD.
+Require the Original input cursor to equal the declared frame count and no pending
+deferred generation, ranged comparison or Native backlog. Return
+`match_complete/record_interval_complete` with that actual paired VBlank as evidence.
+Do not advance either side into an unrecorded frame to seek a process exit or missing
+input fault. Missing input before the declared frame count remains a replay fault.
+Checkpoint suffix completion remains provisional and still requires the complete
+initial-state scan and final Release build.
 
 The event streams must match before memory is compared. A missing call, extra call, wrong
 target, different caller or different frame is a control-flow divergence and includes both
 invocation paths. The packet also includes the MIPS call address and word, delay slot,
 listing, pseudocode, current C and bounded writer evidence.
+
+Advance Original to the next semantic boundary before advancing Native. Original publishes
+its device sample counter at that boundary; parallel advancement lets Native consume a stale
+counter and makes prefix and detailed replay disagree. Keep Original stopped while Native
+reaches the boundary. Preserve the separate Native catch-up path for an open deferred load.
+Publish the committed Original virtual clock with the sample counter under the same
+device sequence. Native cooperative waits consume that actual endpoint before advancing
+their devices. Do not independently predict the CRTC endpoint or correct a timer value
+after comparison. Device reads outside waits must not consume a future published clock.
+
+Treat VBlank IRQ delivery and FrameDone publication as separate events. Original may
+deliver the IRQ callback while FrameDone remains deferred. Before advancing Native,
+publish whether the stopped Original semantic boundary is FrameDone. Native waits must
+deliver an actual crossed VBlank edge without emitting an earlier FrameDone, then emit
+the later FrameDone without delivering that IRQ twice. Keep every event and memory
+comparison mandatory. This metadata describes Original's stopped boundary; it must not
+depend on the frame number, guest memory values or a predicted CPU duration.
+
+The Native deferred mapping appends `original_frame_boundary` after its saved prefix.
+Values are `1` for FrameDone with VBlank IRQ pending, `3` for FrameDone after that IRQ
+was handled, `2` for another boundary and `0` before publication. Read the actual
+Original IRQ status through the existing beam-state query. When the pending VBlank
+edge still needs Native delivery but Original has already handled it, return from that
+wait after delivery and publish the deferred FrameDone at the next wait.
+Keep its offset and the existing portable checkpoint payload length unchanged; exclude
+this transport field from capture and clear it on restore. Republish before Native
+continues. A checkpoint stopped at FrameDone must preserve whether its VBlank IRQ still
+needs delivery, including a FrameDone whose IRQ was already delivered earlier.
 
 DRAM comparison excludes reviewed guest stack, firmware-runtime and trusted-device-state
 ranges. Scratchpad is compared except for reviewed stack or device-state ranges. Ordering
@@ -177,7 +245,31 @@ must synchronously rebuild Release x86 without `LOCKSTEP_DEBUG`. The supervisor 
 COMPLETE only after that build succeeds and records its executable hash. A failed Release build
 fails convergence instead of leaving the Debug lockstep executable as the user-facing binary.
 
-The in-process progress window receives compact updates directly from the supervisor. It shows
+Launch the supervisor worker directly on `WinSta0\\XportConverge` with `CREATE_NO_WINDOW`.
+Debugger, build and indexing children must inherit that hidden desktop. Keep the desktop
+handle open until the worker signals readiness and owns its own desktop handle. Console
+debuggers must also use `CREATE_NO_WINDOW`; do not briefly create consoles on `Default`.
+Interrupt a running x86 Native target through an x86 `DebugBreakProcess` helper with
+`CREATE_NO_WINDOW`; console control events are unavailable in this launch mode.
+Apply `CREATE_NO_WINDOW` explicitly to build, source-index, formatter, `vswhere` and
+`tasklist` subprocesses, including launches outside the supervisor. For agent shell tools
+on Windows, use `exec_command` with `tty: true` so its shell uses the headless ConPTY;
+the non-PTY shell can create a visible `conhost` on `Default` before the command runs.
+
+Launch a separate `pythonw` progress process directly on `WinSta0\\Default`. Create Tk and
+all progress widgets on that process's main thread. Never create the progress UI on the
+hidden desktop and move it to `Default`. Never use `SetThreadDesktop` or desktop switching
+in the progress process, including before `Tk()` after importing UI libraries. Do not move
+an existing window or switch the user's active desktop.
+
+Send compact JSON updates over a local named pipe. The worker never creates a Tk window.
+`supervisor.json` identifies the hidden worker; `progress-process.json` binds the visible
+UI PID and creation time to that exact worker identity. Window helpers must validate both
+identities before operating the progress window. Keep the progress window visible after
+a recoverable replay failure while the converge goal remains unfinished. Close it when
+the supervisor explicitly becomes inactive or its pipe closes.
+
+The progress window shows
 the furthest fully matched frame and the current replay frame on two 480-pixel bars. The
 window is not topmost and closes only when the supervisor marks the run inactive. While the
 supervisor is active, a close or minimize request must restore the same owned window instead
@@ -189,7 +281,7 @@ frame and audit step:
 python -B ../xport/tools/lockstep_activity.py --receipt status/lockstep-converge/RUN/supervisor.json --frame FRAME --activity "MIPS audit FUNCTION: STEP"
 ```
 
-The helper verifies the supervisor PID, process creation time, Default desktop and unique
+The helper verifies the supervisor and progress PIDs, both creation times, Default desktop and unique
 owned window before changing the title. It does not restart converge or write a progress
 file. Update the title when moving to another frame or audit step; a failed ownership check
 must not be bypassed by targeting an arbitrary window.
@@ -209,5 +301,24 @@ comparison remains inside DuckStation.
 For paired probes, the replay-local `event_sequence` is not part of the binding: the
 original callsite and exact DRAM/scratchpad difference must reproduce before bytes are
 sampled. A different earlier divergence is returned without sampling.
+
+For a CPU readback from VRAM, a paired probe may add `gpu_pixels` as at most
+128 `[x, y]` pairs inside 1024 by 512 VRAM. Require the retained checkpoint and
+its next frame's `MODE_TRANSITION` anchor. The diagnostic samples these pixels
+at frame entry and at the exact reproduced divergence. Export the original device
+snapshot to disk and read only the requested pixel words through a mapped file;
+never decode guest RAM into Python. Preserve and reimport the original paired
+checkpoint after the divergent device snapshot, including on decoding failure.
+Do not combine this probe with `capture_spu`. These samples diagnose a producer;
+they do not alter the ordinary memory comparison or establish a MATCH.
+
+For an incoming OT, an instruction probe may set `ot_entry: true` with an Original
+`DrawOTag` entry breakpoint and a Native `DrawOTag` entry using
+`first_storage: "guest"`, `second_storage: "none"`, `after_original: true`.
+Filter both entries to the same root. Normalize the Native mapped pointer to its
+guest address before matching. Compare every tag and payload along that root's
+chain, bounded to 64 nodes, 256 payload bytes per node and 4096 bytes total.
+Report the first differing pointer or payload without skipping or masking bytes.
+This read-only input comparison never advances confirmed frames.
 
 Control-flow refinement includes original GTE control registers and the live native GTE snapshot. This lets the attention packet prove missing matrix or lighting setup without reading either process memory through Python.

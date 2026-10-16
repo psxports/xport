@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 
-from lockstep_audit import checklist
+from lockstep_audit import checklist, words_from_listing
 from lockstep_operand_provenance import _donor_packet
 from lockstep_packet import _audit_function_binding
 from source_context import compact
@@ -56,27 +56,44 @@ def _memory(rows: object, address: int, size: int) -> bytes:
 
 def read_paired_entry_request(root: Path, directory: Path, request: dict,
                               previous: dict, source_roots: tuple[Path, ...]) -> dict:
+    if request.get("buffer_alias") is True:
+        from lockstep_buffer_alias import read_buffer_alias_request
+        return read_buffer_alias_request(root, directory, request, previous, source_roots)
     common = {"kind", "diagnostic_file", "sha256", "image", "owner_function",
               "native_symbol", "input_addresses"}
+    scalar_count = request.get("scalar_arguments")
+    if scalar_count is not None:
+        if type(scalar_count) is not int or not 1 <= scalar_count <= 4:
+            raise ValueError("Paired scalar argument count is invalid")
+        common.add("scalar_arguments")
     extra_store = request.get("extra_store") is True
-    required = common | ({"extra_store"} if extra_store else
+    callee_store = "callee_function" in request
+    if extra_store and callee_store:
+        raise ValueError("A callee store cannot be an extra store")
+    required = common | ({"callee_function"} if callee_store else
+                         {"extra_store"} if extra_store else
                          {"writer_file", "writer_sha256"})
     donor_keys = {"evidence_packet", "evidence_packet_sha256"}
     call_path_keys = {"entry_function", "bridge_function", "native_first_address",
                       "iso9660_path_input"}
     extended = call_path_keys.issubset(request)
+    if scalar_count is not None and extended:
+        raise ValueError("Scalar entry cannot use a pointer call path")
     valid_keys = required | (call_path_keys if extended else set())
     if (set(request) not in (valid_keys, valid_keys | donor_keys) or
             request.get("kind") != "paired_entry"):
         raise ValueError("Invalid paired entry request")
     _donor_packet(directory, request, previous)
     probe = _evidence(directory, request["diagnostic_file"], request["sha256"])
-    writers = (None if extra_store else
+    writers = (None if extra_store or callee_store else
                _evidence(directory, request["writer_file"], request["writer_sha256"]))
     image = request["image"]
     if not isinstance(image, str) or not image or len(image) > 40:
         raise ValueError("Paired entry image is invalid")
     owner = _address(request["owner_function"])
+    callee = _address(request["callee_function"]) if callee_store else None
+    if callee_store and extended:
+        raise ValueError("Callee store cannot use the ISO9660 call path")
     entry = _address(request["entry_function"]) if extended else owner
     bridge = _address(request["bridge_function"]) if extended else None
     native_first = _address(request["native_first_address"]) if extended else None
@@ -106,20 +123,31 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
     hits = [row for row in probe.get("hits") or [] if isinstance(row, dict) and
             str(row.get("pc", "")).lower() == f"0x{entry:08x}" and
             isinstance(row.get("registers"), dict) and
-            str(row["registers"].get("r4", "")).lower() == f"0x{first:08x}" and
-            (second is None or
-             str(row["registers"].get("r5", "")).lower() == f"0x{second:08x}")]
+            (scalar_count is not None or (
+                str(row["registers"].get("r4", "")).lower() == f"0x{first:08x}" and
+                (second is None or
+                 str(row["registers"].get("r5", "")).lower() == f"0x{second:08x}")))]
     if len(hits) != 1:
         raise ValueError("Original function entry is absent or ambiguous")
     native = probe.get("native_entry") or {}
-    expected_storage = "none" if second is None else "guest"
+    expected_storage = "none" if scalar_count is not None or second is None else "guest"
+    if scalar_count is not None:
+        arguments = native.get("arguments") or []
+        if (len(arguments) != 4 or any(
+                _address(hits[0]["registers"].get(f"r{index + 4}")) != _address(arguments[index])
+                for index in range(scalar_count))):
+            raise ValueError("Function scalar inputs already differ at entry")
+        expected_first = _address(hits[0]["registers"].get("r4"))
+    else:
+        expected_first = native_first if extended else first
     if (native.get("symbol") != symbol or native.get("second_storage") != expected_storage or
             str(native.get("output_address", "")).lower() !=
-            f"0x{(native_first if extended else first):08x}" or
-            (second is not None and
+            f"0x{expected_first:08x}" or
+            (scalar_count is None and second is not None and
              str(native.get("right_address", "")).lower() != f"0x{second:08x}")):
         raise ValueError("Native function entry does not match the original")
-    native_rows = native.get("memory") or []
+    native_rows = (native.get("probe_memory") if scalar_count is not None else
+                   native.get("memory")) or []
     sample_first = native_first if extended else first
     size = next((row.get("size") for row in native_rows
                  if isinstance(row, dict) and
@@ -127,10 +155,16 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
     if type(size) is not int or not 1 <= size <= 256:
         raise ValueError("Paired entry sample size is invalid")
     original_first = _memory(hits[0].get("memory"), first, size)
-    native_first_bytes = _memory(native.get("memory"), native_first if extended else first, size)
-    original_second = (_memory(hits[0].get("memory"), second, size)
+    native_first_bytes = _memory(native_rows, native_first if extended else first, size)
+    second_size = (next((row.get("size") for row in native_rows if
+                        isinstance(row, dict) and
+                        row.get("address", "").lower() == f"0x{second:08x}"), None)
+                   if scalar_count is not None and second is not None else size)
+    if second is not None and (type(second_size) is not int or not 1 <= second_size <= 256):
+        raise ValueError("Paired entry second sample size is invalid")
+    original_second = (_memory(hits[0].get("memory"), second, second_size)
                        if second is not None else None)
-    native_second = (_memory(native.get("memory"), second, size)
+    native_second = (_memory(native_rows, second, second_size)
                      if second is not None else None)
     if extended:
         normalize = lambda value: value.split(b"\0", 1)[0].replace(b"/", b"\\").upper().removesuffix(b";1")
@@ -145,14 +179,33 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
     bridge_context = (compact(image, bridge, 262144, True, bridge, full_original=True)
                       if extended else None)
     contexts = [context] + ([bridge_context, writer_context] if extended else [])
+    if callee_store:
+        writer_context = compact(image, callee, 262144, True, callee, full_original=True)
+        contexts.append(writer_context)
     if any((part.get("complete") is not True) for row in contexts for part in
            (row.get("implementation") or {}, row["mips"])):
         raise ValueError("Paired entry audit source is incomplete")
-    start = owner
+    start = callee if callee_store else owner
     end = int(writer_context["function"]["end"])
     writer_pcs = []
     native_writer_sites = []
-    if extra_store:
+    if callee_store:
+        refinement = previous.get("refinement") or {}
+        words = words_from_listing(context["mips"]["lines"])
+        targets = {((pc + 4) & 0xf0000000) | ((word & 0x03ffffff) << 2)
+                   for pc, word in words.items() if word >> 26 == 3}
+        writer_pcs = sorted({int(row["pc"], 16)
+                             for row in refinement.get("original_writes") or []
+                             if start <= int(row["pc"], 16) < end})
+        native_writes = refinement.get("native_writes") or []
+        pattern = re.compile(rf"(?:^|!){re.escape(symbol)}\+0x[0-9a-f]+(?:\s|\Z)", re.I)
+        owned = [row for row in native_writes if any(
+            pattern.search(str(row.get(key, ""))) for key in
+            ("caller_symbol", "caller2_symbol", "caller3_symbol", "caller4_symbol"))]
+        if (refinement.get("interval_complete") is not True or callee not in targets or
+                not writer_pcs or not owned):
+            raise ValueError("Callee store lacks a complete interval and proven owner call")
+    elif extra_store:
         refinement = previous.get("refinement") or {}
         native_writes = refinement.get("native_writes") or []
         if (previous.get("classification") != "extra_store" or
@@ -185,6 +238,9 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
             raise ValueError("Paired entry call path is absent from original MIPS")
     for row in contexts:
         row["machine_audit"] = checklist(row["mips"]["lines"])
+    if callee_store:
+        writer_context["audit_role"] = "downstream_writer"
+        context["audit_cluster"] = [writer_context]
     if extended:
         bridge_context["audit_role"] = "call_path_bridge"
         writer_context["audit_role"] = "downstream_writer"
@@ -204,7 +260,12 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
         "frame": expected_frame, "input_addresses": addresses,
         "input_bytes_match": True, "writer_pcs": [f"0x{pc:08x}" for pc in writer_pcs],
     }
-    if extra_store:
+    if scalar_count is not None:
+        evidence["scalar_arguments"] = native["arguments"][:scalar_count]
+    if callee_store:
+        evidence.update({"callee_function": f"0x{callee:08x}",
+                         "native_owner_writes": len(owned)})
+    elif extra_store:
         evidence.update({"extra_store": True, "native_writer_sites": native_writer_sites})
     else:
         evidence.update({"writer_file": request["writer_file"],
@@ -228,6 +289,11 @@ def read_paired_entry_request(root: Path, directory: Path, request: dict,
         if extra_store else
         "Both sampled inputs match at function entry and original writes occur within "
         "this function; audit its complete implementation and called helpers")
+    if callee_store:
+        packet["cause_statement"] = (
+            "The sampled owner entry inputs match; its proven Original callee writes "
+            "the divergent storage, while the Native interval contains a write under "
+            "the same owner. Audit the owner call decision and the complete callee")
     packet["failure_signature"] = hashlib.sha256(json.dumps({
         "prior": previous["failure_signature"], "owner": owner, "evidence": evidence,
     }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

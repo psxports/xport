@@ -63,24 +63,60 @@ def export_ctree(c,cfg,entry,function_sha256):
              ida=ida_kernwin.get_kernel_version(),hexrays=ida_hexrays.get_hexrays_version(),
              prototype=type_info(c.type),lvars=lvars,nodes=sorted(nodes.values(),key=lambda row:row['id']),
              source_mapping='node_ea_or_null',missing_ea='unsupported_source_map_gap')
+def apply_function_boundaries(cfg):
+ previous_end=0
+ for row in sorted(cfg.get('function_boundaries',[]),key=lambda r:r['start']):
+  start,end=row['start'],row['end']
+  if start%4 or end%4 or start>=end or start<previous_end or not row.get('reason'):
+   raise RuntimeError('Invalid reviewed function boundary')
+  if not any(lo<=start<end<=hi for lo,hi in cfg['code_ranges']):raise RuntimeError('Boundary outside code ranges')
+  raw=ida_bytes.get_bytes(start,end-start)
+  if raw is None or hashlib.sha256(raw).hexdigest()!=row['sha256']:raise RuntimeError('Stale reviewed boundary bytes')
+  previous_end=end
+ for row in sorted(cfg.get('function_boundaries',[]),key=lambda r:r['start']):
+  start,end=row['start'],row['end']
+  owner=ida_funcs.get_func(start)
+  if owner and owner.start_ea!=start:raise RuntimeError('Reviewed boundary overlaps another owner')
+  if owner:ida_funcs.del_func(start)
+  idc.create_insn(end-4)
+  if not ida_funcs.add_func(start,end):raise RuntimeError('Cannot apply reviewed boundary '+hx(start))
+  fn=ida_funcs.get_func(start)
+  if fn.start_ea!=start or fn.end_ea!=end:raise RuntimeError('Reviewed boundary not retained')
+
+def apply_gp(cfg):
+ directive=getattr(idc,'process_config_line',ida_idp.process_config_directive)
+ for line in ('MIPS_GP=0x%X'%cfg['gp'],'MIPS_SIMPLIFY_GP=YES','MIPS_SIMPLIFY=YES','MIPS_STRICT=NO'):
+  result=directive(line)
+  if result not in (None,0,''):raise RuntimeError('MIPS configuration rejected: '+line+': '+str(result))
+
+def verify_gp(cfg):
+ checked=[];failures=[]
+ for lo,hi in cfg['code_ranges']:
+  for ea in idautils.Heads(lo,hi):
+   if not ida_bytes.is_code(ida_bytes.get_full_flags(ea)):continue
+   word=ida_bytes.get_dword(ea)
+   if (word>>21)&31!=28 or word>>26 not in (32,33,35,36,37,40,41,43):continue
+   imm=word&0xffff;imm=imm-0x10000 if imm&0x8000 else imm
+   target=(cfg['gp']+imm)&0xffffffff
+   row=dict(site=ea,target=target,refs=list(idautils.DataRefsFrom(ea)))
+   checked.append(row)
+   if target not in row['refs']:failures.append(row)
+ if failures:raise RuntimeError('GP reference verification failed: '+json.dumps(failures[:8]))
+ return dict(assigned_after_segment_creation=True,gp=cfg['gp'],checked=len(checked),mismatches=0,samples=checked[:8])
+
 def main():
  cfg=json.load(open(idc.ARGV[1],encoding='utf-8-sig'));out=cfg['output'];os.makedirs(out,exist_ok=True)
  if not isinstance(cfg.get('gp'),int) or not 0<cfg['gp']<=0xFFFFFFFF:raise RuntimeError('Reviewed nonzero runtime GP required')
- # Apply reviewed GP before waiting for authoritative analysis
+ # Select the processor before constructing the authoritative segments
  try: idc.set_processor_type('mipsl',idc.SETPROC_USER)
  except Exception:pass
- directive=getattr(idc,'process_config_line',ida_idp.process_config_directive)
- gp_result=directive('MIPS_GP=0x%X'%cfg['gp'])
- if isinstance(gp_result,str) and gp_result:raise RuntimeError('MIPS GP configuration rejected: '+gp_result)
- directive('MIPS_SIMPLIFY_GP=YES')
- directive('MIPS_SIMPLIFY=YES')
- directive('MIPS_STRICT=NO')
  ida_auto.auto_wait()
  if cfg.get('rebuild',True):
   for a in list(idautils.Segments()):ida_segment.del_segm(a,ida_segment.SEGMOD_KILL)
   for part in cfg['segments']:seg(part['start'],part['end'],part['name'],part['class'])
   for im in cfg['loads']:
    raw=open(im['path'],'rb').read()[im.get('offset',0):];ida_bytes.put_bytes(im['base'],raw)
+  apply_gp(cfg)
   ida_ida.inf_set_start_ea(cfg['entry']);ida_ida.inf_set_start_ip(cfg['entry'])
   # Pin PSX code ranges to MIPS32
   for lo,_ in cfg['code_ranges']:
@@ -113,8 +149,11 @@ def main():
   normalize_mips32(cfg['code_ranges'])
   ida_loader.save_database(idc.get_idb_path(),0)
  else:
+  apply_gp(cfg)
   for lo,hi in cfg['code_ranges']:ida_auto.plan_and_wait(lo,hi)
   ida_auto.auto_wait()
+ apply_function_boundaries(cfg)
+ gp_verification=verify_gp(cfg)
  records=[];edges=[];xrefs=[];indirect=[];fail=[];ctree_fail=[]
  hexok=ida_hexrays.init_hexrays_plugin()
  ctree_addresses=set(cfg.get('ctree_addresses',[]))
@@ -157,7 +196,7 @@ def main():
  for s in idautils.Strings():strings.append(dict(address=s.ea,length=s.length,text=str(s)))
  dump(out+'/strings.json',strings)
  segments=[dict(start=a,end=ida_segment.getseg(a).end_ea,name=ida_segment.get_segm_name(ida_segment.getseg(a)),kind=ida_segment.get_segm_class(ida_segment.getseg(a))) for a in idautils.Segments()]
- dump(out+'/export-report.json',dict(image=cfg['image'],ida=ida_kernwin.get_kernel_version(),hexrays=ida_hexrays.get_hexrays_version() if hexok else None,python=sys.version,gp=cfg['gp'],config=cfg,segments=segments,functions=len(records),pseudocode=len(records)-len(fail),failures=len(fail),ctree_requested=len(ctree_addresses),ctree_exported=len(ctree_addresses)-len(ctree_fail),ctree_failures=len(ctree_fail)))
+ dump(out+'/export-report.json',dict(image=cfg['image'],ida=ida_kernwin.get_kernel_version(),hexrays=ida_hexrays.get_hexrays_version() if hexok else None,python=sys.version,gp=cfg['gp'],gp_verification=gp_verification,config=cfg,segments=segments,functions=len(records),pseudocode=len(records)-len(fail),failures=len(fail),ctree_requested=len(ctree_addresses),ctree_exported=len(ctree_addresses)-len(ctree_fail),ctree_failures=len(ctree_fail)))
  write(out+'/'+cfg['image']+'.lst','\n'.join(open(out+'/functions/%08X.lst'%r['address'],encoding='utf8').read() for r in records))
  write(out+'/'+cfg['image']+'.map','\n'.join('%08X %s'%(s['address'],s['name']) for s in names)+'\n')
  ida_loader.save_database(idc.get_idb_path(),0)

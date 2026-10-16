@@ -51,7 +51,7 @@ extern "C"
     void psx_pad_bind_callbacks(const PsxPadCallbackBinding *bindings, uint32 count);
     uint32 psx_pad_owner_cleanup(uint32 owner);
     uint32 psx_pad_owner_begin(uint32 owner, uint32 cleanup_target);
-    void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1);
+    void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1, uint32 cleanup_callback, uint32 delay_cache, uint32 multitap_enable, uint32 actuator_budget);
     void psx_pad_bind_main_mode_commands(uint32 send_target, uint32 receive_target);
     sint32 openPSX(const char *path, uint32 mode);
     sint32 readPSX(sint32 descriptor, void *destination, uint32 length);
@@ -376,10 +376,15 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 psx_clock_cancel(PsxClock *clock, uint32 id);
         sint32 psx_clock_run(PsxClock *clock, uint64 until, uint32 event_budget);
         void psx_vblank_bind(PsxVBlankWait wait, void *context, uint32 initial_count);
+#if defined(LOCKSTEP_DEBUG)
+        sint32 psx_wait_events_resume(void);
+#endif
         void psx_vblank_signal(void);
         sint32 psx_wait_events(void);
         sint32 psx_callbacks_allowed(void);
         void psx_wait_bind_service(uint32 slot, void (*service)(void));
+        void psx_wait_signal_service(uint32 slot);
+        void psx_sync_callbacks(void);
         void psx_native_poll_events(void);
         sint32 psx_vblank_failed(void);
         sint32 psx_vblank_bind_native_counter(uint32 counter);
@@ -926,7 +931,12 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #define setUV3(packet, _u0, _v0, _u1, _v1, _u2, _v2) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)))
 #define setUV4(packet, _u0, _v0, _u1, _v1, _u2, _v2, _u3, _v3) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)), xport_store_u8(&(packet)->p[3].uv.u, (_u3)), xport_store_u8(&(packet)->p[3].uv.v, (_v3)))
 #define setlen(packet, length) xport_store_u8((uint8 *)(packet) + 3u, (length))
-#define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | ((uint32)(intptr)(address) & 0x00ffffffu))
+    uint32 gpu_packet_link(uintptr_t address);
+#if defined(AP_X64)
+    #define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | gpu_packet_link((uintptr_t)(address)))
+#else
+    #define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | ((uint32)(intptr)(address) & 0x00ffffffu))
+#endif
 #define setcode(packet, command) xport_store_u8(&((P_TAG *)(packet))->rgbc.code, (command))
 #define getlen(packet) xport_load_u8((const uint8 *)(packet) + 3u)
 #define getaddr(packet) (xport_load_le32(packet) & 0x00ffffffu)
@@ -1265,6 +1275,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 right);
         sint16 SsUtKeyOnV(sint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right);
         sint16 SsVabOpenHead(uint8 *header, sint16 requested_bank);
+        void SsVabClose(sint16 bank);
         sint16 SsVabTransBody(uint8 *body, sint16 bank);
         sint16 SsVabTransCompleted(sint16 mode);
         sint32 CdControl(uint8 command, uint8 *parameter, uint8 *result);
@@ -1284,6 +1295,23 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 CdGetToc2(sint32 mode, CdlLOC *toc);
         PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback);
         PsxInterruptCallback psx_dma_callback_native(uint32 channel);
+        typedef uint32 (*CdGuestCallback)(uint32 event, uint32 response);
+
+        typedef struct CD_GUEST_BINDING
+        {
+            uint32 context;
+            uint32 events;
+            uint32 responses;
+            uint32 strings;
+            uint32 command_flags;
+            uint32 command_names;
+            uint32 event_names;
+            uint32 poll_enabled;
+            CdGuestCallback (*resolve)(uint32 address);
+        } CD_GUEST_BINDING;
+
+        void cd_bind_guest(const CD_GUEST_BINDING *binding);
+        void cd_publish_guest_irq(uint32 interrupt, const uint8 *response, uint32 length);
         sint32 CD_cw(uint8 command, const uint8 *parameter, uint8 *result, uint32 asynchronous);
         sint32 CD_sync(sint32 mode, uint8 *result);
         sint32 CdSync(sint32 mode, uint8 *result);
@@ -1301,6 +1329,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SpuInitHot(void);
         void SpuQuit(void);
         void SpuSetCommonAttr(SpuCommonAttr *attr);
+        void spu_bind_key_guest(uint32 state_address, uint32 event_mode_address, uint32 event_flags_address, uint32 pending_mask_address, uint32 registers_address);
         void SpuSetKey(sint32 on_off, uint32 voice_bit);
         sint32 SpuSetReverb(sint32 enabled);
         sint32 SpuSetReverbModeParam(SpuReverbAttr *attr);
@@ -1321,7 +1350,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SpuSetVoiceVolume(sint32 voice, sint16 left, sint16 right);
         MATRIX *TransMatrix(MATRIX *matrix, VECTOR *translation);
         sint32 VSync(sint32 mode);
-        sint32 VSyncCallback(PsxInterruptCallback callback);
+        intptr VSyncCallback(PsxInterruptCallback callback);
         sint32 VectorNormal(VECTOR *input, VECTOR *output);
         sint32 VectorNormalS(VECTOR *input, SVECTOR *output);
         sint32 SetVideoMode(sint32 mode);
@@ -1356,6 +1385,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 pad_bind_replay(const PsxPadReplayBinding *binding);
         sint32 pad_publish_replay(sint32 controller, const uint8 *report, uint32 length);
         sint32 pad_replay_failed(void);
+        sint32 pad_replay_is_bound(void);
         sint32 pad_lockstep_apply(sint32 controller, uint32 type, uint32 buttons, uint32 analog);
         int pad_state_io(FILE *file, int load);
 

@@ -39,14 +39,16 @@ Response shape:
 }
 ```
 
+A faulty accepted export discovered at the exact paused `psyq_review` or `frontier_translation` revision with an empty translation ledger can be superseded through the same supervisor with `python -B [XPORT_ROOT]/tools/startup.py reexport --project PROJECT_ROOT --expected-revision REVISION --label NEW_LABEL --exports orig/NEW_ROOT`. Both label and destination must be unused; the destination must stay under project `orig`. The command preserves previous accepted inputs, exports, runs and receipts, archives the prior config/state and resumes export, independent canonicalization, acceptance and PsyQ recognition under fresh labels. It rejects running, stale and post-translation states. Optional image-profile `function_boundaries` rows contain aligned `start`, exclusive `end`, exact original-byte `sha256` and an evidence-based `reason`. The exporter validates all ranges, hashes and non-overlap before changing IDA owners, preserves adjacent data and requires the exact new boundaries before export; accepted old evidence remains immutable. It never overwrites old evidence or initializes another project.
+
 ## Supervisor-owned gates
 
 The supervisor performs and records these gates in order:
 
 1. Refuse an initialized or conflicting root; create the C/VS2022 scaffold and unique runtime ports
    The generated C entry implements `void xport_main(void)` and defines the required `xport_gpu_graph_type_address` binding as unresolved (`0u`). Replace that binding only with original-image evidence before calling GPU wrappers; the scaffold value is not a reviewed guest address.
-2. Run project diagnosis and Debug native build
-   The generated Windows project compiles shared `xport_trace.c` alongside the PSX runtime.
+2. Synchronize the standard GitHub labels/issues, then run project diagnosis and Debug native build
+   The generated Windows project compiles shared `xport_trace.c` alongside the PSX runtime. It also compiles shared `psx_xa.c` for XA decoding. The scaffold defines all four `xport_cd_*_address` bindings as unresolved (`0u`); replace them only with audited original-image evidence before using guest CD storage.
 3. Inventory immutable inputs and hashes; propose PS-X EXE profiles and reuse a persisted licensed tool path only when the path and executable identity validate
 4. Preflight IDA processor/decompiler initialization, Ghidra help output, PsyQ data and native build platform before expensive analysis; accept a legacy Ghidra launcher's nonzero `-help` exit only when the canonical headless usage marker is present. Select the highest discovered Ghidra semantic version that has a matching installed PSX extension profile; a `psyq` retry repairs a mismatched automatically discovered pair
 5. Convert Red Book audio when configured
@@ -66,7 +68,7 @@ The remaining sections define startup evidence and project layout. Read `DECOMPI
 
 ## 0. Ownership and change policy
 
-- One maintained toolset and DuckStation installation: `[XPORT_ROOT]/tools`. Never copy shared Python/C++/DLL/resource implementations into a game project. Thin relative launchers/import shims are allowed; they contain no implementation.
+- One maintained toolset and DuckStation installation: `[XPORT_ROOT]/tools`. Never copy shared Python/C++/DLL/resource implementations into a game project. Thin relative launchers/import shims are allowed; they contain no implementation. Startup copies the default `icon.rc`/`icon.ico` asset pair as the explicit project-owned icon exception; shared runtime code remains referenced.
 - Shared improvements belong here and must work with unrelated games. Parameterize game addresses, image names, structures, ABI hooks, exclusions and paths; do not add game-name conditionals. Test a distinct project/profile and the affected established workflow.
 - Update this document with each shared behavior/format/command change. Agents of every project may improve it. Preserve validated constraints and provenance; replace obsolete instructions instead of appending contradictory history. Keep project-only findings in that project's `AGENTS.md` and evidence files.
 - No fixed final methodology: promote a verified reusable finding into this document/toolset. State applicability, test evidence and limitations. Do not promote a game's workaround into a platform rule.
@@ -83,20 +85,63 @@ Before running any initializer, require both the human-readable project name and
 Project README template:
 
 - `[XPORT_ROOT]/tools/templates/project/README.md.in` -> `[PROJECT_ROOT]/README.md`
-- Render the current template layout without project-specific markup changes: centered linked `cover.png`, project title, description, Play Game link and the `decomp`, `refactor`, `enhance`, `remaster` status rows
-- The public project/repository name is exactly `[FULL_NAME]-xport`; do not derive it from the root directory or append `(xport)`
+- Render the current template layout without project-specific markup changes: centered linked `cover.png` without width or height attributes, project title, description, Play Game link and the `decomp`, `refactor`, `enhance`, `remaster` status rows
+- Define `[PROJECT_NAME]` by removing whitespace from `[FULL_NAME]` and appending `-xport` (for example, `Pandemonium 2` -> `Pandemonium2-xport`). Use it for the README title and repository URLs; preserve `[FULL_NAME]` with spaces in the description. Do not derive it from the root directory or append `(xport)`
 - Play Game is exactly `https://psxports.to/[SHORT_NAME]/`, preserving the supplied short name
 - Use `@@FULL_NAME@@`, `@@PROJECT_NAME@@`, `@@REPOSITORY@@` and `@@SHORT_NAME@@`; HTML-escape displayed names and URL-encode repository/path values
 - Refuse missing templates, missing/unknown tokens and an existing root `README.md` before writing scaffold files; never regenerate an existing README on retry or completion refresh
 - The cover link expects a project-owned root `cover.png`; startup does not fabricate or copy another game's cover
-- Progress images use `https://psxports.pages.dev/progress?repo=[FULL_NAME]-xport&label=STAGE`; labels are `decomp`, `refactor`, `enhance`, `remaster`
+- Progress images use `https://psxports.pages.dev/progress?repo=[PROJECT_NAME]&label=STAGE`; labels are `decomp`, `refactor`, `enhance`, `remaster`
+
+### GitHub labels and default issues
+
+The supervisor runs the mandatory `github` step immediately after writing the local scaffold and before diagnosis/build. The local `initialize_project` helper only writes files; `startup.py start` owns the complete initialization, including GitHub. New `xport-project.json` contains `github.repository: "psxports/[PROJECT_NAME]"`. The repository must already exist, have Issues enabled and support the organization issue type `Task`; startup does not create a repository. For a deliberately different repository identity, correct this explicit config field before retrying the failed `github` step. Never infer an existing project's repository from its directory.
+
+- Canonical profile: `[XPORT_ROOT]/tools/templates/project/github.json`; it is a fixed versioned snapshot, not a live dependency on another game's issues
+- Install GitHub CLI (`gh`) and authorize with `gh auth login --hostname github.com --web`. For a CLI outside PATH, set `XPORT_GH` to its absolute executable path. Use GitHub CLI credentials or its supported `GH_TOKEN`/`GITHUB_TOKEN` environment variables; require repository Issues write access. Do not put tokens in project config, templates or logs
+- Create the six labels below with the exact color/description from the profile. Delete every other repository label, including labels currently assigned to issues or PRs; GitHub removes deleted labels from those items
+- Create all 29 default issues as `open`, type `Task`, with the indicated stage label and no assignees. Create them sequentially in the `issues` array order of the canonical profile; do not alphabetize or parallelize issue creation
+- Read all pages of open and closed issues before creating anything. Match exact titles, ignore PRs and preserve existing issues, including their state, body and assignees. A matching title must already have the required stage label and `Task` type; fail on conflicting metadata or duplicate titles rather than creating another issue
+- Reconcile missing labels/issues on retry. Do not recreate completed issues or roll back successful remote writes after a partial API failure. Keep the `github` step failed until a retry succeeds; do not rerun local initialization or rewrite README
+- Save the successful result with issue numbers/URLs in `status/startup-github.json` and the `github` step result in `status/startup.json`
+- Missing CLI/authentication, repository, Issues support, issue type, write permissions, network access or API quota is a failed `github` step. Fix the cause, then run `startup.py retry --project PROJECT_ROOT --expected-revision REVISION`
+- Explicit reconciliation for an initialized project: `python -B [XPORT_ROOT]/tools/startup_github.py --project PROJECT_ROOT`; require the explicit `github.repository` config field first. This command applies the same label deletion contract
+
+Labels (hex colors):
+
+- `startup`: `#fbca04`, empty description
+- `decomp`: `#8ae13c`, empty description
+- `refactor`: `#c5def5`, empty description
+- `enhance`: `#0052cc`, empty description
+- `remaster`: `#5319e7`, empty description
+- `question`: `#d876e3`, description `Further information is requested`; no default issues
+
+Default issues in creation order (group by `startup` -> `decomp` -> `refactor` -> `enhance` -> `remaster`; preserve the title order within each group):
+
+- `startup` (1): `Project initialization`
+- `decomp` (6): `Main Menu`, `Render`, `Audio`, `Video`, `Gameplay`, `Save Data`
+- `refactor` (7): `Modules`, `Function Names`, `Variable Names`, `Struct Names`, `Initial DRAM state`, `Use native RAM`, `x64 support`
+- `enhance` (9): `WideScreen support`, `Native resolution`, `Frame lerp`, `Renderer`, `Increase view distance`, `Disable LODs`, `Floating Point math`, `Disable subdiv`, `Texture Filtering`
+- `remaster` (6): `Effects`, `Textures`, `Environment`, `UI`, `Fog`, `Soft Shadows`
+
+Game-specific tasks such as `Race`, `Split Screen`, `Camera control`, `Menu effect from NTSC-U`, `Boats`, `Water shader` and `Reduce input lag (25 -> 50 Hz)` are excluded from the default profile. Add them separately only when applicable to the game. Do not delete existing game-specific issues when reconciling the default profile.
 
 Mandatory Windows templates:
 
 - `[XPORT_ROOT]/src/platform/win/xport.vcxproj` -> `[PROJECT_ROOT]/src/platform/win/[SHORT].vcxproj`
 - `[XPORT_ROOT]/src/platform/win/xport.sln` -> `[PROJECT_ROOT]/src/platform/win/[SHORT].sln`
 
-The agent must use both canonical templates through `startup.py`; it renders them with `@@PROJECT_GUID@@`, `@@SHORT_NAME@@`, `@@FULL_NAME@@` and `@@SHARED_SOURCE@@`. Use one new project GUID in both files, the exact user-supplied short name, an XML-escaped full name and the relative shared-source path. Never author these files from scratch or copy another game's project/solution. Preserve template Debug/Release compiler, linker and runtime settings, including Release `/O1`, `/Gw` and switchable xcrt. Fail startup if either template is missing or tokens remain unresolved; do not invent a substitute. After generation, verify that the solution refers to `[SHORT].vcxproj` with the same GUID and maps Debug/Release `x86` to project `Win32`.
+The agent must use both canonical templates through `startup.py`; it renders them with `@@PROJECT_GUID@@`, `@@SHORT_NAME@@`, `@@FULL_NAME@@` and `@@SHARED_SOURCE@@`. Use one new project GUID in both files, the exact user-supplied short name, an XML-escaped full name and the relative shared-source path. Never author these files from scratch or copy another game's project/solution. Preserve template Debug/Release compiler, linker and runtime settings, including Release `/O1`, `/Gw` and switchable xcrt. Fail startup if either template is missing or tokens remain unresolved; do not invent a substitute. After generation, verify that the solution refers to `[SHORT].vcxproj` with the same GUID and maps Debug/Release `x86` to project `Win32` and `x64` to project `x64`.
+
+Default Windows icon:
+
+- Startup copies `[XPORT_ROOT]/src/platform/win/icon.rc` and `icon.ico` into `[PROJECT_ROOT]/src/platform/win`; the local resource defines `MAINICON` from the adjacent local `icon.ico`
+- The canonical vcxproj template references local `ResourceCompile Include="icon.rc"` and `Image Include="icon.ico"` in Debug and Release; the resource compiler include path contains `$(ProjectDir)`
+- Shared files are the default assets for new projects. Each project owns its copies and can replace its local icon independently; later shared-default changes do not alter existing projects
+- Startup refuses missing shared `icon.rc` or `icon.ico`, or existing destination `icon.rc`/`icon.ico`, before writing scaffold files
+- Shared `main.c` loads `MAINICON` for the window and its small icon; the resource is embedded in the executable
+- Existing project files are unchanged; apply the resource item explicitly when updating an existing project
+- When updating an existing project with a user-supplied local `src/platform/win/icon.ico`, create adjacent `icon.rc` containing `MAINICON ICON "icon.ico"`; compile that local resource instead of the shared default and keep the icon search directory explicit
 
 Run the single startup supervisor from the shared toolset. It allocates sibling-aware ports, creates the scaffold, runs diagnosis/build, and continues through all startup gates:
 
@@ -104,14 +149,14 @@ Run the single startup supervisor from the shared toolset. It allocates sibling-
 python -B [XPORT_ROOT]/tools/startup.py start --project [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
 ```
 
-Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 `Debug|Win32` and `Release|Win32` Windows GUI C skeleton. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=768` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`, creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
+Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 Windows GUI C skeleton with Debug/Release for Win32 and x64. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=720` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`, creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
 
 Standard layout:
 
 - `README.md`: One-time render of the canonical project README template; preserve it after initialization
 - `.gitignore`: Exact copy of `[XPORT_ROOT]/tools/templates/project/.gitignore`; keep generated build, runtime, analysis, original-image and agent-state trees out of project history
 - `src/`: Platform-neutral C game implementation and `.h` declarations; preserve guest widths/addresses. The initializer creates `src/game_main.c` with the required game entry/bindings; game code includes the shared `[XPORT_ROOT]/src/xport.h` for the complete Xport contract, fixed-width types and `FUNCTION_MARKER` and must not create a project copy or auxiliary `xport_*.h` contract header.
-- `src/platform/win/`: Only `[SHORT].sln` and `[SHORT].vcxproj`, rendered from the mandatory canonical templates above; VS2022 v143 Debug/Release x86, compiled as C. The solution platform is `x86` and maps to the vcxproj `Win32` platform; configured solution builds must pass `x86`. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
+- `src/platform/win/`: `[SHORT].sln` and `[SHORT].vcxproj`, plus local default `icon.rc` and `icon.ico`; project and solution are rendered from the mandatory canonical templates above; VS2022 v143 Debug/Release x86 and x64, compiled as C. Solution `x86` maps to project `Win32`; solution/project `x64` maps directly. Intermediates are separated by architecture, executable names remain shared, and xcrt is enabled for x86/x64 Release. See [PLATFORMS.md](PLATFORMS.md); converge remains x86. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
 - `bin/`: Native Working Directory. Debug x86 outputs exactly `bin/[SHORT]_debug.exe`. Release x86 outputs exactly `bin/[SHORT].exe`. Both files remain directly under `bin`; one configuration never overwrites the other.
   - `bin/DATA/`: Runtime game data extracted from the first, data track of the CD image.
   - `bin/MUSIC/`: Decimal-name IMA ADPCM WAV tracks generated from the CD audio tracks by `X convert_music`; never place them under `bin/DATA`.
@@ -164,7 +209,7 @@ Static dependency exports from an accepted observed overlay use a distinct image
 
 Run `X ida_export --ida LICENSED_IDA_PATH --image IMAGE --label UNIQUE_PLAN_LABEL --plan`, inspect the validated commands, then run the same command without `--plan` under a different unused export label. Both stages preserve accepted images and write only a fresh labelled `status/ida/runs` directory. Canonicalization and guarded startup acceptance remain mandatory before selecting exports for database import. Zero/missing GP, stale hashes, absent parent acceptance, ambiguous/missing runtime entries, differing GP, foreign paths, invalid raw load bounds or incomplete snapshots reject the inherited route.
 
-The exporter applies the accepted GP to the IDA MIPS processor before the authoritative code-range analysis and before producing per-function listings or pseudocode. Therefore GP-relative operands and data references are based on the reviewed runtime register value in the first canonical export. Never generate pseudocode with a guessed GP and repair the resulting global addresses afterward. Each accepted export records the GP in `export-report.json`; canonicalization and database import must preserve the matching image profile.
+The exporter applies the accepted GP after recreating and loading segments, before seeding functions or authoritative code-range analysis. It assigns `MIPS_GP` through the processor configuration directive and rejects every decoded GP-relative load/store whose IDA data reference differs from `gp + sign_extend(imm16)`. `export-report.json.gp_verification` records actual checked references, not just the requested configuration. Both assignment and reference verification precede per-function listings and pseudocode export. Therefore GP-relative operands and data references are based on the reviewed runtime register value in the first canonical export. Never generate pseudocode with a guessed GP and repair the resulting global addresses afterward. Each accepted export records the GP in `export-report.json`; canonicalization and database import must preserve the matching image profile.
 
 Startup's acceptance gate is the only normal publication path into the configured immutable `paths.ida_exports` tree (new projects use `orig/images`). It requires canonical byte verification, complete per-function artifacts, absent destination image directories and writes a complete hash receipt without deleting the labelled run. It never replaces a prior accepted image; re-analysis needs a new reviewed input root/migration rather than overwriting evidence. Existing integration targets IDA 7.7 MIPS little endian, pins every declared PSX code range to MIPS32 and normalizes any locally inferred MIPS16 instruction heads back to aligned 32-bit words before export; validate another version. The importer/canonicalizer use the final load entry as code image: split-code multi-load images require an explicit mapping extension, not guessed offsets.
 
@@ -222,7 +267,7 @@ After every edit to project `.c`/`.h`, `X code_refresh` is a mandatory completio
 
 Do not emit standalone `(void)parameter;` statements solely to suppress unused formal-parameter warnings; they consume source and audit-context budget without preserving game behavior. Configure the project compiler to ignore only that warning (MSVC `/wd4100`; equivalent targeted option on other compilers). Keep unused-local and other warnings enabled. `X code_refresh` rejects newly present standalone casts whose identifier belongs to the containing function signature. Preserve `(void)function_call()` and other expressions with possible side effects
 
-`X query 0xADDRESS --image IMAGE --audit-context [--budget 12000] [--source-line N] [--mips-address 0xSITE] [--pseudo-line N] [--full-source]` returns one content-bound context instead of making the agent search whole `.c/.h` files. It includes the exact C body when it fits, only lexically referenced declarations in the source include closure, bounded MIPS/IDA, callers/callees, reuse candidates, evidence and explicit gaps. A TODO function with no implementation-index row returns an explicit unmapped implementation and the original audit context so its first translation can follow the same gate. Default output is 4Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎС™64 KiB bounded; oversized bodies return an exact path/range/hash plus a selected window. `--full-source` returns the entire body only if the requested budget can contain it and otherwise fails. A changed indexed file fails with an instruction to refresh the index; no mtime trust
+`X query 0xADDRESS --image IMAGE --audit-context [--budget 12000] [--source-line N] [--mips-address 0xSITE] [--pseudo-line N] [--full-source]` returns one content-bound context instead of making the agent search whole `.c/.h` files. It includes the exact C body when it fits, only lexically referenced declarations in the source include closure, bounded MIPS/IDA, callers/callees, reuse candidates, evidence and explicit gaps. A TODO function with no implementation-index row returns an explicit unmapped implementation and the original audit context so its first translation can follow the same gate. Default output is 4Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р РЋРІвЂћСћ64 KiB bounded; oversized bodies return an exact path/range/hash plus a selected window. `--full-source` returns the entire body only if the requested budget can contain it and otherwise fails. A changed indexed file fails with an instruction to refresh the index; no mtime trust
 
 `X source_context 0xADDRESS --image IMAGE [the same selection options] [--output status/CONTEXT.json]` is the standalone form. Use `query --audit-context` for interactive audit. Use `--output` when the evidence must persist. Interactive stdout is compact single-line JSON to avoid spending context on indentation; retained evidence files remain readable formatted JSON. Declaration matches are lexical candidates, not proof of runtime use or type correctness. Conditional duplicate declarations may remain visible because this index does not run the platform preprocessor
 
@@ -270,4 +315,4 @@ Gate before recording: every configured executable entrypoint is WIP, DONE or re
 
 ## Windows runtime template
 
-Keep `src/platform/win/xport.vcxproj` custom runtime configuration when generating projects. Debug|Win32 uses the normal CRT; Release|Win32 includes shared `platform/win/xcrt.c` by default. `/p:UseXcrt=false` restores the standard CRT in the same Release configuration. Runtime/file/format limits and Release linker settings: [LIBRARY.md](LIBRARY.md#windows-release-crt). Do not introduce local CRT replacements or new runtime configurations.
+Keep `src/platform/win/xport.vcxproj` custom runtime configuration when generating projects. Debug on both architectures uses the normal CRT; Release on both architectures includes shared `platform/win/xcrt.c` by default; each architecture also assembles its matching `platform/win/xcrt_x86.asm` or `platform/win/xcrt_x64.asm` through the canonical MASM imports. `/p:UseXcrt=false` restores the standard CRT in the same Release configuration. Runtime/file/format limits and Release linker settings: [LIBRARY.md](LIBRARY.md#windows-release-crt). Do not introduce local CRT replacements or new runtime configurations.

@@ -2,6 +2,7 @@
 #include "psx_spu.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 extern sint32 cd_stream_pop_sector_native(uint8 output[2352]);
 extern void cd_stream_consumer_native(sint32 enabled);
 #define STREAM_PAYLOAD 2016u
@@ -19,10 +20,42 @@ typedef struct
     uint32 back_frame;
     void (*complete)(void), (*limit)(void);
     CdlCB previous_ready;
+    uint8 callbacks[256];
+    uint32 callback_read, callback_count;
 } StreamState;
 
 static StreamState stream;
 sint32 StCdIntrFlag;
+
+static void stream_wait_service(void)
+{
+    while (stream.callback_count && psx_callbacks_allowed())
+    {
+        void (*callback)(void) = stream.callbacks[stream.callback_read] ? stream.limit : stream.complete;
+        stream.callback_read = (stream.callback_read + 1) & 255;
+        --stream.callback_count;
+        if (callback)
+            callback();
+    }
+}
+
+static void stream_completion(uint32 limit)
+{
+    void (*callback)(void) = limit ? stream.limit : stream.complete;
+    if (!callback)
+        return;
+    if (psx_callbacks_allowed())
+    {
+        callback();
+        return;
+    }
+    if (stream.callback_count == 256)
+        abort();
+    stream.callbacks[(stream.callback_read + stream.callback_count) & 255] = (uint8)limit;
+    ++stream.callback_count;
+    psx_wait_signal_service(3);
+    psx_sync_callbacks();
+}
 
 static uint16 stream_u16(const uint8 *p)
 {
@@ -76,11 +109,13 @@ void StClearRing(void)
             stream_put16(stream_header(i), StFREE);
     stream.read = stream.write = stream.assembly = stream.part = stream.frame = stream.chunks = 0;
     StCdIntrFlag = 0;
+    stream.callback_read = stream.callback_count = 0;
     ++stream.generation;
 }
 
 void StSetRing(uint32 *ring_addr, uint32 ring_size)
 {
+    psx_wait_bind_service(3, stream_wait_service);
     stream.ring = (uint8 *)ring_addr;
     stream.count = ring_addr && ring_size <= UINT32_MAX / 2048u ? ring_size : 0;
     stream.payload = stream.count ? stream.ring + STREAM_HEADER * stream.count : 0;
@@ -97,6 +132,7 @@ static void stream_ready(uint8 status, uint8 *result)
 
 void StSetStream(uint32 mode, uint32 start_frame, uint32 end_frame, void (*func1)(void), void (*func2)(void))
 {
+    psx_wait_bind_service(3, stream_wait_service);
     stream_drop_partial();
     stream.mode = mode & 1u;
     stream.start = start_frame;
@@ -105,6 +141,7 @@ void StSetStream(uint32 mode, uint32 start_frame, uint32 end_frame, void (*func1
     stream.channel = stream.next_channel = 0;
     stream.complete = func1;
     stream.limit = func2;
+    stream.callback_read = stream.callback_count = 0;
     stream.emulate = 0;
     stream.configured = 1;
     cd_stream_consumer_native(1);
@@ -132,6 +169,7 @@ void StUnSetRing(void)
         CdReadyCallback(stream.previous_ready);
     stream.hooked = 0;
     stream.configured = 0;
+    stream.callback_read = stream.callback_count = 0;
     stream.emulate = 0;
     StCdIntrFlag = 0;
     ++stream.generation;
@@ -191,7 +229,7 @@ sint32 stream_feed_sector(const uint8 sector[2048], const CdlLOC *location)
             stream.ended = 1;
             callback = stream.limit;
             if (callback)
-                callback();
+                stream_completion(1);
             return 0;
         }
         index = stream.write;
@@ -203,7 +241,7 @@ sint32 stream_feed_sector(const uint8 sector[2048], const CdlLOC *location)
                 stream.ended = 1;
                 callback = stream.limit;
                 if (callback)
-                    callback();
+                    stream_completion(1);
                 return 0;
             }
             for (i = 0; i < chunks; ++i)
@@ -261,7 +299,7 @@ sint32 stream_feed_sector(const uint8 sector[2048], const CdlLOC *location)
         stream.channel = stream.next_channel;
         callback = stream.complete;
         if (callback)
-            callback();
+            stream_completion(0);
     }
     return 1;
 }

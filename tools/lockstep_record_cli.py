@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from duckstation_runtime import lockstep_timing_arguments
 from duckstation_runtime import (DATA_ROOT_VARIABLE, executable as duckstation_executable,
                                  launch_process, validate_settings)
 from lockstep_gdb import DuckStationLockstep
@@ -73,7 +74,7 @@ def record(root: Path, state: Path, output: Path, frames: int, timeout: float) -
     original = (root / config["paths"]["original_executable"]).resolve()
     manifest_path = Path(__file__).resolve().parent / "duckstation" / "duckstation-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    command = [str(duckstation_executable()), "-batch", "-fastboot", "-statefile",
+    command = [str(duckstation_executable()), *lockstep_timing_arguments(duckstation_executable()), "-batch", "-fastboot", "-statefile",
                str(state.resolve()), str(cue)]
     process = launch_process(command, directory,
                              normalized_environment(updates={DATA_ROOT_VARIABLE: str(directory)}), False)
@@ -85,7 +86,7 @@ def record(root: Path, state: Path, output: Path, frames: int, timeout: float) -
         stop = adapter.remote.packet("?")
         if not stop.startswith(("S", "T")):
             raise RuntimeError("DuckStation did not start paused")
-        adapter.configure_wait_points(config["duckstation"]["wait_points"])
+        adapter.configure_wait_points(config["duckstation"]["wait_points"], config["duckstation"].get("sio_delay"))
         adapter.start_record(frames)
         recorder = FrameDoneRecorder()
         capture_started = time.monotonic()

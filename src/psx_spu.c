@@ -1,7 +1,8 @@
+#include "ap.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
     #include <emscripten.h>
 #endif
 #include "psx_spu.h"
@@ -721,6 +722,7 @@ typedef struct SPU_STATE
     SPU_TRANSFER_STATE transfer;
     uint32 heap_last_idx;
     uint8 initialized;
+    uint8 sample_clock_from_wait;
 } SPU_STATE;
 
 static SPU_STATE spu;
@@ -731,10 +733,12 @@ sint32 spu_load_handoff_file(const char *path)
 {
     uint32 words[51 + 24 * 54], index, cursor = 51;
     FILE *file = path ? xport_fopen(path, "rb") : NULL;
+    uint64 sample_counter = 0;
+    uint8 trailing;
     sint32 ok;
     if (!file)
         return 0;
-    ok = fread(words, sizeof(words), 1, file) == 1 && fgetc(file) == EOF;
+    ok = fread(words, sizeof(words), 1, file) == 1 && fread(&sample_counter, sizeof(sample_counter), 1, file) == 1 && fread(&trailing, 1, 1, file) == 0;
     if (fclose(file) || !ok)
         return 0;
     xport_audio_lock();
@@ -765,6 +769,9 @@ sint32 spu_load_handoff_file(const char *path)
     spu.ext_right = (sint16)words[16];
     spu.cd_mix_controlled = 1;
     spu.key_status = 0;
+    spu.lockstep_ticks = sample_counter;
+    spu.lockstep_clock_valid = 1;
+    spu.sample_clock_from_wait = 1;
     for (index = 0; index < 24; ++index)
     {
         SPU_VOICE *voice = spu.voices + index;
@@ -980,6 +987,7 @@ typedef struct CD_AUDIO_STATE
     uint8 active;
     uint8 paused;
     uint8 muted;
+    uint8 repeat;
 } CD_AUDIO_STATE;
 
 typedef struct LIBSND_STATE
@@ -999,11 +1007,24 @@ typedef struct LIBSND_STATE
     CdlCB ready_callback;
     CdlCB cd_end_callback;
     CdlCB sync_callback;
+
     struct
     {
         uint8 ready, status, response, has_response;
     } pending_callbacks[256];
+
     uint32 pending_callback_read, pending_callback_count;
+
+    struct
+    {
+        uint8 interrupt;
+        uint8 length;
+        uint8 response[8];
+    } pending_sdk_callbacks[256];
+
+    uint32 pending_sdk_read;
+    uint32 pending_sdk_count;
+    uint32 cd_bus_delay;
     uint32 next_sound_ram_address;
     uint32 tick_accumulator;
     uint32 tick_count;
@@ -1032,7 +1053,11 @@ static void cd_queue_callback(uint32 ready, uint8 status, const uint8 *response)
     libsnd.pending_callbacks[index].has_response = response != NULL;
     ++libsnd.pending_callback_count;
     xport_audio_unlock();
+    psx_wait_signal_service(6);
     psx_interrupt_raise(2);
+    psx_sync_callbacks();
+    if (psx_callbacks_allowed())
+        cd_dispatch_ready_event();
 }
 
 static CdlLOC cd_toc[100];
@@ -1104,6 +1129,8 @@ int spu_lockstep_checkpoint_restore(const void *data, size_t size)
     xport_audio_lock();
     spu = saved->spu;
     libsnd = saved->libsnd;
+    if (libsnd.pending_callback_count || libsnd.pending_sdk_count || libsnd.cd_end_callback)
+        psx_wait_signal_service(6);
     reverb_control = saved->reverb_control;
     reverb_work_check = saved->reverb_work_check;
     reverb_work_context = saved->reverb_work_context;
@@ -1129,10 +1156,13 @@ int spu_lockstep_checkpoint_synchronize(void)
     sint16 discarded[2];
     uint64 target;
     sint32 synchronized;
+    uint8 clock_from_wait = spu.sample_clock_from_wait;
 
     if (!xport_lockstep_device_ticks(&target))
         return !xport_lockstep_spu_timeline_active();
+    spu.sample_clock_from_wait = 0;
     spu_render_vblank(discarded, 1u);
+    spu.sample_clock_from_wait = clock_from_wait;
     xport_audio_lock();
     synchronized = spu.lockstep_clock_valid && spu.lockstep_ticks == target;
     xport_audio_unlock();
@@ -1238,6 +1268,8 @@ static void spu_init(void)
     spu.cd_left = 0;
     spu.cd_right = 0;
     spu.initialized = 1;
+    reverb_control.control = 0xC000;
+    reverb_control.enabled = 0;
     libsnd.cd.volume_left = 127;
     libsnd.cd.volume_right = 127;
     libsnd.cd.mix.val0 = 255;
@@ -1298,7 +1330,7 @@ sint32 spu_load_ram_file(const char *path)
 
     if (!path || !*path || !spu.initialized)
         return 0;
-    file = fopen(path, "rb");
+    file = xport_fopen(path, "rb");
     if (!file)
         return 0;
     xport_audio_lock();
@@ -1445,7 +1477,7 @@ static void spu_synchronize_device_clock(void)
 #if defined(LOCKSTEP_DEBUG)
     uint64 target;
 
-    if (spu.lockstep_vblank_render)
+    if (spu.sample_clock_from_wait || spu.lockstep_vblank_render)
         return;
     if (xport_lockstep_spu_timeline_active())
         return;
@@ -1474,7 +1506,9 @@ static sint32 spu_mmio_timed_read16(uint32 physical_address, uint16 *value)
 {
 #if defined(LOCKSTEP_DEBUG)
     uint32 expected = 0u;
-    sint32 synchronized = spu_synchronize_event(XPORT_LOCKSTEP_SPU_VOICE_READ, physical_address, &expected, 0);
+    sint32 synchronized = 0;
+    if (physical_address >= 0x1F801C00 && physical_address < 0x1F801D80 && (physical_address & 15) == 12)
+        synchronized = spu_synchronize_event(XPORT_LOCKSTEP_SPU_VOICE_READ, physical_address, &expected, 0);
 
     if (!synchronized)
         spu_synchronize_device_clock();
@@ -1608,7 +1642,7 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
             /* Bits 0 and 1 enable dry CD and external input mixing
                Bits 2 and 3 route those inputs to the reverb processor
                This host has no external analog input, so that bus is silent */
-            if (changed & ~0xCFu)
+            if (changed & ~0xC0CFu)
             {
 #ifndef NDEBUG
                 fprintf(stderr, "xport_spu_write unsupported control routing value=%04X changed=%04X\n", values[index], changed);
@@ -1682,6 +1716,19 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
                 spu.ext_right = (sint16)values[index];
                 break;
             case 0x1F801DAAu:
+                if ((previous[index] & 0x8000) && !(values[index] & 0x8000))
+                {
+                    uint32 voice_index;
+                    for (voice_index = 0; voice_index < SPU_VOICE_COUNT; ++voice_index)
+                    {
+                        SPU_VOICE *voice = spu.voices + voice_index;
+                        if (voice->adsr_phase != SPU_ADSR_OFF)
+                        {
+                            voice->adsr_phase = SPU_ADSR_OFF;
+                            voice->envelope = 0;
+                        }
+                    }
+                }
                 reverb_control.control = values[index];
                 reverb_control.enabled = (values[index] >> 7) & 1u;
                 spu.cd_mix_controlled = 1u;
@@ -1905,13 +1952,13 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
             tone_destination->adsr2 = tone_source->adsr2;
             tone_destination->program = tone_source->program;
             tone_destination->sample = tone_source->sample;
-            if (tone_destination->sample < 1 || tone_destination->sample > (sint16)sample_count)
+            // Zero denotes an unused tone with no sample address
+            if (tone_destination->sample < 0 || tone_destination->sample > (sint16)sample_count)
                 return -1;
         }
         ++tone_group;
     }
-    if (tone_group != program_count)
-        return -1;
+    // The header can reserve unused tone groups before the sample size table
 
     size_table_offset = 32 + 128 * 16 + (uint32)program_count * 16 * 32;
     for (program = 0; program < 256; ++program)
@@ -1929,6 +1976,27 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
     libsnd.banks[bank] = parsed;
     libsnd.next_sound_ram_address = (libsnd.next_sound_ram_address + parsed.body_size + 7u) & ~7u;
     return bank;
+}
+
+void SsVabClose(sint16 bank)
+{
+    uint32 next = 0x1010;
+    sint32 index;
+    xport_audio_lock();
+    if (bank >= 0 && bank < VAB_BANK_COUNT && libsnd.banks[bank].valid)
+    {
+        memset(libsnd.banks + bank, 0, sizeof(libsnd.banks[bank]));
+        // Reclaim the free tail without moving any live sample data
+        for (index = 0; index < VAB_BANK_COUNT; ++index)
+        {
+            const VAB_BANK *entry = libsnd.banks + index;
+            uint32 end = (entry->body_address + entry->body_size + 7) & ~(uint32)7;
+            if (entry->valid && end > next)
+                next = end;
+        }
+        libsnd.next_sound_ram_address = next;
+    }
+    xport_audio_unlock();
 }
 
 void spu_native_set_mute(sint32 muted)
@@ -2219,7 +2287,7 @@ sint16 SsUtKeyOn(sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 f
     for (voice = 0; voice < SPU_VOICE_COUNT; ++voice)
     {
         sint16 priority = libsnd.voices[voice].priority;
-        if (spu.voices[voice].adsr_phase == SPU_ADSR_OFF && spu.voices[voice].envelope == 0)
+        if (!(spu.key_on_pending & SPU_KEYCH(voice)) && spu.voices[voice].adsr_phase == SPU_ADSR_OFF && spu.voices[voice].envelope == 0)
         {
             selected = voice;
             break;
@@ -2814,16 +2882,59 @@ void SpuGetVoiceAttr(SpuVoiceAttr *attr)
     xport_audio_unlock();
 }
 
+static uint32 spu_key_guest_addresses[5];
+
+void spu_bind_key_guest(uint32 state_address, uint32 event_mode_address, uint32 event_flags_address, uint32 pending_mask_address, uint32 registers_address)
+{
+    spu_key_guest_addresses[0] = state_address;
+    spu_key_guest_addresses[1] = event_mode_address;
+    spu_key_guest_addresses[2] = event_flags_address;
+    spu_key_guest_addresses[3] = pending_mask_address;
+    spu_key_guest_addresses[4] = registers_address;
+}
+
 void SpuSetKey(sint32 on_off, uint32 voice_bit)
 {
+    uint32 cached;
+    uint32 pending;
+    uint32 opposite;
+    uint32 low;
+    uint32 high;
+
+    voice_bit &= SPU_ALLCH;
+    if (on_off != SPU_ON && on_off != SPU_OFF)
+        return;
     xport_audio_lock();
-    if (on_off == SPU_ON)
-        spu_key_on(voice_bit & SPU_ALLCH);
+    if (spu_key_guest_addresses[0] && (r_u32(spu_key_guest_addresses[1]) & 1u))
+    {
+        pending = spu_key_guest_addresses[4] + (on_off == SPU_ON ? 0u : 4u);
+        opposite = spu_key_guest_addresses[4] + (on_off == SPU_ON ? 4u : 0u);
+        low = voice_bit & 0xffffu;
+        high = voice_bit >> 16;
+        w_u16(pending, (uint16)low);
+        w_u16(pending + 2u, (uint16)high);
+        w_u32(spu_key_guest_addresses[2], r_u32(spu_key_guest_addresses[2]) | 1u);
+        cached = r_u32(spu_key_guest_addresses[3]);
+        w_u32(spu_key_guest_addresses[3], on_off == SPU_ON ? cached | voice_bit : cached & ~voice_bit);
+        if (r_u16(opposite) & low)
+            w_u16(opposite, (uint16)(r_u16(opposite) & ~low));
+        if (r_u16(opposite + 2u) & high)
+            w_u16(opposite + 2u, (uint16)(r_u16(opposite + 2u) & ~high));
+    }
+    else if (on_off == SPU_ON)
+    {
+        cached = spu_key_guest_addresses[0] ? r_u32(spu_key_guest_addresses[0]) : 0u;
+        spu_key_on(voice_bit);
+        if (spu_key_guest_addresses[0])
+            w_u32(spu_key_guest_addresses[0], cached | voice_bit);
+    }
     else
     {
-        spu_key_off(voice_bit & SPU_ALLCH);
+        spu_key_off(voice_bit);
+        if (spu_key_guest_addresses[0])
+            w_u32(spu_key_guest_addresses[0], r_u32(spu_key_guest_addresses[0]) & ~voice_bit);
         /* A later SDK stop cancels an unrendered SDK start */
-        spu.key_on_pending &= ~(voice_bit & SPU_ALLCH);
+        spu.key_on_pending &= ~voice_bit;
     }
     xport_audio_unlock();
 }
@@ -2862,10 +2973,11 @@ sint32 SpuIsReverbWorkAreaReserved(sint32 mode)
     return result;
 }
 
-sint32 SpuClearReverbWorkArea(sint32 mode)
+sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTransferBinding *binding, uint32 *direction)
 {
-    uint32 units, begin, length;
-    if ((uint32)mode >= 10u)
+    uint32 units, begin, length, normalized, callback, guest;
+    sint32 result = 0;
+    if ((uint32)mode >= 10u || !source || !binding || !binding->normalized_mode || !binding->completion_callback || !binding->address_units || !binding->source_address || !binding->dma_blocks || binding->address_shift > 3u || binding->block_bytes != 64u || ((binding->clock != NULL) != (binding->wait_until != NULL)) || (binding->clock && !binding->ticks_per_block) || !binding->complete_event)
         return -1;
     xport_audio_lock();
     units = reverb_preset_work[mode];
@@ -2876,13 +2988,81 @@ sint32 SpuClearReverbWorkArea(sint32 mode)
     }
     if (!mode)
         units = 65520u;
-    begin = units << reverb_address_shift;
-    length = (0x10000u - units) << reverb_address_shift;
-    if (begin > sizeof(spu.ram) || length > sizeof(spu.ram) - begin)
-        abort();
-    memset(spu.ram + begin, 0, length);
+    if (units > 0x10000u)
+    {
+        xport_audio_unlock();
+        return -1;
+    }
+    begin = units << binding->address_shift;
+    length = (0x10000u - units) << binding->address_shift;
     xport_audio_unlock();
-    return 0;
+    guest = binding->guest_address ? binding->guest_address(binding->context, source) : xport_guest_buffer_address((void *)source, 1024);
+    normalized = *binding->normalized_mode;
+    callback = *binding->completion_callback;
+    if (normalized == 1u)
+        *binding->normalized_mode = 0u;
+    if (callback)
+        *binding->completion_callback = 0u;
+    do
+    {
+        uint32 bytes = length > 1024u ? 1024u : length;
+        uint32 blocks = (bytes + 63u) >> 6;
+        uint32 rounded = blocks << 6;
+        uint64 deadline;
+        XportDeviceOperation operation = {0};
+        *binding->address_units = (uint16)(begin >> binding->address_shift);
+        if (direction)
+            *direction = 0u;
+        *binding->source_address = guest;
+        *binding->dma_blocks = blocks;
+        if (xport_device_trace_enabled())
+        {
+            if (!xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_SPU, XPORT_DEVICE_SPU_DMA, XPORT_DEVICE_DIRECTION_TO_DEVICE, 4u, 0u))
+            {
+                result = -1;
+                break;
+            }
+            if (!guest)
+                xport_device_trace_gap(&operation, 1u);
+            xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, guest ? XPORT_DEVICE_EVIDENCE_EXACT : XPORT_DEVICE_EVIDENCE_UNCOVERED, guest ? XPORT_DEVICE_REGION_RAM : XPORT_DEVICE_REGION_NONE, guest & 0x1fffffu, XPORT_DEVICE_REGION_SPU_RAM, begin, rounded, 0xffffffffu);
+            if (guest)
+                xport_device_trace_stage(&operation, XPORT_DEVICE_FETCH, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_RAM, guest & 0x1fffffu, XPORT_DEVICE_REGION_NONE, 0u, rounded, 0xffffffffu);
+        }
+        xport_audio_lock();
+        reverb_control.control = (reverb_control.control & ~0x30u) | 0x20u;
+        xport_audio_unlock();
+        result = spu_upload_wrapped(begin, source, rounded) ? 0 : -1;
+        if (!result && binding->clock)
+        {
+            deadline = binding->clock(binding->context) + (uint64)blocks * binding->ticks_per_block;
+            if (!binding->wait_until(binding->context, deadline))
+                result = -1;
+        }
+        xport_audio_lock();
+        reverb_control.control &= ~0x30u;
+        xport_audio_unlock();
+        if (!result && binding->complete_event(binding->context) != 1)
+            result = -1;
+        if (operation.active)
+            xport_device_trace_complete(&operation, !result);
+        if (result || length <= 1024u)
+            break;
+        length -= 1024u;
+        begin += 1024u;
+    } while (1);
+    if (normalized == 1u)
+        *binding->normalized_mode = normalized;
+    if (callback)
+        *binding->completion_callback = callback;
+    return result;
+}
+
+sint32 SpuClearReverbWorkArea(sint32 mode)
+{
+    static const uint8 zero[1024] = {0};
+    if (transfer_pending || transfer_operation.active || transfer_failed)
+        return -1;
+    return spu_clear_reverb_transfer(mode, zero, &transfer, NULL);
 }
 
 void SpuSetReverbDepth(SpuReverbAttr *attr)
@@ -2991,12 +3171,17 @@ sint32 SpuSetReverbModeParam(SpuReverbAttr *attr)
     }
     if (clear)
     {
-        uint32 units = mode ? reverb_preset_work[mode] : 65520u;
-        uint32 begin = units << reverb_address_shift;
-        uint32 length = (0x10000u - units) << reverb_address_shift;
-        if (begin > sizeof(spu.ram) || length > sizeof(spu.ram) - begin)
-            abort();
-        memset(spu.ram + begin, 0, length);
+        uint32 enabled = reverb_control.control & 0x80u;
+        sint32 result;
+        reverb_control.control &= ~0x80u;
+        reverb_control.enabled = 0;
+        xport_audio_unlock();
+        result = SpuClearReverbWorkArea((sint32)mode);
+        xport_audio_lock();
+        reverb_control.control |= enabled;
+        reverb_control.enabled = (reverb_control.control >> 7) & 1;
+        xport_audio_unlock();
+        return result;
     }
     xport_audio_unlock();
     return 0;
@@ -3562,7 +3747,7 @@ static sint16 ima_decode_nibble(IMA_ADPCM_STREAM *stream, sint32 channel, uint8 
     return (sint16)stream->predictor[channel];
 }
 
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
 EM_JS(uint32, web_music_size, (sint32 track), { return Module.xportManifest.music[track] ?.size || 0; });
 
 EM_ASYNC_JS(sint32, web_music_open, (sint32 track, uint8 *data), {
@@ -3591,7 +3776,7 @@ static sint32 ima_load_block(IMA_ADPCM_STREAM *stream)
     const uint8 *block;
     uint32 header_size = stream->channels * 4u;
     sint32 channel;
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
     sint32 available = web_music_fill(stream->file_data);
     uint32 needed = (uint32)(stream->audio_data - stream->file_data) + stream->block_offset;
     uint32 remaining = stream->audio_size - stream->block_offset;
@@ -3721,7 +3906,7 @@ static uint32 ima_decode(IMA_ADPCM_STREAM *stream, sint16 *stereo, uint32 frames
 static uint8 *cd_track_load(sint32 track, uint32 *size)
 {
     char path[64];
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
     uint32 length = web_music_size(track);
     uint8 *data = length ? (uint8 *)calloc(1, length) : 0;
     if (!data || !web_music_open(track, data) || web_music_fill(data) < 0)
@@ -3769,7 +3954,7 @@ static void cd_audio_stop_locked(void)
     if (libsnd.cd.data)
         xport_lockstep_checkpoint_invalidate();
 #endif
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
     web_music_close(libsnd.cd.data);
 #endif
     free(libsnd.cd.data);
@@ -3794,7 +3979,7 @@ sint32 CdPlay(sint32 mode, sint32 *track, sint32 offset)
     data = cd_track_load(selected, &size);
     if (data == 0 || !ima_open(&stream, data, size))
     {
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
         web_music_close(data);
 #endif
         free(data);
@@ -3809,6 +3994,7 @@ sint32 CdPlay(sint32 mode, sint32 *track, sint32 offset)
     libsnd.cd.stream = stream;
     libsnd.cd.track = selected;
     libsnd.cd.active = 1;
+    libsnd.cd.repeat = mode != 0;
     callback = libsnd.sync_callback;
     xport_audio_unlock();
     if (callback != 0)
@@ -3865,7 +4051,7 @@ static sint32 cd_control_dispatch(uint8 command, uint8 *parameter, uint8 *result
 {
     CdlCB callback;
     uint8 status = CdlComplete;
-    if (command == 1u || command == 16u || command == 2u || command == 6u || command == 14u || command == 21u || command == 22u || command == 27u)
+    if (command == 1u || command == 16u || command == 17 || command == 2u || command == 6u || command == 14u || command == 21u || command == 22u || command == 27u)
         return CdControlBPSX(command, parameter, result);
     if (command == CdlPlay && parameter != 0)
     {
@@ -3947,7 +4133,7 @@ static sint32 cd_control_dispatch(uint8 command, uint8 *parameter, uint8 *result
 }
 
 static sint32 cd_command_completion = CdlNoIntr;
-static uint8 cd_command_response;
+static uint8 cd_command_response[8];
 
 sint32 CdSetDebug(sint32 level)
 {
@@ -3973,38 +4159,297 @@ sint32 CdStatus(void)
 
 sint32 CdControl(uint8 command, uint8 *parameter, uint8 *result)
 {
-    uint8 response = 0u;
-    sint32 accepted = cd_control_dispatch(command, parameter, result ? result : &response);
+    uint8 response[8] = {0};
+    sint32 accepted = cd_control_dispatch(command, parameter, response);
     xport_audio_lock();
     cd_command_completion = accepted ? CdlComplete : CdlDiskError;
-    cd_command_response = result ? result[0] : response;
+    memcpy(cd_command_response, response, sizeof(cd_command_response));
     xport_audio_unlock();
+    if (result)
+        memcpy(result, response, command == 16 || command == 17 ? 8 : 1);
     return accepted;
+}
+
+static CD_GUEST_BINDING cd_guest;
+
+void cd_bind_guest(const CD_GUEST_BINDING *binding)
+{
+    if (binding)
+        cd_guest = *binding;
+    else
+        memset(&cd_guest, 0, sizeof(cd_guest));
+}
+
+static void cd_sdk_copy(uint8 *destination, uint32 source)
+{
+    uint32 index;
+    if (destination)
+        for (index = 0; index < 8; ++index)
+            destination[index] = r_u8(source + index);
+}
+
+static void cd_sdk_store(uint32 destination, const uint8 response[8])
+{
+    uint32 index;
+    for (index = 0; index < 8; ++index)
+        w_u8(destination + index, response[index]);
+}
+
+void cd_publish_guest_irq(uint32 interrupt, const uint8 *response, uint32 length)
+{
+    uint8 packet[8] = {0};
+    uint32 index, error = 0, callbacks = 0, target;
+    if (!cd_guest.context || !interrupt)
+        return;
+    if (length > 8)
+        length = 8;
+    for (index = 0; index < length; ++index)
+        packet[index] = response[index];
+    if (interrupt != 3 || r_u32(cd_guest.command_flags + 256 + 4 * r_u8(cd_guest.context + 29)))
+    {
+        if (!(r_u32(cd_guest.context + 12) & 16) && (packet[0] & 16))
+            w_u32(cd_guest.context + 20, r_u32(cd_guest.context + 20) + 1);
+        error = packet[0] & 0x1D;
+        w_u32(cd_guest.context + 12, packet[0]);
+        w_u32(cd_guest.context + 16, packet[1]);
+    }
+#ifdef _DEBUG
+    if (interrupt == 5 && r_s32(cd_guest.context + 8) >= 3)
+    {
+        printf("%s", (const char *)xport_guest_cptr(cd_guest.strings + 44, 1));
+        if (r_s32(cd_guest.context + 8) >= 3)
+            printf((const char *)xport_guest_cptr(cd_guest.strings + 56, 1), (const char *)xport_guest_cptr(r_u32(cd_guest.command_names + 4 * r_u8(cd_guest.context + 29)), 1), (unsigned int)r_u32(cd_guest.context + 12), (unsigned int)r_u32(cd_guest.context + 16));
+    }
+#endif
+    switch (interrupt)
+    {
+        case 1:
+            if (error && length == 1)
+                error = 0;
+            w_u8(cd_guest.events + 1, error ? 5 : 1);
+            cd_sdk_store(cd_guest.responses + 8, packet);
+            callbacks = 4;
+            break;
+        case 2:
+            w_u8(cd_guest.events, error ? 5 : 2);
+            cd_sdk_store(cd_guest.responses, packet);
+            callbacks = 2;
+            break;
+        case 3:
+            if (!error && r_u32(cd_guest.command_flags + 4 * r_u8(cd_guest.context + 29)))
+                w_u8(cd_guest.events, 3);
+            else
+            {
+                w_u8(cd_guest.events, error ? 5 : 2);
+                callbacks = 2;
+            }
+            cd_sdk_store(cd_guest.responses, packet);
+            break;
+        case 4:
+            w_u8(cd_guest.events + 2, 4);
+            w_u8(cd_guest.events + 1, r_u8(cd_guest.events + 2));
+            cd_sdk_store(cd_guest.responses + 16, packet);
+            cd_sdk_store(cd_guest.responses + 8, packet);
+            callbacks = 4;
+            break;
+        case 5:
+            w_u8(cd_guest.events + 1, 5);
+            w_u8(cd_guest.events, r_u8(cd_guest.events + 1));
+            cd_sdk_store(cd_guest.responses, packet);
+            cd_sdk_store(cd_guest.responses + 8, packet);
+            callbacks = 6;
+            break;
+        default:
+#ifdef _DEBUG
+            printf("%s", (const char *)xport_guest_cptr(cd_guest.strings + 84, 1));
+            printf((const char *)xport_guest_cptr(cd_guest.strings + 104, 1), (unsigned int)interrupt);
+#endif
+            break;
+    }
+    if ((callbacks & 4) && (target = r_u32(xport_cd_ready_callback_address)) != 0)
+        (void)cd_guest.resolve(target)(r_u8(cd_guest.events + 1), cd_guest.responses + 8);
+    if ((callbacks & 2) && (target = r_u32(xport_cd_sync_callback_address)) != 0)
+        (void)cd_guest.resolve(target)(r_u8(cd_guest.events), cd_guest.responses);
+}
+
+static void cd_sdk_service(void)
+{
+    for (;;)
+    {
+        uint8 interrupt, length, response[8];
+        uint32 index;
+        xport_audio_lock();
+        if (!libsnd.pending_sdk_count)
+        {
+            xport_audio_unlock();
+            return;
+        }
+        index = libsnd.pending_sdk_read;
+        interrupt = libsnd.pending_sdk_callbacks[index].interrupt;
+        length = libsnd.pending_sdk_callbacks[index].length;
+        memcpy(response, libsnd.pending_sdk_callbacks[index].response, 8);
+        libsnd.pending_sdk_read = (index + 1) & 255;
+        --libsnd.pending_sdk_count;
+        xport_audio_unlock();
+        cd_publish_guest_irq(interrupt, response, length);
+    }
+}
+
+static void cd_sdk_queue(uint8 interrupt, const uint8 response[8], uint8 length)
+{
+    uint32 index;
+    xport_audio_lock();
+    if (libsnd.pending_sdk_count == 256)
+        abort();
+    index = (libsnd.pending_sdk_read + libsnd.pending_sdk_count) & 255;
+    libsnd.pending_sdk_callbacks[index].interrupt = interrupt;
+    libsnd.pending_sdk_callbacks[index].length = length;
+    memcpy(libsnd.pending_sdk_callbacks[index].response, response, 8);
+    ++libsnd.pending_sdk_count;
+    xport_audio_unlock();
+    psx_wait_signal_service(6);
+    psx_sync_callbacks();
+}
+
+static void cd_sdk_timeout_begin(uint32 label)
+{
+    uint32 now = (uint32)VSync(-1);
+    w_u32(cd_guest.responses + 40, label);
+    w_u32(cd_guest.responses + 32, now + 960);
+    w_u32(cd_guest.responses + 36, 0);
+}
+
+static sint32 cd_sdk_timeout_poll(void)
+{
+    uint32 previous;
+    if ((sint32)r_u32(cd_guest.responses + 32) >= VSync(-1))
+    {
+        previous = r_u32(cd_guest.responses + 36);
+        w_u32(cd_guest.responses + 36, previous + 1);
+        if ((sint32)previous <= 0x3C0000)
+            return 0;
+    }
+#ifdef _DEBUG
+    printf("%s", (const char *)xport_guest_cptr(cd_guest.strings, 1));
+    printf((const char *)xport_guest_cptr(cd_guest.strings + 16, 1), (const char *)xport_guest_cptr(r_u32(cd_guest.responses + 40), 1), (const char *)xport_guest_cptr(r_u32(cd_guest.command_names + 4 * r_u8(cd_guest.context + 29)), 1), (const char *)xport_guest_cptr(r_u32(cd_guest.event_names + 4 * r_u8(cd_guest.events)), 1), (const char *)xport_guest_cptr(r_u32(cd_guest.event_names + 4 * r_u8(cd_guest.events + 1)), 1));
+#endif
+    xport_audio_lock();
+    libsnd.pending_sdk_read = libsnd.pending_sdk_count = 0;
+    libsnd.cd_bus_delay = 0x1325;
+    xport_audio_unlock();
+    w_u8(cd_guest.events + 2, 0);
+    w_u8(cd_guest.events + 1, r_u8(cd_guest.events + 2));
+    w_u8(cd_guest.events, 2);
+    return -1;
+}
+
+static void cd_sdk_poll(void)
+{
+    psx_sync_callbacks();
+    if (r_u16(cd_guest.poll_enabled))
+        cd_sdk_service();
 }
 
 sint32 CD_cw(uint8 command, const uint8 *parameter, uint8 *result, uint32 asynchronous)
 {
-    uint8 response = 0;
-    sint32 dispatched = CdControl(command, (uint8 *)parameter, result ? result : &response);
-
+    uint8 response[8] = {0};
+    uint8 complete_response[8] = {0};
+    uint8 status_before, status_after;
+    uint32 table, index;
+    sint32 dispatched;
+    if (!cd_guest.context)
+    {
+        dispatched = CdControl(command, (uint8 *)parameter, result ? result : response);
+        xport_audio_lock();
+        cd_command_completion = dispatched ? CdlComplete : CdlDiskError;
+        xport_audio_unlock();
+        return dispatched ? 0 : -1;
+    }
+#ifdef _DEBUG
+    if (r_s32(cd_guest.context + 8) >= 2)
+        printf((const char *)xport_guest_cptr(cd_guest.strings + 132, 1), (const char *)xport_guest_cptr(r_u32(cd_guest.command_names + 4 * command), 1));
+#endif
+    table = cd_guest.command_flags + 4 * command;
+    if (r_u32(table + 384) && !parameter)
+    {
+#ifdef _DEBUG
+        if (r_s32(cd_guest.context + 8) > 0)
+            printf((const char *)xport_guest_cptr(cd_guest.strings + 140, 1), (const char *)xport_guest_cptr(r_u32(cd_guest.command_names + 4 * command), 1));
+#endif
+        return -2;
+    }
+    (void)CD_sync(0, NULL);
+    if (command == 2)
+        for (index = 0; index < 4; ++index)
+            w_u8(cd_guest.context + 24 + index, parameter[index]);
+    if (command == 14)
+        w_u8(cd_guest.context + 28, parameter[0]);
+    w_u8(cd_guest.events, 0);
+    if (r_u32(table + 128))
+        w_u8(cd_guest.events + 1, 0);
+    w_u8(cd_guest.context + 29, command);
     xport_audio_lock();
-    cd_command_completion = dispatched ? CdlComplete : CdlDiskError;
-    cd_command_response = result ? result[0] : response;
+    status_before = cd_native_status_locked();
     xport_audio_unlock();
-    // Native commands complete immediately and use zero for successful dispatch
-    return dispatched ? 0 : -1;
+    dispatched = cd_control_dispatch(command, (uint8 *)parameter, response);
+    xport_audio_lock();
+    status_after = cd_native_status_locked();
+    cd_command_completion = dispatched ? CdlComplete : CdlDiskError;
+    memcpy(cd_command_response, response, sizeof(cd_command_response));
+    xport_audio_unlock();
+    if (dispatched)
+    {
+        if (r_u32(table + 256))
+            response[0] = status_before;
+        cd_sdk_queue(3, response, command == 16 || command == 17 ? 8 : 1);
+        if (r_u32(table))
+        {
+            complete_response[0] = status_after;
+            cd_sdk_queue(2, complete_response, 1);
+        }
+    }
+    else
+        cd_sdk_queue(5, response, 2);
+    if (asynchronous)
+        return 0;
+    cd_sdk_timeout_begin(cd_guest.strings + 156);
+    while (!r_u8(cd_guest.events))
+    {
+        if (cd_sdk_timeout_poll())
+            return -1;
+        cd_sdk_poll();
+    }
+    cd_sdk_copy(result, cd_guest.responses);
+    return r_u8(cd_guest.events) == 5 ? -1 : 0;
 }
 
 sint32 CD_sync(sint32 mode, uint8 *result)
 {
     sint32 completion;
-
-    xport_audio_lock();
-    completion = cd_command_completion;
-    if (result)
-        result[0] = cd_command_response;
-    xport_audio_unlock();
-    return completion;
+    if (!cd_guest.context)
+    {
+        xport_audio_lock();
+        completion = cd_command_completion;
+        if (result)
+            memcpy(result, cd_command_response, sizeof(cd_command_response));
+        xport_audio_unlock();
+        return completion;
+    }
+    cd_sdk_timeout_begin(cd_guest.strings + 112);
+    do
+    {
+        if (cd_sdk_timeout_poll())
+            return -1;
+        cd_sdk_poll();
+        completion = r_u8(cd_guest.events);
+        if (completion == 2 || completion == 5)
+        {
+            w_u8(cd_guest.events, 2);
+            cd_sdk_copy(result, cd_guest.responses);
+            return completion;
+        }
+    } while (!mode);
+    return 0;
 }
 
 // PsyQ LIBCD SYS command flags for implicit Setloc
@@ -4079,7 +4524,41 @@ sint32 CdControlB(uint8 command, uint8 *parameter, uint8 *result)
 
 sint32 CdControlF(uint8 command, uint8 *parameter)
 {
-    return CdControl(command, parameter, 0);
+    uint32 previous_callback, attempts = 3;
+    CdlCB previous_native_callback = NULL;
+    if (xport_cd_setloc_table_address)
+        previous_callback = r_u32(xport_cd_sync_callback_address);
+    else
+    {
+        previous_callback = 0;
+        previous_native_callback = CdSyncCallback(NULL);
+    }
+    for (;;)
+    {
+        if (xport_cd_setloc_table_address)
+            w_u32(xport_cd_sync_callback_address, 0);
+        else
+            CdSyncCallback(NULL);
+        if (command != 1 && (CdStatus() & 16))
+            (void)CD_cw(1, NULL, NULL, 0);
+        if (!parameter || !(xport_cd_setloc_table_address ? r_u32(xport_cd_setloc_table_address + 4 * command) : (command < sizeof(cd_setloc_commands) ? cd_setloc_commands[command] : 0)) || CD_cw(2, parameter, NULL, 0) == 0)
+        {
+            if (xport_cd_setloc_table_address)
+                w_u32(xport_cd_sync_callback_address, previous_callback);
+            else
+                CdSyncCallback(previous_native_callback);
+            if (CD_cw(command, parameter, NULL, 1) == 0)
+                return 1;
+        }
+        if (attempts-- == 0)
+        {
+            if (xport_cd_setloc_table_address)
+                w_u32(xport_cd_sync_callback_address, previous_callback);
+            else
+                CdSyncCallback(previous_native_callback);
+            return 0;
+        }
+    }
 }
 
 sint32 CdRead2(sint32 mode)
@@ -4106,6 +4585,8 @@ void cd_dispatch_ready_event(void)
 
     if (!psx_callbacks_allowed())
         return;
+
+    cd_sdk_service();
 
     for (;;)
     {
@@ -4378,6 +4859,12 @@ static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 fra
                 }
             }
         }
+        /* Hardware mute precedes CD mixing and the reverb return */
+        if (!(reverb_control.control & 0x4000))
+        {
+            mix_left = mix_right = 0;
+            send_left = send_right = 0;
+        }
         interleaved_stereo[frame * 2] += mix_left;
         interleaved_stereo[frame * 2 + 1] += mix_right;
         if (sends)
@@ -4476,6 +4963,18 @@ void spu_render(sint16 *interleaved_stereo, uint32 frame_count)
         {
             sint32 xa_source = cd_xa_active_locked();
             uint32 produced = xa_source ? cd_xa_render_locked(decoded, count) : ima_decode(&libsnd.cd.stream, decoded, count);
+            while (!xa_source && produced < count && libsnd.cd.repeat && libsnd.cd.stream.decoded_frames >= libsnd.cd.stream.total_frames)
+            {
+                IMA_ADPCM_STREAM stream;
+                uint32 restarted;
+                if (!ima_open(&stream, libsnd.cd.data, libsnd.cd.stream.file_size))
+                    break;
+                libsnd.cd.stream = stream;
+                restarted = ima_decode(&libsnd.cd.stream, decoded + produced * 2u, count - produced);
+                produced += restarted;
+                if (!restarted)
+                    break;
+            }
             for (sample = 0; sample < produced; ++sample)
             {
                 sint32 input_left = decoded[sample * 2];
@@ -4497,7 +4996,7 @@ void spu_render(sint16 *interleaved_stereo, uint32 frame_count)
                 }
             }
             if (!xa_source && produced < count
-#ifdef __EMSCRIPTEN__
+#ifdef AP_WEB
                 && libsnd.cd.stream.decoded_frames >= libsnd.cd.stream.total_frames
 #endif
             )
@@ -4550,6 +5049,13 @@ void spu_render_vblank(sint16 *interleaved_stereo, uint32 frame_count)
     uint64 target;
     uint64 frames;
     uint32 output_frames;
+
+    if (spu.sample_clock_from_wait)
+    {
+        if (interleaved_stereo && frame_count)
+            memset(interleaved_stereo, 0, (size_t)frame_count * 2 * sizeof(*interleaved_stereo));
+        return;
+    }
 
     if (!interleaved_stereo || !frame_count)
         return;
@@ -4758,6 +5264,8 @@ int spu_lockstep_portable_io(FILE *file, int load)
         {
             free(libsnd.cd.data);
             libsnd = saved;
+            if (libsnd.pending_callback_count || libsnd.cd_end_callback)
+                psx_wait_signal_service(6);
             heap = restored_heap;
             heap_failed = bindings.heap_failed;
             reverb_control = bindings.reverb;
@@ -4809,7 +5317,7 @@ int spu_lockstep_portable_selftest(void)
         return 0;
     if (import_path && *import_path)
     {
-        file = fopen(import_path, "rb");
+        file = xport_fopen(import_path, "rb");
         if (!file)
             return 0;
         ok = spu_lockstep_portable_io(file, 1) && fread(expected, 1, sizeof(expected), file) == sizeof(expected) && fgetc(file) == EOF && libsnd.cd.active && libsnd.cd.data && heap.entries == xport_guest_ptr(0x80002000u, 16u) && heap.last_index == xport_guest_ptr(0x80002020u, 4u) && heap.capacity == 2u && heap.limit == 1u && libsnd.cd.stream.decoded_frames == 3u && ima_decode(&libsnd.cd.stream, actual, 6u) == 6u && memcmp(expected, actual, sizeof(expected)) == 0;
@@ -4842,7 +5350,7 @@ int spu_lockstep_portable_selftest(void)
     wav[66] = 0x33;
     wav[67] = 0x44;
     data = (uint8 *)malloc(sizeof(wav));
-    file = export_path && *export_path ? fopen(export_path, "wb") : tmpfile();
+    file = export_path && *export_path ? xport_fopen(export_path, "wb") : tmpfile();
     if (!data || !file)
     {
         free(data);
@@ -4988,7 +5496,7 @@ static sint32 cd_mount_cue_locked(const char *cue_path)
     sint64 bytes;
     if (!cue_path || !xport_file_size(cue_path, &size) || size == SIZE_MAX)
         return 0;
-    data = malloc(size + 1u);
+    data = (char *)malloc(size + 1u);
     if (!data)
         return 0;
     if (!xport_file_read(cue_path, data, size, &read_size) || read_size != size)
@@ -5120,7 +5628,7 @@ sint32 cd_mount_stream_file(const char *path)
     sint64 bytes;
     sint32 valid = 0;
 
-    if (!path || !(file = fopen(path, "rb")))
+    if (!path || !(file = xport_fopen(path, "rb")))
         return 0;
     if (fseek(file, 0, SEEK_END) != 0)
         goto fail;
@@ -5373,7 +5881,7 @@ typedef struct CD_CHECKPOINT
     CD_XA_STATE xa;
     uint32 sector_cursor, data_offset, data_length;
     sint32 read_error, command_completion;
-    uint8 data_mode, command_response;
+    uint8 data_mode, command_response[8];
     uint8 sector_buffer[2352], data_fifo[2340];
 } CD_CHECKPOINT;
 
@@ -5393,7 +5901,7 @@ static void cd_checkpoint_capture(void *data)
     saved->read_error = cd_read_error;
     saved->command_completion = cd_command_completion;
     saved->data_mode = cd_data_mode;
-    saved->command_response = cd_command_response;
+    memcpy(saved->command_response, cd_command_response, sizeof(cd_command_response));
     memcpy(saved->sector_buffer, cd_sector_buffer, sizeof(cd_sector_buffer));
     memcpy(saved->data_fifo, cd_data_fifo, sizeof(cd_data_fifo));
 }
@@ -5408,7 +5916,7 @@ static void cd_checkpoint_restore(const void *data)
     cd_read_error = saved->read_error;
     cd_command_completion = saved->command_completion;
     cd_data_mode = saved->data_mode;
-    cd_command_response = saved->command_response;
+    memcpy(cd_command_response, saved->command_response, sizeof(cd_command_response));
     memcpy(cd_sector_buffer, saved->sector_buffer, sizeof(cd_sector_buffer));
     memcpy(cd_data_fifo, saved->data_fifo, sizeof(cd_data_fifo));
 }
@@ -5468,18 +5976,27 @@ static int cd_callback_selftest(void)
     psx_vblank_bind(cd_callback_test_wait, &response, 0);
     CdSyncCallback(cd_callback_test);
     CdReadyCallback(cd_callback_test);
+    EnterCriticalSectionPSX();
     ok = CdControl(CdlMute, NULL, &response) && CdControl(CdlDemute, NULL, &response);
     response = 0xFF;
     cd_queue_callback(1, CdlDataEnd, NULL);
     cd_dispatch_ready_event();
-    ok = ok && !cd_callback_test_count && VSync(-1) == 0 && !cd_callback_test_count
-         && spu_lockstep_checkpoint_capture(queued, size) && psx_wait_events()
-         && cd_callback_test_count == 3 && !cd_callback_test_failed;
+    ok = ok && !cd_callback_test_count && VSync(-1) == 0 && !cd_callback_test_count && spu_lockstep_checkpoint_capture(queued, size);
+    ExitCriticalSection();
+    ok = ok && cd_callback_test_count == 3 && !cd_callback_test_failed;
     if (ok)
     {
         cd_callback_test_count = 0;
-        ok = spu_lockstep_checkpoint_restore(queued, size) && !cd_callback_test_count
-             && psx_wait_events() && cd_callback_test_count == 3 && !cd_callback_test_failed;
+        ok = spu_lockstep_checkpoint_restore(queued, size) && !cd_callback_test_count;
+        psx_sync_callbacks();
+        ok = ok && cd_callback_test_count == 3 && !cd_callback_test_failed;
+    }
+    if (ok)
+    {
+        cd_callback_test_count = 0;
+        ok = CdControl(CdlMute, NULL, &response) && cd_callback_test_count == 1 && CdControl(CdlDemute, NULL, &response) && cd_callback_test_count == 2;
+        cd_queue_callback(1, CdlDataEnd, NULL);
+        ok = ok && cd_callback_test_count == 3 && !cd_callback_test_failed;
     }
     psx_vblank_bind(NULL, NULL, 0);
     if (!spu_lockstep_checkpoint_restore(previous, size))
@@ -5516,15 +6033,13 @@ static int cd_checkpoint_selftest(void)
     {
         cd_restore_fifo_native(changed, sizeof(changed), 0, 9999);
         cd_xa.credit = 0;
-        ok = spu_lockstep_checkpoint_restore(saved, size) && CdGetSector(actual, 2)
-             && !memcmp(actual, bytes + 8, sizeof(actual)) && cd_sector_cursor == 1234 && cd_data_mode == 0x20 && cd_xa.credit == 37;
+        ok = spu_lockstep_checkpoint_restore(saved, size) && CdGetSector(actual, 2) && !memcmp(actual, bytes + 8, sizeof(actual)) && cd_sector_cursor == 1234 && cd_data_mode == 0x20 && cd_xa.credit == 37;
     }
     if (ok)
     {
         cd_restore_fifo_native(changed, sizeof(changed), 0, 9999);
         cd_xa.credit = 0;
-        ok = fseek(file, 0, SEEK_SET) == 0 && cd_checkpoint_io(file, 1) && CdGetSector(actual, 2)
-             && !memcmp(actual, bytes + 8, sizeof(actual)) && cd_sector_cursor == 1234 && cd_data_mode == 0x20 && cd_xa.credit == 37;
+        ok = fseek(file, 0, SEEK_SET) == 0 && cd_checkpoint_io(file, 1) && CdGetSector(actual, 2) && !memcmp(actual, bytes + 8, sizeof(actual)) && cd_sector_cursor == 1234 && cd_data_mode == 0x20 && cd_xa.credit == 37;
     }
     xport_audio_lock();
     cd_checkpoint_restore(previous);
@@ -5835,7 +6350,7 @@ void CdFlush(void)
     xport_audio_lock();
     cd_data_offset = cd_data_length = 0u;
     cd_command_completion = CdlComplete;
-    cd_command_response = 0u;
+    memset(cd_command_response, 0, sizeof(cd_command_response));
     xport_audio_unlock();
 }
 
@@ -5965,7 +6480,14 @@ CdlLOC *CdIntToPos(sint32 sector, CdlLOC *position)
 sint32 CdDataSync(sint32 mode)
 {
     (void)mode;
-    return cd_read_error ? -1 : 0;
+    if (cd_guest.context)
+    {
+        cd_sdk_timeout_begin(cd_guest.strings + 264);
+        if (cd_sdk_timeout_poll())
+            return -1;
+    }
+    // Native CD DMA finishes before CdGetSector returns
+    return 0;
 }
 
 uint32 xport_guest_buffer_address(void *host_buffer, size_t bytes)
@@ -6024,7 +6546,7 @@ static uint8 cd_native_status_locked(void)
 sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
 {
     sint32 ok = 0;
-    if (command != 1u && command != 2u && command != 6u && command != 14u && command != 16u && command != 21u && command != 22u && command != 27u)
+    if (command != 1u && command != 2u && command != 6u && command != 14u && command != 16u && command != 17 && command != 21u && command != 22u && command != 27u)
         return CdControl(command, parameter, result);
     xport_audio_lock();
     if (command == 1u)
@@ -6047,6 +6569,27 @@ sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
             }
         }
     }
+    else if (command == 17)
+    {
+        // The mounted image is the data track at index 1
+        ok = cd_image != NULL;
+        if (ok && result)
+        {
+            CdlLOC absolute, relative;
+            sint32 sector = (sint32)cd_sector_cursor - (cd_xa.header_valid && cd_sector_cursor != 0);
+            CdIntToPos(sector, &absolute);
+            CdIntToPos(sector - 150, &relative);
+            result[0] = 1;
+            result[1] = 1;
+            memcpy(result + 2, &relative, 3);
+            memcpy(result + 5, &absolute, 3);
+        }
+        else if (result)
+        {
+            result[0] = 1;
+            result[1] = 0x80;
+        }
+    }
     else if (command == 14u)
     {
         if (parameter && cd_image)
@@ -6059,7 +6602,8 @@ sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
     {
         if (command == 2u || parameter)
         {
-            cd_xa_stop_locked();
+            if (command != 2)
+                cd_xa_stop_locked();
             ok = cd_set_location(parameter);
         }
         else
@@ -6072,7 +6616,7 @@ sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result)
         }
     }
     cd_read_error = !ok;
-    if (result && command != 1u && command != 16u)
+    if (result && command != 1u && command != 16u && command != 17)
         result[0] = ok ? 2u : 1u;
     xport_audio_unlock();
     if (ok)

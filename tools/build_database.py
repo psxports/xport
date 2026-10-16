@@ -132,6 +132,8 @@ def main(no_format=False):
     cur=db.execute('INSERT INTO edges(source_image,source_function,site,target,kind,resolution) VALUES(?,?,?,?,?,?)',(image,f['address'],a,target,kind,resolution));eid=cur.lastrowid
     db.executemany('INSERT INTO edge_candidates VALUES(?,?,?)',[(eid,c[0],c[1]) for c in chosen])
     graph.append(dict(source='%s:%08X'%(image,f['address']),site=a,target=target,kind=kind,resolution=resolution,candidates=['%s:%08X'%c for c in chosen]))
+ from resolved_indirect_calls import populate as add_reviewed_indirect_calls
+ indirect_summary=add_reviewed_indirect_calls(db,R,project_config,exported,graph)
  assert translated_seen==set(translations),'Translation refers to missing function'
  semantic_path=project_path('semantic_map','status/semantic-map.json')
  semantic={'functions':[],'structures':[]}
@@ -158,6 +160,7 @@ def main(no_format=False):
  totals={k:sum(x[k] for x in metrics) for k in ['functions','pseudocode','failures','instruction_words','symbols','data_refs']};totals['edges']=len(graph);totals['indirect_transfers']=db.execute('SELECT count(*) FROM indirect_transfers').fetchone()[0];totals['unresolved_targets']=sum(e['resolution']=='unresolved_target' for e in graph);totals['overlay_context_edges']=sum(e['resolution']=='overlay_context_required' for e in graph)
  totals['semantic_aliases']=len(semantic.get('functions',[]));totals['semantic_structures']=len(semantic.get('structures',[]))
  totals['ctree_functions']=ctree_count
+ totals['reviewed_indirect_calls']=indirect_summary
  statuses={s:0 for s in ['TODO','WIP','DONE','SKIP']};statuses.update(dict(db.execute('SELECT status,count(*) FROM functions GROUP BY status')))
  db.close();tmp.replace(path)
  write(project_path('callgraph', 'status/callgraph.json'),dict(identity='image:address',nodes=nodes,edges=graph));write(R/'status/code-gaps.json',gaps);write(R/'status/decompilation-failures.json',failures)

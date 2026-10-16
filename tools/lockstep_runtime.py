@@ -25,7 +25,8 @@ def ensure_source_index(root: Path, config: dict, name: str) -> None:
     command = [sys.executable, '-B', str(Path(__file__).with_name('source_index.py')),
                '--rebuild', '--no-format']
     result = subprocess.run(command, cwd=root, env=environment,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     log = root / 'status' / 'lockstep-converge' / name / 'source-index-startup.log'
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(result.stdout + result.stderr, encoding='utf-8')

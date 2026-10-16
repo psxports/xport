@@ -12,6 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--msbuild', type=Path)
     parser.add_argument('--configuration', choices=('Debug', 'Release'), default='Debug')
+    parser.add_argument('--architecture', choices=('x86', 'x64'), default='x86')
     parser.add_argument('--plan', action='store_true')
     parser.add_argument('--rebuild', action='store_true', help='Force a complete rebuild of the selected configuration')
     args = parser.parse_args()
@@ -29,12 +30,12 @@ def main():
         if not paths:
             raise RuntimeError('Visual Studio 2022 MSBuild not found')
         msbuild = Path(paths[0])
-    command = [str(msbuild), str(solution), '/p:Configuration='+args.configuration, '/p:Platform=x86',
+    command = [str(msbuild), str(solution), '/p:Configuration='+args.configuration, '/p:Platform='+args.architecture,
                '/m', '/nr:false', '/v:minimal', '/nologo']
     if args.rebuild:
         command.append('/t:Rebuild')
     if args.plan:
-        print(json.dumps({'command': command, 'configuration': args.configuration, 'executable': str(executable),
+        print(json.dumps({'command': command, 'configuration': args.configuration, 'architecture': args.architecture, 'executable': str(executable),
                           'working_directory': str(project_path('native_working_directory', 'bin'))}))
         return
     # Preserve a running manual game before touching its executable
@@ -49,7 +50,7 @@ def main():
     with log.open('wb') as stream:
         result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
                                 env=normalized_environment())
-    print(json.dumps({'exit_code': result.returncode, 'configuration': args.configuration, 'log': str(log), 'executable': str(executable)}))
+    print(json.dumps({'exit_code': result.returncode, 'configuration': args.configuration, 'architecture': args.architecture, 'log': str(log), 'executable': str(executable)}))
     if result.returncode:
         raise SystemExit(result.returncode)
 

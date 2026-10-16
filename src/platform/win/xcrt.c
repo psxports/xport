@@ -1,6 +1,7 @@
-/* Minimal Windows x86 Release runtime */
-#if !defined(_M_IX86) || !defined(NDEBUG)
-    #error XCRT requires an x86 Release build
+/* Minimal Windows Release runtime */
+#include "../../ap.h"
+#if !defined(AP_WIN) || (!defined(AP_X86) && !defined(AP_X64)) || !defined(NDEBUG)
+    #error XCRT requires a Windows x86 or x64 Release build
 #endif
 #ifndef _CRT_SECURE_NO_WARNINGS
     #define _CRT_SECURE_NO_WARNINGS
@@ -19,6 +20,14 @@
 #include <setjmp.h>
 #include <time.h>
 #include <limits.h>
+#include <stddef.h>
+
+#ifdef AP_X64
+typedef char XCRT_JUMP_SIZE[sizeof(jmp_buf) == 256 ? 1 : -1];
+typedef char XCRT_JUMP_RIP[offsetof(_JUMP_BUFFER, Rip) == 80 ? 1 : -1];
+typedef char XCRT_JUMP_MXCSR[offsetof(_JUMP_BUFFER, MxCsr) == 88 ? 1 : -1];
+typedef char XCRT_JUMP_XMM[offsetof(_JUMP_BUFFER, Xmm6) == 96 ? 1 : -1];
+#endif
 #pragma function(memcpy, memmove, memset, memcmp, memchr, strlen, strcmp, strcpy, strcat, abs)
 
 static HANDLE process_heap;
@@ -54,15 +63,6 @@ float fminf(float a, float b)
 float fmaxf(float a, float b)
 {
     return float_extremum(a, b, 1);
-}
-
-// The compiler passes x in ST0 and y in ST1, returning atan2(y, x) in ST0
-__declspec(naked) void _CIatan2(void)
-{
-    __asm {
-        fpatan
-        ret
-    }
 }
 
 void *malloc(size_t size)
@@ -103,6 +103,12 @@ __declspec(noreturn) void abort(void)
     for (;;)
     {
     }
+}
+
+int __cdecl _purecall(void)
+{
+    abort();
+    return 0;
 }
 
 static BOOL CALLBACK init_errno(PINIT_ONCE once, PVOID parameter, PVOID *context)
@@ -416,301 +422,41 @@ int snprintf(char *dst, size_t capacity, const char *format, ...)
     return result;
 }
 
-static const float float_unsigned_offset = 2147483648.0f;
-
-// Compiler helper takes a float in XMM0 and returns an unsigned word in EAX
-__declspec(naked) void _ftol3(void)
+int atoi(const char *text)
 {
-    __asm {
-        cvttss2si eax, xmm0
-        test eax, eax
-        jns done
-        ucomiss xmm0, DWORD PTR float_unsigned_offset
-        jb done
-        sub esp, 16
-        movups XMMWORD PTR[esp], xmm0
-        subss xmm0, DWORD PTR float_unsigned_offset
-        cvttss2si eax, xmm0
-        xor eax, 80000000h
-        movups xmm0, XMMWORD PTR[esp]
-        add esp, 16
-    done:
-        ret
-    }
+    unsigned int value = 0;
+    int negative;
+    while (*text == ' ' || (*text >= '\t' && *text <= '\r'))
+        ++text;
+    negative = *text == '-';
+    if (*text == '-' || *text == '+')
+        ++text;
+    while (*text >= '0' && *text <= '9')
+        value = value * 10 + (unsigned int)(*text++ - '0');
+    return (int)(negative ? 0u - value : value);
 }
 
-// SSE2 math helpers take and return a double in XMM0
-__declspec(naked) void _libm_sse2_sqrt_precise(void)
+char *strncpy(char *destination, const char *source, size_t count)
 {
-    __asm {
-        sqrtsd xmm0, xmm0
-        ret
+    char *result = destination;
+    while (count && *source)
+    {
+        *destination++ = *source++;
+        --count;
     }
+    while (count--)
+        *destination++ = 0;
+    return result;
 }
 
-__declspec(naked) void _libm_sse2_sin_precise(void)
+int sprintf(char *destination, const char *format, ...)
 {
-    __asm {
-        sub esp, 8
-        movsd QWORD PTR[esp], xmm0
-        fld QWORD PTR[esp]
-        fsin
-        fstp QWORD PTR[esp]
-        movsd xmm0, QWORD PTR[esp]
-        add esp, 8
-        ret
-    }
-}
-
-__declspec(naked) void _libm_sse2_cos_precise(void)
-{
-    __asm {
-        sub esp, 8
-        movsd QWORD PTR[esp], xmm0
-        fld QWORD PTR[esp]
-        fcos
-        fstp QWORD PTR[esp]
-        movsd xmm0, QWORD PTR[esp]
-        add esp, 8
-        ret
-    }
-}
-
-/* Shared division uses hardware DIV for 64 by 32 and at most 32 steps otherwise */
-static __declspec(naked) uint64_t divide_words(uint32_t nl, uint32_t nh, uint32_t dl, uint32_t dh, int remainder, int signed_value)
-{
-    __asm {
-        push ebp
-        mov ebp, esp
-        push ebx
-        push esi
-        push edi
-        sub esp, 8
-        xor ebx, ebx
-        mov [ebp-16], ebx
-        mov [ebp-20], ebx
-        mov eax, [ebp+8]
-        mov edx, [ebp+12]
-        mov esi, [ebp+16]
-        mov edi, [ebp+20]
-        cmp dword ptr [ebp+28], 0
-        je magnitudes_ready
-        test edx, edx
-        jns numerator_positive
-        neg edx
-        neg eax
-        sbb edx, 0
-        mov ebx, 1
-    numerator_positive:
-        mov [ebp-16], ebx
-        test edi, edi
-        jns denominator_positive
-        neg edi
-        neg esi
-        sbb edi, 0
-        xor ebx, 1
-    denominator_positive:
-        mov [ebp-20], ebx
-    magnitudes_ready:
-        test edi, edi
-        jnz wide_divisor
-        mov ebx, eax
-        mov eax, edx
-        xor edx, edx
-        div esi
-        mov edi, eax
-        mov eax, ebx
-        div esi
-        cmp dword ptr [ebp+24], 0
-        jne narrow_remainder
-        mov edx, edi
-        jmp apply_sign
-    narrow_remainder:
-        mov eax, edx
-        xor edx, edx
-        jmp apply_sign
-    wide_divisor:
-        mov ecx, edx
-        xor edx, edx
-        mov ebx, 32
-    divide_bit:
-        shl eax, 1
-        rcl ecx, 1
-        rcl edx, 1
-        jc subtract_divisor
-        cmp edx, edi
-        jb next_bit
-        ja subtract_divisor
-        cmp ecx, esi
-        jb next_bit
-    subtract_divisor:
-        sub ecx, esi
-        sbb edx, edi
-        inc eax
-    next_bit:
-        dec ebx
-        jnz divide_bit
-        cmp dword ptr [ebp+24], 0
-        jne wide_remainder
-        xor edx, edx
-        jmp apply_sign
-    wide_remainder:
-        mov eax, ecx
-    apply_sign:
-        mov ecx, [ebp-20]
-        cmp dword ptr [ebp+24], 0
-        je sign_ready
-        mov ecx, [ebp-16]
-    sign_ready:
-        test ecx, ecx
-        jz divide_done
-        neg edx
-        neg eax
-        sbb edx, 0
-    divide_done:
-        add esp, 8
-        pop edi
-        pop esi
-        pop ebx
-        pop ebp
-        ret
-    }
-}
-
-__declspec(naked) void _allmul(void)
-{
-    __asm {
-        push ebx
-        mov eax, [esp+8]
-        mov ecx, [esp+16]
-        mul ecx
-        mov ebx, edx
-        mov edx, [esp+12]
-        imul edx, ecx
-        add ebx, edx
-        mov ecx, [esp+20]
-        mov edx, [esp+8]
-        imul ecx, edx
-        mov edx, ebx
-        add edx, ecx
-        pop ebx
-        ret 16
-    }
-}
-
-#define DIVIDE_HELPER(name, rem, sign) __declspec(naked) void name(void){__asm push ebp __asm mov ebp, esp __asm push sign __asm push rem __asm push[ebp + 20] __asm push[ebp + 16] __asm push[ebp + 12] __asm push[ebp + 8] __asm call divide_words __asm add esp, 24 __asm pop ebp __asm ret 16}
-DIVIDE_HELPER(_alldiv, 0, 1)
-DIVIDE_HELPER(_aulldiv, 0, 0)
-DIVIDE_HELPER(_allrem, 1, 1)
-DIVIDE_HELPER(_aullrem, 1, 0)
-
-/* Combined helpers return quotient in EDX:EAX and remainder in EBX:ECX */
-#define DIVREM_HELPER(name, sign) __declspec(naked) void name(void){__asm push ebp __asm mov ebp, esp __asm push esi __asm push edi __asm push sign __asm push 0 __asm push[ebp + 20] __asm push[ebp + 16] __asm push[ebp + 12] __asm push[ebp + 8] __asm call divide_words __asm add esp, 24 __asm mov esi, eax __asm mov edi, edx __asm push sign __asm push 1 __asm push[ebp + 20] __asm push[ebp + 16] __asm push[ebp + 12] __asm push[ebp + 8] __asm call divide_words __asm add esp, 24 __asm mov ebx, edx __asm mov ecx, eax __asm mov edx, edi __asm mov eax, esi __asm pop edi __asm pop esi __asm pop ebp __asm ret 16}
-DIVREM_HELPER(_alldvrm, 1)
-DIVREM_HELPER(_aulldvrm, 0)
-
-__declspec(naked) void _allshl(void)
-{
-    __asm {
-        cmp cl, 64
-        jae empty
-        cmp cl, 32
-        jae shift_high
-        shld edx, eax, cl
-        shl eax, cl
-        ret
-    shift_high:
-        mov edx, eax
-        xor eax, eax
-        and cl, 31
-        shl edx, cl
-        ret
-    empty:
-        xor eax, eax
-        xor edx, edx
-        ret
-    }
-}
-
-__declspec(naked) void _aullshr(void)
-{
-    __asm {
-        cmp cl, 64
-        jae empty
-        cmp cl, 32
-        jae shift_low
-        shrd eax, edx, cl
-        shr edx, cl
-        ret
-    shift_low:
-        mov eax, edx
-        xor edx, edx
-        and cl, 31
-        shr eax, cl
-        ret
-    empty:
-        xor eax, eax
-        xor edx, edx
-        ret
-    }
-}
-
-__declspec(naked) void _allshr(void)
-{
-    __asm {
-        cmp cl, 64
-        jae sign_only
-        cmp cl, 32
-        jae shift_low
-        shrd eax, edx, cl
-        sar edx, cl
-        ret
-    shift_low:
-        mov eax, edx
-        sar edx, 31
-        and cl, 31
-        sar eax, cl
-        ret
-    sign_only:
-        sar edx, 31
-        mov eax, edx
-        ret
-    }
-}
-
-__declspec(naked) int _setjmp3(jmp_buf buffer, int count, ...)
-{
-    __asm {
-        mov edx, [esp+4]
-        mov [edx], ebp
-        mov [edx+4], ebx
-        mov [edx+8], edi
-        mov [edx+12], esi
-        lea eax, [esp+4]
-        mov [edx+16], eax
-        mov eax, [esp]
-        mov [edx+20], eax
-        xor eax, eax
-        ret
-    }
-}
-
-__declspec(noreturn) __declspec(naked) void longjmp(jmp_buf buffer, int value)
-{
-    __asm {
-        mov edx, [esp+4]
-        mov eax, [esp+8]
-        test eax, eax
-        jnz restore
-        inc eax
-    restore:
-        mov ebp, [edx]
-        mov ebx, [edx+4]
-        mov edi, [edx+8]
-        mov esi, [edx+12]
-        mov esp, [edx+16]
-        jmp dword ptr [edx+20]
-    }
+    va_list arguments;
+    int result;
+    va_start(arguments, format);
+    result = wvsprintfA(destination, format, arguments);
+    va_end(arguments);
+    return result;
 }
 
 int _fltused = 0;

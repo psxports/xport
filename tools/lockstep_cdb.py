@@ -8,7 +8,6 @@ import math
 import os
 import queue
 import re
-import signal
 import struct
 import subprocess
 import threading
@@ -181,7 +180,7 @@ def resolve_cdb(path: Path | None = None) -> Path:
 class CdbController:
     """Own one debugger and expose stopped semantic native events"""
 
-    _MARKER = re.compile(r"XPORT\|([^\r\n]+)")
+    _MARKER = re.compile(r"XPORT\|([^%\r\n]+)\r?$")
 
     def __init__(self, executable: Path, pdb: Path, *, arguments: tuple[str, ...] = (),
                  cwd: Path | None = None, cdb: Path | None = None, timeout: float = 10.0,
@@ -229,7 +228,8 @@ class CdbController:
     def start(self) -> None:
         if self.process is not None:
             raise CdbError("Controller already started")
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
+                         getattr(subprocess, "CREATE_NO_WINDOW", 0))
         argv = [str(self.cdb), "-lines", "-y", str(self.pdb.parent), str(self.executable), *self.arguments]
         self.process = subprocess.Popen(
             argv, cwd=self.cwd, env=normalized_environment(updates=self.environment), stdin=subprocess.PIPE,
@@ -252,6 +252,7 @@ class CdbController:
         self._send(
             f'sxe -c ".printf \\"XPORT|FAULT|{self.token}|%x|%p\\\\n\\", @$tpid, @eip" av'
         )
+        self._install_abort_breakpoints()
         self._send(
             f'sxe -c ".printf \\"XPORT|EXIT|{self.token}|%x\\\\n\\", @$tpid" epr'
         )
@@ -340,7 +341,7 @@ class CdbController:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise CdbTimeout(f"Timed out waiting for CDB {kind}", process_id=self._target_pid)
+                raise CdbTimeout(f"Timed out waiting for CDB {kind}\n{self.output[-8000:]}", process_id=self._target_pid)
             try:
                 marker = self._markers.get(timeout=min(remaining, 0.1))
             except queue.Empty:
@@ -393,9 +394,16 @@ class CdbController:
                 f'poi(poi(@ebp)+4), poi(poi(poi(@ebp))+4)"'
             )
 
+    def _install_abort_breakpoints(self) -> None:
+        for runtime in (self.module, "ucrtbased", "ucrtbase"):
+            self._send(
+                f'bu {runtime}!abort ".printf \\"XPORT|FAULT|{self.token}|%x|%p\\\\n\\", @$tpid, @eip"'
+            )
+
     def probe_function_entry(self, symbol: str, output_address: int, *,
                              max_hits: int = 128, timeout: float = 30.0,
                              second_storage: str = "guest",
+                             first_storage: str = "scalar",
                              caller_stack_offsets: tuple[int, ...] = (),
                              match_occurrence: int = 1) -> dict:
         if self._running:
@@ -403,23 +411,27 @@ class CdbController:
         if (not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", symbol) or
                 not 0 <= output_address <= 0xFFFFFFFF or not 1 <= max_hits <= 1024 or
                 not 0 < timeout <= 120 or second_storage not in {"guest", "host", "none"} or
+                first_storage not in {"scalar", "guest"} or
                 not 1 <= match_occurrence <= max_hits or
                 len(caller_stack_offsets) > 8 or any(
                     type(offset) is not int or offset % 4 or not -256 <= offset <= 256
                     for offset in caller_stack_offsets)):
             raise ValueError("Native function entry probe is invalid")
         self._send("bc *")
+        self._install_abort_breakpoints()
         host_values = ("|%x|%x|%x|%x" if second_storage == "host" else "")
         host_reads = (", dwo(poi(@esp+8)), dwo(poi(@esp+8)+4), "
                       "dwo(poi(@esp+8)+8), dwo(poi(@esp+8)+0xc)"
                       if second_storage == "host" else "")
         caller_formats = "|%x" * len(caller_stack_offsets)
+        first_expression = ('poi(@esp+4)' if first_storage == 'scalar' else
+                            f'poi(@esp+4)-poi({self.module}!xport_lockstep_dram)+0x80000000')
         caller_reads = "".join(
             f", dwo(@ebp{'+' if offset >= 0 else '-'}0x{abs(offset):x})"
             for offset in caller_stack_offsets)
         self._send(
-            f'bu {self.module}!{symbol} ".printf \\"XPORT|ENTRY|{self.token}|%x|%p|%p|%p|%p|%p|%p'
-            f'{host_values}{caller_formats}|%y\\\\n\\", @$tpid, @eip, poi(@esp), poi(@esp+4), '
+            f'bm {self.module}!{symbol} ".printf \\"XPORT|ENTRY|{self.token}|%x|%p|%p|%p|%p|%p|%p'
+            f'{host_values}{caller_formats}|%y\\\\n\\", @$tpid, @eip, poi(@esp), {first_expression}, '
             f'poi(@esp+8), poi(@esp+0xc), poi(@esp+0x10){host_reads}{caller_reads}, poi(@esp)"'
         )
         matching_hits = 0
@@ -443,7 +455,7 @@ class CdbController:
                           "arguments": [f"0x{value:08X}" for value in
                                         (first, second, third, fourth)],
                           "hits": hit_number, "match_occurrence": match_occurrence,
-                          "second_storage": second_storage}
+                          "second_storage": second_storage, "first_storage": first_storage}
                 if second_storage != "none":
                     result["right_address"] = f"0x{second:08X}"
                 if second_storage == "host":
@@ -457,7 +469,9 @@ class CdbController:
                         for offset, value in zip(caller_stack_offsets,
                                                  marker[stack_start:-1])]
                 return result
-        raise CdbError("Native function entry did not receive the requested output address")
+        raise CdbError(f"Native function entry did not receive the requested output address: "
+                       f"last arguments {first:08X}, {second:08X}, {third:08X}, {fourth:08X}; "
+                       f"caller {caller:08X}")
 
     def set_causal_entry_breakpoint(self, symbol: str, *, quaternion_inputs: bool = False,
                                    all_symbol_matches: bool = False) -> None:
@@ -480,8 +494,9 @@ class CdbController:
             raise CdbError("Target must be stopped before setting a data watchpoint")
         if self._refinement_watchpoint:
             raise CdbError("Only one refinement watchpoint is supported per fresh replay")
-        limits = {"dram": 0x200000, "scratchpad": 0x400}
-        symbols = {"dram": "xport_lockstep_dram", "scratchpad": "xport_lockstep_scratchpad"}
+        limits = {"dram": 0x200000, "scratchpad": 0x400, "vram": 0x100000}
+        symbols = {"dram": "xport_lockstep_dram", "scratchpad": "xport_lockstep_scratchpad",
+                   "vram": "xport_lockstep_vram"}
         if (region not in limits or width not in {1, 2, 4} or offset < 0 or
                 offset % width or offset + width > limits[region]):
             raise CdbError("Native watchpoint is outside lockstep memory")
@@ -612,6 +627,23 @@ class CdbController:
             raise CdbProtocolError(f"Writer ring request did not stick: {marker}")
         return True
 
+    def diagnostic_values(self, expressions: list[str]) -> dict[str, int]:
+        if self._running:
+            raise CdbError("Target must be stopped before reading diagnostic values")
+        if len(expressions) > 128 or any(not re.fullmatch(
+                r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[[0-9]{1,2}\])*", value)
+                for value in expressions):
+            raise CdbError("Invalid diagnostic field expression")
+        result = {}
+        for value in expressions:
+            self._send(f'.printf "XPORT|VALUE|{self.token}|%I64x\\n", '
+                       f'@@c++({self.module}!{value})')
+            marker = self._wait("VALUE", self.timeout)
+            if len(marker) != 3:
+                raise CdbProtocolError(f"Malformed diagnostic value: {marker}")
+            result[value] = int(marker[2], 16)
+        return result
+
     def registers(self) -> dict[str, int]:
         if self._running:
             raise CdbError("Target must be stopped before reading registers")
@@ -624,6 +656,23 @@ class CdbController:
             raise CdbProtocolError(f"Malformed register marker: {marker}")
         names = ("eax", "edx", "esp", "ebp", "eip")
         return dict(zip(names, (int(value, 16) for value in marker[2:])))
+
+    def capture_checkpoint(self, frame: int, *, restored: bool = False) -> None:
+        if self._running:
+            raise CdbError("Target must be stopped before capturing a checkpoint")
+        self._send(
+            f'bu /1 {self.module}!xport_lockstep_checkpoint_committed_break '
+            f'".printf \\"XPORT|CAPTURED|{self.token}|%x|%x\\\\n\\", '
+            f'poi({self.module}!xport_lockstep_checkpoint_valid), '
+            f'poi({self.module}!frame_entry_index)"'
+        )
+        if not restored:
+            self._send(f"ed {self.module}!xport_lockstep_checkpoint_requested 1")
+        self.continue_execution()
+        marker = self._wait("CAPTURED", self.timeout)
+        self._running = False
+        if len(marker) != 4 or int(marker[2], 16) != 1 or int(marker[3], 16) != frame + 1:
+            raise CdbProtocolError("Native checkpoint did not commit the matched frame")
 
     def restore_checkpoint(self) -> None:
         if self._running:
@@ -640,12 +689,17 @@ class CdbController:
         if not address:
             raise CdbProtocolError("Native checkpoint jump symbol is unavailable")
         self._send("bc *")
+        self._install_abort_breakpoints()
         for name in ("xport_lockstep_boundary_break", "xport_lockstep_vblank_break",
                      "xport_lockstep_transition_break"):
             symbol = f"{self.module}!{name}"
             self._send(
                 f'bu {symbol} ".printf \\"XPORT|BOUNDARY|{self.token}|%x\\\\n\\", @$tpid"'
             )
+        fault_instruction = getattr(self, "_last_fault_instruction", None)
+        if fault_instruction is not None:
+            self._send(
+                f'ba e1 0x{fault_instruction:x} ".printf \\"XPORT|FAULT|{self.token}|%x|%p\\\\n\\", @$tpid, @eip"')
         self._send(f"r eip=0x{address:x}")
         self._event_sequence = 0
         self._boundary_sequence = 0
@@ -683,6 +737,15 @@ class CdbController:
             "sxy": values[37:40], "sz": values[40:44],
         }
 
+    def capture_call_stack(self) -> str:
+        if self._running:
+            raise CdbError("Target must be stopped before capturing its call stack")
+        start = len(self.output)
+        self._send("k")
+        self._send(f'.printf "XPORT|CALL_STACK|{self.token}\\n"')
+        self._wait("CALL_STACK", self.timeout)
+        return self.output[start:]
+
     def stack(self) -> list[dict]:
         return [
             {
@@ -701,13 +764,41 @@ class CdbController:
         frame = self._stack[-1]
         return {"symbol": frame.function, "file": frame.file, "line": frame.line}
 
+    def _break_target(self) -> None:
+        if self._target_pid is None:
+            raise CdbProtocolError("Native PID is unavailable for debugger break")
+        # Match the supported x86 target without requiring a console
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64/WindowsPowerShell/v1.0/powershell.exe"
+        script = '''
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class XportDebuggerBreak {
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint rights, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool DebugBreakProcess(IntPtr process);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr process);
+}
+'@
+$targetHandle = [XportDebuggerBreak]::OpenProcess(0x1F0FFF, $false, TARGET_PID)
+if ($targetHandle -eq [IntPtr]::Zero) { exit 2 }
+try { if (-not [XportDebuggerBreak]::DebugBreakProcess($targetHandle)) { exit 3 } }
+finally { [void][XportDebuggerBreak]::CloseHandle($targetHandle) }
+'''.replace("TARGET_PID", str(self._target_pid))
+        result = subprocess.run(
+            [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode:
+            raise CdbProtocolError(f"Native debugger break failed: {result.returncode}: {result.stderr[-1024:]}")
+
     def interrupt(self, timeout: float | None = None) -> tuple[int, int]:
         if not self.process or self.process.poll() is not None:
             raise CdbProtocolError("CDB is not running")
         if not self._running:
             self._send(f'.printf "XPORT|INTERRUPTED|{self.token}|%x|%p\\n", @$tpid, @eip')
         else:
-            self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            self._break_target()
+            self._send("~0s")
             self._send(f'.printf "XPORT|INTERRUPTED|{self.token}|%x|%p\\n", @$tpid, @eip')
         marker = self._wait("INTERRUPTED", timeout or self.timeout)
         self._remember_pid(marker[2])
@@ -893,10 +984,24 @@ class CdbController:
         return validate_event(event)
 
     def _terminal_event(self, kind: str, *, instruction: int | None = None) -> dict:
+        if kind == "FAULT":
+            self._last_fault_instruction = instruction
+        frame = 0
+        if kind == "FAULT" and self.memory_ready:
+            self._send(
+                f'.printf "XPORT|TERMINAL_STATE|{self.token}|%x|%x|%x\\n", '
+                f'poi({self.module}!xport_lockstep_mode), poi({self.module}!xport_lockstep_epoch), '
+                f'poi({self.module}!boundary_frame)')
+            state = self._wait("TERMINAL_STATE", self.timeout)
+            if len(state) != 5 or int(state[2], 16) not in (0, 1):
+                raise CdbProtocolError("Malformed native terminal state")
+            self._mode = "DETAILED" if int(state[2], 16) == 0 else "PREFIX_GUARD"
+            self._epoch = int(state[3], 16)
+            frame = int(state[4], 16)
         event = {
             "schema": SCHEMA, "contract": EVENT_CONTRACT, "side": "native", "kind": kind,
             "mode": self._mode, "epoch": self._epoch,
-            "event_sequence": self._event_sequence, "frame": 0, "image": self.executable.name,
+            "event_sequence": self._event_sequence, "frame": frame, "image": self.executable.name,
             "function": None, "parent_invocation": self._stack[-1].invocation if self._stack else 0,
             "invocation": 0, "depth": len(self._stack), "call_ordinal": 0,
             "callsite": None, "target": None, "return_pc": None,
@@ -1005,8 +1110,7 @@ class CdbController:
             if process.poll() is None:
                 try:
                     if self._running:
-                        process.send_signal(signal.CTRL_BREAK_EVENT)
-                        time.sleep(0.1)
+                        self.interrupt(timeout=3.0)
                     self._send(".kill")
                     self._send("q")
                     process.wait(timeout=3)
