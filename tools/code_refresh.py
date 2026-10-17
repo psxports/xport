@@ -75,7 +75,7 @@ def database_check(path):
 def source_hygiene(root):
     from source_index import functions
     suppressions=[]
-    for path in (root/'src').rglob('*.c'):
+    for path in sorted(list((root/'src').rglob('*.c'))+list((root/'src').rglob('*.cpp'))):
         text=path.read_text(encoding='utf-8-sig')
         for function in functions(text,path.relative_to(root).as_posix()):
             brace=text.find('{',function['start'],function['end']);signature=text[function['start']:brace]

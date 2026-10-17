@@ -97,6 +97,13 @@ typedef struct XINPUT_STATE
 
 typedef DWORD(WINAPI *XInputGetStateProc)(DWORD dwUserIndex, XINPUT_STATE *pState);
 
+typedef struct
+{
+    WORD low, high;
+} XINPUT_VIBRATION;
+
+typedef DWORD(WINAPI *XInputSetStateProc)(DWORD index, XINPUT_VIBRATION *vibration);
+
 #define XUSER_MAX_COUNT 4
 #define XINPUT_GAMEPAD_DPAD_UP 0x0001
 #define XINPUT_GAMEPAD_DPAD_DOWN 0x0002
@@ -124,6 +131,9 @@ static jmp_buf platform_game_exit;
 static sint32 platform_game_exit_active;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
+static uint32 platform_gamepad_buttons[2];
+// Zero selects keyboard, one selects gamepad
+static uint8 platform_input_type[2];
 static uint8 platform_hd_pressed[2];
 /* Four PS1 axes, analog availability and physical D-pad bits */
 static uint8 platform_pad_analog[2][6];
@@ -137,6 +147,9 @@ static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
 static HMODULE platform_xinput_module;
 static XInputGetStateProc _XInputGetState;
+static XInputSetStateProc _XInputSetState;
+static XINPUT_VIBRATION platform_rumble[4];
+static uint8 platform_rumble_valid[4];
 
 static void xport_timer_init(void)
 {
@@ -169,7 +182,7 @@ void xport_timer_wait_frame(uint32 refresh_rate)
     if (!refresh_rate)
         refresh_rate = FIELD_RATE;
     now = xport_timer_get();
-    period = 1000000u / refresh_rate;
+    period = refresh_rate == FIELD_RATE ? (uint64)1000000u * FIELD_RATE_DENOMINATOR / FIELD_RATE_NUMERATOR : 1000000u / refresh_rate;
     if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
         platform_frame_deadline = now + period;
     while (now < platform_frame_deadline)
@@ -335,6 +348,7 @@ static sint32 xinput_load(const char *name)
     }
     platform_xinput_module = module;
     _XInputGetState = get_state;
+    _XInputSetState = (XInputSetStateProc)GetProcAddress(module, "XInputSetState");
     return 1;
 }
 
@@ -418,6 +432,50 @@ static uint32 xinput_read(sint32 player, uint8 axes[6])
     return 0;
 }
 
+static void xinput_stop_rumble(void)
+{
+    if (_XInputSetState)
+    {
+        XINPUT_VIBRATION vibration = {0, 0};
+        for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
+            _XInputSetState(idx, &vibration);
+    }
+    memset(platform_rumble_valid, 0, sizeof(platform_rumble_valid));
+}
+
+sint32 xport_input_rumble_supported(sint32 controller)
+{
+    if (controller < 0 || controller >= 2 || !_XInputGetState || !_XInputSetState || (controller == 0 && platform_pad_override))
+        return 0;
+    XINPUT_STATE state;
+    for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
+        if (_XInputGetState(idx, &state) == ERROR_SUCCESS && controller-- == 0)
+            return 1;
+    return 0;
+}
+
+void xport_input_rumble(sint32 controller, uint16 low, uint16 high)
+{
+    if (controller < 0 || controller >= 2 || !_XInputGetState || !_XInputSetState)
+        return;
+    if (!platform_input_type[controller] || (platform_window && GetForegroundWindow() != platform_window) || (controller == 0 && platform_pad_override))
+        low = high = 0;
+    XINPUT_STATE state;
+    XINPUT_VIBRATION vibration = {low, high};
+    for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
+        if (_XInputGetState(idx, &state) != ERROR_SUCCESS)
+            platform_rumble_valid[idx] = 0;
+        else if (controller-- == 0)
+        {
+            if (!platform_rumble_valid[idx] || platform_rumble[idx].low != low || platform_rumble[idx].high != high)
+            {
+                platform_rumble_valid[idx] = _XInputSetState(idx, &vibration) == ERROR_SUCCESS;
+                platform_rumble[idx] = vibration;
+            }
+            return;
+        }
+}
+
 static void switch_window_mode(void)
 {
     static WINDOWPLACEMENT windowed_placement;
@@ -476,6 +534,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             }
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KILLFOCUS:
+            xinput_stop_rumble();
             memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
             return 0;
         case WM_SYSCOMMAND:
@@ -502,7 +561,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             {
                 button = key_to_pad(controller, wparam, lparam);
                 if (message == WM_KEYDOWN)
+                {
+                    if (button && !(platform_pad_buttons[controller] & button))
+                    {
+                        platform_input_type[controller] = 0;
+                        xport_input_rumble(controller, 0, 0);
+                    }
                     platform_pad_buttons[controller] |= button;
+                }
                 else
                     platform_pad_buttons[controller] &= ~button;
             }
@@ -515,6 +581,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
+    memset(platform_gamepad_buttons, 0, sizeof(platform_gamepad_buttons));
+    memset(platform_input_type, 0, sizeof(platform_input_type));
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
     platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
@@ -549,6 +617,9 @@ uint32 xport_input_read(sint32 controller)
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
     uint32 buttons = xinput_read(controller, platform_pad_analog[controller]);
+    if (buttons & ~platform_gamepad_buttons[controller])
+        platform_input_type[controller] = 1;
+    platform_gamepad_buttons[controller] = buttons;
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller];
     if (axes[5] & 1u)
@@ -689,6 +760,57 @@ static sint32 null_active;
 static uint64 null_frames;
 static CRITICAL_SECTION audio_lock;
 static sint32 audio_lock_initialized;
+#if XPORT_AUDIO_VBLANK_QUEUE
+enum
+{
+    AUDIO_PCM_CAPACITY = SPU_SAMPLE_RATE * 2
+};
+
+static sint16 audio_pcm[AUDIO_PCM_CAPACITY * 2];
+static uint32 audio_pcm_read, audio_pcm_write;
+volatile uint32 g_xport_audio_queue_peak;
+
+static sint32 audio_pcm_take(sint16 *samples, uint32 count)
+{
+    uint32 index;
+    xport_audio_lock();
+    if (audio_pcm_write - audio_pcm_read < count)
+    {
+        xport_audio_unlock();
+        return 0;
+    }
+    for (index = 0; index < count; ++index)
+    {
+        uint32 slot = (audio_pcm_read + index) % AUDIO_PCM_CAPACITY;
+        samples[index * 2] = audio_pcm[slot * 2];
+        samples[index * 2 + 1] = audio_pcm[slot * 2 + 1];
+    }
+    audio_pcm_read += count;
+    xport_audio_unlock();
+    return 1;
+}
+
+static void audio_pcm_put(const sint16 *samples, uint32 count)
+{
+    uint32 index, queued;
+    xport_audio_lock();
+    queued = audio_pcm_write - audio_pcm_read;
+    if (count > AUDIO_PCM_CAPACITY - queued)
+        abort();
+    for (index = 0; index < count; ++index)
+    {
+        uint32 slot = (audio_pcm_write + index) % AUDIO_PCM_CAPACITY;
+        audio_pcm[slot * 2] = samples[index * 2];
+        audio_pcm[slot * 2 + 1] = samples[index * 2 + 1];
+    }
+    audio_pcm_write += count;
+    if (queued + count > g_xport_audio_queue_peak)
+        g_xport_audio_queue_peak = queued + count;
+    xport_audio_unlock();
+    /* A pending semaphore wake already covers newly queued PCM */
+    ReleaseSemaphore(output.semaphore, 1, NULL);
+}
+#endif
 
 volatile uint32 g_xport_audio_submitted_buffers;
 
@@ -724,7 +846,7 @@ static DWORD WINAPI wave_thread(void *argument)
         for (index = 0; index < XPORT_AUDIO_BUFFER_COUNT; ++index)
         {
             WAVEHDR *header = state->headers + index;
-            if (!(header->dwFlags & WHDR_DONE))
+            if (state->prepared[index] && !(header->dwFlags & WHDR_DONE))
                 continue;
             if (state->prepared[index])
             {
@@ -732,7 +854,12 @@ static DWORD WINAPI wave_thread(void *argument)
                     continue;
                 state->prepared[index] = 0;
             }
+#if XPORT_AUDIO_VBLANK_QUEUE
+            if (!audio_pcm_take(state->samples[index], XPORT_AUDIO_BUFFER_FRAMES))
+                continue;
+#else
             spu_render(state->samples[index], XPORT_AUDIO_BUFFER_FRAMES);
+#endif
             {
                 sint32 sample_index;
                 uint32 peak = 0;
@@ -845,6 +972,10 @@ sint32 xport_audio_init(void)
     g_xport_audio_output_muted = 0;
 #endif
     memset(&output, 0, sizeof(output));
+#if XPORT_AUDIO_VBLANK_QUEUE
+    audio_pcm_read = audio_pcm_write = 0;
+    g_xport_audio_queue_peak = 0;
+#endif
     g_xport_audio_submitted_buffers = 0;
     g_xport_audio_nonzero_buffers = 0;
     g_xport_audio_peak = 0;
@@ -918,27 +1049,35 @@ sint32 xport_audio_is_running(void)
     return InterlockedCompareExchange(&output.running, 1, 1) != 0;
 }
 
-/* Advance the null sink on guest VBlank time without a host worker */
+/* Render guest time before the next VBlank IRQ can change SPU registers */
 void xport_audio_vblank(uint32 before, uint32 rate)
 {
     sint16 *samples;
     uint32 remaining, count;
-    if (!null_active || !rate)
+    if ((!null_active && (!XPORT_AUDIO_VBLANK_QUEUE || !xport_audio_is_running())) || !rate)
     {
         spu_dispatch_pending_irq();
         return;
     }
-    // Keep the null-sink buffer off the probe-free Release stack
+    // Keep the field buffer off the probe-free Release stack
     samples = malloc(2048 * sizeof(*samples));
     if (!samples)
         abort();
-    remaining = (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate);
+    remaining = (rate == FIELD_RATE ? xport_field_sample_count(before, SPU_SAMPLE_RATE) : (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate));
     while (remaining)
     {
         uint32 peak = 0;
         uint32 sample_index;
         count = remaining > 1024 ? 1024 : remaining;
         spu_render_vblank(samples, count);
+#if XPORT_AUDIO_VBLANK_QUEUE
+        if (!null_active)
+        {
+            audio_pcm_put(samples, count);
+            remaining -= count;
+            continue;
+        }
+#endif
         for (sample_index = 0; sample_index < count * 2; ++sample_index)
         {
             sint32 value = samples[sample_index];
@@ -957,12 +1096,65 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     spu_dispatch_pending_irq();
 }
 
+#if defined(_DEBUG)
 static FILE *collect_log;
+static uint32 collect_hashes[1024];
+static size_t collect_count;
+static CRITICAL_SECTION collect_lock;
+
+static sint32 collect_requested(const char *command_line)
+{
+    while (*command_line)
+    {
+        char argument[9];
+        size_t length = 0;
+        sint32 quoted = 0;
+        while (*command_line == ' ' || *command_line == '\t')
+            ++command_line;
+        while (*command_line && (quoted || (*command_line != ' ' && *command_line != '\t')))
+        {
+            if (*command_line == '"')
+                quoted = !quoted;
+            else
+            {
+                if (length < sizeof(argument))
+                    argument[length] = *command_line;
+                ++length;
+            }
+            ++command_line;
+        }
+        if (length == sizeof(argument) && !memcmp(argument, "--collect", sizeof(argument)))
+            return 1;
+    }
+    return 0;
+}
+
+static sint32 collect_begin(void)
+{
+    collect_log = fopen("../src/platform/web/collect.log", "w");
+    if (!collect_log)
+        return 0;
+    collect_count = 0;
+    InitializeCriticalSection(&collect_lock);
+    return 1;
+}
+
+static void collect_end(void)
+{
+    if (collect_log)
+    {
+        fclose(collect_log);
+        collect_log = NULL;
+        DeleteCriticalSection(&collect_lock);
+    }
+}
+#endif
 
 FILE *xport_fopen(const char *path, const char *mode)
 {
     FILE *file = fopen(path, mode);
-    if (file && collect_log && mode[0] == 'r')
+#if defined(_DEBUG)
+    if (file && collect_log && mode[0] == 'r' && !strchr(mode, '+'))
     {
         const char *resource = NULL;
         const char *cursor;
@@ -976,15 +1168,35 @@ FILE *xport_fopen(const char *path, const char *mode)
         {
             char buffer[MAX_PATH + 1];
             size_t length = 0;
+            size_t index;
+            uint32 hash = 2166136261u;
             for (; *resource && *resource != ';' && length < MAX_PATH; ++resource)
-                buffer[length++] = *resource == '\\' ? '/' : *resource;
-            buffer[length++] = '\n';
-            fwrite(buffer, 1, length, collect_log);
-#if defined(_DEBUG)
-            fflush(collect_log);
-#endif
+            {
+                unsigned char value = (unsigned char)(*resource == '\\' ? '/' : *resource);
+                buffer[length++] = (char)value;
+                if (value >= 'A' && value <= 'Z')
+                    value += 'a' - 'A';
+                hash = (hash ^ value) * 16777619u;
+            }
+            if (*resource && *resource != ';')
+                return file;
+            EnterCriticalSection(&collect_lock);
+            for (index = 0; index < collect_count; ++index)
+                if (collect_hashes[index] == hash)
+                    break;
+            if (index == collect_count && collect_count < sizeof(collect_hashes) / sizeof(collect_hashes[0]))
+            {
+                buffer[length++] = '\n';
+                if (fwrite(buffer, 1, length, collect_log) == length)
+                {
+                    collect_hashes[collect_count++] = hash;
+                    fflush(collect_log);
+                }
+            }
+            LeaveCriticalSection(&collect_lock);
         }
     }
+#endif
     return file;
 }
 
@@ -1052,6 +1264,7 @@ void xport_set_cleanup(void (*cleanup)(void))
 
 void xport_shutdown(void)
 {
+    xinput_stop_rumble();
     void (*cleanup)(void) = platform_cleanup;
     platform_cleanup = NULL;
     if (cleanup)
@@ -1059,6 +1272,7 @@ void xport_shutdown(void)
     xport_audio_shutdown();
     vid_free();
     _XInputGetState = NULL;
+    _XInputSetState = NULL;
     if (platform_xinput_module != NULL)
     {
         FreeLibrary(platform_xinput_module);
@@ -1084,7 +1298,6 @@ void xport_shutdown(void)
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR command_line, int show_command)
 {
     int result;
-    int collect = strstr(command_line, "--collect") != NULL;
 #if defined(LOCKSTEP_DEBUG)
     if (!xport_lockstep_memory_init())
     {
@@ -1096,16 +1309,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR comman
     xport_lockstep_memory_ready();
 #endif
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
-    if (collect)
+#if defined(_DEBUG)
+    if (collect_requested(command_line) && !collect_begin())
     {
-        const char *path = "../src/platform/web/collect.log";
-        collect_log = fopen(path, "a");
-        if (!collect_log)
-        {
-            MessageBoxA(NULL, path, "Cannot open collect.log", MB_OK | MB_ICONERROR);
-            return 1;
-        }
+        MessageBoxA(NULL, "../src/platform/web/collect.log", "Cannot open collect.log", MB_OK | MB_ICONERROR);
+        return 1;
     }
+#endif
     platform_run_mode = RUN_MODE_GAME;
 #if defined(LOCKSTEP_DEBUG)
     if (strstr(command_line, "--lockstep-replay"))
@@ -1129,7 +1339,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR comman
 #if defined(LOCKSTEP_DEBUG)
     xport_lockstep_memory_shutdown();
 #endif
-    if (collect_log)
-        fclose(collect_log);
+#if defined(_DEBUG)
+    collect_end();
+#endif
     return result;
 }

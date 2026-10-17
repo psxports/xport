@@ -4,8 +4,11 @@ import gzip
 import hashlib
 import html
 import json
+import re
 import shutil
 from pathlib import Path
+from urllib.parse import quote
+from web_output_permissions import inherit_output_permissions
 
 
 PACKAGE_LIMIT = 25 * 1024 * 1024
@@ -36,6 +39,40 @@ def collect_files(project_root):
             continue
         files.append((path, Path("/") / "DATA" / relative, path.stat().st_size))
     return sorted(files, key=lambda item: (-item[2], item[1].as_posix()))
+
+
+def github_cover_url(project):
+    config_path = project / 'xport-project.json'
+    config = json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.is_file() else {}
+    github = config.get('github', {})
+    repository = github.get('repository')
+    branch = github.get('branch')
+    if not repository or not branch:
+        return ''
+    if not isinstance(repository, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('Invalid github.repository for social preview')
+    if not isinstance(branch, str):
+        raise ValueError('Invalid github.branch for social preview')
+    return 'https://raw.githubusercontent.com/' + repository + '/' + quote(branch, safe='') + '/cover.png'
+
+
+def social_preview(args):
+    title = html.escape(args.full_name + ' (xport)', quote=True)
+    page_url = 'https://psxports.to/' + quote(args.short_name, safe='') + '/'
+    cover_url = html.escape(github_cover_url(args.project.resolve()), quote=True)
+    tags = [f'<meta property="og:title" content="{title}">',
+            '<meta property="og:type" content="website">',
+            f'<meta property="og:url" content="{page_url}">',
+            f'<meta name="twitter:title" content="{title}">']
+    if cover_url:
+        tags += [f'<meta property="og:image" content="{cover_url}">',
+                 f'<meta property="og:image:alt" content="{title} cover">',
+                 '<meta name="twitter:card" content="summary">',
+                 f'<meta name="twitter:image" content="{cover_url}">',
+                 f'<meta name="twitter:image:alt" content="{title} cover">']
+    else:
+        tags.append('<meta name="twitter:card" content="summary">')
+    return '\n  '.join(tags)
 
 
 def main():
@@ -152,6 +189,15 @@ def build_lazy(args, output):
     runtime_name = 'xport-assets-' + hashlib.sha256(runtime).hexdigest()[:16] + '.js'
     (output / runtime_name).write_bytes(runtime)
     index = args.index_template.read_text(encoding='utf-8').replace('@@FULL_NAME@@', html.escape(args.full_name))
+    icon_source = project / 'src/platform/win/icon.ico'
+    icon_name = None
+    favicon = ''
+    if icon_source.is_file():
+        icon_data = icon_source.read_bytes()
+        icon_name = 'xport-icon-' + hashlib.sha256(icon_data).hexdigest()[:16] + '.ico'
+        (output / icon_name).write_bytes(icon_data)
+        favicon = '<link rel="icon" type="image/x-icon" href="' + icon_name + '">'
+    index = index.replace('@@FAVICON@@', favicon).replace('@@SOCIAL_PREVIEW@@', social_preview(args))
     index = index.replace('@@PACKAGES@@', manifest_name).replace('@@ASSETS@@', runtime_name)
     (output / 'index.html').write_text(index, encoding='utf-8')
     keep = {item['url'] for item in manifest['packages']} | {manifest_name, runtime_name, 'xport-runtime.js'}
@@ -159,10 +205,23 @@ def build_lazy(args, output):
         for path in output.glob(pattern):
             if path.name not in keep:
                 path.unlink()
+    for path in output.glob('xport-icon-*.ico'):
+        if path.name != icon_name:
+            path.unlink()
     keep_music = {item['url'].split('/')[1] for item in manifest['music'].values()}
     for path in music_output.glob('*.WAV'):
         if path.name not in keep_music:
             path.unlink()
+    published = [output / name for name in keep if (output / name).is_file()]
+    published += [output / 'index.html']
+    published += [music_output / name for name in keep_music]
+    published += [path for path in (output / 'xport-runtime.wasm', output / 'xport-runtime.js.map',
+                                    output / 'xport-runtime.wasm.map') if path.is_file()]
+    if icon_name:
+        published.append(output / icon_name)
+    corrected = inherit_output_permissions(published)
+    if corrected:
+        print(f'Restored destination ACL inheritance for {len(corrected)} published web files')
     print(f'Startup: {len(startup)} collected files; {len(groups)} total packages')
     if not log.exists():
         print('No collect.log: package zero is empty; DATA will load on first access')

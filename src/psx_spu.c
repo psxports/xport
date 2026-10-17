@@ -697,6 +697,10 @@ typedef struct SPU_STATE
     uint32 key_status;
     uint32 key_on_pending;
     uint32 key_off_pending;
+    uint16 mmio_transfer_control;
+    uint16 mmio_transfer_address;
+    uint16 mmio_fifo[32];
+    uint32 mmio_fifo_count;
     uint32 pitch_modulation;
     uint16 irq_address;
     uint8 irq_flag;
@@ -1396,6 +1400,42 @@ static sint32 spu_mmio_read16(uint32 physical_address, uint16 *value)
     }
     switch (physical_address)
     {
+        case 0x1F801D84u:
+            *value = (uint16)reverb_control.depth_left;
+            return 1;
+        case 0x1F801D86u:
+            *value = (uint16)reverb_control.depth_right;
+            return 1;
+        case 0x1F801D88u:
+            *value = (uint16)spu.key_on_pending;
+            return 1;
+        case 0x1F801D8Au:
+            *value = (uint16)(spu.key_on_pending >> 16);
+            return 1;
+        case 0x1F801D8Cu:
+            *value = (uint16)spu.key_off_pending;
+            return 1;
+        case 0x1F801D8Eu:
+            *value = (uint16)(spu.key_off_pending >> 16);
+            return 1;
+        case 0x1F801D98u:
+            *value = (uint16)spu.reverb_voice_mask;
+            return 1;
+        case 0x1F801D9Au:
+            *value = (uint16)(spu.reverb_voice_mask >> 16);
+            return 1;
+        case 0x1F801DA2u:
+            *value = (uint16)reverb_control.work_address;
+            return 1;
+        case 0x1F801DA6u:
+            *value = spu.mmio_transfer_address;
+            return 1;
+        case 0x1F801DACu:
+            *value = spu.mmio_transfer_control;
+            return 1;
+        case 0x1F801DAEu:
+            *value = (uint16)((reverb_control.control & 0x3F) | (spu.irq_flag ? 0x40 : 0));
+            return 1;
         case 0x1F801D80u:
             *value = (uint16)spu.master_left;
             return 1;
@@ -1433,6 +1473,11 @@ static sint32 spu_mmio_read16(uint32 physical_address, uint16 *value)
             *value = (uint16)(spu.end_flags >> 16);
             return 1;
         default:
+            if (physical_address >= 0x1F801DC0u)
+            {
+                *value = reverb_control.parameters[(physical_address - 0x1F801DC0u) / 2u];
+                return 1;
+            }
             return 0;
     }
 }
@@ -1571,10 +1616,24 @@ sint32 spu_mmio_read(void *user, uint32 physical_address, uint32 width, uint32 *
 
 static sint32 spu_mmio_common_writable(uint32 address)
 {
+    if (address >= 0x1F801DC0u && address < 0x1F801E00u && !(address & 1))
+        return 1;
     if (address >= 0x1F801C00 && address < 0x1F801D80 && !(address & 1))
         return 1;
     switch (address)
     {
+        case 0x1F801D84u:
+        case 0x1F801D86u:
+        case 0x1F801D88u:
+        case 0x1F801D8Au:
+        case 0x1F801D8Cu:
+        case 0x1F801D8Eu:
+        case 0x1F801D98u:
+        case 0x1F801D9Au:
+        case 0x1F801DA2u:
+        case 0x1F801DA6u:
+        case 0x1F801DA8u:
+        case 0x1F801DACu:
         case 0x1F801D80u:
         case 0x1F801D82u:
         case 0x1F801D90:
@@ -1618,7 +1677,11 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
         }
         if (index == count)
         {
-            if (!spu_mmio_common_writable(address) || !spu_mmio_read16(address, &values[index]))
+            if (!spu_mmio_common_writable(address))
+                goto finish;
+            if (address == 0x1F801DA8u)
+                values[index] = 0;
+            else if (!spu_mmio_read16(address, &values[index]))
                 goto finish;
             addresses[index] = address;
             previous[index] = values[index];
@@ -1642,7 +1705,7 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
             /* Bits 0 and 1 enable dry CD and external input mixing
                Bits 2 and 3 route those inputs to the reverb processor
                This host has no external analog input, so that bus is silent */
-            if (changed & ~0xC0CFu)
+            if (changed & ~0xC0FFu)
             {
 #ifndef NDEBUG
                 fprintf(stderr, "xport_spu_write unsupported control routing value=%04X changed=%04X\n", values[index], changed);
@@ -1650,9 +1713,18 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
                 goto finish;
             }
         }
+        if (addresses[index] == 0x1F801DA8u && spu.mmio_fifo_count == 32u)
+            goto finish;
+        if (addresses[index] == 0x1F801DACu && values[index] != 4u)
+            goto finish;
     }
     for (index = 0u; index < count; ++index)
     {
+        if (addresses[index] >= 0x1F801DC0u)
+        {
+            reverb_control.parameters[(addresses[index] - 0x1F801DC0u) / 2u] = values[index];
+            continue;
+        }
         if (addresses[index] < 0x1F801D80)
         {
             SPU_VOICE *voice = spu.voices + (addresses[index] - 0x1F801C00) / 16;
@@ -1691,6 +1763,41 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
         }
         switch (addresses[index])
         {
+            case 0x1F801D84u:
+                reverb_control.depth_left = (sint16)values[index];
+                break;
+            case 0x1F801D86u:
+                reverb_control.depth_right = (sint16)values[index];
+                break;
+            case 0x1F801D88u:
+            case 0x1F801D8Au:
+                spu_key_on(((uint32)values[index] << (addresses[index] == 0x1F801D88u ? 0 : 16)) & SPU_ALLCH);
+                break;
+            case 0x1F801D8Cu:
+            case 0x1F801D8Eu:
+                spu_key_off(((uint32)values[index] << (addresses[index] == 0x1F801D8Cu ? 0 : 16)) & SPU_ALLCH);
+                break;
+            case 0x1F801D98u:
+                spu.reverb_voice_mask = (spu.reverb_voice_mask & 0xFFFF0000u) | values[index];
+                break;
+            case 0x1F801D9Au:
+                spu.reverb_voice_mask = (spu.reverb_voice_mask & 0xFFFFu) | ((uint32)values[index] << 16);
+                break;
+            case 0x1F801DA2u:
+                reverb_control.work_address = values[index];
+                spu_reverb_reset_cursor();
+                break;
+            case 0x1F801DA6u:
+                spu.mmio_transfer_address = values[index];
+                transfer_byte_address = (uint32)values[index] << 3;
+                spu_irq_check_range(transfer_byte_address, 2);
+                break;
+            case 0x1F801DA8u:
+                spu.mmio_fifo[spu.mmio_fifo_count++] = values[index];
+                break;
+            case 0x1F801DACu:
+                spu.mmio_transfer_control = values[index];
+                break;
             case 0x1F801D90:
                 spu.pitch_modulation = (spu.pitch_modulation & 0xFFFF0000) | values[index];
                 break;
@@ -1730,6 +1837,18 @@ sint32 spu_mmio_write(void *user, uint32 physical_address, uint32 width, uint32 
                     }
                 }
                 reverb_control.control = values[index];
+                if ((values[index] & 0x30u) == 0x10u && spu.mmio_fifo_count)
+                {
+                    uint32 word;
+                    for (word = 0; word < spu.mmio_fifo_count; ++word)
+                    {
+                        spu_irq_check_range(transfer_byte_address, 2);
+                        spu.ram[transfer_byte_address] = (uint8)spu.mmio_fifo[word];
+                        spu.ram[(transfer_byte_address + 1u) & (SPU_RAM_SIZE - 1u)] = (uint8)(spu.mmio_fifo[word] >> 8);
+                        transfer_byte_address = (transfer_byte_address + 2u) & (SPU_RAM_SIZE - 1u);
+                    }
+                    spu.mmio_fifo_count = 0;
+                }
                 reverb_control.enabled = (values[index] >> 7) & 1u;
                 spu.cd_mix_controlled = 1u;
                 if (!(values[index] & 0x40))
@@ -2973,29 +3092,12 @@ sint32 SpuIsReverbWorkAreaReserved(sint32 mode)
     return result;
 }
 
-sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTransferBinding *binding, uint32 *direction)
+static sint32 spu_clear_reverb_region(uint32 begin, uint32 length, const void *source, const SpuTransferBinding *binding, uint32 *direction)
 {
-    uint32 units, begin, length, normalized, callback, guest;
+    uint32 normalized, callback, guest;
     sint32 result = 0;
-    if ((uint32)mode >= 10u || !source || !binding || !binding->normalized_mode || !binding->completion_callback || !binding->address_units || !binding->source_address || !binding->dma_blocks || binding->address_shift > 3u || binding->block_bytes != 64u || ((binding->clock != NULL) != (binding->wait_until != NULL)) || (binding->clock && !binding->ticks_per_block) || !binding->complete_event)
+    if (!source || !binding || !binding->normalized_mode || !binding->completion_callback || !binding->address_units || !binding->source_address || !binding->dma_blocks || binding->address_shift > 3u || binding->block_bytes != 64u || ((binding->clock != NULL) != (binding->wait_until != NULL)) || (binding->clock && !binding->ticks_per_block) || !binding->complete_event)
         return -1;
-    xport_audio_lock();
-    units = reverb_preset_work[mode];
-    if (spu_reverb_work_occupied(units))
-    {
-        xport_audio_unlock();
-        return -1;
-    }
-    if (!mode)
-        units = 65520u;
-    if (units > 0x10000u)
-    {
-        xport_audio_unlock();
-        return -1;
-    }
-    begin = units << binding->address_shift;
-    length = (0x10000u - units) << binding->address_shift;
-    xport_audio_unlock();
     guest = binding->guest_address ? binding->guest_address(binding->context, source) : xport_guest_buffer_address((void *)source, 1024);
     normalized = *binding->normalized_mode;
     callback = *binding->completion_callback;
@@ -3055,6 +3157,46 @@ sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTrans
     if (callback)
         *binding->completion_callback = callback;
     return result;
+}
+
+sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTransferBinding *binding, uint32 *direction)
+{
+    uint32 units;
+    if ((uint32)mode >= 10u || !source || !binding || !binding->normalized_mode || !binding->completion_callback || !binding->address_units || !binding->source_address || !binding->dma_blocks || binding->address_shift > 3u || binding->block_bytes != 64u || ((binding->clock != NULL) != (binding->wait_until != NULL)) || (binding->clock && !binding->ticks_per_block) || !binding->complete_event)
+        return -1;
+    xport_audio_lock();
+    units = reverb_preset_work[mode];
+    if (spu_reverb_work_occupied(units))
+    {
+        xport_audio_unlock();
+        return -1;
+    }
+    if (!mode)
+        units = 65520u;
+    xport_audio_unlock();
+    if (units > 0x10000u)
+        return -1;
+    return spu_clear_reverb_region(units << binding->address_shift, (0x10000u - units) << binding->address_shift, source, binding, direction);
+}
+
+sint32 spu_clear_reverb_guest(const SpuNativeTransferGuestBinding *guest, uint32 begin, uint32 bytes, uint32 source, uint32 direction)
+{
+    const void *buffer;
+    uint32 *direction_state;
+    if (!guest || begin >= SPU_RAM_SIZE || bytes > SPU_RAM_SIZE - begin || guest->address_shift > 3u)
+        return -1;
+    buffer = psx_addr(source, 1024u);
+    direction_state = (uint32 *)psx_addr(direction, 4u);
+    if (!buffer || !direction_state || transfer_pending || transfer_operation.active || transfer_failed)
+        return -1;
+    if (native_transfer_binding != SPU_TRANSFER_GUEST)
+    {
+        if (!spu_bind_native_transfer_guest(guest))
+            return -1;
+    }
+    else if (transfer.requested_mode != (uint32 *)psx_addr(guest->requested_mode, 4u) || transfer.normalized_mode != (uint32 *)psx_addr(guest->normalized_mode, 4u) || transfer.address_units != (uint16 *)psx_addr(guest->address_units, 2u) || transfer.completion != (uint32 *)psx_addr(guest->completion, 4u) || transfer.completion_callback != (uint32 *)psx_addr(guest->completion_callback, 4u) || transfer.source_address != (uint32 *)psx_addr(guest->source_address, 4u) || transfer.dma_blocks != (uint32 *)psx_addr(guest->dma_blocks, 4u) || transfer.address_shift != guest->address_shift)
+        return -1;
+    return spu_clear_reverb_region(begin, bytes, buffer, &transfer, direction_state);
 }
 
 sint32 SpuClearReverbWorkArea(sint32 mode)
@@ -4793,9 +4935,46 @@ static void spu_reverb_frame(sint32 left, sint32 right, sint32 *wet_left, sint32
     spu.reverb_history_index = (index + 1u) % 39u;
 }
 
+/* Optional raw PCM capture, 24 stereo voices in sample-major order */
+static FILE *spu_voice_capture_file;
+#ifdef _DEBUG
+static sint32 spu_voice_capture_checked;
+#endif
+static sint16 spu_voice_capture_buffer[256][24][2];
+static uint32 spu_voice_capture_frames;
+uint64 spu_voice_capture_sample_count;
+
+#ifdef _DEBUG
+static void spu_voice_capture_close(void)
+{
+    if (spu_voice_capture_file)
+    {
+        fwrite(spu_voice_capture_buffer, sizeof(spu_voice_capture_buffer[0]), spu_voice_capture_frames, spu_voice_capture_file);
+        fclose(spu_voice_capture_file);
+        spu_voice_capture_file = NULL;
+        spu_voice_capture_frames = 0;
+    }
+}
+
+#endif
+
 static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 frame_count)
 {
     uint32 frame;
+#ifdef _DEBUG
+    if (!spu_voice_capture_checked)
+    {
+        const char *path = getenv("XPORT_SPU_VOICE_CAPTURE");
+        spu_voice_capture_checked = 1;
+        if (path && *path)
+        {
+            spu_voice_capture_file = xport_fopen(path, "wb");
+            if (!spu_voice_capture_file)
+                abort();
+            atexit(spu_voice_capture_close);
+        }
+    }
+#endif
     if (interleaved_stereo == 0)
         return;
     for (frame = 0; frame < frame_count; ++frame)
@@ -4806,6 +4985,8 @@ static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 fra
         sint32 send_right = 0;
         sint32 previous_amplitude = 0;
         sint32 index;
+        if (spu_voice_capture_file)
+            memset(spu_voice_capture_buffer[spu_voice_capture_frames], 0, sizeof(spu_voice_capture_buffer[0]));
         for (index = 0; index < SPU_VOICE_COUNT; ++index)
         {
             SPU_VOICE *voice = spu.voices + index;
@@ -4824,6 +5005,11 @@ static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 fra
             {
                 sint32 left = apply_volume(amplitude, fixed_volume((uint16)voice->registers.volume_left));
                 sint32 right = apply_volume(amplitude, fixed_volume((uint16)voice->registers.volume_right));
+                if (spu_voice_capture_file)
+                {
+                    spu_voice_capture_buffer[spu_voice_capture_frames][index][0] = (sint16)audio_sample_clamp(left);
+                    spu_voice_capture_buffer[spu_voice_capture_frames][index][1] = (sint16)audio_sample_clamp(right);
+                }
                 mix_left += left;
                 mix_right += right;
                 if (spu.reverb_voice_mask & (1u << index))
@@ -4859,6 +5045,14 @@ static void spu_mix_voices(sint32 *interleaved_stereo, sint32 *sends, uint32 fra
                 }
             }
         }
+        if (spu_voice_capture_file && ++spu_voice_capture_frames == 256u)
+        {
+            if (fwrite(spu_voice_capture_buffer, sizeof(spu_voice_capture_buffer[0]), 256u, spu_voice_capture_file) != 256u)
+                abort();
+            spu_voice_capture_frames = 0;
+        }
+        if (spu_voice_capture_file)
+            ++spu_voice_capture_sample_count;
         /* Hardware mute precedes CD mixing and the reverb return */
         if (!(reverb_control.control & 0x4000))
         {

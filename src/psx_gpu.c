@@ -184,8 +184,8 @@ sint32 gpu_frame_sync(uint32 fields)
         return 0;
     }
     now = xport_timer_get();
-    scaled = (uint64)fields * 1000000;
-    span = scaled / FIELD_RATE;
+    scaled = (uint64)fields * 1000000u * FIELD_RATE_DENOMINATOR;
+    span = scaled / FIELD_RATE_NUMERATOR;
     // Rebase after a pause instead of replaying an unbounded backlog
     if (!frame_skip.started || now < frame_skip.last_time || now - frame_skip.last_time > 1000000)
     {
@@ -197,8 +197,8 @@ sint32 gpu_frame_sync(uint32 fields)
     else
     {
         scaled += frame_skip.fraction;
-        frame_skip.deadline += scaled / FIELD_RATE;
-        frame_skip.fraction = scaled % FIELD_RATE;
+        frame_skip.deadline += scaled / FIELD_RATE_NUMERATOR;
+        frame_skip.fraction = scaled % FIELD_RATE_NUMERATOR;
     }
     frame_skip.last_time = now;
     // Blocking VSync latches one decision for every pass of the following frame

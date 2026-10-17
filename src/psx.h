@@ -23,13 +23,15 @@ extern "C"
     GDB_CALL uint8 r_u8(uint32 address);
     GDB_CALL uint16 r_u16(uint32 address);
     GDB_CALL uint32 r_u32(uint32 address);
+    /* Return the aligned word and observe the active LWL/LWR byte lanes */
+    GDB_CALL uint32 r_masked_u32(uint32 address, uint32 byte_mask);
     GDB_CALL sint8 r_s8(uint32 address);
     GDB_CALL sint16 r_s16(uint32 address);
     GDB_CALL sint32 r_s32(uint32 address);
-    GDB_CALL sint32 w_u8(uint32 address, uint32 value);
-    GDB_CALL sint32 w_u16(uint32 address, uint32 value);
-    GDB_CALL sint32 w_u32(uint32 address, uint32 value);
-    GDB_CALL sint32 w_masked_u32(uint32 address, uint32 value, uint32 byte_mask);
+    GDB_CALL sint32(w_u8)(uint32 address, uint32 value);
+    GDB_CALL sint32(w_u16)(uint32 address, uint32 value);
+    GDB_CALL sint32(w_u32)(uint32 address, uint32 value);
+    GDB_CALL sint32(w_masked_u32)(uint32 address, uint32 value, uint32 byte_mask);
 
 /* Use the PsyQ name instead of the Windows API macro */
 #ifdef OpenEvent
@@ -105,6 +107,7 @@ extern "C"
     uint64 __divdf3PSX(uint64 left, uint64 right);
     float __truncdfsf2(double value);
     void qsortPSX(void *base, size_t count, size_t size, int (*compare)(const void *, const void *));
+    uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value);
     sint32 OpenEventPSX(uint32 event_class, uint32 specification, uint32 mode, uint32 guest_callback);
     sint32 EnableEventPSX(uint32 handle);
     sint32 DisableEventPSX(uint32 handle);
@@ -116,8 +119,12 @@ extern "C"
     uint32 psx_bios_enqueue_timer_vblank(uint32 priority);
     uint32 psx_bios_reset_entry_interrupt(void);
     uint32 psx_bios_init_user_heap(uint32 base, uint32 bytes);
+    uint32 mallocPSX(uint32 bytes);
+    void freePSX(uint32 address);
     uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1);
     uint32 StartPAD(void);
+    uint32 PAD_init2(uint32 type, uint32 destination);
+    uint32 PAD_dr(void);
     uint32 ChangeClearPAD(uint32 mode);
     uint32 ReadInitPadFlag(void);
     uint32 xport_bios_init_card(uint32 mode);
@@ -1016,6 +1023,10 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         VECTOR *ApplyMatrix(MATRIX *matrix, SVECTOR *input, VECTOR *output);
         VECTOR *ApplyMatrixLV(MATRIX *matrix, VECTOR *input, VECTOR *output);
         VECTOR *ApplyRotMatrix(SVECTOR *input, VECTOR *output);
+        VECTOR *ApplyRotMatrixLV(const VECTOR *source, VECTOR *destination);
+        uint32 ApplyRotMatrixLVPSX(uint32 source, uint32 destination);
+        uint32 MulRotMatrixPSX(uint32 matrix);
+        uint32 MulRotMatrix0PSX(uint32 source, uint32 destination);
         SVECTOR *ApplyMatrixSV(MATRIX *matrix, SVECTOR *input, SVECTOR *output);
         sint32 AverageZ3(sint32 z0, sint32 z1, sint32 z2);
         sint32 AverageZ4(sint32 z0, sint32 z1, sint32 z2, sint32 z3);
@@ -1029,10 +1040,12 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 *ClearOTagR(uint32 *ot, sint32 count);
         sint32 ccos(sint32 a);
         sint32 csin(sint32 a);
+        sint32 catan(sint32 a);
         sint32 rcos(sint32 a);
         sint32 rsin(sint32 a);
         uint32 SquareRoot0(sint32 input);
         uint32 SquareRoot0PSX(uint32 input, uint32 table_address);
+        uint32 SquareRoot12PSX(uint32 input, uint32 table_address);
 
         typedef struct
         {
@@ -1089,6 +1102,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 xport_gte_read_data(uint32 register_index);
         uint32 xport_gte_read_flag(void);
         uint32 xport_gte_read_screen_offset(uint32 axis);
+        uint32 xport_gte_read_translation(uint32 axis);
         uint32 VectorNormalSS(SVECTOR *source, SVECTOR *destination);
         void xport_gte_execute(uint32 command);
         void xport_gte_write_unavailable_data(uint32 register_index, uint32 value);
@@ -1115,6 +1129,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 PadInitDirectPSX(uint32 first_packet, uint32 second_packet);
         uint32 PadStartComPSX(void);
         void PadSetAct(sint32 port, uint8 *actuator, sint32 length);
+        sint32 PadInfoAct(sint32 port, sint32 actuator, sint32 term);
         sint32 PadSetActAlign(sint32 port, uint8 *alignment);
         sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock);
         void PadStartCom(void);
@@ -1420,6 +1435,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
     sint32 SetConf(sint32 events, sint32 threads, uint32 stack_top);
     sint32 _96_init(void);
+    uint32 _96_remove(void);
     sint32 InitTAP(uint32 first_buffer, uint32 second_buffer, sint32 first_mode, sint32 second_mode);
     sint32 StartTAP(void);
     sint32 MemCardInitPSX(void);

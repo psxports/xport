@@ -115,13 +115,25 @@ Create a dependency-ordered plan under project `status`. Each stage defines obje
 Default stage sequence; combine or reorder implementation stages when ownership dependencies require it:
 
 1. Baseline, transition, ownership/dependency map and project-specific acceptance scenarios
-2. Reconstruct subsystem/module boundaries from original MIPS address layout and confirmed code/data relationships; rename functions, variables and structures, consolidate semantic modules, and verify type/function/callback contracts
-3. Migrate connected state families with every reader/writer and initialization/reset path
+2. Establish subsystem/module boundaries from original MIPS address layout and confirmed code/data relationships; verify candidate type/function/callback contracts before choosing an ownership migration
+3. Migrate connected state families with every reader/writer and initialization/reset path; integrate established names, original methods, semantic modules and reference mappings in the same change
 4. Decode resources and isolate binary/device representations from native ownership
 5. Extract repeated operations; remove unused interfaces and temporary adapters
 6. Remove residual game DRAM dependencies, then audit the complete project and deliver final Release
 
 Migrate a connected data/operation family, not an arbitrary file or fixed number of functions. Inventory assignments, aliases, macros, dynamic bases, callbacks, overlapping views and indirect consumers; a search for `r_*/w_*` alone cannot close a stage. Classify masks, packed values, asset bytes and provenance separately from pointers. Unknown reachable effects remain unresolved until traced through consumers and original evidence.
+
+## Execution granularity and throughput
+
+- Choose the largest coherent ownership/lifecycle family whose dependencies can be reviewed and changed together. Include its related fields, original operations, all direct/indirect consumers, initialization, reset, release and boundary adapters. Do not default to one field, one function or one rename per stage; do not combine unrelated owners merely to enlarge a batch
+- Build one working ownership inventory for the family, then update affected relationships as evidence changes. Reuse reviewed original inputs and unchanged dependency evidence by identity; do not restart the same whole-project search for every field. A textual candidate list is not proof of alias or parameter domains
+- Complete verified names, method placement, module consolidation and adapter removal with the ownership migration. Use a separate naming-only or single-field stage only when requested or when it resolves a concrete prerequisite; record that dependency rather than treating cosmetic work as completed native ownership
+- During implementation use targeted compilation and focused checks for the changed contracts. At the integrated family boundary run the complete required `X code_refresh` and affected runtime scenarios against the actual current executable. Do not repeat the full cycle after each intermediate field or rename; do not omit configured checks, accept a known failure or declare an unvalidated family complete
+- After a failure, identify and repair its cause, then complete the required gates. If code, dependencies and checks remain unchanged after a successful gate, reuse that evidence; rerun when later changes invalidate its scope. Keep failed runs as historical failures
+- Use actual build/test/runtime timings to identify expensive gates before optimizing the workflow. Parallelize independent reads or checks when their tools and shared resources permit it; keep dependent edits, integration and runtime sessions ordered. This does not authorize additional agents or changes to the project's delegation policy
+- Observe confirmed live work through its process/session handle. Prefer completion notifications or bounded waits of roughly 30-60 seconds to repeated 1-5 second polls; perform independent analysis while a job runs. An observation timeout is not job termination. Preserve progress communication and tool-specific deadlines
+- Keep one concise current family report with source/executable identities, ownership decisions, commands/results, exact verification scopes and unresolved closing requirements; link immutable historical evidence. Do not create repeated narrative inventories or rename unchanged receipts solely to fill a turn
+- Internal implementation batches are not additional user-acceptance gates. Within an authorized aggregate goal, continue through the approved stages unless an explicit checkpoint, missing required input, user stop or actual blocker requires otherwise. Preserve the entry gate and every explicitly agreed acceptance requirement
 
 ## Stage execution and validation
 
@@ -131,11 +143,11 @@ Four-byte resource IDs: after establishing alignment and a complete four-byte sp
 
 1. Audit the selected family's full ownership and consumers; distinguish storage migration from an algorithm repair. For newly translated/repaired semantics follow [DECOMPILATION.md](DECOMPILATION.md); consult [LIBRARY.md](LIBRARY.md) for shared SDK changes
 2. Apply the family migration together; preserve unrelated work and pre-existing defects. Compare complete affected operations, not only the reported failure branch
-3. After C/H changes run `X code_refresh` with project `code_refresh.build` configured for ordinary Debug. Complete its applicable index/mapping, build and configured checks. Do not use `--no-build`/`--no-tests` to claim a skipped gate passed
+3. After the integrated family's C/H changes run `X code_refresh` with project `code_refresh.build` configured for ordinary Debug. Intermediate focused checks do not replace this gate. Complete its applicable index/mapping, build and configured checks. Do not use `--no-build`/`--no-tests` to claim a skipped gate passed
 4. Add/run focused checks for risky codecs, indices, pool/buffer lifetime, pointer exchange and fixed-point math. Structural refresh, prior-C fixtures, original-MIPS fixtures, native runtime and audiovisual observations prove different scopes; record each separately
 5. Exercise relevant project scenarios: cold startup; UI/input transitions; main gameplay and state changes; finish/results; exit/reentry; save/load; audio/video; repeated sessions. Include optional modes and recordings/replays only when the game uses them. Test reset/reuse after the first successful session
-6. At stage completion, or on user request, run `X build_native --configuration Release` (current tool: Windows x86); resolve executable paths from project configuration and record the actual target. Other targets use their documented project build commands. Preserve a running manual game; request closure instead of terminating it or silently substituting an executable
-7. Deliver the actual Release path/hash and concise report. Record completed checks, remaining user checks and limitations. Wait for explicit user acceptance before the next stage
+6. At final delivery, an explicitly agreed Release checkpoint, or on user request, run `X build_native --configuration Release` (current tool: Windows x86); resolve executable paths from project configuration and record the actual target. Do not add a Release build to each internal batch. Other targets use their documented project build commands. Preserve a running manual game; request closure instead of terminating it or silently substituting an executable
+7. Record the actual checked target path/hash, completed checks, remaining user checks and limitations. At a delivery checkpoint provide the Release result and obtain any explicitly required user acceptance. Otherwise continue the next authorized stage without adding an approval stop
 
 During implementation build Debug; do not repeatedly build Release after every edit. A failed check or unresolved required scenario keeps the relevant requirement open. Never replace a missing broad check with a narrower green check. A generic user acceptance records delivery acceptance; it is not a fabricated list of individual observed scenario results.
 
@@ -146,7 +158,7 @@ Maintain only current project state plus linked historical evidence:
 - Authorization/baseline; stage plan and acceptance status
 - Ownership map with initialization/lifetime, classified binary/device boundaries and temporary-adapter removal list
 - Source/executable hashes, applicable original mappings, commands/logs and exact check scopes
-- Stage report and explicit user acceptance; carryover items retain their original requirement and named closing evidence
+- Family result and acceptance at the explicitly required checkpoints; carryover items retain their original requirement and named closing evidence
 
 Do not reuse stale fixture hashes after edits. Do not rewrite old failures as PASS or delete known limitations. Check terminal state from actual process/session handles, not a leftover status file. When user verification is the only remaining gate, stop edits; do not generate repeated tests/builds to simulate progress. Apply the goal tool's blocked threshold if automatic continuation repeats that gate.
 

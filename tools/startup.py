@@ -1135,6 +1135,10 @@ def advance(root, state):
                 state = publish(root, state, step='github')
             elif step == 'github':
                 result = startup_github.sync_project(root)
+                if result.get('branch'):
+                    config = project(root)
+                    config['github']['branch'] = result['branch']
+                    atomic_json(root/CONFIG_NAME, config)
                 atomic_json(root/'status/startup-github.json', result)
                 record_step(state, step, result, started)
                 state = publish(root, state, step='build')

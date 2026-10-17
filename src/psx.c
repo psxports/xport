@@ -5,6 +5,8 @@
 #include "psx.h"
 #include "psx_gpu.h"
 
+uint32 PAD_dr(void);
+
 #if defined(XPORT_MEMORY_DIAGNOSTICS)
     #undef w_u8
     #undef w_u16
@@ -58,6 +60,11 @@ GDB_CALL uint16 r_u16(uint32 address)
 GDB_CALL uint32 r_u32(uint32 address)
 {
     return xport_memory_read(address, 4u);
+}
+
+GDB_CALL uint32 r_masked_u32(uint32 address, uint32 byte_mask)
+{
+    return xport_memory_read_masked_u32(address, byte_mask);
 }
 
 GDB_CALL sint8 r_s8(uint32 address)
@@ -1879,6 +1886,32 @@ sint32 ccos(sint32 a)
     return psyq_sine((sint32)((uint32)a + 0x400u));
 }
 
+// PsyQ COR_06 retains all twelve steps, including zero increments
+static const uint32 psyq_catan_steps[12] = {511, 302, 159, 81, 41, 20, 10, 5, 3, 1, 0, 0};
+
+sint32 catan(sint32 a)
+{
+    uint32 x = 4096, y = (uint32)a, angle = 0, step;
+    for (step = 0; step < 12; ++step)
+    {
+        uint32 x_shift = (uint32)((sint32)x >> step);
+        uint32 y_shift = (uint32)((sint32)y >> step);
+        if ((sint32)y >= 0)
+        {
+            x += y_shift;
+            y -= x_shift;
+            angle += psyq_catan_steps[step];
+        }
+        else
+        {
+            x -= y_shift;
+            y += x_shift;
+            angle -= psyq_catan_steps[step];
+        }
+    }
+    return (sint32)angle;
+}
+
 sint32 rsin(sint32 a)
 {
     return csin(a);
@@ -2475,6 +2508,105 @@ static MATRIX *multiply_matrix_rotation(MATRIX *source, MATRIX *input_matrix, MA
     memcpy((uint8 *)destination + 8, &third_word, 4);
     memcpy((uint8 *)destination + 16, &fifth_word, 4);
     return destination;
+}
+
+VECTOR *ApplyRotMatrixLV(const VECTOR *source, VECTOR *destination)
+{
+    uint32 input[3], low[3], high[3], axis;
+    input[0] = source->vx;
+    input[1] = source->vy;
+    input[2] = source->vz;
+    for (axis = 0; axis < 3; ++axis)
+    {
+        uint32 magnitude = input[axis];
+        if ((sint32)magnitude < 0)
+        {
+            magnitude = 0 - magnitude;
+            high[axis] = 0 - (uint32)((sint32)magnitude >> 15);
+            low[axis] = 0 - (magnitude & 0x7FFF);
+        }
+        else
+        {
+            high[axis] = magnitude >> 15;
+            low[axis] = magnitude & 0x7FFF;
+        }
+    }
+    for (axis = 0; axis < 3; ++axis)
+        xport_gte_write_data(9 + axis, high[axis]);
+    xport_gte_execute(0x41E012);
+    for (axis = 0; axis < 3; ++axis)
+        high[axis] = xport_gte_read_data(25 + axis);
+    for (axis = 0; axis < 3; ++axis)
+        xport_gte_write_data(9 + axis, low[axis]);
+    xport_gte_execute(0x49E012);
+    for (axis = 0; axis < 3; ++axis)
+        input[axis] = xport_gte_read_data(25 + axis) + (high[axis] << 3);
+    destination->vx = input[0];
+    destination->vy = input[1];
+    destination->vz = input[2];
+    return destination;
+}
+
+uint32 ApplyRotMatrixLVPSX(uint32 source, uint32 destination)
+{
+    VECTOR input, output;
+    input.vx = r_u32(source);
+    input.vy = r_u32(source + 4);
+    input.vz = r_u32(source + 8);
+    ApplyRotMatrixLV(&input, &output);
+    w_u32(destination, output.vx);
+    w_u32(destination + 4, output.vy);
+    w_u32(destination + 8, output.vz);
+    return destination;
+}
+
+static uint32 mul_rot_matrix_psx(uint32 source, uint32 destination, uint32 first)
+{
+    uint32 second, third, column1[3], column2[3];
+    second = r_u32(source + 4);
+    third = r_u32(source + 12);
+    first = (first & 0xFFFF) | (second & 0xFFFF0000);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    first = r_u16(source + 2);
+    second = r_u32(source + 8);
+    third = (uint32)(sint32)r_s16(source + 14);
+    first |= second << 16;
+    column1[0] = xport_gte_read_data(9);
+    column1[1] = xport_gte_read_data(10);
+    column1[2] = xport_gte_read_data(11);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    first = r_u16(source + 4);
+    second = r_u32(source + 8);
+    third = r_u32(source + 16);
+    first |= second & 0xFFFF0000;
+    column2[0] = xport_gte_read_data(9);
+    column2[1] = xport_gte_read_data(10);
+    column2[2] = xport_gte_read_data(11);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    w_u32(destination, (column1[0] & 0xFFFF) | (column2[0] << 16));
+    w_u32(destination + 12, (column1[2] & 0xFFFF) | (column2[2] << 16));
+    first = xport_gte_read_data(9);
+    second = xport_gte_read_data(10);
+    w_u32(destination + 4, (first & 0xFFFF) | (column1[1] << 16));
+    w_u32(destination + 8, (column2[1] & 0xFFFF) | (second << 16));
+    w_u32(destination + 16, xport_gte_read_data(11));
+    return destination;
+}
+
+uint32 MulRotMatrixPSX(uint32 matrix)
+{
+    return mul_rot_matrix_psx(matrix, matrix, r_u32(matrix));
+}
+
+uint32 MulRotMatrix0PSX(uint32 source, uint32 destination)
+{
+    return mul_rot_matrix_psx(source, destination, r_u16(source));
 }
 
 MATRIX *MulMatrix0(MATRIX *left, MATRIX *right, MATRIX *destination)
@@ -3674,6 +3806,13 @@ void xport_gte_write_control(uint32 index, uint32 value)
     }
 }
 
+uint32 xport_gte_read_translation(uint32 axis)
+{
+    if (axis >= 3u)
+        abort();
+    return (uint32)gte.translation[axis];
+}
+
 void gte_transform_raw(const SVECTOR *v, VECTOR *out)
 {
     transform(&gte.rotation, v, out, 1);
@@ -4022,10 +4161,11 @@ static void psx_native_vblank_poll(void)
     }
     elapsed = now >= native_vblank_last_us ? now - native_vblank_last_us : 0u;
     native_vblank_last_us = now;
-    fields = elapsed / 1000000u * FIELD_RATE;
-    native_vblank_fraction += elapsed % 1000000u * FIELD_RATE;
-    fields += native_vblank_fraction / 1000000u;
-    native_vblank_fraction %= 1000000u;
+    fields = (elapsed / 1000000u) * FIELD_RATE_NUMERATOR / FIELD_RATE_DENOMINATOR;
+    native_vblank_fraction += ((elapsed / 1000000u) * FIELD_RATE_NUMERATOR % FIELD_RATE_DENOMINATOR) * 1000000u +
+        (elapsed % 1000000u) * FIELD_RATE_NUMERATOR;
+    fields += native_vblank_fraction / ((uint64)1000000u * FIELD_RATE_DENOMINATOR);
+    native_vblank_fraction %= (uint64)1000000u * FIELD_RATE_DENOMINATOR;
     present_field = fields != 0u;
     while (fields && !vblank_wait_failed)
     {
@@ -4154,6 +4294,9 @@ static sint32 pad_replay_failure;
 static uint32 pad_replay_inputs[2][3];
 static uint32 bios_pad_initialized;
 static uint32 bios_pad_clear_mode;
+static uint32 bios_legacy_pad_buffers;
+static uint32 bios_legacy_pad_destination;
+static uint32 bios_legacy_pad_enabled;
 
 sint32 pad_bind_replay(const PsxPadReplayBinding *binding)
 {
@@ -4434,6 +4577,21 @@ void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1, uint32 cleanup_cal
     native_pad_delay_cache = delay_cache;
     native_pad_multitap_enable = multitap_enable;
     native_pad_actuator_budget = actuator_budget;
+}
+
+static void pad_update_rumble(uint32 port)
+{
+    uint16 low = 0, high = 0;
+    if (pad_active && pad_actuators[port])
+        for (uint32 idx = 0; idx < sizeof(pad_alignment[port]) && idx < pad_actuator_lengths[port]; ++idx)
+        {
+            uint8 value = pad_actuators[port][idx];
+            if (pad_alignment[port][idx] == 0 && value)
+                high = 65535;
+            else if (pad_alignment[port][idx] == 1)
+                low = value * 257u;
+        }
+    xport_input_rumble((sint32)port, low, high);
 }
 
 static void bios_native_pad_poll(void)
@@ -4754,6 +4912,7 @@ static void bios_native_pad_poll(void)
             uint32 owner = native_pad_packet_owners[port];
             uint32 packet;
             uint16 owner_buttons = (uint16)~xport_input_read((sint32)port);
+            pad_update_rumble(port);
             uint8 axes[4];
             sint32 analog = xport_input_analog((sint32)port, axes) && pad_main_mode[port];
             pad_publish((sint32)port, 1, (uint16)((owner_buttons >> 8) | (owner_buttons << 8)));
@@ -4772,6 +4931,8 @@ static void bios_native_pad_poll(void)
             w_u8(packet + 7u, axes[3]);
         }
     }
+    if (pad_active && bios_legacy_pad_enabled && bios_legacy_pad_destination)
+        PAD_dr();
 }
 
 void PadStartCom(void)
@@ -4782,6 +4943,9 @@ void PadStartCom(void)
 void PadStopCom(void)
 {
     pad_active = 0;
+    if (!pad_replay_bound)
+        for (uint32 port = 0; port < 2; ++port)
+            xport_input_rumble((sint32)port, 0, 0);
 }
 
 sint32 PadGetState(sint32 port)
@@ -4889,6 +5053,26 @@ sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset)
         default:
             return 0;
     }
+}
+
+sint32 PadInfoAct(sint32 port, sint32 actuator, sint32 term)
+{
+    uint32 index = ((uint32)port & 0xF0u) != 0u;
+    uint32 owner = native_pad_packet_owners[index];
+    if (owner)
+    {
+        uint32 count = r_u8(owner + 0xE9u);
+        if (actuator < 0)
+            return (sint32)count;
+        if ((uint32)actuator >= count || term < 1 || term > 5)
+            return 0;
+        return r_u8(r_u32(owner + 4u) + 5u * (uint32)actuator + (uint32)term - 1u);
+    }
+    if ((port != 0 && port != 0x10) || pad_replay_bound || !pad_active || !xport_input_rumble_supported((sint32)index))
+        return 0;
+    if (actuator < 0)
+        return 2;
+    return actuator < 2 && term == 3 ? actuator : 0;
 }
 
 void PadSetAct(sint32 port, uint8 *actuator, sint32 length)
@@ -5272,6 +5456,9 @@ sint32 SetConf(sint32 events, sint32 threads, uint32 stack_top)
 /* SCPH-5502 kernel heap metadata and allocation algorithm */
 uint32 psx_bios_init_kernel_heap(uint32 base, uint32 bytes)
 {
+    bios_legacy_pad_buffers = 0;
+    bios_legacy_pad_destination = 0;
+    bios_legacy_pad_enabled = 0;
     w_u32(0x7460u, base);
     w_u32(base, 0u);
     w_u32(0x7468u, base + (bytes & ~3u) + 4u);
@@ -5424,9 +5611,125 @@ uint32 psx_bios_init_user_heap(uint32 base, uint32 bytes)
     return bytes & ~3u;
 }
 
+static uint32 bios_user_heap_extend(uint32 bytes)
+{
+    uint32 current = r_u32(0xA0009000u);
+    uint32 end = r_u32(0xA0009008u);
+    uint32 quantum, larger, smaller, available, count;
+    if (bytes != 0u)
+    {
+        quantum = r_u32(0xA0009004u);
+        larger = quantum < bytes ? bytes : quantum;
+        smaller = quantum < bytes ? quantum : bytes;
+        available = ((end - current) & ~3u) - 4u;
+        if (available >= larger)
+            count = larger;
+        else if (available >= smaller)
+            count = smaller;
+        else
+            return 0xFFFFFFFFu;
+    }
+    else
+    {
+        if (current >= end)
+            return 0xFFFFFFFFu;
+        count = 0u;
+    }
+    w_u32(current + (uint32)((sint32)count / 4) * 4u, 0xFFFFFFFEu);
+    w_u32(current - 4u, count | 1u);
+    w_u32(0xA0009000u, current + (uint32)((sint32)(count + 4u) / 4) * 4u);
+    return 0u;
+}
+
+uint32 mallocPSX(uint32 bytes)
+{
+    uint32 size = (bytes + 3u) & ~3u;
+    uint32 cursor, header, following, next, result;
+    sint32 passes = 2;
+    if (r_u32(0xA000900Cu) == 0u)
+    {
+        cursor = r_u32(0xA0009000u);
+        if (cursor >= r_u32(0xA0009008u))
+            return 0u;
+        w_u32(cursor, 0xFFFFFFFEu);
+        w_u32(0xA000B064u, cursor);
+        w_u32(0xA0009000u, cursor + 4u);
+        if (bios_user_heap_extend(size) != 0u)
+            return 0u;
+        w_u32(0xA000B060u, r_u32(0xA000B064u));
+        w_u32(0xA000900Cu, 1u);
+    }
+    for (;;)
+    {
+        cursor = r_u32(0xA000B064u);
+        header = r_u32(cursor);
+        if ((header & 1u) != 0u)
+        {
+            if ((size | 1u) == header)
+            {
+                w_u32(cursor, header & ~1u);
+                return r_u32(0xA000B064u) + 4u;
+            }
+            if ((size | 1u) < header)
+            {
+                w_u32(cursor + (uint32)((sint32)size / 4) * 4u + 4u, header - size - 4u);
+                w_u32(r_u32(0xA000B064u), size);
+                return r_u32(0xA000B064u) + 4u;
+            }
+            if (header >= size)
+                continue;
+            following = cursor + (header & ~3u) + 4u;
+            next = r_u32(following);
+            if (next == 0xFFFFFFFEu)
+            {
+                --passes;
+                if (passes > 0)
+                    w_u32(0xA000B064u, r_u32(0xA000B060u));
+                else if (bios_user_heap_extend(size) != 0u)
+                    return 0u;
+            }
+            else if ((next & 1u) != 0u)
+                w_u32(r_u32(0xA000B064u), header + (next & ~1u) + 4u);
+            else
+                w_u32(0xA000B064u, following);
+        }
+        else if (header != 0xFFFFFFFEu)
+            w_u32(0xA000B064u, cursor + (header & ~3u) + 4u);
+        else
+        {
+            --passes;
+            if (passes > 0)
+                w_u32(0xA000B064u, r_u32(0xA000B060u));
+            else
+            {
+                result = bios_user_heap_extend(size);
+                if (result != 0u)
+                    return result;
+            }
+        }
+    }
+}
+
+void freePSX(uint32 address)
+{
+    w_u32(address - 4u, r_u32(address - 4u) | 1u);
+}
+
 sint32 _96_init(void)
 {
     return CdInit();
+}
+
+uint32 _96_remove(void)
+{
+    EnterCriticalSectionPSX();
+    CloseEventPSX(r_u32(0xA000B9B8u));
+    CloseEventPSX(r_u32(0xA000B9BCu));
+    CloseEventPSX(r_u32(0xA000B9C0u));
+    CloseEventPSX(r_u32(0xA000B9C4u));
+    CloseEventPSX(r_u32(0xA000B9C8u));
+    SysDeqIntRP(0u, 0xA00091D0u);
+    return SysDeqIntRP(0u, 0xA00091E0u);
 }
 
 sint32 InitTAP(uint32 first_buffer, uint32 second_buffer, sint32 first_mode, sint32 second_mode)
@@ -5455,10 +5758,13 @@ sint32 MemCardStartPSX(void)
 
 uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1)
 {
-    if (size0 < 8u || size1 < 8u || size0 > PSX_DRAM_SIZE || size1 > PSX_DRAM_SIZE || !bios_card_address(buffer0, size0, 1u) || !bios_card_address(buffer1, size1, 1u))
+    if (size0 < 8u || size0 > PSX_DRAM_SIZE || !bios_card_address(buffer0, size0, 1u))
         return 0u;
+    if (size1 == 0u ? buffer1 != 0u : size1 < 8u || size1 > PSX_DRAM_SIZE || !bios_card_address(buffer1, size1, 1u))
+        return 0u;
+    bios_legacy_pad_enabled = 0;
     pad_packets[0] = (uint8 *)psx_addr(buffer0, size0);
-    pad_packets[1] = (uint8 *)psx_addr(buffer1, size1);
+    pad_packets[1] = size1 != 0u ? (uint8 *)psx_addr(buffer1, size1) : NULL;
     w_u32(0x74C8u, buffer0);
     w_u32(0x74CCu, buffer1);
     w_u32(0x74D8u, size0);
@@ -5474,6 +5780,51 @@ uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1)
     pad_publish(1, 0, 0xFFFFu);
     xport_input_init();
     return 1u;
+}
+
+uint32 PAD_dr(void)
+{
+    uint32 port, packed = 0;
+    for (port = 0; port < 2; ++port)
+    {
+        const uint8 *packet = pad_packets[port];
+        uint32 buttons = 0xFFFF;
+        if (packet && packet[0] == 0 && (packet[1] == 0x41 || packet[1] == 0x23))
+        {
+            buttons = ((uint32)packet[2] << 8) | packet[3];
+            if (packet[1] == 0x23)
+            {
+                buttons |= 0x7C7;
+                if (packet[5] > 0x10) buttons &= ~0x40u;
+                if (packet[6] > 0x10) buttons &= ~0x80u;
+            }
+        }
+        packed |= buttons << (port * 16);
+    }
+    w_u32(bios_legacy_pad_destination, packed);
+    return packed;
+}
+
+uint32 PAD_init2(uint32 type, uint32 destination)
+{
+    if (type != 0x20000000u && type != 0x20000001u)
+        return 0;
+    if (!bios_legacy_pad_buffers)
+    {
+        bios_legacy_pad_buffers = psx_bios_kernel_malloc(0x44);
+        if (!bios_legacy_pad_buffers || bios_legacy_pad_buffers == ~0u)
+        {
+            bios_legacy_pad_buffers = 0;
+            return 0;
+        }
+    }
+    memset(psx_addr(bios_legacy_pad_buffers, 0x44), 0, 0x44);
+    if (!InitPAD(bios_legacy_pad_buffers, 0x22, bios_legacy_pad_buffers + 0x22, 0x22))
+        return 0;
+    StartPAD();
+    bios_legacy_pad_destination = destination;
+    bios_legacy_pad_enabled = 1;
+    return 2;
 }
 
 uint32 StartPAD(void)
@@ -6909,6 +7260,18 @@ void xport_gte_execute(uint32 command)
                 native_gte_mac_ir(row, (sint64)gte.ir[row] * gte.ir[row], shift, lm);
             finish_flag();
             return;
+        case 0x3Du:
+        case 0x3Eu:
+            for (row = 0u; row < 3u; ++row)
+            {
+                sint64 value = (sint64)gte.ir0 * gte.ir[row];
+                if (opcode == 0x3Eu)
+                    value += (sint64)gte.mac[row] * (shift ? 4096 : 1);
+                native_gte_mac_ir(row, value, shift, lm);
+            }
+            push_rgb_from_mac();
+            finish_flag();
+            return;
         case 0x0Cu:
         {
             sint32 ir[3] = {gte.ir[0], gte.ir[1], gte.ir[2]};
@@ -8244,6 +8607,26 @@ uint32 SquareRoot0PSX(uint32 input, uint32 table_address)
     return result;
 }
 
+uint32 SquareRoot12PSX(uint32 input, uint32 table_address)
+{
+    uint32 leading, even, normalized, value;
+    sint32 shift;
+    xport_gte_write_data(30, input);
+    leading = xport_gte_read_data(31);
+    if (leading == 32)
+        return 0;
+    even = leading & 0xFFFFFFFE;
+    shift = (19 - (sint32)even) >> 1;
+    if (even < 24)
+        normalized = (uint32)((sint32)input >> ((24 - even) & 31));
+    else
+        normalized = input << ((even - 24) & 31);
+    value = (uint32)(sint32)r_s16(table_address + 2 * (normalized - 64));
+    if (shift < 0)
+        return value >> ((uint32)-shift & 31);
+    return value << ((uint32)shift & 31);
+}
+
 uint32 xport_sdk_texture_frame_acquire(size_t bytes)
 {
     (void)bytes;
@@ -8288,8 +8671,45 @@ uint32 xport_guest_call_known_registers(uint32 target, uint32 *registers, uint32
 
 uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
 {
-    (void)destination;
-    (void)format;
-    (void)value;
-    abort();
+    uint32 count = 0u, consumed = 0u;
+    uint32 character, digits, magnitude;
+    uint8 decimal[10];
+    while ((character = r_u8(format++)) != 0u)
+    {
+        if (character != '%')
+        {
+            w_u8(destination + count++, character);
+            continue;
+        }
+        character = r_u8(format++);
+        if (character == '%')
+        {
+            w_u8(destination + count++, '%');
+            continue;
+        }
+        if (character != 'd' || consumed != 0u)
+        {
+#ifdef _DEBUG
+            fprintf(stderr, "sprintfPSX: Unsupported one-argument format conversion %02X\n", character);
+#endif
+            abort();
+        }
+        consumed = 1u;
+        magnitude = value;
+        if ((sint32)value < 0)
+        {
+            w_u8(destination + count++, '-');
+            magnitude = 0u - value;
+        }
+        digits = 0u;
+        do
+        {
+            decimal[digits++] = (uint8)('0' + magnitude % 10u);
+            magnitude /= 10u;
+        } while (magnitude != 0u);
+        while (digits != 0u)
+            w_u8(destination + count++, decimal[--digits]);
+    }
+    w_u8(destination + count, 0u);
+    return count;
 }

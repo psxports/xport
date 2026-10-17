@@ -79,6 +79,39 @@ typedef union
 #if !defined(FIELD_RATE)
     #error FIELD_RATE must be defined by the consuming project
 #endif
+#ifndef FIELD_RATE_NUMERATOR
+    #if FIELD_RATE == 50
+        #define FIELD_RATE_NUMERATOR 53203425
+    #elif FIELD_RATE == 60
+        #define FIELD_RATE_NUMERATOR 53693175
+    #else
+        #define FIELD_RATE_NUMERATOR FIELD_RATE
+    #endif
+#endif
+#ifndef FIELD_RATE_DENOMINATOR
+    #if FIELD_RATE == 50
+        #define FIELD_RATE_DENOMINATOR (3406 * 314)
+    #elif FIELD_RATE == 60
+        #define FIELD_RATE_DENOMINATOR (3413 * 263)
+    #else
+        #define FIELD_RATE_DENOMINATOR 1
+    #endif
+#endif
+#ifndef XPORT_AUDIO_VBLANK_QUEUE
+    #define XPORT_AUDIO_VBLANK_QUEUE 0
+#endif
+#if FIELD_RATE_NUMERATOR <= 0 || FIELD_RATE_DENOMINATOR <= 0
+    #error Physical field rate must be positive
+#endif
+
+/* Keep nominal SDK rates separate from the physical video clock */
+static __inline uint32 xport_field_sample_count(uint32 before, uint32 sample_rate)
+{
+    uint64 scaled = (uint64)sample_rate * FIELD_RATE_DENOMINATOR;
+    uint64 remainder = scaled % FIELD_RATE_NUMERATOR;
+    return (uint32)(scaled / FIELD_RATE_NUMERATOR +
+        (((uint64)before * remainder % FIELD_RATE_NUMERATOR) + remainder) / FIELD_RATE_NUMERATOR);
+}
 
 #if defined(_DEBUG) && defined(_MSC_VER)
     #define GDB_CALL __declspec(dllexport) __declspec(noinline)
@@ -116,6 +149,8 @@ extern "C"
     sint32 xport_poll(void);
     uint32 xport_input_read(sint32 controller);
     sint32 xport_input_analog(sint32 controller, uint8 axes[4]);
+    sint32 xport_input_rumble_supported(sint32 controller);
+    void xport_input_rumble(sint32 controller, uint16 low, uint16 high);
     void xport_input_override(sint32 enabled, uint32 buttons);
     sint32 xport_window_init(void);
     sint32 xport_present(const uint32 *pixels, sint32 bitmap_width, sint32 bitmap_height, sint32 source_x, sint32 source_y, sint32 source_width, sint32 source_height, const char *title);
@@ -136,6 +171,7 @@ extern "C"
     sint32 xport_load(void *data, sint32 capacity);
     sint32 xport_memory_readable(const void *address, size_t size);
     uint32 xport_memory_read(uint32 address, uint32 width);
+    uint32 xport_memory_read_masked_u32(uint32 address, uint32 byte_mask);
     sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byte_mask);
     void xport_message_error(const char *title, const char *message);
     RUN_MODE xport_run_mode(void);

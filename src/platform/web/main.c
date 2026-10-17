@@ -13,7 +13,6 @@ int xport_hd = 1;
     #error SHORT_NAME must be defined by the consuming project
 #endif
 
-// clang-format off
 EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, sint32 writing), {
     if (!data || size <= 0)
         return -1;
@@ -81,7 +80,6 @@ EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, s
             db.close();
     }
 });
-// clang-format on
 
 sint32 xport_save(const void *data, sint32 size)
 {
@@ -105,6 +103,9 @@ static sint32 platform_headless;
 static sint32 platform_quit;
 static void (*platform_cleanup)(void);
 static uint32 platform_pad_buttons[2];
+static uint32 platform_gamepad_buttons[2];
+// Zero selects keyboard or touch, one selects gamepad
+static uint8 platform_input_type[2];
 static uint8 platform_hd_pressed[2];
 /* Four PS1 axes, analog availability and physical D-pad bits */
 static uint8 platform_pad_analog[2][6];
@@ -116,7 +117,6 @@ static uint64 platform_poll_deadline;
 static sint32 audio_active;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
-static uint32 audio_output_accumulator;
 static sint16 audio_input[XPORT_AUDIO_INPUT_FRAMES * 2];
 static float audio_output[XPORT_AUDIO_OUTPUT_FRAMES * 2];
 
@@ -133,10 +133,14 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE void
     xport_touch_set(uint32 buttons)
 {
+    if (buttons & ~platform_touch_buttons & 0xffffu)
+    {
+        platform_input_type[0] = 0;
+        xport_input_rumble(0, 0, 0);
+    }
     platform_touch_buttons = buttons & 0xffffu;
 }
 
-// clang-format off
 EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
     HEAPU8.fill(128, axes, axes + 4);
     HEAPU8[axes + 4] = 0;
@@ -206,7 +210,61 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
     }
     return buttons;
 });
-// clang-format on
+
+EM_JS(sint32, xport_gamepad_rumble, (sint32 player, uint16 low, uint16 high, sint32 query), {
+    if (player < 0 || player >= 2)
+        return 0;
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    let index = 0;
+    for (const pad of pads)
+    {
+        if (!pad || !pad.connected || index++ !== player)
+            continue;
+        const actuator = pad.vibrationActuator;
+        if (!actuator || typeof actuator.playEffect !== 'function' || (actuator.effects && !actuator.effects.includes('dual-rumble')))
+            return 0;
+        if (query)
+            return 1;
+        if (!document.hasFocus())
+            low = high = 0;
+        const states = Module.xportRumble || (Module.xportRumble = new Map());
+        const prev = states.get(pad.index);
+        const now = performance.now();
+        if (prev && prev.actuator === actuator && prev.low === low && prev.high === high && (!low && !high || now - prev.time < 100))
+            return 1;
+        states.set(pad.index, {actuator, low, high, time: now});
+        try
+        {
+            const effect = !low && !high && typeof actuator.reset === 'function'
+                ? actuator.reset()
+                : actuator.playEffect('dual-rumble', {duration: 250, startDelay: 0, strongMagnitude: low / 65535, weakMagnitude: high / 65535});
+            Promise.resolve(effect).catch(() => {
+                if (states.get(pad.index)?.time === now)
+                    states.delete(pad.index);
+            });
+        }
+        catch (error)
+        {
+            states.delete(pad.index);
+        }
+        return 1;
+    }
+    return 0;
+});
+
+sint32 xport_input_rumble_supported(sint32 controller)
+{
+    return !(controller == 0 && platform_pad_override) && xport_gamepad_rumble(controller, 0, 0, 1);
+}
+
+void xport_input_rumble(sint32 controller, uint16 low, uint16 high)
+{
+    if (controller < 0 || controller >= 2)
+        return;
+    if (!platform_input_type[controller] || (controller == 0 && platform_pad_override))
+        low = high = 0;
+    xport_gamepad_rumble(controller, low, high, 0);
+}
 
 EM_JS(uint32, xport_audio_rate, (), { return Module.xportAudioRate || 44100; });
 
@@ -308,7 +366,14 @@ static EM_BOOL key_event(sint32 type, const EmscriptenKeyboardEvent *event, void
             continue;
         handled = EM_TRUE;
         if (type == EMSCRIPTEN_EVENT_KEYDOWN)
+        {
+            if (!(platform_pad_buttons[controller] & button))
+            {
+                platform_input_type[controller] = 0;
+                xport_input_rumble(controller, 0, 0);
+            }
             platform_pad_buttons[controller] |= button;
+        }
         else
             platform_pad_buttons[controller] &= ~button;
     }
@@ -321,6 +386,8 @@ static EM_BOOL blur_event(sint32 type, const EmscriptenFocusEvent *event, void *
     (void)event;
     (void)user;
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
+    xport_input_rumble(0, 0, 0);
+    xport_input_rumble(1, 0, 0);
     return EM_FALSE;
 }
 
@@ -345,7 +412,7 @@ void xport_timer_wait_frame(uint32 refresh_rate)
     uint64 period;
     if (!refresh_rate)
         refresh_rate = FIELD_RATE;
-    period = 1000000u / refresh_rate;
+    period = refresh_rate == FIELD_RATE ? (uint64)1000000u * FIELD_RATE_DENOMINATOR / FIELD_RATE_NUMERATOR : 1000000u / refresh_rate;
     if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
         platform_frame_deadline = now + period;
     while (now < platform_frame_deadline)
@@ -360,6 +427,8 @@ void xport_timer_wait_frame(uint32 refresh_rate)
 sint32 xport_input_init(void)
 {
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
+    memset(platform_gamepad_buttons, 0, sizeof(platform_gamepad_buttons));
+    memset(platform_input_type, 0, sizeof(platform_input_type));
     memset(platform_hd_pressed, 0, sizeof(platform_hd_pressed));
     memset(platform_pad_analog, 128, sizeof(platform_pad_analog));
     platform_pad_analog[0][4] = platform_pad_analog[1][4] = 0;
@@ -391,6 +460,9 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
     uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller]);
+    if (buttons & ~platform_gamepad_buttons[controller])
+        platform_input_type[controller] = 1;
+    platform_gamepad_buttons[controller] = buttons;
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0);
     if (axes[5] & 1u)
@@ -476,7 +548,6 @@ sint32 xport_isquit(void)
 sint32 xport_audio_init(void)
 {
     audio_active = 1;
-    audio_output_accumulator = 0;
     g_xport_audio_backend_active = 1;
     return 1;
 }
@@ -510,15 +581,13 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     spu_dispatch_pending_irq();
     if (!audio_active || !rate)
         return;
-    input_frames = (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate);
+    input_frames = (rate == FIELD_RATE ? xport_field_sample_count(before, SPU_SAMPLE_RATE) : (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate));
     if (!input_frames || input_frames > XPORT_AUDIO_INPUT_FRAMES)
         return;
     spu_render(audio_input, input_frames);
     spu_dispatch_pending_irq();
     output_rate = xport_audio_rate();
-    audio_output_accumulator += output_rate;
-    output_frames = audio_output_accumulator / rate;
-    audio_output_accumulator %= rate;
+    output_frames = rate == FIELD_RATE ? xport_field_sample_count(before, output_rate) : (uint32)(((uint64)(before + 1u) * output_rate) / rate - ((uint64)before * output_rate) / rate);
     if (!output_frames || output_frames > XPORT_AUDIO_OUTPUT_FRAMES)
         return;
     for (index = 0; index < input_frames * 2; ++index)
@@ -613,6 +682,8 @@ void xport_set_cleanup(void (*cleanup)(void))
 
 void xport_shutdown(void)
 {
+    xport_input_rumble(0, 0, 0);
+    xport_input_rumble(1, 0, 0);
     void (*cleanup)(void) = platform_cleanup;
     platform_cleanup = NULL;
     if (cleanup)

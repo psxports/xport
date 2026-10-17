@@ -170,6 +170,32 @@ uint32 xport_memory_read(uint32 address, uint32 width)
     return value;
 }
 
+uint32 xport_memory_read_masked_u32(uint32 address, uint32 byte_mask)
+{
+    XportMappedRange mapped;
+    uint32 value;
+    if ((address & 3u) || !byte_mask || (byte_mask & ~15u))
+    {
+        xport_set_error(&memory_context, XPORT_MEMORY_ERROR_ARGUMENT);
+        return 0;
+    }
+    if (xport_mmio_contains(&memory_context, address, 4u))
+    {
+        /* The existing device callback cannot represent partial read lanes */
+        if (byte_mask != 15u)
+        {
+            xport_set_error(&memory_context, XPORT_MEMORY_ERROR_ARGUMENT);
+            return 0;
+        }
+        return xport_memory_read(address, 4u);
+    }
+    if (!xport_map(&memory_context, address, 4u, 0, &mapped))
+        return 0;
+    value = xport_bytes_load(mapped.pointer, 4u);
+    xport_observe(&memory_context, XPORT_MEMORY_READ, mapped.region, mapped.offset, 4u, value, value, byte_mask);
+    return value;
+}
+
 sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byte_mask)
 {
     XportMappedRange mapped;

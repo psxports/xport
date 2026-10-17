@@ -4,7 +4,9 @@ XPORT_ROOT := $(abspath $(XPORT_WEB_DIR)/../../..)
 EMSDK_ROOT := $(XPORT_ROOT)/tools/emsdk
 EMSDK_PYTHON := $(EMSDK_ROOT)/python/3.13.3_64bit/python.exe
 EMCC := $(EMSDK_PYTHON) $(EMSDK_ROOT)/upstream/emscripten/emcc.py --em-config $(EMSDK_ROOT)/.emscripten
+EMXX := $(EMSDK_PYTHON) $(EMSDK_ROOT)/upstream/emscripten/em++.py --em-config $(EMSDK_ROOT)/.emscripten
 WEB_PACKAGER := $(XPORT_ROOT)/tools/web_packager.py
+WEB_OUTPUT_PERMISSIONS := $(XPORT_ROOT)/tools/web_output_permissions.py
 WEB_PACKAGER_FLAGS ?=
 WEB_EXCLUDE_FILES ?=
 DIST_DIR ?= ../../../../.github/site/$(SHORT_NAME)
@@ -31,7 +33,9 @@ dep_for = $(patsubst %.o,%.d,$(call object_for,$(1)))
 OBJECTS := $(foreach source,$(SOURCES),$(call object_for,$(source)))
 DEPFILES := $(foreach source,$(SOURCES),$(call dep_for,$(source)))
 
-COMMON_FLAGS := -std=c11 -fdeclspec -fno-strict-aliasing -fwrapv -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
+COMMON_FLAGS := -fdeclspec -fno-strict-aliasing -fwrapv -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
+C_FLAGS ?= -std=c11
+CXX_FLAGS ?= -std=c++17
 COMMON_FLAGS += -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-ignored-attributes -Wno-incompatible-library-redeclaration
 COMMON_FLAGS += -DAP_WEB=1 -DGAPI_OGL -DXPORT_NATIVE -I$(PROJECT_ROOT)/src -I$(XPORT_ROOT)/src $(APP_DEFINES)
 COMMON_FLAGS += -DSHORT_NAME=\"$(SHORT_NAME)\"
@@ -56,19 +60,20 @@ $(OBJ_DIR):
 
 define compile_rule
 $(call object_for,$(1)): $(1) $(XPORT_WEB_DIR)/Makefile $(PROJECT_WEB_MAKEFILE) | $(OBJ_DIR)
-	$$(EMCC) $$(COMMON_FLAGS) $$(BUILD_FLAGS) -MMD -MP -MF $(call dep_for,$(1)) -c $(1) -o $$@
+	$(if $(filter %.cpp %.cc %.cxx,$(1)),$$(EMXX) $$(CXX_FLAGS),$$(EMCC) $$(C_FLAGS)) $$(COMMON_FLAGS) $$(BUILD_FLAGS) -MMD -MP -MF $(call dep_for,$(1)) -c $(1) -o $$@
 endef
 
 $(foreach source,$(SOURCES),$(eval $(call compile_rule,$(source))))
 
 -include $(DEPFILES)
 
-$(OUTPUT): $(OBJECTS) | $(DIST_DIR)
+$(OUTPUT): $(OBJECTS) $(WEB_OUTPUT_PERMISSIONS) | $(DIST_DIR)
 	$(file >$(LINK_RESPONSE),$(OBJECTS))
-	$(EMCC) $(filter-out -x c++,$(COMMON_FLAGS)) $(BUILD_FLAGS) $(LINK_FLAGS) @$(LINK_RESPONSE) -o $(OUTPUT)
+	$(if $(filter %.cpp %.cc %.cxx,$(SOURCES)),$(EMXX),$(EMCC)) $(filter-out -x c++,$(COMMON_FLAGS)) $(BUILD_FLAGS) $(LINK_FLAGS) @$(LINK_RESPONSE) -o $(OUTPUT)
+	$(EMSDK_PYTHON) $(WEB_OUTPUT_PERMISSIONS) --runtime $(OUTPUT)
 
 packages: $(OUTPUT) $(XPORT_WEB_DIR)/index.html | $(DIST_DIR)
 	$(EMSDK_PYTHON) $(WEB_PACKAGER) --project $(PROJECT_ROOT) --output $(DIST_DIR) --short-name $(SHORT_NAME) --full-name "$(FULL_NAME)" --index-template $(XPORT_WEB_DIR)/index.html $(foreach pattern,$(WEB_EXCLUDE_FILES),--exclude "$(pattern)") $(WEB_PACKAGER_FLAGS)
 
 clean:
-	rm -f $(OBJECTS) $(DEPFILES) $(LINK_RESPONSE) $(DIST_DIR)/index.html $(DIST_DIR)/xport.js $(DIST_DIR)/xport.wasm $(DIST_DIR)/xport.wasm.map $(DIST_DIR)/xport.data $(DIST_DIR)/xport.data.js $(DIST_DIR)/xport-*.data $(DIST_DIR)/xport-*.js $(DIST_DIR)/xport-*.wasm $(DIST_DIR)/xport-*.wasm.map
+	rm -f $(OBJECTS) $(DEPFILES) $(LINK_RESPONSE) $(DIST_DIR)/index.html $(DIST_DIR)/xport.js $(DIST_DIR)/xport.wasm $(DIST_DIR)/xport.wasm.map $(DIST_DIR)/xport.data $(DIST_DIR)/xport.data.js $(DIST_DIR)/xport-*.data $(DIST_DIR)/xport-*.js $(DIST_DIR)/xport-*.wasm $(DIST_DIR)/xport-*.wasm.map $(DIST_DIR)/xport-icon-*.ico

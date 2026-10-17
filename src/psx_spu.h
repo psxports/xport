@@ -148,6 +148,7 @@ extern "C"
 
     sint32 spu_bind_transfer(const SpuTransferBinding *binding);
     sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTransferBinding *binding, uint32 *direction);
+    sint32 spu_clear_reverb_guest(const SpuNativeTransferGuestBinding *guest, uint32 begin, uint32 bytes, uint32 source, uint32 direction);
     sint32 spu_transfer_failed(void);
     sint32 SpuSetTransferMode(sint32 mode);
     uint32 SpuSetTransferStartAddr(uint32 address);

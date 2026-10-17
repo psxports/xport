@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-16 18:19:31 UTC
+
+- Added `r_masked_u32` for aligned word reads with explicit LWL/LWR observation byte lanes. Existing scalar and MMIO contracts are unchanged; partial MMIO is rejected because the device read callback has no mask. No new consumer binding, serialized state or required migration. Native x86/x64 and x86 LOCKSTEP_DEBUG contract tests pass; FF texture-loader raw/C comparison passes37 cases including two unaligned sources with exact ordered masks. Contract: docs/MASKED_MEMORY.md. Evidence: FightingForce-xport/status/implementation-completion/masked-memory-compatibility-review.json and texture-loader-full-review.json. Other consumers' gameplay and physical bus timing are not certified
+
 ## 2026-10-15 01:59:41 UTC
 
 - Implemented native GP0(02) VRAM fill in DrawPrim and OT command execution: RGB555, 16-pixel X/width alignment, zero dimensions, wrapping and existing interlace/frame-skip policy. GPU/device observers retain original commands and exact VRAM writes; API, bindings and snapshot layouts are unchanged. Debug GPU observer and FF display integration pass; Rapid Racer Debug compiles. Agent Armstrong compilation is blocked by old packet fields and Gran Turismo linking by unrelated missing vid symbols. Evidence: FightingForce-xport/status/implementation-completion/display-initialize-review.json. Consumers require a rebuild only

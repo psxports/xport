@@ -29,6 +29,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - User-initiated native/readability refactoring after confirmed full main-functionality coverage: read [docs/REFACTORING.md](docs/REFACTORING.md); verify its entry gate before planning or changing the state model
 - Lockstep protocols and repair artifacts: read [docs/LOCKSTEP.md](docs/LOCKSTEP.md)
 - Device evidence: read [docs/DEVICE_PROVENANCE.md](docs/DEVICE_PROVENANCE.md)
+- Regional PS-X EXE analysis and automated function/data matching: read [docs/REGION_COMPARE.md](docs/REGION_COMPARE.md)
 - DuckStation deployment and provenance: read [docs/DUCKSTATION.md](docs/DUCKSTATION.md) and [docs/DUCKSTATION_SOURCES.md](docs/DUCKSTATION_SOURCES.md)
 - Graphics enhancement, OG/HD migration and GitHub `enhance` tasks: read [docs/ENHANCE.md](docs/ENHANCE.md), then [docs/VID.md](docs/VID.md) for exact API contracts
 - Windows x86/x64, AP platform flags, architecture selection and x86-only converge constraints: read [docs/PLATFORMS.md](docs/PLATFORMS.md)

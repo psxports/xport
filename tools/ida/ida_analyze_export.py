@@ -191,6 +191,10 @@ def main():
   records.append(dict(address=ea,end=fn.end_ea,name=name,chunks=chunks,sha256=hashlib.sha256(raw).hexdigest(),size=len(raw),status='TODO',boundary_status='IDA_discovered_unreviewed',pseudocode=pseudopath,instructions=instructions))
   if len(records)%100==0:print('Exported',cfg['image'],len(records))
  names=[dict(address=a,name=n,kind='code' if ida_bytes.is_code(ida_bytes.get_full_flags(a)) else 'data',size=ida_bytes.get_item_size(a)) for a,n in idautils.Names()]
+ if cfg.get('comparison_features'):
+  sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+  from ida_compare_features import export_features
+  dump(out+'/comparison-features.json',export_features(records,xrefs,names))
  dump(out+'/functions.json',records);dump(out+'/callgraph.json',edges);dump(out+'/data-xrefs.json',xrefs);dump(out+'/symbols.json',names);dump(out+'/indirect-calls.json',indirect);dump(out+'/decompilation-failures.json',fail);dump(out+'/ctree-failures.json',ctree_fail)
  strings=[]
  for s in idautils.Strings():strings.append(dict(address=s.ea,length=s.length,text=str(s)))
