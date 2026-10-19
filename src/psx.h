@@ -55,9 +55,18 @@ extern "C"
     uint32 psx_pad_owner_begin(uint32 owner, uint32 cleanup_target);
     void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1, uint32 cleanup_callback, uint32 delay_cache, uint32 multitap_enable, uint32 actuator_budget);
     void psx_pad_bind_main_mode_commands(uint32 send_target, uint32 receive_target);
+
+    typedef struct
+    {
+        uint32 descriptors, error, invalid_seek_text;
+    } PSX_BIOS_FILE_GUEST_BINDING;
+
+    sint32 psx_bios_bind_file_guest(const PSX_BIOS_FILE_GUEST_BINDING *binding);
+    sint32 lseekPSX(sint32 descriptor, sint32 offset, uint32 origin);
     sint32 openPSX(const char *path, uint32 mode);
     sint32 readPSX(sint32 descriptor, void *destination, uint32 length);
     sint32 writePSX(sint32 fd, const void *src, uint32 length);
+
     sint32 closePSX(sint32 descriptor);
     sint32 erase(const char *path);
 
@@ -83,6 +92,7 @@ extern "C"
     sint32 CdReset(sint32 mode);
     sint32 CdControlBPSX(uint8 command, uint8 *parameter, uint8 *result);
     sint32 StopRCnt(uint32 counter, uint32 control_slot, uint32 mask_table);
+    sint32 psx_root_counter_stop(uint32 counter);
     sint32 StopCallback(void);
     sint32 Exec(uint32 guest_header, uint32 argc, uint32 argv);
     sint32 randPSX(void);
@@ -105,6 +115,7 @@ extern "C"
     uint64 __adddf3PSX(uint64 left, uint64 right);
     uint64 __muldf3PSX(uint64 left, uint64 right);
     uint64 __divdf3PSX(uint64 left, uint64 right);
+    uint64 __divdi3PSX(uint64 dividend, uint64 divisor);
     float __truncdfsf2(double value);
     void qsortPSX(void *base, size_t count, size_t size, int (*compare)(const void *, const void *));
     uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value);
@@ -122,6 +133,7 @@ extern "C"
     uint32 mallocPSX(uint32 bytes);
     void freePSX(uint32 address);
     uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1);
+    uint32 InitPADNative(uint8 *buffer0, uint32 size0, uint8 *buffer1, uint32 size1);
     uint32 StartPAD(void);
     uint32 PAD_init2(uint32 type, uint32 destination);
     uint32 PAD_dr(void);
@@ -130,8 +142,33 @@ extern "C"
     uint32 xport_bios_init_card(uint32 mode);
     void psx_bios_bind_card_irq_initializer(void (*initializer)(void));
     uint32 xport_bios_start_card(void);
+    uint32 xport_bios_stop_card(void);
+    uint32 xport_bios_stop_pad(void);
+    uint32 GetC0Table(void);
+    uint32 GetB0Table(void);
+
+    typedef struct PsxCardSdkBinding
+    {
+        uint32 init_pad_flag;
+        uint32 saved_return;
+        uint32 copy_source;
+        uint32 first_source;
+        uint32 second_source;
+        uint32 first_return;
+        uint32 second_return;
+        uint32 clear_return;
+        uint32 clear_add_pc;
+    } PsxCardSdkBinding;
+
+    void psx_bios_bind_card_sdk(const PsxCardSdkBinding *binding);
+    void InitCARD(sint32 mode);
+    void StartCARD(void);
+    void psx_bios_bind_card_stop(void (*restore)(uint32), uint32 return_continuation);
+    uint32 StopCARD(void);
+    void xport_mips_overflow_exception(uint32 pc);
     uint32 VSyncCallbackPSX(uint32 guest_callback);
     uint32 ResetCallbackPSX(void);
+
     sint32 xport_bios_enter_critical(void);
     void xport_bios_exit_critical(void);
     void psx_bios_bind_card_patches(uint32 copy_source, uint32 first_source, uint32 second_source, uint32 first_destination, uint32 second_destination);
@@ -140,6 +177,16 @@ extern "C"
     uint32 psx_bios_card_load_guest(uint32 channel);
     uint32 psx_bios_card_read_guest(uint32 channel, uint32 sector, uint32 buffer);
     void psx_bios_card_poll(void);
+
+    typedef struct PsxCardFormatGuestBinding
+    {
+        uint32 records;
+        uint32 defects;
+        uint32 sector_buffer;
+    } PsxCardFormatGuestBinding;
+
+    void psx_card_bind_format_guest(const PsxCardFormatGuestBinding *binding);
+    sint32 _card_format(sint32 channel);
     void UnDeliverEvent(uint32 event_class, uint32 spec);
 
     typedef uint16 u_short;
@@ -259,6 +306,9 @@ extern "C"
         sint16 m[3][3];
         sint32 t[3];
     } MATRIX;
+
+    extern const MATRIX psx_identity_matrix;
+    extern const uint32 psx_identity_rotation_words[5];
 
     typedef struct
     {
@@ -490,6 +540,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #define CdlPause 0x09
 #define CdlMute 0x0b
 #define CdlDemute 0x0c
+#define CdlGetlocP 0x11
 #define CdlSetmode 0x0e
 #define CdlSeekL 0x15
 
@@ -1025,6 +1076,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         VECTOR *ApplyRotMatrix(SVECTOR *input, VECTOR *output);
         VECTOR *ApplyRotMatrixLV(const VECTOR *source, VECTOR *destination);
         uint32 ApplyRotMatrixLVPSX(uint32 source, uint32 destination);
+        MATRIX *MulRotMatrix(MATRIX *matrix);
+        MATRIX *MulRotMatrix0(const MATRIX *source, MATRIX *destination);
         uint32 MulRotMatrixPSX(uint32 matrix);
         uint32 MulRotMatrix0PSX(uint32 source, uint32 destination);
         SVECTOR *ApplyMatrixSV(MATRIX *matrix, SVECTOR *input, SVECTOR *output);
@@ -1036,6 +1089,11 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 SetDrawMovePSX(uint32 destination, uint32 rectangle, uint32 x, uint32 y);
         void SetDrawMove(DR_MOVE *packet, PSX_RECT *rectangle, sint32 x, sint32 y);
         uint32 xport_guest_call3(uint32 target, uint32 argument0, uint32 argument1, uint32 argument2);
+        uint32 xport_guest_call0(uint32 target);
+        sint32 xport_guest_call2(uint32 target, uint32 argument0, uint32 argument1);
+        typedef uint32 (*PsxGuestDispatch)(uint32 target, uint32 argument_count, uint32 argument0, uint32 argument1, uint32 argument2);
+        void psx_bind_guest_dispatch(PsxGuestDispatch dispatch);
+        uint32 psx_dispatch_guest_call(uint32 target, uint32 argument_count, uint32 argument0, uint32 argument1, uint32 argument2);
         uint32 xport_guest_call_known_registers(uint32 target, uint32 *registers, uint32 known_register_mask);
         uint32 *ClearOTagR(uint32 *ot, sint32 count);
         sint32 ccos(sint32 a);
@@ -1045,6 +1103,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 rsin(sint32 a);
         uint32 SquareRoot0(sint32 input);
         uint32 SquareRoot0PSX(uint32 input, uint32 table_address);
+        uint32 SquareRoot12(sint32 input);
         uint32 SquareRoot12PSX(uint32 input, uint32 table_address);
 
         typedef struct
@@ -1099,6 +1158,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void xport_gte_write_data(uint32 register_index, uint32 value);
         void xport_gte_mvmva(uint32 command);
         void xport_gte_write_control(uint32 index, uint32 value);
+        uint32 xport_gte_read_control(uint32 index);
         uint32 xport_gte_read_data(uint32 register_index);
         uint32 xport_gte_read_flag(void);
         uint32 xport_gte_read_screen_offset(uint32 axis);
@@ -1122,12 +1182,14 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void PadInit(sint32 mode);
         sint32 PadGetState(sint32 port);
         uint32 PadGetStatePSX(uint32 port);
+
         void PadSetActPSX(uint32 port, uint32 actuator, uint32 length);
         uint32 PadSetActAlignPSX(uint32 port, uint32 alignment);
         sint32 PadInfoMode(sint32 port, sint32 term, sint32 offset);
         void PadInitDirect(uint8 *pad1, uint8 *pad2);
         uint32 PadInitDirectPSX(uint32 first_packet, uint32 second_packet);
         uint32 PadStartComPSX(void);
+
         void PadSetAct(sint32 port, uint8 *actuator, sint32 length);
         sint32 PadInfoAct(sint32 port, sint32 actuator, sint32 term);
         sint32 PadSetActAlign(sint32 port, uint8 *alignment);
@@ -1178,7 +1240,22 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, sint32 *files, sint32 offset, sint32 maximum);
         sint32 ResetCallback(void);
         typedef void (*PsxInterruptCallback)(void);
+
+        typedef struct PsxCallbackDriver
+        {
+            uint16 initialized;
+            uint16 saved_interrupt_mask;
+            uint32 saved_dma_control;
+        } PsxCallbackDriver;
+
+        extern PsxCallbackDriver psx_callback_driver;
+        PsxCallbackDriver *psx_callback_reset_driver(void);
+        PsxCallbackDriver *stopIntr(void);
+        PsxCallbackDriver *restartIntr(void);
         PsxInterruptCallback InterruptCallback(sint32 interrupt, PsxInterruptCallback callback);
+        PsxInterruptCallback psx_bios_vsync_callback(PsxInterruptCallback callback);
+        PsxInterruptCallback setIntrVSync(uint32 slot, PsxInterruptCallback callback);
+        void trapIntrVSync(void);
         void psx_interrupt_raise(uint32 interrupt);
         MATRIX *RotMatrix(SVECTOR *rotation, MATRIX *matrix);
         MATRIX *RotMatrixX(sint32 angle, MATRIX *matrix);
@@ -1187,6 +1264,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         MATRIX *RotMatrixYXZ(SVECTOR *rotation, MATRIX *matrix);
         MATRIX *MulMatrix(MATRIX *left, MATRIX *right);
         MATRIX *MulMatrix0(MATRIX *left, MATRIX *right, MATRIX *destination);
+        MATRIX *SetMulMatrix(MATRIX *left, MATRIX *right);
         MATRIX *MulMatrix2(MATRIX *source, MATRIX *destination);
         void RotTrans(SVECTOR *input, VECTOR *output, sint32 *flags);
         sint32 RotTransPers(SVECTOR *input, sint32 *screen_xy, sint32 *projection, sint32 *flags);
@@ -1195,7 +1273,9 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SetDispMask(sint32 enabled);
         DISPENV *SetDefDispEnv(DISPENV *environment, sint32 x, sint32 y, sint32 width, sint32 height);
         DRAWENV *SetDefDrawEnv(DRAWENV *environment, sint32 x, sint32 y, sint32 width, sint32 height);
-        void SetDrawArea(DR_AREA *packet, PSX_RECT *rectangle);
+        void gpu_bind_draw_area_bounds(uint32 width_address, uint32 height_address);
+        uint32 SetDrawArea(DR_AREA *packet, const PSX_RECT *rectangle);
+        void SetDrawLoad(DR_LOAD *packet, const PSX_RECT *rectangle);
         void SetDrawOffset(void *packet, const sint16 *offset);
         void SetDrawEnv(DR_ENV *packet, DRAWENV *environment);
         void SetDrawStp(DR_STP *packet, sint32 enabled);
@@ -1239,6 +1319,65 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
             sint16 right;
         } SndVolume2;
 
+        typedef struct VabHdr
+        {
+            sint32 form;
+            sint32 ver;
+            sint32 id;
+            uint32 fsize;
+            uint16 reserved0;
+            uint16 ps;
+            uint16 ts;
+            uint16 vs;
+            uint8 mvol;
+            uint8 pan;
+            uint8 attr1;
+            uint8 attr2;
+            uint32 reserved1;
+        } VabHdr;
+
+        typedef struct ProgAtr
+        {
+            uint8 tones;
+            uint8 mvol;
+            uint8 prior;
+            uint8 mode;
+            uint8 mpan;
+            sint8 reserved0;
+            sint16 attr;
+            uint32 reserved1;
+            uint32 reserved2;
+        } ProgAtr;
+
+        typedef struct VagAtr
+        {
+            uint8 prior;
+            uint8 mode;
+            uint8 vol;
+            uint8 pan;
+            uint8 center;
+            uint8 shift;
+            uint8 min;
+            uint8 max;
+            uint8 vibW;
+            uint8 vibT;
+            uint8 porW;
+            uint8 porT;
+            uint8 pbmin;
+            uint8 pbmax;
+            uint8 reserved1;
+            uint8 reserved2;
+            uint16 adsr1;
+            uint16 adsr2;
+            sint16 prog;
+            sint16 vag;
+            sint16 reserved[4];
+        } VagAtr;
+
+        typedef char XPORT_VAB_HDR_SIZE_CHECK[sizeof(VabHdr) == 32 ? 1 : -1];
+        typedef char XPORT_PROG_ATR_SIZE_CHECK[sizeof(ProgAtr) == 16 ? 1 : -1];
+        typedef char XPORT_VAG_ATR_SIZE_CHECK[sizeof(VagAtr) == 32 ? 1 : -1];
+
         typedef struct SndRegisterAttr
         {
             SndVolume2 volume;
@@ -1281,6 +1420,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 _SsVmKeyOffNow(void);
         uint32 vmNoiseOff(uint8 voice);
         uint32 note2pitch(void);
+        uint16 _spu_note2pitch(uint16 center_note, uint16 center_fine, uint16 note, uint16 note_fine);
+        uint32 _spu_FsetRXXa(sint32 register_index, uint32 address);
         uint16 SsPitchFromNote(sint32 note, sint16 fine, uint8 center, uint8 shift);
         void xport_libsnd_bind_sequence_mark_table(uint32 table_address);
         uint32 _SsReadDeltaValue(sint16 sequence, sint16 separation);
@@ -1289,6 +1430,10 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 SsVoiceCheck(uint32 voice, sint32 bank_program, sint16 note);
         uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 right);
         sint16 SsUtKeyOnV(sint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right);
+        sint16 SsUtGetVabHdr(sint16 bank, VabHdr *attributes);
+        sint16 SsUtGetProgAtr(sint16 bank, sint16 program, ProgAtr *attributes);
+        sint16 SsUtGetVagAtr(sint16 bank, sint16 program, sint16 tone, VagAtr *attributes);
+        sint16 SsUtSetVagAtr(sint16 bank, sint16 program, sint16 tone, const VagAtr *attributes);
         sint16 SsVabOpenHead(uint8 *header, sint16 requested_bank);
         void SsVabClose(sint16 bank);
         sint16 SsVabTransBody(uint8 *body, sint16 bank);
@@ -1305,10 +1450,13 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         PsxInterruptCallback CdDataCallback(PsxInterruptCallback callback);
         CdlCB CdReadyCallback(CdlCB callback);
         CdlCB CdSyncCallback(CdlCB callback);
+        CdlCB CdReadCallback(CdlCB callback);
         sint32 CdSetDebug(sint32 level);
         void srandPSX(uint32 seed);
         sint32 CdGetToc2(sint32 mode, CdlLOC *toc);
         PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback);
+
+        PsxInterruptCallback setIntrDMA(uint32 channel, PsxInterruptCallback callback);
         PsxInterruptCallback psx_dma_callback_native(uint32 channel);
         typedef uint32 (*CdGuestCallback)(uint32 event, uint32 response);
 
@@ -1323,6 +1471,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
             uint32 event_names;
             uint32 poll_enabled;
             CdGuestCallback (*resolve)(uint32 address);
+            void (*dispatch)(uint32 target, uint32 event, uint32 response);
         } CD_GUEST_BINDING;
 
         void cd_bind_guest(const CD_GUEST_BINDING *binding);
@@ -1334,16 +1483,23 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 CdDataSync(sint32 mode);
         sint32 CdGetDiskType(void);
         sint32 CdGetSector(void *destination, sint32 words);
+        sint32 CdRead(sint32 count, uint32 *destination, sint32 mode);
+        sint32 CdReadSync(sint32 mode, uint8 *result);
         sint32 CdPosToInt(CdlLOC *position);
         uint32 CdReadyCallbackPSX(uint32 callback);
         uint32 CdSyncCallbackPSX(uint32 callback);
         void SpuGetCommonAttr(SpuCommonAttr *attr);
         void SpuGetVoiceAttr(SpuVoiceAttr *attr);
         sint32 SpuGetKeyStatus(uint32 voice_bit);
+        void SpuGetAllKeysStatus(uint8 *status);
+        void spu_bind_key_status_guest(uint32 state_address, uint32 registers_pointer_address);
         void SpuInit(void);
+        uint32 SpuStart(void);
         void SpuInitHot(void);
         void SpuQuit(void);
         void SpuSetCommonAttr(SpuCommonAttr *attr);
+        uint32 WaitEventPSX(uint32 handle);
+
         void spu_bind_key_guest(uint32 state_address, uint32 event_mode_address, uint32 event_flags_address, uint32 pending_mask_address, uint32 registers_address);
         void SpuSetKey(sint32 on_off, uint32 voice_bit);
         sint32 SpuSetReverb(sint32 enabled);
@@ -1357,8 +1513,9 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 SpuSetTransferMode(sint32 mode);
         uint32 SpuSetTransferStartAddr(uint32 address);
         uint32 SpuWrite(const void *source, uint32 byte_count);
+        sint32 SpuReadDecodedData(void *destination, sint32 flags);
         sint32 SpuIsTransferCompleted(sint32 mode);
-        void SpuSetVoiceAttr(SpuVoiceAttr *attr);
+        void SpuSetVoiceAttr(const SpuVoiceAttr *attr);
         void SpuSetVoiceLoopStartAddr(sint32 voice, uint32 loop_start_address);
         void SpuSetVoicePitch(sint32 voice, uint16 pitch);
         void SpuSetVoiceStartAddr(sint32 voice, uint32 start_address);
@@ -1425,6 +1582,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
     {
 #endif
         sint32 xport_psx_exe_load(const PSX_EXE *executable);
+        void InitHeap(uint32 address, uint32 bytes);
         sint32 xport_cd_file_size(uint32 guest_path, const char *root, size_t *size);
         sint32 xport_cd_file_size_native(const char *src, const char *root, size_t *size);
         sint32 xport_cd_file_read_native(const char *src, const char *root, void *dst, size_t cap, size_t *size);
@@ -1458,6 +1616,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
     sint32 StartRCnt(uint32 counter);
     void psx_root_counter_bind(uint32 control_slot, uint32 mask_table);
+    void psx_native_bus_bind(void);
     void psx_root_counter_bind_clock(PsxRootClockSample sample, void *context);
     void psx_root_counter_poll(void);
 

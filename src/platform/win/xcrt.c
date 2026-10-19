@@ -462,13 +462,66 @@ int sprintf(char *destination, const char *format, ...)
 int _fltused = 0;
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show);
 
+typedef void(__cdecl *XcrtInitializer)(void);
+
+typedef struct XcrtExitEntry
+{
+    XcrtInitializer callback;
+    struct XcrtExitEntry *next;
+} XcrtExitEntry;
+
+static SRWLOCK exit_lock = SRWLOCK_INIT;
+static XcrtExitEntry *exit_callbacks;
+
+#pragma section(".CRT$XCA", read)
+#pragma section(".CRT$XCZ", read)
+__declspec(allocate(".CRT$XCA")) XcrtInitializer xcrt_init_begin[1] = {0};
+__declspec(allocate(".CRT$XCZ")) XcrtInitializer xcrt_init_end[1] = {0};
+
+int __cdecl atexit(void(__cdecl *callback)(void))
+{
+    XcrtExitEntry *entry;
+    if (!callback)
+        return -1;
+    entry = (XcrtExitEntry *)malloc(sizeof(*entry));
+    if (!entry)
+        return -1;
+    entry->callback = callback;
+    AcquireSRWLockExclusive(&exit_lock);
+    entry->next = exit_callbacks;
+    exit_callbacks = entry;
+    ReleaseSRWLockExclusive(&exit_lock);
+    return 0;
+}
+
 __declspec(noreturn) void exit(int code)
 {
+    for (;;)
+    {
+        XcrtExitEntry *entry;
+        XcrtInitializer callback;
+        AcquireSRWLockExclusive(&exit_lock);
+        entry = exit_callbacks;
+        if (!entry)
+        {
+            ReleaseSRWLockExclusive(&exit_lock);
+            break;
+        }
+        exit_callbacks = entry->next;
+        callback = entry->callback;
+        ReleaseSRWLockExclusive(&exit_lock);
+        free(entry);
+        callback();
+    }
     ExitProcess((UINT)code);
 }
 
 __declspec(noreturn) void WinMainCRTStartup(void)
 {
+    XcrtInitializer *initializer;
     process_heap = GetProcessHeap();
-    ExitProcess((UINT)WinMain(GetModuleHandleA(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT));
+    for (initializer = xcrt_init_begin + 1; initializer < xcrt_init_end; ++initializer)
+        if (*initializer)
+            (*initializer)();
+    exit(WinMain(GetModuleHandleA(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT));
 }

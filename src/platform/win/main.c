@@ -141,7 +141,6 @@ static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
 static LARGE_INTEGER platform_timer_frequency;
 static LARGE_INTEGER platform_timer_start;
-static uint64 platform_frame_deadline;
 static sint32 platform_timer_initialized;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
@@ -175,23 +174,25 @@ uint64 xport_timer_get(void)
 
 void xport_timer_wait_frame(uint32 refresh_rate)
 {
-    uint64 now;
-    uint64 period;
-    uint64 remaining;
-    xport_timer_init();
-    if (!refresh_rate)
-        refresh_rate = FIELD_RATE;
-    now = xport_timer_get();
-    period = refresh_rate == FIELD_RATE ? (uint64)1000000u * FIELD_RATE_DENOMINATOR / FIELD_RATE_NUMERATOR : 1000000u / refresh_rate;
-    if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
-        platform_frame_deadline = now + period;
-    while (now < platform_frame_deadline)
+    uint64 idx;
+    uint64 now = xport_timer_get();
+    uint64 deadline;
+    if (!refresh_rate || refresh_rate == FIELD_RATE)
     {
-        remaining = platform_frame_deadline - now;
+        xport_frame_fract(&idx);
+        deadline = xport_frame_time(idx + 1);
+    }
+    else
+    {
+        idx = now / 1000000 * refresh_rate + now % 1000000 * refresh_rate / 1000000;
+        deadline = ((idx + 1) * 1000000 + refresh_rate - 1) / refresh_rate;
+    }
+    while (now < deadline)
+    {
+        uint64 remaining = deadline - now;
         Sleep(remaining > 2000 ? (DWORD)(remaining / 1000 - 1) : 0);
         now = xport_timer_get();
     }
-    platform_frame_deadline += period;
 }
 
 void xport_render_wait(void)
@@ -387,6 +388,7 @@ static uint32 xinput_to_pad(const XINPUT_GAMEPAD *gamepad)
         buttons |= PADL2;
     if (gamepad->bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD)
         buttons |= PADR2;
+#if XPORT_PAD_HACK
     if (gamepad->sThumbLX < -XINPUT_STICK_DPAD_THRESHOLD)
         buttons |= PADLleft;
     if (gamepad->sThumbLX > XINPUT_STICK_DPAD_THRESHOLD)
@@ -395,6 +397,7 @@ static uint32 xinput_to_pad(const XINPUT_GAMEPAD *gamepad)
         buttons |= PADLdown;
     if (gamepad->sThumbLY > XINPUT_STICK_DPAD_THRESHOLD)
         buttons |= PADLup;
+#endif
     return buttons;
 }
 
@@ -620,6 +623,7 @@ uint32 xport_input_read(sint32 controller)
     if (buttons & ~platform_gamepad_buttons[controller])
         platform_input_type[controller] = 1;
     platform_gamepad_buttons[controller] = buttons;
+#if XPORT_PAD_HACK
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller];
     if (axes[5] & 1u)
@@ -634,6 +638,7 @@ uint32 xport_input_read(sint32 controller)
         axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
     if (directions & (PADLup | PADLdown))
         axes[3] = (directions & PADLup) ? ((directions & PADLdown) ? 128 : 0) : 255;
+#endif
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;
@@ -767,7 +772,7 @@ enum
 };
 
 static sint16 audio_pcm[AUDIO_PCM_CAPACITY * 2];
-static uint32 audio_pcm_read, audio_pcm_write;
+static uint64 audio_pcm_read, audio_pcm_write;
 volatile uint32 g_xport_audio_queue_peak;
 
 static sint32 audio_pcm_take(sint16 *samples, uint32 count)
@@ -793,10 +798,22 @@ static sint32 audio_pcm_take(sint16 *samples, uint32 count)
 static void audio_pcm_put(const sint16 *samples, uint32 count)
 {
     uint32 index, queued;
-    xport_audio_lock();
-    queued = audio_pcm_write - audio_pcm_read;
-    if (count > AUDIO_PCM_CAPACITY - queued)
+    if (count > AUDIO_PCM_CAPACITY)
         abort();
+    for (;;)
+    {
+        xport_audio_lock();
+        queued = audio_pcm_write - audio_pcm_read;
+        if (queued > AUDIO_PCM_CAPACITY)
+            abort();
+        if (count <= AUDIO_PCM_CAPACITY - queued)
+            break;
+        xport_audio_unlock();
+        // Let WaveOut consume queued samples before publishing another field
+        if (!xport_audio_is_running())
+            abort();
+        Sleep(1);
+    }
     for (index = 0; index < count; ++index)
     {
         uint32 slot = (audio_pcm_write + index) % AUDIO_PCM_CAPACITY;
@@ -1309,6 +1326,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR comman
     xport_lockstep_memory_ready();
 #endif
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
+#if !defined(LOCKSTEP_DEBUG) && defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+    xport_memory_bind_mmio(0x1F801C00, 0x200, spu_mmio_read, spu_mmio_write, NULL);
+#endif
 #if defined(_DEBUG)
     if (collect_requested(command_line) && !collect_begin())
     {

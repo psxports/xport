@@ -11,7 +11,7 @@ from xport_project import project_path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fixture', choices=('gpu_observer', 'vsync_callback', 'spu_control', 'spu_pending_key', 'pad_replay'), default='gpu_observer')
+    parser.add_argument('--fixture', choices=('gpu_observer', 'vsync_callback', 'spu_control', 'spu_pending_key', 'spu_decoded', 'pad_replay'), default='gpu_observer')
     parser.add_argument('--configuration', choices=('Debug', 'Release'), default='Debug')
     parser.add_argument('--architecture', choices=('x86', 'x64'), default='x86')
     args = parser.parse_args()

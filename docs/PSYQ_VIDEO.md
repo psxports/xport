@@ -47,6 +47,15 @@ The implementation is a native playback service, not complete PS1 hardware emula
 
 `cd_mount_stream_file(path)` in `psx_spu` mounts RIFF/CDXA `data` chunks, raw 2352-byte Mode2 sectors or 2048-byte STR user sectors. Seek sector zero with `CdIntToPos(0, &pos)` and `CdControlB(CdlSeekL, &pos, NULL)` before `CdRead2`. The existing SPU clock advances the same bounded audio/data queues. User sectors receive a native Mode2 data envelope and contain no XA audio. This mount replaces the prior image only after validating container and sector bounds; an invalid file preserves the existing mount. `cd_mount_cue` retains its raw-disc behavior and resets file offsets and stride when replacing a stream file. Consumers retain paths, movie descriptors, frame limits and presentation policy.
 
+## Guest VLC state boundary
+
+- Compile `src/psx_vlc_guest.c` when using `DecDCTvlcSize2PSX`, `DecDCTvlcBuildPSX` or `DecDCTvlc2PSX`; the existing pure native decoder remains in `src/psx_vlc.c`
+- Call `psx_vlc_bind_guest(state_address, table_source, size_add_pc, decode_entry)` before these entries. Bind original image addresses and the reviewed matching SDK instruction layout; each entry aborts when its required binding is absent
+- The state block contains limit at0, nine continuation words at4..36 and final output end at40. Inputs, tables and outputs remain numeric guest addresses accessed through standard scalar memory services
+- Preserve the original compressed table expansion, forward overlapping copies, halfword XOR phase, continuation publication, signed ADD/ADDI/SUB traps and sentinel fill. Native callback/configuration pointers never enter the guest state block
+- AC3 evidence and executable checks: `AceCombat3-xport/status/function-coverage/first/integration-vlc-review.json`; run `python -B tools/test_native_vlc_table.py` then `python -B tools/test_native_vlc_decode.py` from that project
+- These checks cover the table bytes, selected VLC streams, continuation state and trap PCs. They do not prove MDEC DMA/device behavior, movie presentation or malformed-stream coverage
+
 ## Compact VLC regression
 
 - `tools/tests/native/vlc_compact.c` is a standalone fixture that includes the actual decoder

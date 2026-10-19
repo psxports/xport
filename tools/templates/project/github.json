@@ -1,0 +1,154 @@
+{
+  "schema": 1,
+  "type": "Task",
+  "labels": [
+    {
+      "name": "startup",
+      "color": "fbca04",
+      "description": ""
+    },
+    {
+      "name": "decomp",
+      "color": "8ae13c",
+      "description": ""
+    },
+    {
+      "name": "refactor",
+      "color": "c5def5",
+      "description": ""
+    },
+    {
+      "name": "enhance",
+      "color": "0052cc",
+      "description": ""
+    },
+    {
+      "name": "remaster",
+      "color": "5319e7",
+      "description": ""
+    },
+    {
+      "name": "question",
+      "color": "d876e3",
+      "description": "Further information is requested"
+    }
+  ],
+  "issues": [
+    {
+      "title": "Project initialization",
+      "label": "startup"
+    },
+    {
+      "title": "Main Menu",
+      "label": "decomp"
+    },
+    {
+      "title": "Render",
+      "label": "decomp"
+    },
+    {
+      "title": "Audio",
+      "label": "decomp"
+    },
+    {
+      "title": "Video",
+      "label": "decomp"
+    },
+    {
+      "title": "Gameplay",
+      "label": "decomp"
+    },
+    {
+      "title": "Save Data",
+      "label": "decomp"
+    },
+    {
+      "title": "Modules",
+      "label": "refactor"
+    },
+    {
+      "title": "Function Names",
+      "label": "refactor"
+    },
+    {
+      "title": "Variable Names",
+      "label": "refactor"
+    },
+    {
+      "title": "Struct Names",
+      "label": "refactor"
+    },
+    {
+      "title": "Initial DRAM state",
+      "label": "refactor"
+    },
+    {
+      "title": "Use native RAM",
+      "label": "refactor"
+    },
+    {
+      "title": "x64 support",
+      "label": "refactor"
+    },
+    {
+      "title": "WideScreen support",
+      "label": "enhance"
+    },
+    {
+      "title": "Native resolution",
+      "label": "enhance"
+    },
+    {
+      "title": "Frame lerp",
+      "label": "enhance"
+    },
+    {
+      "title": "Renderer",
+      "label": "enhance"
+    },
+    {
+      "title": "Increase view distance",
+      "label": "enhance"
+    },
+    {
+      "title": "Disable LODs",
+      "label": "enhance"
+    },
+    {
+      "title": "Floating Point math",
+      "label": "enhance"
+    },
+    {
+      "title": "Disable subdiv",
+      "label": "enhance"
+    },
+    {
+      "title": "Texture Filtering",
+      "label": "enhance"
+    },
+    {
+      "title": "Effects",
+      "label": "remaster"
+    },
+    {
+      "title": "Textures",
+      "label": "remaster"
+    },
+    {
+      "title": "Environment",
+      "label": "remaster"
+    },
+    {
+      "title": "UI",
+      "label": "remaster"
+    },
+    {
+      "title": "Fog",
+      "label": "remaster"
+    },
+    {
+      "title": "Soft Shadows",
+      "label": "remaster"
+    }
+  ]
+}

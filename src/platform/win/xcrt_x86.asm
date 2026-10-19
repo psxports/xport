@@ -17,6 +17,36 @@ __CIatan2 proc
     ret
 __CIatan2 endp
 
+; Convert unsigned EDX:ECX to binary32 in XMM0
+public __ultof3
+__ultof3 proc
+    sub esp, 8
+    test edx, edx
+    js upper_half
+    mov [esp], ecx
+    mov [esp+4], edx
+    fild QWORD PTR[esp]
+    fstp DWORD PTR[esp]
+    movss xmm0, DWORD PTR[esp]
+    add esp, 8
+    ret
+upper_half:
+    ; Retain the discarded low bit for correct halfway rounding
+    mov eax, ecx
+    and eax, 1
+    shrd ecx, edx, 1
+    shr edx, 1
+    or ecx, eax
+    mov [esp], ecx
+    mov [esp+4], edx
+    fild QWORD PTR[esp]
+    fstp DWORD PTR[esp]
+    movss xmm0, DWORD PTR[esp]
+    addss xmm0, xmm0
+    add esp, 8
+    ret
+__ultof3 endp
+
 public __ftol3
 __ftol3 proc
     cvttss2si eax, xmm0

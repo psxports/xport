@@ -57,12 +57,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--role')
     parser.add_argument('--game-exe',action='store_true')
+    parser.add_argument('--disc',type=Path,help='Boot another original disc without changing project configuration')
     parser.add_argument('--state',type=Path)
     parser.add_argument('--slot',type=int)
     parser.add_argument('--visible',action='store_true')
     parser.add_argument('--plan',action='store_true')
     parser.add_argument('--lockstep-timing',action='store_true')
     args=parser.parse_args()
+    if args.disc and args.game_exe:
+        parser.error('--disc cannot be combined with --game-exe')
     root,config=load_project()
     role=args.role or config['duckstation'].get('default_role','user')
     port=config['duckstation']['reserved_gdb_ports'][role]
@@ -86,7 +89,7 @@ def main():
     else:
         if args.lockstep_timing and not args.state and args.slot is None:
             command.extend(['-exe', str(boot)])
-        command.append(str(project_path('disc_image')))
+        command.append(str(args.disc.resolve(strict=True) if args.disc else project_path('disc_image')))
     if args.plan:
         print(json.dumps({'command':command,'data_directory':str(data),'port':port,'visible':args.visible}))
         return
@@ -97,7 +100,7 @@ def main():
             verify_owner(data, port, owner)
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             parser.exit(1, f'Port {port} belongs to an unverified process (PID {owner["Id"]}); no changes made. {error}\n')
-        if not args.visible or args.state or args.slot is not None or args.game_exe or args.lockstep_timing:
+        if not args.visible or args.state or args.slot is not None or args.game_exe or args.lockstep_timing or args.disc:
             parser.exit(1, f'DuckStation is already running for this role (PID {owner["Id"]}, port {port}). Close it before starting another scenario; its current state was preserved.\n')
         focused = show_existing_window(owner['Id'])
         print('DuckStation is already running.' if focused else

@@ -13,6 +13,7 @@ int xport_hd = 1;
     #error SHORT_NAME must be defined by the consuming project
 #endif
 
+// clang-format off
 EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, sint32 writing), {
     if (!data || size <= 0)
         return -1;
@@ -26,12 +27,19 @@ EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, s
             let blocked = false;
             const request = indexedDB.open('XPORT_SAVES', 1);
             request.onupgradeneeded = () => request.result.createObjectStore('saves');
-            request.onsuccess = () => {
-                if (blocked) request.result.close();
-                else resolve(request.result);
+            request.onsuccess = () =>
+            {
+                if (blocked)
+                    request.result.close();
+                else
+                    resolve(request.result);
             };
             request.onerror = () => reject(request.error);
-            request.onblocked = () => { blocked = true; reject(new Error('Save database blocked')); };
+            request.onblocked = () =>
+            {
+                blocked = true;
+                reject(new Error('Save database blocked'));
+            };
         });
         return await new Promise((resolve, reject) => {
             const transaction = db.transaction('saves', writing ? 'readwrite' : 'readonly');
@@ -80,6 +88,7 @@ EM_ASYNC_JS(sint32, save_transfer, (const char *name, void *data, sint32 size, s
             db.close();
     }
 });
+// clang-format on
 
 sint32 xport_save(const void *data, sint32 size)
 {
@@ -112,7 +121,6 @@ static uint8 platform_pad_analog[2][6];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
-static uint64 platform_frame_deadline;
 static uint64 platform_poll_deadline;
 static sint32 audio_active;
 static RUN_MODE platform_run_mode;
@@ -141,7 +149,8 @@ extern "C"
     platform_touch_buttons = buttons & 0xffffu;
 }
 
-EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
+// clang-format off
+EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes, sint32 pad_hack), {
     HEAPU8.fill(128, axes, axes + 4);
     HEAPU8[axes + 4] = 0;
     HEAPU8[axes + 5] = 0;
@@ -155,7 +164,8 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
             continue;
         if (controller++ !== player)
             continue;
-        const axis = index => {
+        const axis = index =>
+        {
             const value = pad.axes[index];
             return Number.isFinite(value) ? Math.max(0, Math.min(255, Math.floor((value + 1) * 128))) : 128;
         };
@@ -164,9 +174,8 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
         HEAPU8[axes + 2] = axis(0);
         HEAPU8[axes + 3] = axis(1);
         HEAPU8[axes + 4] = pad.axes.length >= 4 ? 1 : 0;
-        HEAPU8[axes + 5] = (pressed(pad, 12) ? 1 : 0) | (pressed(pad, 13) ? 2 : 0) |
-            (pressed(pad, 14) ? 4 : 0) | (pressed(pad, 15) ? 8 : 0);
-        if (pad.axes.length > 1)
+        HEAPU8[axes + 5] = (pressed(pad, 12) ? 1 : 0) | (pressed(pad, 13) ? 2 : 0) | (pressed(pad, 14) ? 4 : 0) | (pressed(pad, 15) ? 8 : 0);
+        if (pad_hack && pad.axes.length > 1)
         {
             if (pad.axes[0] < -0.4)
                 buttons |= 0x8000;
@@ -210,7 +219,9 @@ EM_JS(uint32, xport_gamepad_buttons, (sint32 player, uint8 *axes), {
     }
     return buttons;
 });
+// clang-format on
 
+// clang-format off
 EM_JS(sint32, xport_gamepad_rumble, (sint32 player, uint16 low, uint16 high, sint32 query), {
     if (player < 0 || player >= 2)
         return 0;
@@ -230,14 +241,12 @@ EM_JS(sint32, xport_gamepad_rumble, (sint32 player, uint16 low, uint16 high, sin
         const states = Module.xportRumble || (Module.xportRumble = new Map());
         const prev = states.get(pad.index);
         const now = performance.now();
-        if (prev && prev.actuator === actuator && prev.low === low && prev.high === high && (!low && !high || now - prev.time < 100))
+        if (prev &&prev.actuator === actuator &&prev.low === low &&prev.high === high && (!low && !high || now - prev.time < 100))
             return 1;
-        states.set(pad.index, {actuator, low, high, time: now});
+        states.set(pad.index, {actuator, low, high, time : now});
         try
         {
-            const effect = !low && !high && typeof actuator.reset === 'function'
-                ? actuator.reset()
-                : actuator.playEffect('dual-rumble', {duration: 250, startDelay: 0, strongMagnitude: low / 65535, weakMagnitude: high / 65535});
+            const effect = !low &&!high &&typeof actuator.reset === 'function' ? actuator.reset() : actuator.playEffect('dual-rumble', {duration : 250, startDelay : 0, strongMagnitude : low / 65535, weakMagnitude : high / 65535});
             Promise.resolve(effect).catch(() => {
                 if (states.get(pad.index)?.time === now)
                     states.delete(pad.index);
@@ -251,6 +260,7 @@ EM_JS(sint32, xport_gamepad_rumble, (sint32 player, uint16 low, uint16 high, sin
     }
     return 0;
 });
+// clang-format on
 
 sint32 xport_input_rumble_supported(sint32 controller)
 {
@@ -408,20 +418,25 @@ EM_ASYNC_JS(void, xport_render_wait, (void), { await new Promise(function(wake) 
 
 void xport_timer_wait_frame(uint32 refresh_rate)
 {
+    uint64 idx;
     uint64 now = xport_timer_get();
-    uint64 period;
-    if (!refresh_rate)
-        refresh_rate = FIELD_RATE;
-    period = refresh_rate == FIELD_RATE ? (uint64)1000000u * FIELD_RATE_DENOMINATOR / FIELD_RATE_NUMERATOR : 1000000u / refresh_rate;
-    if (!platform_frame_deadline || now > platform_frame_deadline + period * 4)
-        platform_frame_deadline = now + period;
-    while (now < platform_frame_deadline)
+    uint64 deadline;
+    if (!refresh_rate || refresh_rate == FIELD_RATE)
     {
-        emscripten_sleep((unsigned)((platform_frame_deadline - now + 999u) / 1000u));
-        now = xport_timer_get();
-        platform_poll_deadline = now + period;
+        xport_frame_fract(&idx);
+        deadline = xport_frame_time(idx + 1);
     }
-    platform_frame_deadline += period;
+    else
+    {
+        idx = now / 1000000 * refresh_rate + now % 1000000 * refresh_rate / 1000000;
+        deadline = ((idx + 1) * 1000000 + refresh_rate - 1) / refresh_rate;
+    }
+    while (now < deadline)
+    {
+        emscripten_sleep((unsigned)((deadline - now + 999u) / 1000u));
+        now = xport_timer_get();
+        platform_poll_deadline = now + 1000000u / FIELD_RATE;
+    }
 }
 
 sint32 xport_input_init(void)
@@ -459,10 +474,11 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
         return 0;
     if (controller == 0 && platform_pad_override)
         return platform_override_buttons;
-    uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller]);
+    uint32 buttons = xport_gamepad_buttons(controller, platform_pad_analog[controller], XPORT_PAD_HACK);
     if (buttons & ~platform_gamepad_buttons[controller])
         platform_input_type[controller] = 1;
     platform_gamepad_buttons[controller] = buttons;
+#if XPORT_PAD_HACK
     uint8 *axes = platform_pad_analog[controller];
     uint32 directions = platform_pad_buttons[controller] | (controller == 0 ? platform_touch_buttons : 0);
     if (axes[5] & 1u)
@@ -477,6 +493,7 @@ EMSCRIPTEN_KEEPALIVE uint32 xport_input_read(sint32 controller)
         axes[2] = (directions & PADLleft) ? ((directions & PADLright) ? 128 : 0) : 255;
     if (directions & (PADLup | PADLdown))
         axes[3] = (directions & PADLup) ? ((directions & PADLdown) ? 128 : 0) : 255;
+#endif
     uint8 pressed = (buttons & PADi) != 0;
     if (pressed && !platform_hd_pressed[controller])
         xport_hd = !xport_hd;
@@ -701,6 +718,9 @@ int main(int argc, char **argv)
     platform_run_mode = RUN_MODE_GAME;
     platform_exit_code = 0;
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
+#if !defined(LOCKSTEP_DEBUG) && defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+    xport_memory_bind_mmio(0x1F801C00, 0x200, spu_mmio_read, spu_mmio_write, NULL);
+#endif
     xport_input_init();
     xport_main();
     result = platform_exit_code;

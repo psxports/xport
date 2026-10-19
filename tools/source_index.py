@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-cpp-source-index-v9'
+PARSER_VERSION='c-cpp-source-index-v10'
 CODE_EXTENSIONS=('.c','.cpp')
 HEADER_EXTENSIONS=('.h','.hpp')
 SOURCE_EXTENSIONS=CODE_EXTENSIONS+HEADER_EXTENSIONS
@@ -205,6 +205,22 @@ def relative_source(root,path):
     return resolved.relative_to(root).as_posix(),resolved
 
 
+def ledger_source(root,entry):
+    """Keep explicitly retired native copies separate from executable source bindings"""
+    retired=entry.get('native_retirement')
+    if retired is None:return relative_source(root,entry['source'])
+    if not isinstance(retired,dict) or retired.get('kind') not in ('shared_sdk','native_inline','native_virtual','native_unused_interface'):
+        raise ValueError('Invalid native retirement kind: '+str(entry.get('source')))
+    if not retired.get('reason') or not retired.get('current_contract') or not isinstance(retired.get('evidence'),list) or not retired['evidence']:
+        raise ValueError('Native retirement requires reason, current contract and evidence')
+    for reference in retired['evidence']:
+        if not isinstance(reference,str):raise ValueError('Invalid native retirement evidence')
+        path=(root/reference.split('#',1)[0]).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            raise ValueError('Missing project native retirement evidence: '+reference)
+    return None,None
+
+
 def include_closure(root,relative,texts):
     todo=[relative];seen=set()
     while todo:
@@ -244,14 +260,14 @@ def mapping_summary(db):
     return dict(parser_version=PARSER_VERSION,
         source_files=db.execute('SELECT count(*) FROM source_files').fetchone()[0],
         declarations=db.execute('SELECT count(*) FROM source_declarations').fetchone()[0],
-        mapped=counts.get('mapped',0),ambiguous=counts.get('ambiguous',0),unmapped=counts.get('unmapped',0))
+        mapped=counts.get('mapped',0),ambiguous=counts.get('ambiguous',0),unmapped=counts.get('unmapped',0),retired=counts.get('retired_native_copy',0))
 
 
 def populate(db,root,ledger):
     """Create derived source tables. Ledger remains the editable mapping authority"""
     db.executescript('''
     CREATE TABLE source_files(path TEXT PRIMARY KEY,sha256 TEXT NOT NULL,bytes INTEGER NOT NULL,parser_version TEXT NOT NULL);
-    CREATE TABLE implementations(image TEXT NOT NULL,address INTEGER NOT NULL,source_path TEXT NOT NULL,symbol TEXT,start_offset INTEGER,end_offset INTEGER,start_line INTEGER,end_line INTEGER,body_sha256 TEXT,mapping_status TEXT NOT NULL,mapping_basis TEXT,parser_version TEXT NOT NULL,PRIMARY KEY(image,address),FOREIGN KEY(image,address) REFERENCES functions(image,address),FOREIGN KEY(source_path) REFERENCES source_files(path));
+    CREATE TABLE implementations(image TEXT NOT NULL,address INTEGER NOT NULL,source_path TEXT,symbol TEXT,start_offset INTEGER,end_offset INTEGER,start_line INTEGER,end_line INTEGER,body_sha256 TEXT,mapping_status TEXT NOT NULL,mapping_basis TEXT,parser_version TEXT NOT NULL,PRIMARY KEY(image,address),FOREIGN KEY(image,address) REFERENCES functions(image,address),FOREIGN KEY(source_path) REFERENCES source_files(path));
     CREATE TABLE implementation_identifiers(image TEXT NOT NULL,address INTEGER NOT NULL,identifier TEXT NOT NULL,PRIMARY KEY(image,address,identifier),FOREIGN KEY(image,address) REFERENCES implementations(image,address));
     CREATE TABLE source_declarations(id INTEGER PRIMARY KEY,path TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,start_offset INTEGER NOT NULL,end_offset INTEGER NOT NULL,start_line INTEGER NOT NULL,end_line INTEGER NOT NULL,sha256 TEXT NOT NULL,FOREIGN KEY(path) REFERENCES source_files(path));
     CREATE TABLE implementation_declarations(image TEXT NOT NULL,address INTEGER NOT NULL,declaration INTEGER NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(image,address,declaration),FOREIGN KEY(image,address) REFERENCES implementations(image,address),FOREIGN KEY(declaration) REFERENCES source_declarations(id));
@@ -270,9 +286,17 @@ def populate(db,root,ledger):
         cur=db.execute('INSERT INTO source_declarations(path,name,kind,start_offset,end_offset,start_line,end_line,sha256) VALUES(?,?,?,?,?,?,?,?)',
             (item['path'],item['name'],item['kind'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256']))
         declaration_ids[item['name']].append((cur.lastrowid,item['path']))
-    mapped=ambiguous=unmapped=0
+    mapped=ambiguous=unmapped=retired=0
     for entry in ledger:
-        rel,_=relative_source(root,entry['source']);candidates=parsed.get(rel,[]);address=entry['address'];image=entry['image']
+        rel,_=ledger_source(root,entry);address=entry['address'];image=entry['image']
+        if rel is None:
+            if any((address,image) in item['markers'] for items in parsed.values() for item in items):
+                raise ValueError('Native retirement conflicts with current marker: '+image+':'+hex(address))
+            db.execute('INSERT INTO implementations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(image,address,None,None,None,None,None,None,None,'retired_native_copy','explicit_native_retirement',PARSER_VERSION))
+            retired+=1
+            continue
+        if rel not in texts:raise ValueError('Ledger implementation source missing: '+rel)
+        candidates=parsed.get(rel,[])
         item,status,basis=select_implementation(entry,candidates)
         if item:
             mapped+=1
@@ -311,16 +335,19 @@ def populate(db,root,ledger):
             links=[row for row in declaration_ids.get(token,[]) if row[1] in allowed]
             db.executemany('INSERT OR IGNORE INTO implementation_declarations VALUES(?,?,?,?)',[(image,address,row[0],'lexical_identifier_in_include_closure') for row in links])
         mapped+=1
-    return dict(parser_version=PARSER_VERSION,source_files=len(paths),declarations=len(decls),mapped=mapped,ambiguous=ambiguous,unmapped=unmapped)
+    return dict(parser_version=PARSER_VERSION,source_files=len(paths),declarations=len(decls),mapped=mapped,ambiguous=ambiguous,unmapped=unmapped,retired=retired)
 
 
 def incremental_source_refresh(db,root,ledger,changed):
     """Refresh changed sources and their declaration links in an existing index"""
     texts={source_relative(root,p):p.read_text(encoding='utf-8-sig') for p in source_inventory(root)}
     affected=set();changed_headers=set()
+    retired={(entry['address'],entry['image']) for entry in ledger if entry.get('native_retirement') is not None}
     for relative in changed:
         path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower() in HEADER_EXTENSIONS
         parsed=[] if is_header else functions(text,relative)
+        if any(identity in retired for item in parsed for identity in item['markers']):
+            raise ValueError('Native retirement conflicts with current marker in '+relative)
         if is_header:changed_headers.add(relative)
         declaration_ids=[r[0] for r in db.execute('SELECT id FROM source_declarations WHERE path=?',(relative,))]
         if declaration_ids:
@@ -331,7 +358,7 @@ def incremental_source_refresh(db,root,ledger,changed):
             db.execute('INSERT INTO source_declarations(path,name,kind,start_offset,end_offset,start_line,end_line,sha256) VALUES(?,?,?,?,?,?,?,?)',
                 (item['path'],item['name'],item['kind'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256']))
         for entry in ledger:
-            rel,_=relative_source(root,entry['source'])
+            rel,_=ledger_source(root,entry)
             if rel!=relative:continue
             image,address=entry['image'],entry['address'];affected.add((image,address,relative))
             db.execute('DELETE FROM implementation_declarations WHERE image=? AND address=?',(image,address))
@@ -474,11 +501,13 @@ def rebuild(format_changed=True):
         else:formatting=dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha((Path(__file__).resolve().parents[1]/'src/.clang-format').read_bytes()))
         indexed_mappings={(image,address):source for image,address,source in db.execute('SELECT image,address,source_path FROM implementations')} if required<=tables else {}
         previous_status_identities={(image,address) for image,address in db.execute("SELECT image,address FROM implementations WHERE mapping_basis!='unique_original_address_symbol'")} if required<=tables else set()
-        ledger_mappings={(entry['image'],entry['address']):relative_source(root,entry['source'])[0] for entry in ledger}
+        ledger_mappings={(entry['image'],entry['address']):ledger_source(root,entry)[0] for entry in ledger}
+        indexed_retirements={(image,address) for image,address in db.execute("SELECT image,address FROM implementations WHERE mapping_status='retired_native_copy'")} if required<=tables else set()
+        ledger_retirements={key for key,path in ledger_mappings.items() if path is None}
         mapping_changes=set(indexed_mappings)^set(ledger_mappings)
         mapping_changes.update(key for key in set(indexed_mappings)&set(ledger_mappings) if indexed_mappings[key]!=ledger_mappings[key])
-        changed=sorted(set(changed)|{ledger_mappings[key] for key in mapping_changes if key in ledger_mappings}) if isinstance(changed,list) else changed
-        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and set(indexed_mappings)==set(ledger_mappings) and all(path.lower().endswith(SOURCE_EXTENSIONS) for path in changed)
+        changed=sorted(set(changed)|{ledger_mappings[key] for key in mapping_changes if key in ledger_mappings and ledger_mappings[key] is not None}) if isinstance(changed,list) else changed
+        can_increment=required<=tables and metadata.get('source_index_parser')==PARSER_VERSION and set(current)==set(indexed) and set(indexed_mappings)==set(ledger_mappings) and indexed_retirements==ledger_retirements and all(path.lower().endswith(SOURCE_EXTENSIONS) for path in changed)
         if can_increment:
             removed=set(indexed_mappings)-set(ledger_mappings)
             for image,address in removed:

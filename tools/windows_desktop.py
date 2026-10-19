@@ -17,6 +17,21 @@ def process_desktop(environment=None):
     return name
 
 
+def current_desktop_name():
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    user.GetThreadDesktop.argtypes = [wintypes.DWORD]
+    user.GetThreadDesktop.restype = wintypes.HANDLE
+    user.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    handle = user.GetThreadDesktop(kernel.GetCurrentThreadId())
+    name = ctypes.create_unicode_buffer(256)
+    needed = wintypes.DWORD()
+    if not handle or not user.GetUserObjectInformationW(handle, 2, name, ctypes.sizeof(name), ctypes.byref(needed)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return name.value
+
+
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NO_WINDOW = 0x08000000

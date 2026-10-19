@@ -4,10 +4,12 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 
 ## Mandatory rules
 
-- Startup may create a new consuming project `README.md` once from `tools/templates/project/README.md.in`; refuse an existing README before initialization. Otherwise never create, edit, move, delete or regenerate any file named `README.md` in xport or a consuming project
+- Present results in Markdown; do not use Canvas for presentation
+- Startup may create a new consuming project `README.md` once from `tools/templates/project/README.md.in`; refuse an existing README before initialization. The explicit `commit decomp` command may only comment the Play Game anchor as defined in `docs/COMMIT.md`. Otherwise never create, edit, move, delete or regenerate any file named `README.md` in xport or a consuming project
 - Keep xport-owned Markdown documentation in `[XPORT_ROOT]/docs`; `AGENTS.md`, `CHANGELOG.md` and the immutable root `README.md` are the only root exceptions
 - Write documentation for agents: use explicit commands, inputs, outputs, invariants, failure conditions and terminal conditions; remove narrative, duplication, optional wording and contradictory rules
 - Put reusable tools in `tools`, the shared PSX/PsyQ host runtime in `src`, and game facts, adapters, generated artifacts and evidence in the consuming project
+- Reuse existing SDK-reviewed xport PsyQ APIs; coverage/converge does not authorize parallel SDK implementations, duplicate `*_guest.c` layers or rewriting the runtime for guest RAM equality. Follow [docs/DECOMPILATION.md#reuse-the-existing-xport-sdk-runtime](docs/DECOMPILATION.md#reuse-the-existing-xport-sdk-runtime); obtain separate explicit authorization before replacing shared SDK implementations or expanding device emulation
 - Resolve project identity and paths from `xport-project.json`; never infer them from a source path or game name
 - For an existing consuming project, use the nearest ancestor of the current working directory that contains `xport-project.json`, or an explicit project path from the user. If neither identifies one project, ask for its path; never select a sibling from its name, prior status or available artifacts
 - Preserve unrelated work, original inputs, third-party licenses, upstream identities and source hashes
@@ -19,11 +21,12 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 
 ## Task router
 
+- `commit decomp`: read [docs/COMMIT.md](docs/COMMIT.md); batch commit/push initialized sibling projects only, with the exact message `decomp progress`
 - `startup FULL_NAME SHORT_NAME`, project creation, ownership, layout, build gates and music conversion: read [docs/STARTUP.md](docs/STARTUP.md)
 - `record SLOT NAME`, `stop` and capture validation: read [docs/RECORDING.md](docs/RECORDING.md)
 - `function_converge NAME` and its matching `stop`: read [docs/FUNCTION_COVERAGE.md](docs/FUNCTION_COVERAGE.md)
 - `boost NAME` or `boost` with an explicitly supplied function set: read [docs/BOOST.md](docs/BOOST.md); run one fast three-agent draft translation pass without a goal, audit, build or runtime workflow
-- `coverage NAME`: read [docs/COVERAGE.md](docs/COVERAGE.md); default to native-first saved C, integration and a bounded playable scenario; preserve existing translations and proof history, use three workers, and separate draft progress from proof counts. Use strict audit gates only for an explicitly requested strict deliverable
+- `coverage NAME`: read [docs/COVERAGE.md](docs/COVERAGE.md) and its canonical translation rules in [docs/DECOMPILATION.md](docs/DECOMPILATION.md#full-pass-translation-and-batch-modules); complete the selected function pass before integration/builds. Preserve saved bodies/proof history and separate translation counts from proof counts. No workers without explicit authorization; strict gates only for an explicitly requested strict deliverable
 - `converge NAME`: create an active goal, then read [docs/CONVERGENCE.md](docs/CONVERGENCE.md); keep the same supervisor alive and under event-driven observation until full-record `MATCH`, required user input or an explicit user stop; mark the goal complete only after verified `MATCH`
 - Manual translation or repair of decompiled C: read [docs/DECOMPILATION.md](docs/DECOMPILATION.md)
 - User-initiated native/readability refactoring after confirmed full main-functionality coverage: read [docs/REFACTORING.md](docs/REFACTORING.md); verify its entry gate before planning or changing the state model
@@ -39,6 +42,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 Read only the documents routed by the current task. Do not preload old chats, complete logs, unrelated evidence or the whole documentation tree.
 # Build policy for coverage and converge
 
-- Run Debug builds only while `coverage` or `converge` is in progress
+- Ordinary coverage: no builds during the translation pass; integrate and build Debug after the complete pass, following docs/DECOMPILATION.md
+- Converge and explicitly requested strict coverage retain their documented Debug gates
 - Do not run Release builds for batches, retries, or intermediate corrections
 - Run one Release build after the task is complete as its final verification, or when the user explicitly requests Release

@@ -19,6 +19,7 @@ XPORT_SOURCES := \
 	$(XPORT_ROOT)/src/vid_ogl.c \
 	$(XPORT_ROOT)/src/psx_font.c \
 	$(XPORT_ROOT)/src/psx_spu.c \
+	$(XPORT_ROOT)/src/psx_seq.c \
 	$(XPORT_ROOT)/src/psx_xa.c \
 	$(XPORT_ROOT)/src/psx_mdec.c \
 	$(XPORT_ROOT)/src/psx_press.c \

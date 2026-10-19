@@ -97,6 +97,9 @@ typedef union
         #define FIELD_RATE_DENOMINATOR 1
     #endif
 #endif
+#ifndef XPORT_PAD_HACK
+    #define XPORT_PAD_HACK 0
+#endif
 #ifndef XPORT_AUDIO_VBLANK_QUEUE
     #define XPORT_AUDIO_VBLANK_QUEUE 0
 #endif
@@ -109,8 +112,7 @@ static __inline uint32 xport_field_sample_count(uint32 before, uint32 sample_rat
 {
     uint64 scaled = (uint64)sample_rate * FIELD_RATE_DENOMINATOR;
     uint64 remainder = scaled % FIELD_RATE_NUMERATOR;
-    return (uint32)(scaled / FIELD_RATE_NUMERATOR +
-        (((uint64)before * remainder % FIELD_RATE_NUMERATOR) + remainder) / FIELD_RATE_NUMERATOR);
+    return (uint32)(scaled / FIELD_RATE_NUMERATOR + (((uint64)before * remainder % FIELD_RATE_NUMERATOR) + remainder) / FIELD_RATE_NUMERATOR);
 }
 
 #if defined(_DEBUG) && defined(_MSC_VER)
@@ -143,6 +145,23 @@ extern "C"
     void xport_set_cleanup(void (*cleanup)(void));
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
+
+    static __inline float xport_frame_fract(uint64 *idx)
+    {
+        uint64 elapsed = xport_timer_get();
+        uint64 seconds = elapsed / 1000000 * FIELD_RATE_NUMERATOR;
+        uint64 fraction = seconds % FIELD_RATE_DENOMINATOR * 1000000 + elapsed % 1000000 * FIELD_RATE_NUMERATOR;
+        uint64 period = (uint64)1000000 * FIELD_RATE_DENOMINATOR;
+        *idx = seconds / FIELD_RATE_DENOMINATOR + fraction / period;
+        return (float)(fraction % period) / (float)period;
+    }
+
+    static __inline uint64 xport_frame_time(uint64 idx)
+    {
+        uint64 scaled = idx * FIELD_RATE_DENOMINATOR;
+        return scaled / FIELD_RATE_NUMERATOR * 1000000 + (scaled % FIELD_RATE_NUMERATOR * 1000000 + FIELD_RATE_NUMERATOR - 1) / FIELD_RATE_NUMERATOR;
+    }
+
     void xport_timer_wait_frame(uint32 refresh_rate);
     void xport_render_wait(void);
     sint32 xport_input_init(void);
@@ -187,17 +206,20 @@ extern "C"
 
     /* Required link-time services implemented by every game */
     void xport_main(void);
-    // Native builds need no guest GPU/CD address bindings
+    // Native consumers select GPU and CD ownership independently
 #if defined(XPORT_NATIVE_GPU_CD)
     #define xport_gpu_graph_type_address 0u
+#else
+// Zero selects the native standard GPU, nonzero selects a guest PsyQ byte
+extern const uint32 xport_gpu_graph_type_address;
+#endif
+#if defined(XPORT_NATIVE_GPU_CD) || (defined(XPORT_NATIVE_CD) && XPORT_NATIVE_CD)
     #define xport_cd_sync_callback_address 0u
     #define xport_cd_ready_callback_address 0u
     #define xport_cd_status_address 0u
     #define xport_cd_setloc_table_address 0u
 #else
-// Zero selects the native standard GPU, nonzero selects a guest PsyQ byte
-extern const uint32 xport_gpu_graph_type_address;
-// Native CD consumers define all four bindings as zero and use typed callbacks
+// Native CD consumers use typed callbacks without guest PsyQ state
 extern const uint32 xport_cd_sync_callback_address;
 extern const uint32 xport_cd_ready_callback_address;
 extern const uint32 xport_cd_status_address;

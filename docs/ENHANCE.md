@@ -64,17 +64,20 @@ The initial HD implementation can transform/project float geometry on CPU and su
 
 Never write an interpolated transform back to physics, collision, AI, aiming or gameplay visibility state. More frequent HD input sampling must not introduce more physics steps or change their duration. Treat any input-rate change as a separate audited gameplay change.
 
-## 5. Separate logic ticks from rendered frames
+## 5. Add frame interpolation and separate logic ticks from rendering
 
-Use monotonic integer time and the game's original field rate. For the current microsecond timer:
+This enhancement stage uses the shared `xport_frame_fract(uint64 *idx)` API from `xport.h`. The toolset owns conversion of elapsed application time into a physical logic-frame index and interpolation phase; the game owns simulation steps, render snapshots and their interpolation. Use this API when adding frame interpolation to a project instead of introducing a game-local clock calculation:
 
 ```c
-uint64 scaled = xport_timer_get() * FIELD_RATE;
-uint64 frame_index = scaled / 1000000;
-float frame_fract = (uint32)(scaled % 1000000) / 1000000.0f;
+uint64 frame_index;
+float frame_fract = xport_frame_fract(&frame_index);
 ```
 
-The quotient and remainder come from the same scaled integer, avoiding double-precision time and the rounding mismatch from reconstructing a tick boundary with integer division. Use 1000 instead of 1000000 only when the input really is milliseconds. `FIELD_RATE` belongs to the game, not the monitor refresh rate.
+The function writes the current tick index through the required `idx` pointer and returns its fractional phase as `float`. Both values come from one monotonic integer timestamp since application startup; the calculation does not require double-precision time. Calling it observes the clock without advancing simulation, waiting for VBlank or rendering a frame. Sample it again after processing pending ticks, since simulation work can cross another tick boundary.
+
+The physical rate follows the shared PAL/NTSC profile: nominal `FIELD_RATE=50` selects `53203425/1069484` Hz, and `FIELD_RATE=60` selects `53693175/897619` Hz. Other nominal rates use `FIELD_RATE/1`; explicit `FIELD_RATE_NUMERATOR` and `FIELD_RATE_DENOMINATOR` overrides remain available. Games must not duplicate this conversion or assume exactly 50/60 ticks per wall-clock second. `FIELD_RATE` belongs to the game, not the monitor refresh rate.
+
+`xport_frame_time(index)` returns the absolute microsecond boundary rounded up; native and Web field waits calculate their next deadline from this clock without accumulating rounded periods. The game owns its last processed tick cursor. Reseed that cursor and previous/current render samples at scene entry, resume and OG/HD transitions where elapsed time must not be replayed as catch-up simulation.
 
 Run logic for pending `frame_index` steps. Render independently using `frame_fract` between the two most recent complete states, N-1 and N. At 0 the image shows N-1; at 1 it shows N. This adds up to one tick of visual latency. It does not predict N+1 or modify physics. Use the host render wait separately from logic timing; native `VSync(-1)` observes field delivery without imposing another blocking field per HD redraw.
 

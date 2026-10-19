@@ -2,8 +2,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#if defined(_WIN32) && !defined(XPORT_XCRT)
+    #include <io.h>
+    #include <fcntl.h>
+#endif
 #include "psx.h"
 #include "psx_gpu.h"
+#include "psx_mdec.h"
+
+const MATRIX psx_identity_matrix = {{{4096, 0, 0}, {0, 4096, 0}, {0, 0, 4096}}, {0, 0, 0}};
+
+const uint32 psx_identity_rotation_words[5] = {4096, 0, 4096, 0, 4096};
 
 uint32 PAD_dr(void);
 
@@ -140,6 +149,8 @@ static void *native_root_clock_context;
 static uint64 native_root_last_tick;
 static sint32 native_video_mode;
 void psx_root_counter_poll(void);
+static void native_mdec_advance(uint64 ticks);
+static void native_gpu_service(void);
 static void mc_poll(void);
 static void bios_native_irq_dispatch(void);
 static sint32 bios_native_irq_ready(void);
@@ -147,6 +158,7 @@ static sint32 bios_native_irq_ready(void);
 static uint32 bios_interrupts_enabled = 1u;
 static uint32 bios_vblank_pending;
 static uint32 bios_vsync_callback;
+static PsxInterruptCallback bios_vsync_native_callback;
 static uint32 bios_callbacks_running = 1u;
 static PsxGuestCallback bios_native_dispatch;
 static void *bios_native_dispatch_context;
@@ -568,6 +580,108 @@ uint32 psx_bios_card_load_guest(uint32 channel)
     w_u32(0xA0009F28u + offset, 1u);
     bios_card_pending_ports |= 1u << port;
     return 1u;
+}
+
+static PsxCardFormatGuestBinding card_format_guest;
+
+void psx_card_bind_format_guest(const PsxCardFormatGuestBinding *binding)
+{
+    memset(&card_format_guest, 0, sizeof(card_format_guest));
+    if (binding)
+        card_format_guest = *binding;
+}
+
+static void card_format_clear(uint32 address, uint32 bytes)
+{
+    uint32 index;
+    for (index = 0; index < bytes; ++index)
+        w_u8(address + index, 0);
+}
+
+static void card_format_checksum(uint32 buffer)
+{
+    uint32 index, checksum = 0;
+    for (index = 0; index < 127; ++index)
+        checksum ^= r_u8(buffer + index);
+    w_u8(buffer + 127, checksum);
+}
+
+static void card_format_wait(sint32 channel)
+{
+    uint32 status;
+    do
+    {
+        psx_bios_card_poll();
+        status = r_u8(0x7568 + (uint32)(channel >> 4));
+    } while ((status & 1) == 0);
+}
+
+sint32 _card_format(sint32 channel)
+{
+    uint32 buffer, record, index, group, word, values[4], result;
+
+    if (!card_format_guest.records || !card_format_guest.defects || !card_format_guest.sector_buffer)
+        abort();
+    buffer = card_format_guest.sector_buffer;
+    record = card_format_guest.records;
+    for (index = 0; index < 15; ++index)
+    {
+        card_format_clear(buffer, 128);
+        card_format_clear(record, 32);
+        w_u32(card_format_guest.records + index * 32, 0xA0);
+        w_u32(card_format_guest.records + index * 32 + 4, 0);
+        w_u16(card_format_guest.records + index * 32 + 8, 0xFFFF);
+        for (group = 0; group < 2; ++group)
+        {
+            for (word = 0; word < 4; ++word)
+                values[word] = r_u32(record + group * 16 + word * 4);
+            for (word = 0; word < 4; ++word)
+                w_u32(buffer + group * 16 + word * 4, values[word]);
+        }
+        card_format_checksum(buffer);
+        _new_card();
+        result = psx_bios_card_write_guest((uint32)channel, index + 1, buffer);
+        if (result != 1)
+            return 0;
+        card_format_wait(channel);
+        record += 32;
+    }
+    record = card_format_guest.defects;
+    for (index = 0; index < 20; ++index)
+    {
+        w_u32(record, 0xFFFFFFFF);
+        card_format_clear(buffer, 128);
+        result = r_u32(record);
+        w_u32(buffer, result);
+        card_format_checksum(buffer);
+        _new_card();
+        result = psx_bios_card_write_guest((uint32)channel, index + 16, buffer);
+        if (result != 1)
+            return 0;
+        card_format_wait(channel);
+        record += 4;
+    }
+    card_format_clear(buffer, 128);
+    w_u8(buffer, 77);
+    w_u8(buffer + 1, 67);
+    card_format_checksum(buffer);
+    _new_card();
+    result = psx_bios_card_write_guest((uint32)channel, 0, buffer);
+    if (result != 1)
+        return 0;
+    card_format_wait(channel);
+    card_format_clear(buffer, 128);
+    _new_card();
+    result = psx_bios_card_read_guest((uint32)channel, 0, buffer);
+    if (result != 1)
+        return 0;
+    card_format_wait(channel);
+    _new_card();
+    result = psx_bios_card_load_guest((uint32)channel);
+    if (result != 1)
+        return 0;
+    card_format_wait(channel);
+    return 1;
 }
 
 void DeliverEvent(uint32 event_class, uint32 spec)
@@ -1175,7 +1289,9 @@ void psx_vblank_signal(void)
         vblank_count = ++*vblank_native_guest_counter;
     else
         ++vblank_count;
-    if (bios_callbacks_running && bios_vsync_callback)
+    if (bios_callbacks_running && bios_vsync_native_callback)
+        bios_vsync_native_callback();
+    else if (bios_callbacks_running && bios_vsync_callback)
     {
         if (!bios_native_dispatch || !bios_native_dispatch(bios_native_dispatch_context, bios_vsync_callback))
         {
@@ -1617,7 +1733,32 @@ void *psx_addr(uint32 address, size_t count)
     return base + physical;
 }
 
+PsxCallbackDriver psx_callback_driver;
 static PsxInterruptCallback native_irq_callbacks[11];
+static PsxInterruptCallback native_vsync_callbacks[8];
+
+PsxInterruptCallback setIntrVSync(uint32 slot, PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous;
+    if (slot >= sizeof(native_vsync_callbacks) / sizeof(native_vsync_callbacks[0]))
+        return NULL;
+    previous = native_vsync_callbacks[slot];
+    if (callback != previous)
+        native_vsync_callbacks[slot] = callback;
+    return previous;
+}
+
+void trapIntrVSync(void)
+{
+    uint32 slot;
+    PsxInterruptCallback callback;
+    for (slot = 0; slot < sizeof(native_vsync_callbacks) / sizeof(native_vsync_callbacks[0]); ++slot)
+    {
+        callback = native_vsync_callbacks[slot];
+        if (callback != NULL)
+            callback();
+    }
+}
 
 static sint32 bios_native_irq_ready(void)
 {
@@ -1739,13 +1880,56 @@ void psx_interrupt_raise(uint32 interrupt)
 
 sint32 ResetCallback(void)
 {
-    static uint32 initialized;
-    if (initialized)
+    if (psx_callback_driver.initialized != 0)
         return 0;
     vsync_callback = NULL;
     memset(native_irq_callbacks, 0, sizeof(native_irq_callbacks));
-    initialized = 1u;
+    memset(native_vsync_callbacks, 0, sizeof(native_vsync_callbacks));
+    psx_callback_driver.initialized = 1u;
+    psx_callback_driver.saved_interrupt_mask = 0;
+    psx_callback_driver.saved_dma_control = 0;
+#if defined(XPORT_NATIVE_CALLBACK_BOOTSTRAP) && XPORT_NATIVE_CALLBACK_BOOTSTRAP
+    bios_vsync_callback = 0;
+    bios_vsync_native_callback = NULL;
+    bios_callbacks_running = 1;
+    psx_irq_native_mask_exchange(0);
+    psx_irq_native_acknowledge(0x7FF);
+    // Retain device setup without the guest exception context or dispatch vectors
+    w_u32(0x1F8010F0, 0x33333333);
+    w_u32(0x1F801114, 0x107);
+    ChangeClearPAD(0);
+    ChangeClearRCnt(3, 0);
+    w_u32(0x1F8010F4, 0);
+    psx_irq_native_mask_exchange(9);
+    xport_bios_exit_critical();
+#endif
     return 0;
+}
+
+PsxCallbackDriver *stopIntr(void)
+{
+    if (psx_callback_driver.initialized == 0)
+        return NULL;
+    xport_bios_enter_critical();
+    psx_callback_driver.saved_interrupt_mask = r_u16(0x1F801074u);
+    psx_callback_driver.saved_dma_control = r_u32(0x1F8010F0u);
+    w_u16(0x1F801074u, 0);
+    w_u16(0x1F801070u, r_u16(0x1F801074u));
+    w_u32(0x1F8010F0u, r_u32(0x1F8010F0u) & 0x77777777);
+    psx_bios_reset_entry_interrupt();
+    psx_callback_driver.initialized = 0;
+    return &psx_callback_driver;
+}
+
+PsxCallbackDriver *restartIntr(void)
+{
+    if (psx_callback_driver.initialized != 0)
+        return NULL;
+    psx_callback_driver.initialized = 1;
+    w_u16(0x1F801074u, psx_callback_driver.saved_interrupt_mask);
+    w_u32(0x1F8010F0u, psx_callback_driver.saved_dma_control);
+    xport_bios_exit_critical();
+    return &psx_callback_driver;
 }
 
 intptr VSyncCallback(PsxInterruptCallback callback)
@@ -1929,6 +2113,29 @@ static const sint16 psyq_atan_table[1025] = {0,   1,   2,   2,   3,   3,   4,   
                                              384, 385, 385, 385, 386, 386, 387, 387, 388, 388, 388, 389, 389, 390, 390, 391, 391, 391, 392, 392, 393, 393, 394, 394, 395, 395, 395, 396, 396, 397, 397, 398, 398, 398, 399, 399, 400, 400, 401, 401, 401, 402, 402, 403, 403, 403, 404, 404, 405, 405, 406, 406, 406, 407, 407, 408, 408, 409, 409, 409, 410, 410, 411, 411, 411, 412, 412, 413, 413, 413, 414, 414, 415, 415, 416, 416, 416, 417, 417, 418, 418, 418, 419, 419, 420, 420, 420, 421, 421, 422, 422, 422, 423, 423, 424, 424, 425, 425, 425, 426, 426, 427, 427, 427, 428, 428, 429, 429, 429, 430, 430, 431, 431, 431, 432, 432, 432, 433, 433, 434, 434, 434, 435, 435, 436, 436, 436, 437, 437, 438, 438, 438, 439, 439, 440, 440, 440, 441, 441, 441, 442, 442, 443, 443, 443, 444, 444, 445, 445, 445, 446, 446, 446, 447, 447, 448, 448, 448, 449, 449, 450, 450, 450, 451, 451, 451, 452, 452, 453, 453, 453,
                                              454, 454, 454, 455, 455, 456, 456, 456, 457, 457, 457, 458, 458, 459, 459, 459, 460, 460, 460, 461, 461, 461, 462, 462, 463, 463, 463, 464, 464, 464, 465, 465, 465, 466, 466, 467, 467, 467, 468, 468, 468, 469, 469, 469, 470, 470, 471, 471, 471, 472, 472, 472, 473, 473, 473, 474, 474, 474, 475, 475, 476, 476, 476, 477, 477, 477, 478, 478, 478, 479, 479, 479, 480, 480, 480, 481, 481, 481, 482, 482, 483, 483, 483, 484, 484, 484, 485, 485, 485, 486, 486, 486, 487, 487, 487, 488, 488, 488, 489, 489, 489, 490, 490, 490, 491, 491, 491, 492, 492, 492, 493, 493, 493, 494, 494, 494, 495, 495, 495, 496, 496, 496, 497, 497, 497, 498, 498, 498, 499, 499, 499, 500, 500, 500, 501, 501, 501, 502, 502, 502, 503, 503, 503, 504, 504, 504, 505, 505, 505, 506, 506, 506, 507, 507, 507, 508, 508, 508, 509, 509, 509, 510, 510, 510, 511, 511, 511, 511, 512, 512};
 
+static sint32 psyq_atan_ratio(uint32 numerator, uint32 denominator)
+{
+    if (denominator == 0)
+        xport_mips_break(7);
+    if (denominator == 0xFFFFFFFF && numerator == 0x80000000)
+        xport_mips_break(6);
+    return (sint32)((sint64)(sint32)numerator / (sint32)denominator);
+}
+
+uint64 __divdi3PSX(uint64 dividend, uint64 divisor)
+{
+    uint32 negative = (uint32)((dividend ^ divisor) >> 63);
+    uint64 quotient;
+    if ((dividend >> 63) != 0)
+        dividend = (uint64)0 - dividend;
+    if ((divisor >> 63) != 0)
+        divisor = (uint64)0 - divisor;
+    if (divisor == 0)
+        xport_mips_break(7);
+    quotient = dividend / divisor;
+    return negative ? (uint64)0 - quotient : quotient;
+}
+
 sint32 ratan2(sint32 y, sint32 x)
 {
     sint32 negative_x = x < 0;
@@ -1944,12 +2151,12 @@ sint32 ratan2(sint32 y, sint32 x)
         return 0;
     if (y < x)
     {
-        ratio = ((uint32)y & 0x7FE00000u) != 0u ? y / (x >> 10) : (y << 10) / x;
+        ratio = ((uint32)y & 0x7FE00000) != 0 ? psyq_atan_ratio((uint32)y, (uint32)(x >> 10)) : psyq_atan_ratio((uint32)y << 10, (uint32)x);
         angle = psyq_atan_table[ratio];
     }
     else
     {
-        ratio = ((uint32)x & 0x7FE00000u) != 0u ? x / (y >> 10) : (x << 10) / y;
+        ratio = ((uint32)x & 0x7FE00000) != 0 ? psyq_atan_ratio((uint32)x, (uint32)(y >> 10)) : psyq_atan_ratio((uint32)x << 10, (uint32)y);
         angle = 1024 - psyq_atan_table[ratio];
     }
     if (negative_x)
@@ -2066,30 +2273,28 @@ sint32 VectorNormalS(VECTOR *input, SVECTOR *output)
 
 VECTOR *OuterProduct0(VECTOR *left, VECTOR *right, VECTOR *output)
 {
-    sint16 left_x;
-    sint16 left_y;
-    sint16 left_z;
-    sint16 right_x;
-    sint16 right_y;
-    sint16 right_z;
-    sint32 x;
-    sint32 y;
-    sint32 z;
-
+    uint32 saved[3], words[3];
     if (!left || !right || !output)
         return output;
-    left_x = (sint16)left->vx;
-    left_y = (sint16)left->vy;
-    left_z = (sint16)left->vz;
-    right_x = (sint16)right->vx;
-    right_y = (sint16)right->vy;
-    right_z = (sint16)right->vz;
-    x = (sint32)((sint64)left_y * right_z - (sint64)left_z * right_y);
-    y = (sint32)((sint64)left_z * right_x - (sint64)left_x * right_z);
-    z = (sint32)((sint64)left_x * right_y - (sint64)left_y * right_x);
-    output->vx = x;
-    output->vy = y;
-    output->vz = z;
+    saved[0] = xport_gte_read_control(0);
+    saved[1] = xport_gte_read_control(2);
+    saved[2] = xport_gte_read_control(4);
+    words[0] = xport_load_le32((const uint8 *)left);
+    words[1] = xport_load_le32((const uint8 *)left + 4);
+    words[2] = xport_load_le32((const uint8 *)left + 8);
+    xport_gte_write_control(0, words[0]);
+    xport_gte_write_control(2, words[1]);
+    xport_gte_write_control(4, words[2]);
+    xport_gte_write_data(11, xport_load_le32((const uint8 *)right + 8));
+    xport_gte_write_data(9, xport_load_le32((const uint8 *)right));
+    xport_gte_write_data(10, xport_load_le32((const uint8 *)right + 4));
+    xport_gte_execute(0x170000C);
+    xport_store_le32((uint8 *)output, xport_gte_read_data(25));
+    xport_store_le32((uint8 *)output + 4, xport_gte_read_data(26));
+    xport_store_le32((uint8 *)output + 8, xport_gte_read_data(27));
+    xport_gte_write_control(0, saved[0]);
+    xport_gte_write_control(2, saved[1]);
+    xport_gte_write_control(4, saved[2]);
     return output;
 }
 
@@ -2599,6 +2804,57 @@ static uint32 mul_rot_matrix_psx(uint32 source, uint32 destination, uint32 first
     return destination;
 }
 
+static MATRIX *mul_rot_matrix_native(const MATRIX *source, MATRIX *destination, uint32 first)
+{
+    const uint8 *input = (const uint8 *)source;
+    uint8 *output = (uint8 *)destination;
+    uint32 second, third, column1[3], column2[3];
+    second = xport_load_le32(input + 4);
+    third = xport_load_le32(input + 12);
+    first = (first & 0xFFFF) | (second & 0xFFFF0000);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    first = xport_load_le16(input + 2);
+    second = xport_load_le32(input + 8);
+    third = (uint32)(sint32)(sint16)xport_load_le16(input + 14);
+    first |= second << 16;
+    column1[0] = xport_gte_read_data(9);
+    column1[1] = xport_gte_read_data(10);
+    column1[2] = xport_gte_read_data(11);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    first = xport_load_le16(input + 4);
+    second = xport_load_le32(input + 8);
+    third = xport_load_le32(input + 16);
+    first |= second & 0xFFFF0000;
+    column2[0] = xport_gte_read_data(9);
+    column2[1] = xport_gte_read_data(10);
+    column2[2] = xport_gte_read_data(11);
+    xport_gte_write_data(0, first);
+    xport_gte_write_data(1, third);
+    xport_gte_execute(0x486012);
+    xport_store_le32(output, (column1[0] & 0xFFFF) | (column2[0] << 16));
+    xport_store_le32(output + 12, (column1[2] & 0xFFFF) | (column2[2] << 16));
+    first = xport_gte_read_data(9);
+    second = xport_gte_read_data(10);
+    xport_store_le32(output + 4, (first & 0xFFFF) | (column1[1] << 16));
+    xport_store_le32(output + 8, (column2[1] & 0xFFFF) | (second << 16));
+    xport_store_le32(output + 16, xport_gte_read_data(11));
+    return destination;
+}
+
+MATRIX *MulRotMatrix(MATRIX *matrix)
+{
+    return mul_rot_matrix_native(matrix, matrix, xport_load_le32((const uint8 *)matrix));
+}
+
+MATRIX *MulRotMatrix0(const MATRIX *source, MATRIX *destination)
+{
+    return mul_rot_matrix_native(source, destination, xport_load_le16((const uint8 *)source));
+}
+
 uint32 MulRotMatrixPSX(uint32 matrix)
 {
     return mul_rot_matrix_psx(matrix, matrix, r_u32(matrix));
@@ -2674,7 +2930,15 @@ MATRIX *MulMatrix2(MATRIX *source, MATRIX *destination)
 {
     if (!source || !destination)
         return destination;
-    return multiply_matrix_rotation(source, destination, destination);
+    return MulMatrix0(source, destination, destination);
+}
+
+MATRIX *SetMulMatrix(MATRIX *left, MATRIX *right)
+{
+    MATRIX result;
+    MulMatrix0(left, right, &result);
+    SetRotMatrix(&result);
+    return left;
 }
 
 static void transform(const MATRIX *m, const SVECTOR *v, VECTOR *out, sint32 translate)
@@ -3103,14 +3367,23 @@ VECTOR *ApplyMatrixLV(MATRIX *m, VECTOR *v, VECTOR *out)
 
 SVECTOR *ApplyMatrixSV(MATRIX *m, SVECTOR *v, SVECTOR *out)
 {
-    VECTOR q;
+    uint32 words[5], x, y, z;
+    uint32 index;
     if (!m || !v || !out)
         return out;
-    transform(m, v, &q, 0);
-    out->vx = (sint16)q.vx;
-    out->vy = (sint16)q.vy;
-    out->vz = (sint16)q.vz;
-    out->pad = 0;
+    for (index = 0; index < 5; ++index)
+        words[index] = xport_load_le32((const uint8 *)m + index * 4);
+    for (index = 0; index < 5; ++index)
+        xport_gte_write_control(index, words[index]);
+    xport_gte_write_data(0, xport_load_le32((const uint8 *)v));
+    xport_gte_write_data(1, xport_load_le32((const uint8 *)v + 4));
+    xport_gte_execute(0x486012);
+    x = xport_gte_read_data(9);
+    y = xport_gte_read_data(10);
+    z = xport_gte_read_data(11);
+    xport_store_le16((uint8 *)out, (uint16)x);
+    xport_store_le16((uint8 *)out + 2, (uint16)y);
+    xport_store_le16((uint8 *)out + 4, (uint16)z);
     return out;
 }
 
@@ -3806,6 +4079,49 @@ void xport_gte_write_control(uint32 index, uint32 value)
     }
 }
 
+uint32 xport_gte_read_control(uint32 index)
+{
+    const MATRIX *matrix;
+    uint32 component, value;
+    if (index < 5 || (index >= 8 && index <= 12) || (index >= 16 && index <= 20))
+    {
+        matrix = index < 5 ? &gte.rotation : index < 16 ? &gte.light : &gte.color;
+        component = (index - (index < 5 ? 0 : index < 16 ? 8 : 16)) * 2;
+        value = (uint16)matrix->m[component / 3][component % 3];
+        if (component == 8)
+            return (uint32)(sint32)(sint16)value;
+        ++component;
+        return value | ((uint32)(uint16)matrix->m[component / 3][component % 3] << 16);
+    }
+    if (index >= 5 && index <= 7)
+        return (uint32)gte.translation[index - 5];
+    if (index >= 13 && index <= 15)
+        return (uint32)gte.back_color[index - 13];
+    if (index >= 21 && index <= 23)
+        return (uint32)gte.far_color[index - 21];
+    switch (index)
+    {
+        case 24:
+            return ((uint32)gte.ofx << 16) | native_gte_ofx_fraction;
+        case 25:
+            return ((uint32)gte.ofy << 16) | native_gte_ofy_fraction;
+        case 26:
+            return (uint32)(sint32)(sint16)gte.h;
+        case 27:
+            return (uint32)(sint32)(sint16)gte.dqa;
+        case 28:
+            return (uint32)gte.dqb;
+        case 29:
+            return (uint32)(sint32)(sint16)gte.zsf3;
+        case 30:
+            return (uint32)(sint32)(sint16)gte.zsf4;
+        case 31:
+            return (uint32)gte.flag;
+        default:
+            abort();
+    }
+}
+
 uint32 xport_gte_read_translation(uint32 axis)
 {
     if (axis >= 3u)
@@ -4162,8 +4478,7 @@ static void psx_native_vblank_poll(void)
     elapsed = now >= native_vblank_last_us ? now - native_vblank_last_us : 0u;
     native_vblank_last_us = now;
     fields = (elapsed / 1000000u) * FIELD_RATE_NUMERATOR / FIELD_RATE_DENOMINATOR;
-    native_vblank_fraction += ((elapsed / 1000000u) * FIELD_RATE_NUMERATOR % FIELD_RATE_DENOMINATOR) * 1000000u +
-        (elapsed % 1000000u) * FIELD_RATE_NUMERATOR;
+    native_vblank_fraction += ((elapsed / 1000000u) * FIELD_RATE_NUMERATOR % FIELD_RATE_DENOMINATOR) * 1000000u + (elapsed % 1000000u) * FIELD_RATE_NUMERATOR;
     fields += native_vblank_fraction / ((uint64)1000000u * FIELD_RATE_DENOMINATOR);
     native_vblank_fraction %= (uint64)1000000u * FIELD_RATE_DENOMINATOR;
     present_field = fields != 0u;
@@ -4255,7 +4570,7 @@ int psx_state_io(FILE *f, int load)
     }
     else if (!psx_state_block(f, &timers, sizeof(timers), 0))
         return 0;
-    if (!psx_state_block(f, &native_root_irq, sizeof(native_root_irq), load) || !psx_state_block(f, native_timer_irq_fired, sizeof(native_timer_irq_fired), load) || !psx_state_block(f, &native_root_last_tick, sizeof(native_root_last_tick), load) || !psx_state_block(f, &bios_vblank_pending, sizeof(bios_vblank_pending), load) || !psx_state_block(f, &bios_interrupts_enabled, sizeof(bios_interrupts_enabled), load) || !psx_state_block(f, &bios_callbacks_running, sizeof(bios_callbacks_running), load))
+    if (!psx_state_block(f, &native_root_irq, sizeof(native_root_irq), load) || !psx_state_block(f, native_timer_irq_fired, sizeof(native_timer_irq_fired), load) || !psx_state_block(f, &native_root_last_tick, sizeof(native_root_last_tick), load) || !psx_state_block(f, &bios_vblank_pending, sizeof(bios_vblank_pending), load) || !psx_state_block(f, &bios_interrupts_enabled, sizeof(bios_interrupts_enabled), load) || !psx_state_block(f, &bios_callbacks_running, sizeof(bios_callbacks_running), load) || !psx_state_block(f, &psx_callback_driver, sizeof(psx_callback_driver), load))
         return 0;
     if (load)
     {
@@ -5255,6 +5570,17 @@ static sint32 resolve_cd_path_native(const char *src, const char *root, char *ho
     return 1;
 }
 
+void InitHeap(uint32 address, uint32 bytes)
+{
+    uint32 end;
+    w_u32(0xA0009000, address);
+    end = address + ((bytes >> 2) << 2);
+    w_u32(address, 0);
+    w_u32(0xA0009008, end + 4);
+    w_u32(0xA0009004, bytes);
+    w_u32(0xA000900C, 0);
+}
+
 sint32 xport_psx_exe_load(const PSX_EXE *executable)
 {
     uint8 *image;
@@ -5756,6 +6082,24 @@ sint32 MemCardStartPSX(void)
     abort();
 }
 
+uint32 InitPADNative(uint8 *buffer0, uint32 size0, uint8 *buffer1, uint32 size1)
+{
+    if (!buffer0 || size0 < 8u || size0 > PSX_DRAM_SIZE)
+        return 0u;
+    if (size1 == 0u ? buffer1 != NULL : !buffer1 || size1 < 8u || size1 > PSX_DRAM_SIZE)
+        return 0u;
+    bios_legacy_pad_enabled = 0;
+    pad_packets[0] = buffer0;
+    pad_packets[1] = buffer1;
+    pad_active = 0;
+    bios_pad_initialized = 1u;
+    w_u32(0x74B8u, 1u);
+    pad_publish(0, 0, 0xFFFFu);
+    pad_publish(1, 0, 0xFFFFu);
+    xport_input_init();
+    return 1u;
+}
+
 uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1)
 {
     if (size0 < 8u || size0 > PSX_DRAM_SIZE || !bios_card_address(buffer0, size0, 1u))
@@ -5795,8 +6139,10 @@ uint32 PAD_dr(void)
             if (packet[1] == 0x23)
             {
                 buttons |= 0x7C7;
-                if (packet[5] > 0x10) buttons &= ~0x40u;
-                if (packet[6] > 0x10) buttons &= ~0x80u;
+                if (packet[5] > 0x10)
+                    buttons &= ~0x40u;
+                if (packet[6] > 0x10)
+                    buttons &= ~0x80u;
             }
         }
         packed |= buttons << (port * 16);
@@ -5913,6 +6259,7 @@ uint32 ReadInitPadFlag(void)
 
 uint32 _patch_card(void)
 {
+    uint32 index, value;
     if (!bios_card_patches_bound)
     {
 #ifndef NDEBUG
@@ -5920,7 +6267,11 @@ uint32 _patch_card(void)
 #endif
         abort();
     }
-    memmove(psx_addr(bios_card_first_destination, 20u), psx_addr(bios_card_first_source, 20u), 20u);
+    for (index = 0; index < 5; ++index)
+    {
+        value = r_u32(bios_card_first_source + index * 4);
+        w_u32(bios_card_first_destination + index * 4, value);
+    }
     w_u32(0xDFFCu, bios_card_first_destination + 20u);
     FlushCache();
     return bios_card_first_destination + 20u;
@@ -5928,6 +6279,7 @@ uint32 _patch_card(void)
 
 uint32 _patch_card2(void)
 {
+    uint32 index, value;
     if (!bios_card_patches_bound)
     {
 #ifndef NDEBUG
@@ -5936,13 +6288,18 @@ uint32 _patch_card2(void)
         abort();
     }
     uint32 original = r_u32(bios_card_second_destination);
-    memmove(psx_addr(bios_card_second_destination, 20u), psx_addr(bios_card_second_source, 20u), 20u);
+    for (index = 0; index < 5; ++index)
+    {
+        value = r_u32(bios_card_second_source + index * 4);
+        w_u32(bios_card_second_destination + index * 4, value);
+    }
     FlushCache();
     return original;
 }
 
 uint32 _copy_memcard_patch(void)
 {
+    uint32 index, value;
     if (!bios_card_patches_bound)
     {
 #ifndef NDEBUG
@@ -5950,22 +6307,148 @@ uint32 _copy_memcard_patch(void)
 #endif
         abort();
     }
-    memmove(psx_addr(0xDF80u, 112u), psx_addr(bios_card_copy_source, 112u), 112u);
+    for (index = 0; index < 28; ++index)
+    {
+        value = r_u32(bios_card_copy_source + index * 4);
+        w_u32(0xDF80 + index * 4, value);
+    }
     return 0xDFF0u;
+}
+
+static PsxCardSdkBinding bios_card_sdk;
+static void (*bios_card_stop_restore)(uint32);
+static uint32 bios_card_stop_return;
+static uint32 bios_card_sdk_bound;
+
+void psx_bios_bind_card_sdk(const PsxCardSdkBinding *binding)
+{
+    if (!binding || !binding->init_pad_flag || !binding->saved_return || !binding->copy_source || !binding->first_source || !binding->second_source || !binding->first_return || !binding->second_return || !binding->clear_return || !binding->clear_add_pc)
+        abort();
+    bios_card_sdk = *binding;
+    bios_card_copy_source = binding->copy_source;
+    bios_card_first_source = binding->first_source;
+    bios_card_second_source = binding->second_source;
+    bios_card_patches_bound = 1;
+    bios_card_sdk_bound = 1;
+}
+
+/* Native returns retain the original guest continuation storage */
+static int bios_card_sdk_returns_to(uint32 expected)
+{
+    uint32 target = r_u32(bios_card_sdk.saved_return);
+    if (target == expected)
+        return 1;
+    xport_guest_call0(target);
+    return 0;
+}
+
+void psx_bios_bind_card_stop(void (*restore)(uint32), uint32 return_continuation)
+{
+    bios_card_stop_restore = restore;
+    bios_card_stop_return = return_continuation;
+}
+
+uint32 StopCARD(void)
+{
+    if (!bios_card_stop_restore)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Unbound StopCARD kernel restore\n");
+#else
+        (void)0;
+#endif
+        abort();
+    }
+    xport_bios_stop_card();
+    bios_card_stop_restore(bios_card_stop_return);
+    return 0;
+}
+
+void InitCARD(sint32 mode)
+{
+    uint32 previous, table, base, high, low;
+    sint64 destination;
+    if (!bios_card_sdk_bound)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Unbound InitCARD SDK image layout\n");
+#endif
+        abort();
+    }
+    ChangeClearPAD(0);
+    VSync(0);
+    previous = (uint32)xport_bios_enter_critical();
+    if (r_u32(bios_card_sdk.init_pad_flag) == 0)
+        mode = 0;
+    xport_bios_init_card((uint32)mode);
+    _copy_memcard_patch();
+
+    w_u32(bios_card_sdk.saved_return, bios_card_sdk.first_return);
+    xport_bios_enter_critical();
+    table = GetC0Table();
+    base = r_u32(table + 24);
+    high = r_u32(base + 112);
+    low = r_u32(base + 116);
+    bios_card_first_destination = (((high & 0xFFFF) << 16) + (low & 0xFFFF)) + 40;
+    _patch_card();
+    if (!bios_card_sdk_returns_to(bios_card_sdk.first_return))
+        return;
+
+    w_u32(bios_card_sdk.saved_return, bios_card_sdk.second_return);
+    xport_bios_enter_critical();
+    table = GetB0Table();
+    base = r_u32(table + 364);
+    bios_card_second_destination = base + 2504;
+    _patch_card2();
+    if (!bios_card_sdk_returns_to(bios_card_sdk.second_return))
+        return;
+
+    w_u32(bios_card_sdk.saved_return, bios_card_sdk.clear_return);
+    table = GetB0Table();
+    base = r_u32(table + 364);
+    destination = (sint64)(sint32)base + 6536;
+    if (destination < INT32_MIN || destination > INT32_MAX)
+        xport_mips_overflow_exception(bios_card_sdk.clear_add_pc);
+    w_u32((uint32)destination, 0);
+    FlushCache();
+    if (!bios_card_sdk_returns_to(bios_card_sdk.clear_return))
+        return;
+    if (previous == 1)
+        xport_bios_exit_critical();
+}
+
+void StartCARD(void)
+{
+    uint32 previous = (uint32)xport_bios_enter_critical();
+    xport_bios_start_card();
+    ChangeClearPAD(0);
+    if (previous == 1)
+        xport_bios_exit_critical();
+}
+
+PsxInterruptCallback psx_bios_vsync_callback(PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous = bios_vsync_native_callback;
+    bios_vsync_callback = 0;
+    bios_vsync_native_callback = callback;
+    return previous;
 }
 
 uint32 VSyncCallbackPSX(uint32 guest_callback)
 {
     uint32 previous = bios_vsync_callback;
+    bios_vsync_native_callback = NULL;
     bios_vsync_callback = guest_callback;
     return previous;
 }
 
 uint32 ResetCallbackPSX(void)
 {
-    uint32 previous = bios_callbacks_running;
+    uint32 previous;
+    previous = bios_callbacks_running;
     ResetCallback();
     bios_vsync_callback = 0u;
+    bios_vsync_native_callback = NULL;
     bios_callbacks_running = 1u;
     return previous;
 }
@@ -6003,6 +6486,38 @@ sint32 xport_bios_enter_critical(void)
     sint32 previous = (sint32)bios_interrupts_enabled;
     bios_interrupts_enabled = 0u;
     return previous;
+}
+
+uint32 GetC0Table(void)
+{
+    return 0x674;
+}
+
+uint32 GetB0Table(void)
+{
+    return 0x874;
+}
+
+uint32 xport_bios_stop_pad(void)
+{
+    uint32 result;
+    xport_bios_enter_critical();
+    ChangeClearRCnt(3, 1);
+    result = SysDeqIntRP(2, 0x74A8);
+    pad_active = 0;
+    xport_bios_exit_critical();
+    return result;
+}
+
+uint32 xport_bios_stop_card(void)
+{
+    xport_bios_enter_critical();
+    ChangeClearRCnt(3, 1);
+    SysDeqIntRP(2, 0x74A8);
+    w_u32(0x74BC, 0);
+    bios_card_pending_ports = 0;
+    xport_bios_exit_critical();
+    return 1;
 }
 
 void xport_bios_exit_critical(void)
@@ -6142,10 +6657,30 @@ void xport_missing_guest_main_sprintf(char *destination, const char *format, con
     abort();
 }
 
+static PsxGuestDispatch native_guest_dispatch;
+
+void psx_bind_guest_dispatch(PsxGuestDispatch dispatch)
+{
+    native_guest_dispatch = dispatch;
+}
+
+uint32 psx_dispatch_guest_call(uint32 target, uint32 argument_count, uint32 argument0, uint32 argument1, uint32 argument2)
+{
+    if (!native_guest_dispatch)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Unbound guest dispatch %08X/%u\n", target, argument_count);
+#else
+        (void)0;
+#endif
+        abort();
+    }
+    return native_guest_dispatch(target, argument_count, argument0, argument1, argument2);
+}
+
 uint32 xport_guest_call0(uint32 target)
 {
-    (void)target;
-    abort();
+    return psx_dispatch_guest_call(target, 0, 0, 0, 0);
 }
 
 void xport_mips_overflow_exception(uint32 pc)
@@ -6345,6 +6880,16 @@ void xport_gte_write_data(uint32 register_index, uint32 value)
         gte.mac0 = (sint32)value;
     else if (register_index >= 25u && register_index <= 27u)
         gte.mac[register_index - 25u] = (sint32)value;
+    else if (register_index == 28)
+    {
+        gte.ir[0] = (value & 31) * 128;
+        gte.ir[1] = ((value >> 5) & 31) * 128;
+        gte.ir[2] = ((value >> 10) & 31) * 128;
+    }
+    else if (register_index == 29)
+    {
+        /* ORGB is read only */
+    }
     else if (register_index == 30u)
     {
         uint32 bits = (value & 0x80000000u) != 0u ? ~value : value;
@@ -6394,6 +6939,20 @@ uint32 xport_gte_read_data(uint32 register_index)
         return (uint32)gte.mac0;
     if (register_index >= 25u && register_index <= 27u)
         return (uint32)gte.mac[register_index - 25u];
+    if (register_index == 28 || register_index == 29)
+    {
+        uint32 color = 0, index;
+        for (index = 0; index < 3; ++index)
+        {
+            sint32 component = gte.ir[index] / 128;
+            if (component < 0)
+                component = 0;
+            else if (component > 31)
+                component = 31;
+            color |= (uint32)component << (index * 5);
+        }
+        return color;
+    }
     if (register_index == 30u)
         return gte_lzcs;
     if (register_index == 31u)
@@ -6415,6 +6974,25 @@ CdlFILE *CdSearchFile(CdlFILE *result, const char *path)
 sint32 CdReset(sint32 mode)
 {
     return cd_reset_native(mode);
+}
+
+sint32 psx_root_counter_stop(uint32 counter)
+{
+    static const uint32 interrupt_masks[4] = {0x10, 0x20, 0x40, 1};
+    uint32 index = counter & 0xFFFFu;
+    uint32 value;
+    if (index >= sizeof(interrupt_masks) / sizeof(interrupt_masks[0]))
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "xport: Invalid native root counter selector %u\n", index);
+#else
+        (void)0;
+#endif
+        abort();
+    }
+    value = r_u32(0x1F801074u);
+    w_u32(0x1F801074u, value & ~interrupt_masks[index]);
+    return 1;
 }
 
 sint32 StopRCnt(uint32 counter, uint32 control_slot, uint32 mask_table)
@@ -6529,6 +7107,35 @@ sint32 CloseEventPSX(uint32 handle)
     return 1;
 }
 
+uint32 WaitEventPSX(uint32 handle)
+{
+    uint32 base = r_u32(0xA0000120);
+    uint32 slot = base + (handle & 0xFFFF) * 28 + 4;
+    uint32 status = r_u32(slot);
+    if (status == 0x4000)
+    {
+        w_u32(slot, 0x2000);
+        return 1;
+    }
+    status = r_u32(slot);
+    if (status != 0x2000)
+        return 0;
+    while (r_u32(slot) != 0x4000)
+    {
+        if (!psx_wait_events())
+        {
+#ifndef NDEBUG
+            fprintf(stderr, "WaitEventPSX cannot advance event %08X\n", handle);
+#else
+            (void)0;
+#endif
+            abort();
+        }
+    }
+    w_u32(slot, 0x2000);
+    return 1;
+}
+
 uint32 xport_missing_cd_sync_guest_callback(uint32 guest_callback)
 {
     return CdSyncCallbackPSX(guest_callback);
@@ -6566,6 +7173,411 @@ static sint32 native_root_irq_write(void *user, uint32 address, uint32 width, ui
     if ((width != 2u && width != 4u) || (offset != 0u && offset != 4u))
         return 0;
     return psx_irq_write(&native_root_irq, offset, value);
+}
+
+static PsxDmaState native_bus_dma = {{{0}, {0}, {0}, {0}, {0}, {0}, {0, 0, 2, 0}}, 0x07654321, 0, 0};
+
+static MdecState native_mdec;
+static uint32 native_mdec_servicing;
+static uint32 native_mdec_words[65536];
+static uint32 native_gpu_servicing;
+
+static void native_gpu_request(void)
+{
+    uint32 status;
+    if (!gpu_port_read(4, &status))
+        abort();
+    native_bus_dma.channels[2].request = (status >> 25) & 1;
+    if (!psx_irq_line(&native_root_irq, 1, (status >> 24) & 1))
+        abort();
+}
+
+static sint32 native_gpu_transfer(void)
+{
+    PsxDmaChannel *dma = &native_bus_dma.channels[2];
+    uint32 address = dma->base & 0xFFFFFC;
+    uint32 mode = (dma->control >> 9) & 3;
+    uint32 reverse = dma->control & 2, output = dma->control & 1;
+    uint32 count = dma->block & 0xFFFF, blocks = dma->block >> 16;
+    uint32 tag = 0, index, value, physical;
+    if (mode == 3 || (mode == 2 && !output))
+        return -1;
+    dma->control &= ~0x10000000;
+    if (mode == 2)
+    {
+        if (address >= 0x800000)
+            return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 2);
+        tag = r_u32(0x80000000 | (address & (PSX_DRAM_SIZE - 1)));
+        count = tag >> 24;
+        address += 4;
+        reverse = 0;
+    }
+    else if (!count)
+        count = 65536;
+    if (count && (address >= 0x800000 || (reverse ? (count - 1) * 4 > address : (count - 1) * 4 >= 0x800000 - address)))
+        return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 2);
+    for (index = 0; index < count; ++index)
+    {
+        physical = (address + (reverse ? 0 - index * 4 : index * 4)) & (PSX_DRAM_SIZE - 1);
+        if (output)
+        {
+            value = r_u32(0x80000000 | physical);
+            if (!gpu_port_write(0, value))
+                return -1;
+        }
+        else
+        {
+            if (!gpu_port_read(0, &value))
+                return -1;
+            if (!w_u32(0x80000000 | physical, value))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 2);
+            if (xport_device_trace_enabled() && !psx_dma_trace_write(&native_bus_dma, 2, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_RAM, physical, 4, 15))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 2);
+        }
+    }
+    native_gpu_request();
+    if (mode == 2)
+    {
+        dma->base = tag & 0xFFFFFF;
+        if (dma->base != 0xFFFFFF)
+            return 1;
+    }
+    else if (mode == 1)
+    {
+        dma->base = (address + (reverse ? 0 - count * 4 : count * 4)) & 0xFFFFFF;
+        if (!blocks)
+            blocks = 65536;
+        --blocks;
+        dma->block = (dma->block & 0xFFFF) | (blocks << 16);
+        if (blocks)
+            return 1;
+    }
+    return psx_dma_complete(&native_bus_dma, &native_root_irq, 2);
+}
+
+static void native_gpu_service(void)
+{
+    uint32 nodes = 0;
+    if (native_gpu_servicing)
+        return;
+    native_gpu_servicing = 1;
+    native_gpu_request();
+    while (psx_dma_ready(&native_bus_dma, 2, 0, 0) == 1)
+    {
+        if (++nodes > PSX_DRAM_SIZE / 4)
+        {
+#ifndef NDEBUG
+            fputs("Native GPU DMA did not terminate within RAM tag capacity\n", stderr);
+#else
+            (void)0;
+#endif
+            abort();
+        }
+        dma_trace_start(&native_bus_dma, 2);
+        if (native_gpu_transfer() != 1)
+        {
+#ifndef NDEBUG
+            fputs("Unsupported native GPU DMA transfer\n", stderr);
+#else
+            (void)0;
+#endif
+            abort();
+        }
+    }
+    native_gpu_servicing = 0;
+}
+
+static void native_mdec_requests(void)
+{
+    native_bus_dma.channels[0].request = (native_mdec.status >> 28) & 1;
+    native_bus_dma.channels[1].request = (native_mdec.status >> 27) & 1;
+}
+
+static sint32 native_mdec_transfer(uint32 channel)
+{
+    PsxDmaChannel *dma = &native_bus_dma.channels[channel];
+    uint32 mode = (dma->control >> 9) & 3;
+    uint32 address = dma->base & 0xFFFFFC;
+    uint32 reverse = dma->control & 2;
+    uint32 count = dma->block & 0xFFFF;
+    uint32 blocks = dma->block >> 16;
+    uint32 index, copied;
+    if (mode > 1 || ((dma->control & 1) != (channel == 0)))
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "Unsupported native MDEC DMA channel%u control%08X\n", channel, dma->control);
+#else
+        (void)0;
+#endif
+        return -1;
+    }
+    if (!count)
+        count = 65536;
+    if (!blocks)
+        blocks = 65536;
+    dma->control &= ~0x10000000;
+    if (address >= 0x800000 || (reverse ? (count - 1) * 4 > address : (count - 1) * 4 >= 0x800000 - address))
+        return psx_dma_bus_error(&native_bus_dma, &native_root_irq, channel);
+    if (!channel)
+    {
+        for (index = 0; index < count; ++index)
+            native_mdec_words[index] = r_u32(0x80000000 | ((address + (reverse ? 0 - index * 4 : index * 4)) & (PSX_DRAM_SIZE - 1)));
+        copied = mdec_dma_write(&native_mdec, native_mdec_words, count);
+        if (copied > count * 2)
+            abort();
+    }
+    else
+    {
+        copied = mdec_dma_read(&native_mdec, native_mdec_words, count);
+        for (index = 0; index < copied; ++index)
+        {
+            uint32 destination = (address + (reverse ? 0 - index * 4 : index * 4)) & (PSX_DRAM_SIZE - 1);
+            if (!w_u32(0x80000000 | destination, native_mdec_words[index]))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, channel);
+            if (xport_device_trace_enabled() && !psx_dma_trace_write(&native_bus_dma, channel, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_RAM, destination, 4, 15))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, channel);
+        }
+    }
+    native_mdec_requests();
+    if (mode == 1)
+    {
+        dma->base = (address + (reverse ? 0 - count * 4 : count * 4)) & 0xFFFFFF;
+        --blocks;
+        dma->block = (dma->block & 0xFFFF) | (blocks << 16);
+        if (blocks)
+            return 1;
+    }
+    return psx_dma_complete(&native_bus_dma, &native_root_irq, channel);
+}
+
+static void native_mdec_advance(uint64 ticks)
+{
+    uint32 channel, progress, step;
+    if (native_mdec_servicing)
+        return;
+    native_mdec_servicing = 1;
+    for (;;)
+    {
+        do
+        {
+            progress = 0;
+            native_mdec_requests();
+            for (channel = 0; channel < 2; ++channel)
+            {
+                if (psx_dma_ready(&native_bus_dma, channel, 0, 0) == 1)
+                {
+                    dma_trace_start(&native_bus_dma, channel);
+                    if (native_mdec_transfer(channel) != 1)
+                        abort();
+                    progress = 1;
+                }
+            }
+        } while (progress);
+        if (!ticks || !native_mdec.copy_ticks)
+            break;
+        step = ticks < native_mdec.copy_ticks ? (uint32)ticks : native_mdec.copy_ticks;
+        mdec_advance(&native_mdec, step);
+        ticks -= step;
+    }
+    native_mdec_servicing = 0;
+}
+
+static sint32 native_bus_dma_transfer(void *context, uint32 channel)
+{
+    uint32 address, count, index, next, value;
+    (void)context;
+    if (channel < 2)
+        return native_mdec_transfer(channel);
+    if (channel == 2)
+        return native_gpu_transfer();
+    if (channel == 6)
+    {
+        address = native_bus_dma.channels[6].base & 0xFFFFFC;
+        count = native_bus_dma.channels[6].block & 0xFFFF;
+        if (!count)
+            count = 0x10000;
+        native_bus_dma.channels[6].control &= ~0x10000000;
+        if (address >= 0x800000 || count - 1 > address / 4)
+            return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 6);
+        address &= PSX_DRAM_SIZE - 1;
+        for (index = 0; index < count; ++index)
+        {
+            next = (address - 4) & (PSX_DRAM_SIZE - 1);
+            value = index + 1 == count ? 0xFFFFFF : next;
+            if (!w_u32(0x80000000 | address, value))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 6);
+            if (xport_device_trace_enabled() && !psx_dma_trace_write(&native_bus_dma, 6, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_RAM, address, 4, 15))
+                return psx_dma_bus_error(&native_bus_dma, &native_root_irq, 6);
+            address = next;
+        }
+        return psx_dma_complete(&native_bus_dma, &native_root_irq, 6);
+    }
+#ifndef NDEBUG
+    fprintf(stderr, "Unbound native DMA transfer channel %u\n", channel);
+#else
+    (void)0;
+#endif
+    return -1;
+}
+
+static sint32 native_bus_dma_halt(void *context, uint32 ticks)
+{
+    (void)context;
+#ifndef NDEBUG
+    fprintf(stderr, "Unbound native DMA halt for %u ticks\n", ticks);
+#else
+    (void)0;
+#endif
+    return 0;
+}
+
+static sint32 native_bus_read(void *context, uint32 address, uint32 width, uint32 *value)
+{
+    uint32 offset, channel, index;
+    if ((address == 0x1F801820 || address == 0x1F801824) && width == 4)
+    {
+        uint32 stall;
+        sint32 result;
+        psx_root_counter_poll();
+        if (address == 0x1F801824)
+            *value = native_mdec.status;
+        else
+        {
+            result = mdec_read_data(&native_mdec, value, &stall);
+            if (!result)
+            {
+                native_mdec_advance(stall);
+                result = mdec_read_data(&native_mdec, value, &stall);
+            }
+            if (result != 1)
+                return 0;
+            native_mdec_advance(0);
+        }
+        return 1;
+    }
+    if (address >= 0x1F801C00 && address < 0x1F801E00)
+        return spu_mmio_read(context, address, width, value);
+    if ((address == 0x1F801810 || address == 0x1F801814) && width == 4)
+    {
+        psx_native_poll_events();
+        return gpu_port_read(address - 0x1F801810, value);
+    }
+    if (address >= 0x1F801070 && address < 0x1F801078)
+        return native_root_irq_read(context, address, width, value);
+    if (address >= 0x1F801080 && address < 0x1F8010F8 && width == 4)
+    {
+        psx_root_counter_poll();
+        offset = address - 0x1F801080;
+        channel = offset >> 4;
+        if (offset == 0x70)
+            *value = native_bus_dma.priority;
+        else if (offset == 0x74)
+            *value = native_bus_dma.interrupt;
+        else if (channel < 7 && (offset & 15) == 0)
+            *value = native_bus_dma.channels[channel].base;
+        else if (channel < 7 && (offset & 15) == 4)
+            *value = native_bus_dma.channels[channel].block;
+        else if (channel < 7 && (offset & 15) == 8)
+            *value = native_bus_dma.channels[channel].control;
+        else
+            return 0;
+        return 1;
+    }
+    if (address >= 0x1F801100 && address < 0x1F80112C && (width == 2 || width == 4))
+    {
+        offset = address - 0x1F801100;
+        index = offset >> 4;
+        if (index >= 3 || ((offset & 15) != 0 && (offset & 15) != 4 && (offset & 15) != 8))
+            return 0;
+        psx_root_counter_poll();
+        if ((offset & 15) == 0)
+            *value = timers.counter[index];
+        else if ((offset & 15) == 4)
+        {
+            *value = timers.mode[index];
+            timers.mode[index] &= ~0x1800;
+        }
+        else
+            *value = timers.target[index];
+        return 1;
+    }
+    return 0;
+}
+
+static sint32 native_bus_write(void *context, uint32 address, uint32 width, uint32 value, uint32 byte_mask)
+{
+    uint32 offset, index;
+    if (address >= 0x1F801C00 && address < 0x1F801E00)
+        return spu_mmio_write(context, address, width, value, byte_mask);
+    if ((width != 2 && width != 4) || byte_mask != ((1 << width) - 1))
+        return 0;
+    if ((address == 0x1F801820 || address == 0x1F801824) && width == 4)
+    {
+        psx_root_counter_poll();
+        if (address == 0x1F801824)
+            mdec_control(&native_mdec, value);
+        else if (mdec_write_data(&native_mdec, value) != 2)
+            return 0;
+        native_mdec_advance(0);
+        return 1;
+    }
+    if ((address == 0x1F801810 || address == 0x1F801814) && width == 4)
+    {
+        uint32 status;
+        if (!gpu_port_write(address - 0x1F801810, value) || !gpu_port_read(4, &status))
+            return 0;
+        if (!psx_irq_line(&native_root_irq, 1, (status >> 24) & 1))
+            return 0;
+        native_gpu_service();
+        return 1;
+    }
+    if (address >= 0x1F801070 && address < 0x1F801078)
+        return native_root_irq_write(context, address, width, value, byte_mask);
+    if (address >= 0x1F801080 && address < 0x1F8010F8 && width == 4)
+    {
+        sint32 result;
+        psx_root_counter_poll();
+        result = psx_dma_write(&native_bus_dma, &native_root_irq, address - 0x1F801080, value, 0, native_bus_dma_transfer, native_bus_dma_halt, NULL);
+        if (result != 1)
+            return 0;
+        native_mdec_advance(0);
+        native_gpu_service();
+        return 1;
+    }
+    if (address >= 0x1F801100 && address < 0x1F80112C)
+    {
+        offset = address - 0x1F801100;
+        index = offset >> 4;
+        if (index >= 3 || ((offset & 15) != 0 && (offset & 15) != 4 && (offset & 15) != 8))
+            return 0;
+        psx_root_counter_poll();
+        if ((offset & 15) == 0)
+            timers.counter[index] = value & 0xFFFF;
+        else if ((offset & 15) == 4)
+        {
+            timers.mode[index] = (timers.mode[index] & 0x1800) | (value & 0x3FF) | 0x400;
+            timers.counter[index] = 0;
+            native_timer_irq_fired[index] = 0;
+            psx_irq_line(&native_root_irq, index + 4, 0);
+        }
+        else
+            timers.target[index] = value & 0xFFFF;
+        return 1;
+    }
+    return 0;
+}
+
+void psx_native_bus_bind(void)
+{
+    spu_mmio_initialize();
+    memset(native_pad_serial, 0, sizeof(native_pad_serial));
+    mdec_initialize(&native_mdec);
+    native_mdec_requests();
+    native_gpu_request();
+    native_root_last_us = xport_timer_get();
+    native_root_clock_started = 1;
+    native_root_tick_fraction = 0;
+    xport_memory_bind_mmio(0x1F801040, 0xDC0, native_bus_read, native_bus_write, NULL);
 }
 
 void psx_root_counter_bind(uint32 control_slot, uint32 mask_table)
@@ -6622,6 +7634,8 @@ void psx_root_counter_poll(void)
         ticks += native_root_tick_fraction / 1000000u;
         native_root_tick_fraction %= 1000000u;
     }
+    native_mdec_advance(ticks);
+    native_gpu_service();
     {
         uint64 remaining = ticks;
         while (remaining)
@@ -6705,6 +7719,22 @@ PsxInterruptCallback DMACallback(uint32 channel, PsxInterruptCallback callback)
     return previous;
 }
 
+PsxInterruptCallback setIntrDMA(uint32 channel, PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous;
+    uint32 value, bit;
+    if (channel >= sizeof(native_dma_callbacks) / sizeof(native_dma_callbacks[0]))
+        return NULL;
+    previous = DMACallback(channel, callback);
+    if (previous != callback)
+    {
+        value = (r_u32(0x1F8010F4) & 0x00FFFFFFu) | 0x00800000u;
+        bit = 1u << (channel + 16);
+        w_u32(0x1F8010F4, callback != NULL ? value | bit : value & ~bit);
+    }
+    return previous;
+}
+
 uint32 CdReadyCallbackPSX(uint32 callback)
 {
     uint32 previous;
@@ -6733,10 +7763,74 @@ uint32 xport_guest_nonlocal_transfer(uint32 owner_entry, uint32 source_pc, uint3
 
 uint32 bzeroPSX(uint32 destination, uint32 length)
 {
-    if (destination == 0u || (sint32)length <= 0)
-        return 0u;
-    memset(psx_addr(destination, length), 0, length);
-    return destination;
+    uint32 initial = destination;
+    if (!destination || (sint32)length <= 0)
+        return 0;
+    do
+    {
+        w_u8(destination, 0);
+        --length;
+        ++destination;
+    } while ((sint32)length > 0);
+    return initial;
+}
+
+static PSX_BIOS_FILE_GUEST_BINDING bios_file_guest;
+
+sint32 psx_bios_bind_file_guest(const PSX_BIOS_FILE_GUEST_BINDING *binding)
+{
+    memset(&bios_file_guest, 0, sizeof(bios_file_guest));
+    if (!binding)
+        return 1;
+    if ((binding->descriptors & 3) || (binding->error & 3) || !psx_addr(binding->descriptors, 16 * 44) || !psx_addr(binding->error, 4) || !psx_addr(binding->invalid_seek_text, 1))
+        return 0;
+    bios_file_guest = *binding;
+    return 1;
+}
+
+sint32 lseekPSX(sint32 descriptor, sint32 offset, uint32 origin)
+{
+    uint32 file;
+    if (!bios_file_guest.descriptors)
+        abort();
+    if (descriptor < 0 || descriptor >= 16)
+    {
+        w_u32(bios_file_guest.error, 9);
+        return -1;
+    }
+    file = bios_file_guest.descriptors + (uint32)descriptor * 44;
+    if (r_u32(file) == 0)
+    {
+        w_u32(bios_file_guest.error, 9);
+        return -1;
+    }
+    if (origin == 0)
+        w_u32(file + 16, (uint32)offset);
+    else if (origin == 1)
+    {
+        uint32 position = r_u32(file + 16);
+        w_u32(file + 16, position + (uint32)offset);
+    }
+    else if (origin != 2)
+    {
+        const char *message = psx_addr(bios_file_guest.invalid_seek_text, 1);
+        const char *end;
+        uintptr_t offset;
+        if (!message || (uintptr_t)message < (uintptr_t)DRAM || (uintptr_t)message - (uintptr_t)DRAM >= sizeof(DRAM))
+            abort();
+        offset = (uintptr_t)message - (uintptr_t)DRAM;
+        end = memchr(message, 0, sizeof(DRAM) - offset);
+        if (!end)
+            abort();
+#ifndef NDEBUG
+        fwrite(psx_addr(bios_file_guest.invalid_seek_text, end - message), 1, end - message, stdout);
+#endif
+        w_u32(bios_file_guest.error, 0x16);
+        w_u32(file + 24, 0x16);
+        return -1;
+    }
+    /* Original origin2 leaves the position unchanged */
+    return r_s32(file + 16);
 }
 
 sint32 openPSX(const char *path, uint32 mode)
@@ -6763,11 +7857,31 @@ sint32 readPSX(sint32 descriptor, void *destination, uint32 length)
 
 sint32 writePSX(sint32 fd, const void *src, uint32 length)
 {
-    (void)fd;
-    (void)src;
-    (void)length;
-    // No BIOS file descriptor is available without a card medium
-    return -1;
+#if defined(NDEBUG)
+    if ((fd != 1 && fd != 2) || (!src && length))
+        return -1;
+    return (sint32)length;
+#else
+    FILE *stream;
+    size_t written;
+    #if defined(_WIN32) && !defined(XPORT_XCRT)
+    int previous_mode;
+    #endif
+    if ((fd != 1 && fd != 2) || (!src && length))
+        return -1;
+    stream = fd == 1 ? stdout : stderr;
+    fflush(stream);
+    #if defined(_WIN32) && !defined(XPORT_XCRT)
+    previous_mode = _setmode(_fileno(stream), _O_BINARY);
+    #endif
+    written = length ? fwrite(src, 1, length, stream) : 0;
+    fflush(stream);
+    #if defined(_WIN32) && !defined(XPORT_XCRT)
+    if (previous_mode >= 0)
+        _setmode(_fileno(stream), previous_mode);
+    #endif
+    return (sint32)(uint32)written;
+#endif
 }
 
 sint32 erase(const char *path)
@@ -7233,6 +8347,35 @@ void xport_gte_execute(uint32 command)
             finish_flag();
             return;
         }
+        case 0x11:
+            for (row = 0; row < 3; ++row)
+            {
+                sint64 base = (sint64)gte.ir[row] * 4096;
+                sint32 difference;
+                native_gte_mac_ir(row, (sint64)gte.far_color[row] * 4096 - base, shift, 0);
+                difference = gte.ir[row];
+                native_gte_mac_ir(row, base + (sint64)gte.ir0 * difference, shift, lm);
+            }
+            push_rgb_from_mac();
+            finish_flag();
+            return;
+        case 0x1E:
+        case 0x20:
+            for (index = 0; index < (uint32)(opcode == 0x20 ? 3 : 1); ++index)
+            {
+                sint32 input[3];
+                v = native_gte_vertex(index);
+                input[0] = v.vx;
+                input[1] = v.vy;
+                input[2] = v.vz;
+                native_gte_matrix(&gte.light, input, NULL, shift, lm);
+                for (row = 0; row < 3; ++row)
+                    input[row] = gte.ir[row];
+                native_gte_matrix(&gte.color, input, gte.back_color, shift, lm);
+                push_rgb_from_mac();
+            }
+            finish_flag();
+            return;
         case 0x10u:
             native_gte_depth_color(gte.rgbc, shift, lm);
             finish_flag();
@@ -7348,10 +8491,7 @@ sint32 MemCardEndPSX(void)
 #endif
         abort();
     }
-    /* BIOS _stop_card removes the card interrupt routine */
-    SysDeqIntRP(2u, 0x74A8u);
-    w_u32(0x74BCu, 0u);
-    bios_card_pending_ports = 0u;
+    xport_bios_stop_card();
     xport_bios_enter_critical();
     destination = r_u32(bios_card_end_table + 24u) + 112u;
     if (!bios_card_address(destination, 12u, 4u))
@@ -7473,11 +8613,7 @@ void xport_guest_frame_release(uint32 address, size_t bytes)
 
 uint32 xport_guest_call3(uint32 target, uint32 argument0, uint32 argument1, uint32 argument2)
 {
-    (void)target;
-    (void)argument0;
-    (void)argument1;
-    (void)argument2;
-    abort();
+    return psx_dispatch_guest_call(target, 3, argument0, argument1, argument2);
 }
 
 void xport_gpu_clear_otag_r_guest_driver(uint32 guest_ot, uint32 count)
@@ -8607,6 +9743,26 @@ uint32 SquareRoot0PSX(uint32 input, uint32 table_address)
     return result;
 }
 
+uint32 SquareRoot12(sint32 input)
+{
+    uint32 leading, even, normalized, value;
+    sint32 shift;
+    xport_gte_write_data(30, (uint32)input);
+    leading = xport_gte_read_data(31);
+    if (leading == 32)
+        return 0;
+    even = leading & 0xFFFFFFFE;
+    shift = (19 - (sint32)even) >> 1;
+    if (even < 24)
+        normalized = (uint32)(input >> ((24 - even) & 31));
+    else
+        normalized = (uint32)input << ((even - 24) & 31);
+    value = (uint32)(sint32)psyq_sqrt_table[normalized - 64];
+    if (shift < 0)
+        return value >> ((uint32)-shift & 31);
+    return value << ((uint32)shift & 31);
+}
+
 uint32 SquareRoot12PSX(uint32 input, uint32 table_address)
 {
     uint32 leading, even, normalized, value;
@@ -8712,4 +9868,28 @@ uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
     }
     w_u8(destination + count, 0u);
     return count;
+}
+
+PsxCallbackDriver *psx_callback_reset_driver(void)
+{
+    uint32 address;
+    if (psx_callback_driver.initialized != 0)
+        return NULL;
+    ResetCallbackPSX();
+    psx_root_counter_bind(0, 0);
+    w_u16(0x1F801074u, 0);
+    w_u16(0x1F801070u, r_u16(0x1F801074u));
+    w_u32(0x1F8010F0u, 0x33333333);
+    psx_callback_driver.saved_interrupt_mask = 0;
+    psx_callback_driver.saved_dma_control = 0;
+    w_u32(0x1F801114u, 0x107);
+    for (address = 0; address < 8; ++address)
+        setIntrVSync(address, NULL);
+    InterruptCallback(0, trapIntrVSync);
+    for (address = 0; address < 7; ++address)
+        DMACallback(address, NULL);
+    w_u32(0x1F8010F4, 0);
+    _96_remove();
+    ExitCriticalSection();
+    return &psx_callback_driver;
 }

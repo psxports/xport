@@ -60,6 +60,9 @@ Verify OG chains above 4 GiB, callback roundtrips, raster/VRAM/VSync, actual nat
 
 Pilot evidence and validation limits: consuming project's `status/audits/x64/report.json`. No game Release build or runtime acceptance is implied by a Debug fixture or project-property evaluation.
 
+
+Native VM platform startup binds the existing `spu_mmio_read`/`spu_mmio_write` callbacks to `0x1F801C00..0x1F801DFF` after `xport_memory_init`. The native SEQ/VM flush uses these SPU register accesses; XA mixing follows a separate path and can remain audible when this binding is missing. Keep this device-register boundary separate from game DRAM ownership. Historical `LOCKSTEP_DEBUG` retains its own binding contract. Do not enable unrelated DMA/GPU bus paths to restore native SPU output.
+
 ## XCRT architecture checks
 
 Run the complete unoptimized runtime fixture independently of game Release builds:
@@ -69,4 +72,12 @@ python -B [XPORT_ROOT]/tools/tests/xcrt_test.py --architecture x64 --output PROJ
 python -B [XPORT_ROOT]/tools/tests/xcrt_test.py --architecture x86 --output PROJECT_ROOT/status/audits/xcrt-x64/x86
 ```
 
-The fixture links `/NODEFAULTLIB`, checks startup, allocation, strings, native file I/O, integer division and non-unwinding jumps, and rejects CRT DLL imports. x64 checks float/double sin/cos/atan2/sqrt against dynamically loaded UCRT, restores all nonvolatile integer/XMM registers and MXCSR/x87 control words across a jump, and exercises `__chkstk` with a 32 KiB stack allocation. These fixtures do not establish game Release runtime acceptance.
+The fixture links `/NODEFAULTLIB`, checks startup, actual global C++ construction/destruction, LIFO `atexit` including registration during exit, allocation, strings, native file I/O, integer division and non-unwinding jumps, and rejects CRT DLL imports. x86 directly checks the `__ultof3` register ABI (`EDX:ECX` unsigned 64-bit input, `XMM0` binary32 output) against an integer round-to-nearest-even reference at powers of two, halfway boundaries and 16384 additional values. x64 checks float/double sin/cos/atan2/sqrt against dynamically loaded UCRT, restores all nonvolatile integer/XMM registers and MXCSR/x87 control words across a jump, and exercises `__chkstk` with a 32 KiB stack allocation. These fixtures do not establish game Release runtime acceptance.
+
+## Minimal XCRT and C++ lifetime
+
+`WinMainCRTStartup` initializes the heap, walks linker-sorted `.CRT$XCA` through `.CRT$XCZ` C++ initializers and calls `exit` after `WinMain`. `atexit` retains callbacks in a heap-backed LIFO list; callbacks run outside its lock and may register additional callbacks. `abort` does not run exit callbacks. This is ordinary C++ static lifetime support, independent of STL.
+
+Release excludes diagnostic formatting, output and diagnostic strings at compile time. Keep failure conditions and termination outside Debug-only output blocks. XCRT must not implement `printf`, `fprintf`, `vfprintf`, `fputs`, `fflush` or `__acrt_iob_func`; do not replace them with success stubs or pull in the standard CRT to satisfy diagnostic calls. Debug may use normal CRT diagnostics. BIOS standard-output writes validate their arguments and discard their payload in Release. Native XCRT file writes are synchronous and unbuffered; actual resource/save writes retain their byte-count checks.
+
+Existing `sprintf`/`snprintf` format into caller-owned buffers using Windows formatters and do not implement the complete ISO printf contract. They are distinct from diagnostic output and remain available for required game text/path construction.

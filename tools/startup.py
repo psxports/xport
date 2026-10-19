@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 import startup_github
+import startup_disc
 from urllib.parse import quote
 
 from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
@@ -308,6 +309,7 @@ def initialize_project(root, name, short_name, first_port=2400):
                                       'default_role': 'user', 'data_directory': 'tools/duckstation/data/user',
                                       'data_directories': {role: 'tools/duckstation/data/'+role for role in ports}},
                        'lockstep': {'schema': 1, 'enabled': False, 'original_image': '',
+                           'timing': {'video_standard': 'NTSC', 'field_rate': 60},
                            'native_configuration': 'Debug', 'native_platform': 'x86',
                            'msbuild_property': 'LockstepDebug=true', 'source_roots': ['src'],
                            'max_events': 1000000,
@@ -355,6 +357,31 @@ void xport_main(void)
                 listener.close()
 
 
+def stage_project_gitignore(root):
+    root = Path(root).resolve()
+    if not (root/'.gitignore').is_file():
+        raise ValueError('STARTUP_GIT_INDEX: missing generated .gitignore')
+
+    def git(*arguments):
+        try:
+            result = subprocess.run(['git', '-C', str(root), *arguments],
+                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ValueError('STARTUP_GIT_INDEX: Git is unavailable or timed out') from error
+        if result.returncode:
+            raise ValueError('STARTUP_GIT_INDEX: '+result.stderr.strip())
+        return result.stdout.strip()
+
+    created = not (root/'.git').exists()
+    if created:
+        git('init', '--quiet')
+    if git('rev-parse', '--show-prefix'):
+        raise ValueError('STARTUP_GIT_INDEX: project must be its own repository root')
+    git('add', '--', '.gitignore')
+    git('ls-files', '--error-unmatch', '--', '.gitignore')
+    return {'repository_created': created, 'indexed_files': ['.gitignore']}
+
+
 def project(root):
     return read_json(Path(root)/CONFIG_NAME)
 
@@ -398,7 +425,7 @@ def run_shared(root, tool, arguments=()):
 def inventory(root):
     root = Path(root)
     candidates = []
-    for base in (root/'iso', root/'orig'):
+    for base in (root/'iso', root/'bin/DATA', root/'orig'):
         if not base.exists():
             continue
         for path in sorted(item for item in base.rglob('*') if item.is_file()):
@@ -416,6 +443,7 @@ def inventory(root):
             candidates.append(item)
     return {'file_count': len(candidates), 'total_bytes': sum(item['bytes'] for item in candidates),
             'files': candidates[:64], 'files_truncated': len(candidates) > 64,
+            'system_configs': [item for item in candidates if Path(item['path']).name.upper() == 'SYSTEM.CNF'],
             'cue_files': [item['path'] for item in candidates if item['path'].lower().endswith('.cue')],
             'psx_executables': [item for item in candidates if item.get('psx_exe')]}
 
@@ -496,7 +524,7 @@ def image_review_proposal(root, found):
             or any(item['psx_exe']['file_offset']+item['psx_exe']['payload_size'] > item.get('bytes', 0) for item in executables)):
         return None
     boot = None
-    system_item = next((item for item in found.get('files', []) if Path(item['path']).name.upper() == 'SYSTEM.CNF'), None)
+    system_item = next((item for item in found.get('system_configs', found.get('files', [])) if Path(item['path']).name.upper() == 'SYSTEM.CNF'), None)
     system = root/system_item['path'] if system_item else root/'orig/SYSTEM.CNF'
     if system.is_file():
         match = re.search(r'(?im)^\s*BOOT\s*=\s*cdrom:\\+([^;\r\n]+)', system.read_text(errors='replace'))
@@ -565,7 +593,15 @@ def validate_capture_contract(root):
     if any(value not in directories or value not in ports for value in (role, record_role)):
         raise ValueError('Reserve the user and lockstep DuckStation runtimes')
     disc = root/config.get('paths', {}).get('disc_image', '')
-    original = root/'orig'/image
+    profile_path = project_path(root, config, 'ida_configs', 'tools/ida')/(image+'.json')
+    if profile_path.is_file():
+        profile = read_json(profile_path)
+        if profile.get('image') != image or len(profile.get('loads', [])) != 1:
+            raise ValueError('Recording image requires its exact single-load IDA profile')
+        original = Path(profile['loads'][0]['path'])
+        original = original if original.is_absolute() else root/original
+    else:
+        original = root/'orig'/image
     if not disc.is_file() or not original.is_file():
         raise ValueError('Lockstep recording requires the disc image and original executable')
     return {'schema': 1, 'original_image': image, 'duckstation_role': role,
@@ -1132,6 +1168,10 @@ def advance(root, state):
                 result = initialize_project(root, state['name'], state['short_name'], state.get('first_port', 2400))
                 os.environ['XPORT_PROJECT'] = str(root)
                 record_step(state, step, {'name': result['name'], 'short_name': result['short_name']}, started)
+                state = publish(root, state, step='git_index')
+            elif step == 'git_index':
+                result = stage_project_gitignore(root)
+                record_step(state, step, result, started)
                 state = publish(root, state, step='github')
             elif step == 'github':
                 result = startup_github.sync_project(root)
@@ -1146,6 +1186,11 @@ def advance(root, state):
                 doctor = run_shared(root, 'doctor')
                 build = run_shared(root, 'build_native')
                 record_step(state, step, {'doctor': doctor, 'build': build}, started)
+                state = publish(root, state, step='extract_data')
+            elif step == 'extract_data':
+                result = startup_disc.extract(root)
+                atomic_json(root/'status/startup-extraction.json', result)
+                record_step(state, step, {'disc_count': len(result['discs']), 'file_count': result['file_count']}, started)
                 state = publish(root, state, step='inventory')
             elif step == 'inventory':
                 found = inventory(root)
@@ -1324,7 +1369,10 @@ def retry(root, expected_revision, advance_now=True):
         stored_inventory = dict(state.get('inventory', {}))
         if stored_inventory and 'total_bytes' not in stored_inventory:
             stored_inventory['total_bytes'] = sum(item.get('bytes', 0) for item in stored_inventory.get('files', []))
-        if stored_inventory and digest_bytes(canonical(inventory(root))) != digest_bytes(canonical(stored_inventory)):
+        current_inventory = inventory(root) if stored_inventory else {}
+        if 'system_configs' not in stored_inventory:
+            current_inventory.pop('system_configs', None)
+        if stored_inventory and digest_bytes(canonical(current_inventory)) != digest_bytes(canonical(stored_inventory)):
             raise ValueError('STARTUP_INPUTS_CHANGED: review images before retry')
         receipt = archive_failed_artifacts(root, state)
         state.setdefault('recoveries', []).append({'revision': state['revision'], 'step': state['failure']['step'], 'receipt': receipt,
@@ -1518,9 +1566,17 @@ def dispatch_worker(root):
         validate_runtime_access()
     log = (root/'status/startup-worker.log').open('ab')
     flags = 0
+    desktop = None
+    if os.name == 'nt' and os.environ.get('XPORT_WINDOWS_DESKTOP'):
+        from windows_desktop import launch_default_desktop_process, process_desktop
+        desktop = process_desktop()
     if os.name == 'nt':
         flags = subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP|subprocess.DETACHED_PROCESS
-    process = subprocess.Popen([sys.executable, '-B', str(Path(__file__).resolve()), 'work', '--project', str(root)],
+    command = [sys.executable, '-B', str(Path(__file__).resolve()), 'work', '--project', str(root)]
+    if desktop:
+        process = launch_default_desktop_process(command, root, visible=False, environment=dict(os.environ))
+    else:
+        process = subprocess.Popen(command,
                                cwd=root, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                creationflags=flags, start_new_session=os.name != 'nt')
     receipt = {'pid': process.pid, 'status': 'running', 'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
@@ -1530,7 +1586,14 @@ def dispatch_worker(root):
 def work(root):
     root = Path(root).resolve();receipt_path = root/'status/startup-worker.json'
     try:
-        with StartupLock(root):return advance(root, load_state(root))
+        if os.name == 'nt':
+            from windows_desktop import current_desktop_name
+            atomic_json(root/'status/startup-worker-desktop.json',
+                        {'pid': os.getpid(), 'desktop': current_desktop_name(),
+                         'requested': os.environ.get('XPORT_WINDOWS_DESKTOP', 'WinSta0\\Default')})
+        with (root/'status/startup-worker.log').open('a', encoding='utf-8') as output:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                with StartupLock(root):return advance(root, load_state(root))
     finally:
         receipt = read_json(receipt_path) if receipt_path.is_file() else {'pid': os.getpid()}
         receipt.update(status='stopped', stopped_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())

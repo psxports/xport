@@ -91,8 +91,10 @@ def main():
     root,project=load_project();settings=project.get('code_refresh',{});started=time.perf_counter();steps={};logs=[];failure=None
     report_path=artifact_path(settings.get('report','status/code-refresh-latest.json'));log_path=artifact_path(settings.get('log','status/code-refresh-latest.log'))
     try:
-        from source_index import rebuild
-        at=time.perf_counter();steps['source_index']=rebuild(format_changed=not args.no_format);steps['source_index']['seconds']=round(time.perf_counter()-at,3)
+        if settings.get('source_index',True):
+            from source_index import rebuild
+            at=time.perf_counter();steps['source_index']=rebuild(format_changed=not args.no_format);steps['source_index']['seconds']=round(time.perf_counter()-at,3)
+        else:steps['source_index']={'skipped':True,'reason':'Disabled by project configuration'}
         steps['source_hygiene']=source_hygiene(root)
         if steps['source_hygiene']['void_parameter_suppressions']:raise RuntimeError('Standalone (void)param suppressions are forbidden; configure the compiler unused-parameter warning')
         build=settings.get('build')
@@ -112,8 +114,10 @@ def main():
                 outcome=run_command(argv,root,logs);outcome['name']=test['name'];tests.append(outcome)
             steps['tests']=tests
         steps['artifacts']=refresh_artifacts(root,settings.get('artifacts',[]))
-        progress=[sys.executable,str(Path(__file__).resolve().parent/'render_progress.py')]
-        steps['progress']=run_command(progress,root,logs,{'XPORT_PROJECT':str(root)})
+        if settings.get('progress',True):
+            progress=[sys.executable,str(Path(__file__).resolve().parent/'render_progress.py')]
+            steps['progress']=run_command(progress,root,logs,{'XPORT_PROJECT':str(root)})
+        else:steps['progress']={'skipped':True,'reason':'Disabled by project configuration'}
         database=(root/project['paths']['analysis_database']).resolve();steps['database']=database_check(database)
         if steps['database']['integrity']!='ok' or steps['database']['foreign_key_errors']:raise RuntimeError('SQLite validation failed')
     except Exception as error:

@@ -8,6 +8,7 @@
 extern "C"
 {
 #endif
+    extern const uint32 gpu_dma_nop_terminator[5];
 #if defined(LOCKSTEP_DEBUG)
     extern uint16 (*xport_lockstep_vram)[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     #define VRAM (*xport_lockstep_vram)
@@ -15,6 +16,23 @@ extern "C"
 extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
 #endif
     uint32 gpu_vram_version(void);
+    sint32 gpu_port_read(uint32 offset, uint32 *value);
+    sint32 gpu_port_write(uint32 offset, uint32 value);
+    extern sint32 graph_debug_level;
+
+    typedef struct GpuGraphControl
+    {
+        uint8 type;
+        uint8 queue_enabled;
+        uint8 reverse;
+        uint8 command_cache[256];
+    } GpuGraphControl;
+
+    extern GpuGraphControl gpu_graph_control;
+
+    void _ctl(uint32 command);
+    uint32 _getctl(uint32 command);
+    uint32 _status(void);
 
     typedef struct GpuTimImage
     {

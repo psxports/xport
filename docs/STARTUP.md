@@ -19,6 +19,8 @@ Normative extension of `../AGENTS.md`. Read this file only when that contract ro
 
 Compact observation and submission:
 
+On Windows a worker with `XPORT_WINDOWS_DESKTOP` uses the validated value through the shared native `CreateProcessW` launcher and hides its startup window; Python's limited `subprocess.STARTUPINFO` does not pass `lpDesktop`. Without that variable the existing detached console launch remains the default. For a requested hidden desktop, the caller must create and retain that desktop until the worker starts, and pass its `WinSta0\NAME` value in the environment. A hidden parent window alone does not establish the detached worker's desktop. The worker records its own Windows API desktop name and PID in `status/startup-worker-desktop.json`; verify that receipt before claiming hidden-desktop execution. Never switch the user's visible desktop.
+
 ```powershell
 python -B [XPORT_ROOT]/tools/startup.py status --project PROJECT_ROOT --after-revision REVISION
 python -B [XPORT_ROOT]/tools/startup.py submit --project PROJECT_ROOT
@@ -45,11 +47,11 @@ A faulty accepted export discovered at the exact paused `psyq_review` or `fronti
 
 The supervisor performs and records these gates in order:
 
-1. Refuse an initialized or conflicting root; create the C/VS2022 scaffold and unique runtime ports
+1. Refuse an initialized or conflicting root; create the C/VS2022 scaffold and unique runtime ports. The following `git_index` step creates a project-local Git repository only when absent and stages the generated `.gitignore` before GitHub synchronization
    The generated C entry implements `void xport_main(void)` and defines the required `xport_gpu_graph_type_address` binding as unresolved (`0u`). Replace that binding only with original-image evidence before calling GPU wrappers; the scaffold value is not a reviewed guest address.
 2. Synchronize the standard GitHub labels/issues, then run project diagnosis and Debug native build
    The generated Windows project compiles shared `xport_trace.c` alongside the PSX runtime. It also compiles shared `psx_xa.c` for XA decoding. The scaffold defines all four `xport_cd_*_address` bindings as unresolved (`0u`); replace them only with audited original-image evidence before using guest CD storage.
-3. Inventory immutable inputs and hashes; propose PS-X EXE profiles and reuse a persisted licensed tool path only when the path and executable identity validate
+3. Extract every disc data track from `iso` into `bin/DATA` through `extract_data`, then inventory immutable inputs and hashes; propose PS-X EXE profiles and reuse a persisted licensed tool path only when the path and executable identity validate
 4. Preflight IDA processor/decompiler initialization, Ghidra help output, PsyQ data and native build platform before expensive analysis; accept a legacy Ghidra launcher's nonzero `-help` exit only when the canonical headless usage marker is present. Select the highest discovered Ghidra semantic version that has a matching installed PSX extension profile; a `psyq` retry repairs a mismatched automatically discovered pair
 5. Convert Red Book audio when configured
 6. Plan, export, independently canonicalize and fail-closed accept IDA/MIPS evidence
@@ -63,6 +65,20 @@ The supervisor performs and records these gates in order:
 The model owns only the ambiguous attention kinds `image_review`, `tool_paths`, `psyq_review`, and `frontier_translation`. It must preserve image-qualified identities, audit the complete MIPS, use pseudocode only when its completeness metadata permits it, keep unsupported facts explicit, and never treat compilation, SKIP classification or wrapper presence as runtime equivalence.
 
 The remaining sections define startup evidence and project layout. Read `DECOMPILATION.md` only for a translation attention or decompilation failure. Runtime `record`, `stop`, and `converge` are separate workflows.
+
+## Source region and video timing
+
+- Prefer NTSC-U or NTSC-J originals for analysis when multiple regional versions are available; honor an explicitly selected region. Record the canonical image identity and reviewed video standard in the consuming project
+- New projects default to `FIELD_RATE=60` and `lockstep.timing = {"video_standard": "NTSC", "field_rate": 60}`. The scaffold default is not evidence of the original video mode. Before the first recording or native runtime validation, verify the selected original and keep both native Debug/Release definitions and recording timing consistent
+- For an explicitly selected PAL original, set `FIELD_RATE=50` in both native configurations and set `lockstep.timing` to `{"video_standard": "PAL", "field_rate": 50}`. Preserve existing recording identities; never relabel old captures when correcting a project configuration
+
+## Disc extraction
+
+- Place all disc images and their CUE files under project `iso` before startup. CUE filenames must reference existing track files exactly; do not guess replacements. Extraction supports ISO9660 `.iso` and standalone `.bin`/`.img`, plus CUE data tracks in MODE1/2048, MODE1/2352, MODE2/2352 and MODE2/2336. Referenced audio BIN files are excluded from data-image discovery; Red Book conversion remains a separate gate
+- Extract every directory and file, remove ISO version suffixes (`;1`), preserve names and file bytes, and read ordinary files as 2048-byte logical sectors. Search file sectors in order before choosing the output format. Stop at the first Mode 2 sector that has Form 2 (`0x20`) or Realtime (`0x40`) set in its submode and retain the entire file as complete physical sectors (2352 or 2336 bytes according to the input), including all Form 1 sectors and subheaders. Only when every sector has been checked without a raw trigger, extract 2048-byte logical payloads and trim the final payload to the ISO file size. EOF/EOR differences alone do not select raw storage; the first matching sector is sufficient for raw, but a normal first sector is insufficient for logical storage. Never classify raw overlays during startup; their discovery, load addresses and analysis belong to decompilation
+- Multiple discs use separate `bin/DATA/1`, `bin/DATA/2`, etc. to preserve conflicting paths; there is no fixed disc-count limit. Review boot executable, image-qualified profiles, runtime data roots and music selection explicitly for a multi-disc project; duplicate executable basenames do not produce an automatic proposal
+- Save paths, source extents, output sizes and SHA-256 hashes in `status/startup-extraction.json`. No executable or overlay copy is written to `orig`; existing analysis/export paths remain there
+- Retry reuses byte-identical extracted files and refuses to overwrite different existing files. Originals remain untouched. Unsafe paths, missing CUE tracks, invalid/truncated volumes and unsupported ISO extensions fail `extract_data`; correct the reported source or format before retrying. With no disc images, retain the existing `image_review` attention for missing original inputs
 
 ## Detailed project setup, analysis and planning
 
@@ -95,7 +111,7 @@ Project README template:
 
 ### GitHub labels and default issues
 
-The supervisor runs the mandatory `github` step immediately after writing the local scaffold and before diagnosis/build. The local `initialize_project` helper only writes files; `startup.py start` owns the complete initialization, including GitHub. New `xport-project.json` contains `github.repository: "psxports/[PROJECT_NAME]"`; the successful GitHub step also records the repository default branch in `github.branch` for web social previews. The repository must already exist, have Issues enabled and support the organization issue type `Task`; startup does not create a repository. For a deliberately different repository identity, correct this explicit config field before retrying the failed `github` step. Never infer an existing project's repository from its directory.
+The supervisor runs the mandatory `github` step after writing the local scaffold and completing `git_index`, before diagnosis/build. The local `initialize_project` helper only writes files; `startup.py start` owns the complete initialization, including GitHub. New `xport-project.json` contains `github.repository: "psxports/[PROJECT_NAME]"`; the successful GitHub step also records the repository default branch in `github.branch` for web social previews. The repository must already exist, have Issues enabled and support the organization issue type `Task`; startup does not create a repository. For a deliberately different repository identity, correct this explicit config field before retrying the failed `github` step. Never infer an existing project's repository from its directory.
 
 - Canonical profile: `[XPORT_ROOT]/tools/templates/project/github.json`; it is a fixed versioned snapshot, not a live dependency on another game's issues
 - Install GitHub CLI (`gh`) and authorize with `gh auth login --hostname github.com --web`. For a CLI outside PATH, set `XPORT_GH` to its absolute executable path. Use GitHub CLI credentials or its supported `GH_TOKEN`/`GITHUB_TOKEN` environment variables; require repository Issues write access. Do not put tokens in project config, templates or logs
@@ -149,20 +165,20 @@ Run the single startup supervisor from the shared toolset. It allocates sibling-
 python -B [XPORT_ROOT]/tools/startup.py start --project [PROJECT_ROOT] --name "[FULL PROJECT NAME]" --short-name [SHORT]
 ```
 
-Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 Windows GUI C skeleton with Debug/Release for Win32 and x64. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=720` and `FIELD_RATE=50`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`, creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
+Initialization refuses every file it would overwrite, locks allocation, checks sibling reservations and live listeners, assigns distinct audit/trace/user GDB ports plus a separate lockstep compatibility role and creates a compilable VS2022 v143 Windows GUI C skeleton with Debug/Release for Win32 and x64. Every generated native build configuration defines the project-specific `WND_TITLE="[FULL PROJECT NAME] (xport)"`, `WND_WIDTH=960`, `WND_HEIGHT=720` and `FIELD_RATE=60`; all four definitions are mandatory because the shared runtime has no fallbacks. The initializer copies the canonical `tools/templates/project/.gitignore`; the supervisor then stages exactly that generated file with `git add -- .gitignore` in the `git_index` step. If the project has no `.git` directory/file, initialize a repository at that exact project root; never stage into an ancestor repository. Preserve other index entries and do not commit, push or set a remote during this step. Git availability, timeout and index errors fail `git_index`; fix the cause and use revision-aware `retry`, which does not regenerate the scaffold or README. The initializer creates a project `AGENTS.md` routing stub, creates the empty translation ledger and configures `code_refresh` to build the short-name solution. The generated ignore file excludes the root `_build`, `bin`, `status`, `tools`, `orig`, `iso` and `.cursor` trees; startup refuses to replace an existing `.gitignore`. Fill the stub with reviewed image identities, language evidence/decision, dummy scope, wrappers and hooks before relying on those facts. Closed emulators still reserve ports. Do not copy a project's port to another project. One GDB controller per instance.
 
 Standard layout:
 
 - `README.md`: One-time render of the canonical project README template; preserve it after initialization
-- `.gitignore`: Exact copy of `[XPORT_ROOT]/tools/templates/project/.gitignore`; keep generated build, runtime, analysis, original-image and agent-state trees out of project history
+- `.gitignore`: Exact copy of `[XPORT_ROOT]/tools/templates/project/.gitignore`, automatically added to the project Git index during startup; keep generated build, runtime, analysis, original-image and agent-state trees out of project history
 - `src/`: Platform-neutral C game implementation and `.h` declarations; preserve guest widths/addresses. The initializer creates `src/game_main.c` with the required game entry/bindings; game code includes the shared `[XPORT_ROOT]/src/xport.h` for the complete Xport contract, fixed-width types and `FUNCTION_MARKER` and must not create a project copy or auxiliary `xport_*.h` contract header.
 - `src/platform/win/`: `[SHORT].sln` and `[SHORT].vcxproj`, plus local default `icon.rc` and `icon.ico`; project and solution are rendered from the mandatory canonical templates above; VS2022 v143 Debug/Release x86 and x64, compiled as C. Solution `x86` maps to project `Win32`; solution/project `x64` maps directly. Intermediates are separated by architecture, executable names remain shared, and xcrt is enabled for x86/x64 Release. See [PLATFORMS.md](PLATFORMS.md); converge remains x86. The project compiles the shared `[XPORT_ROOT]/src/platform/win/main.c` backend and adds translated project `src` files explicitly.
 - `bin/`: Native Working Directory. Debug x86 outputs exactly `bin/[SHORT]_debug.exe`. Release x86 outputs exactly `bin/[SHORT].exe`. Both files remain directly under `bin`; one configuration never overwrites the other.
-  - `bin/DATA/`: Runtime game data extracted from the first, data track of the CD image.
+  - `bin/DATA/`: All files from the ISO9660 data track, including executables and unidentified overlays. One disc extracts directly here; multiple discs extract separately under `1`, `2`, etc., in descriptor-path order.
   - `bin/MUSIC/`: Decimal-name IMA ADPCM WAV tracks generated from the CD audio tracks by `X convert_music`; never place them under `bin/DATA`.
 - `_build/`: native compiler intermediates. Never point to another game's build tree.
 - `iso/`: user-supplied disc images and tracks; record hashes/provenance and never treat filenames as identity.
-- `orig/`: immutable accepted original inputs. `orig/images/[IMAGE]/` is the accepted canonical IDA snapshot; `orig/ghidra/` may retain reviewed SDK-recognition inputs when the project chooses that path.
+- `orig/`: immutable accepted analysis outputs and listings. Startup reads executables directly from `bin/DATA`; never copy executables or overlays into `orig`. Preserve legacy original inputs already stored here. `orig/images/[IMAGE]/` is the accepted canonical IDA snapshot; `orig/ghidra/` may retain reviewed SDK-recognition inputs when the project chooses that path.
 - `status/`: reproducible databases, progress, ledgers, evidence, logs, trace sessions and reports.
   - `status/ida/runs/[LABEL]/`: fresh labelled IDA databases, logs, configs and exports under review.
   - `status/ida/accepted/[LABEL].json`: hash receipt for a run copied into the immutable configured `ida_exports` tree.
@@ -193,7 +209,7 @@ Projects with no reviewed Red Book tracks set `capabilities.redbook_audio.enable
 
 ## 2. Export original code; establish SQL
 
-1. Identify each executable/overlay revision. Record SHA-256, file segments/offsets, load addresses, entry, GP and overlay residency. Identity is `(image revision, virtual address)`, never name/address alone.
+1. Identify known executable revisions for startup. Do not require discovery or classification of unidentified overlays; decompilation adds their reviewed profiles later. For each configured image, record SHA-256, file segments/offsets, load addresses, entry, GP and overlay residency. Identity is `(image revision, virtual address)`, never name/address alone.
 2. Create `tools/ida/[IMAGE].json`: `image`, `entry`, `gp`, `segments` (`start/end/name/class`), `loads` (`path/base/offset`), `seeds`, `code_ranges`, optional `external_symbols`. Use actual image facts. IDA auto names are not debug symbols.
 3. Supply the licensed IDA path and reviewed image profiles through the current startup attention packet. The supervisor plans under `startup-ida-plan`, executes under `startup-ida-v1`, canonicalizes, and accepts the result as one guarded gate.
 
@@ -273,15 +289,15 @@ Do not emit standalone `(void)parameter;` statements solely to suppress unused f
 
 ## 4. Translate only the executable entrypoint during startup
 
-`source_context` distinguishes a full pseudocode text view from a reviewed semantic gap. After an accepted export, project-owned `analysis.pseudocode_reviews` may bind an incomplete draft by image/address, original function hash and pseudocode hash without editing that export. Its response sets `pseudocode.complete: false`, keeps text availability in `content_complete` and includes the review reason/hash. Use the review schema and active coverage packet migration in `COVERAGE.md`; a complete file read alone does not resolve an identified omitted MIPS path.
+`source_context` distinguishes a full pseudocode text view from a reviewed semantic gap. After an accepted export, project-owned `analysis.pseudocode_reviews` may bind an incomplete draft by image/address, original function hash and pseudocode hash without editing that export. Its response sets `pseudocode.complete: false`, keeps text availability in `content_complete` and includes the review reason/hash. Use the review schema and explicit strict coverage packet migration in `COVERAGE_STRICT.md`; a complete file read alone does not resolve an identified omitted MIPS path.
 
 1. Resolve startup roots only from `analysis.native_entrypoints`. If that field is absent, use the configured `analysis.default_image` entry. Do not infer additional roots from the call graph.
 2. Put only configured roots whose SQL status is `TODO` in the startup packet. Do not include direct callees, transitive dependencies, callback targets, leaves or strongly connected components. Preserve WIP, DONE and reviewed SKIP roots without re-auditing them.
 3. For each selected root retain the original hash, image-verified complete MIPS and available pseudocode with completeness metadata. Use complete pseudocode as the structural baseline and prove every constant, signed operation, delay slot, ABI decision, branch, call and memory effect from MIPS. Translate missing or incomplete pseudocode directly from MIPS.
-4. Emit only the entrypoint C body, required declarations and its exact image-qualified `FUNCTION_MARKER`. Calls to still-TODO functions remain ordinary declared calls. Do not create stubs during startup, inline guessed implementations or widen startup scope to satisfy the linker. The later coverage supervisor alone may create the link-only TODO abort stubs defined by `COVERAGE.md`.
+4. Emit only the entrypoint C body, required declarations and its exact image-qualified `FUNCTION_MARKER`. Calls to still-TODO functions remain ordinary declared calls. Do not create stubs during startup, inline guessed implementations or widen startup scope to satisfy the linker. Ordinary coverage keeps pending targets as declarations through the full translation pass; only the explicitly selected strict supervisor may create its link-only TODO abort stubs under `COVERAGE_STRICT.md`.
 5. After accepting the entrypoint, rebuild the source index and derived SQL state. This is the startup translation gate. A full native link is deliberately deferred because unimplemented callees are expected.
-6. Finish startup trace-contract and emulator deployment gates. Then obtain first-call order with `function_converge NAME`, stop that recording, and run `coverage NAME`. Coverage translates and proves the remaining recorded functions in packets of 16.
-7. Coverage owns source-module allocation, ledger updates, intermediate validation, the first complete Debug link and the single final Release build. No later workflow may restore dependency expansion to startup.
+6. Finish startup trace-contract and emulator deployment gates. Then obtain first-call order with `function_converge NAME`, stop that recording, and run `coverage NAME`. Coverage follows the complete selected-function pass and sequential module rules in `DECOMPILATION.md`; recording order prioritizes translation and does not impose 16-function source batches.
+7. Coverage follows the canonical decompilation policy for source-module allocation and manual provenance updates, then performs integration and required Debug/final build checks after the complete translation pass. Explicit strict proof commands retain their separate gates. No later workflow may restore dependency expansion to startup.
 
 The first function follows this reproducible sequence:
 
@@ -312,6 +328,8 @@ TODO means no accepted implementation. Move to WIP only after the exact `(image,
 The public marker forwards the caller's image, address, function, file, line, host return address and enabled channel flags to `xport_function_marker` in shared `xport_trace.c`. Channel bits 1 and 2 preserve the caller translation unit's `XPORT_ENABLE_AUDIT` and `LOCKSTEP_DEBUG` choices even when shared source has different audit flags. The service emits those enabled events with the original caller identity; LockstepDebug requires the shared source to be built for that channel. The host return address is captured at the macro callsite, never inside the forwarding service. Both ordinary game translation units and trace-enabled units use the same public macro.
 
 Gate before recording: every configured executable entrypoint is WIP, DONE or reviewed SKIP; all other TODO functions and unresolved edges remain inventoried; the entrypoint implementation and evidence are reviewable; no semantics were invented; the source index, ledger and `status/progress.html` reflect reality. A successful native link and global TODO zero are later coverage milestones. Before every intermediate report run `X render_progress`; after changing importer inputs run `X build_database` first. Preserve legacy log encoding (ASCII additions if required).
+
+Recording-contract validation resolves `lockstep.original_image` through that image's exact single-load IDA profile, including extracted `bin/DATA` paths and image-qualified aliases. Preserve legacy `orig/IMAGE` inputs only when no image profile exists. Never copy a newly extracted executable into `orig` to satisfy this gate.
 
 ## Windows runtime template
 

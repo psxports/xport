@@ -121,8 +121,8 @@ def native_executable_path(configuration='Release'):
 def artifact_path(relative):
     root = project_root()
     path = (root/relative).resolve()
-    if not any(path.is_relative_to(root/base) for base in ('status', 'tools')):
-        raise ValueError('Generated artifacts must remain in project status or tools')
+    if not any(path.is_relative_to(root/base) for base in ('status', 'tools', '_build')):
+        raise ValueError('Generated artifacts must remain in project status, tools or _build')
     return path
 
 

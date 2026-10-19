@@ -4,6 +4,8 @@ Normative extension of `../AGENTS.md`
 
 The shared runtime is reproduced from `duckstation/duckstation-manifest.json`. The manifest pins upstream commit `5fd366809053fe287291de7a39752c4d5d5b146b`, dependencies, build settings, the complete `internal-trace-api.patch` and required executable markers. `tools/duckstation_build.py` builds and publishes the distribution. Project BIOS, disc images, settings and save states remain in isolated project data directories.
 
+For another original region, run `python -B tools/duckstation_run.py --role user --visible --disc ORIGINAL.cue` from xport with `XPORT_PROJECT` set to the consuming project. The override preserves project configuration and uses the same role data and GDB port. Close the existing role process first; `--disc` rejects an occupied endpoint. It cannot be combined with `--game-exe`.
+
 DuckStation uses CPU-driven device time by default. `-standard-timing` remains an explicit alias for that default. Record, converge and cooperative diagnostics launch with `-lockstep-timing`; only this argument selects cooperative device time before boot. The timing mode is fixed for the process lifetime and is not selected through GDB. Original function coverage and normal manual play need no project wait-point or SIO registry.
 
 The shared launcher reads the verified runtime receipt's `timing` contract. Current runtimes declare `default: standard`, `lockstep_argument: -lockstep-timing` and `standard_argument: -standard-timing`. A retained protocol-23 runtime without this field predates the default change and remains implicitly cooperative; launch it without the new flag. Preserve `XPORT_DUCKSTATION_EXECUTABLE` and do not rewrite retained binaries or receipts.

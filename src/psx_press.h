@@ -20,6 +20,7 @@ extern "C"
 #endif
     typedef void (*DecDCTCallback)(void);
     void DecDCTReset(sint32 mode);
+
     DECDCTENV *DecDCTGetEnv(DECDCTENV *env);
     DECDCTENV *DecDCTPutEnv(DECDCTENV *env);
     sint32 DecDCTBufSize(uint32 *bs);

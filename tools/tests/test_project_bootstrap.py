@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 
 import source_index
@@ -12,6 +13,23 @@ import startup
 
 
 class ProjectBootstrapTests(unittest.TestCase):
+    def test_initializer_keeps_native_and_recording_ntsc_timing_in_sync(self):
+        from lockstep_record_cli import recording_timing
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Timing-xport'
+            startup.initialize_project(root, 'Timing Fixture', 'TF', 43120)
+            config = json.loads((root/'xport-project.json').read_text(encoding='utf-8'))
+            self.assertEqual(config['lockstep']['timing'], {'video_standard': 'NTSC', 'field_rate': 60})
+            self.assertEqual(recording_timing(config), ('NTSC', 60))
+            project = ET.parse(root/'src/platform/win/TF.vcxproj')
+            namespace = {'msbuild': 'http://schemas.microsoft.com/developer/msbuild/2003'}
+            groups = project.findall('msbuild:ItemDefinitionGroup', namespace)
+            for configuration in ['Debug', 'Release']:
+                group = next(group for group in groups if group.get('Condition') == "'$(Configuration)'=='"+configuration+"'")
+                definitions = group.find('msbuild:ClCompile/msbuild:PreprocessorDefinitions', namespace).text.split(';')
+                self.assertEqual([value for value in definitions if value.startswith('FIELD_RATE=')], ['FIELD_RATE=60'])
+
     def test_initializer_uses_user_short_name_for_native_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'FightingForce-xport'
@@ -47,7 +65,7 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertIn('WND_TITLE=&quot;Fighting Force (xport)&quot;', project)
             self.assertIn('WND_WIDTH=960', project)
             self.assertIn('WND_HEIGHT=768', project)
-            self.assertIn('FIELD_RATE=50', project)
+            self.assertIn('FIELD_RATE=60', project)
             self.assertEqual(project.count('_CRT_SECURE_NO_WARNINGS'), 2)
             self.assertEqual(project.count('<TreatWarningAsError>true</TreatWarningAsError>'), 2)
             self.assertEqual(project.count('<DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings>'), 2)

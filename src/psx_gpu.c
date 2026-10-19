@@ -1,13 +1,17 @@
 #include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
 /* Software GPU raster core */
 #include "psx.h"
 #include "psx_gpu.h"
 #include "xport.h"
 #include "xport_trace.h"
-#include <string.h>
-#include <stdio.h>
 #define VRAM_W GPU_VRAM_WIDTH
 #define VRAM_H GPU_VRAM_HEIGHT
+
+// PsyQ DMA terminator followed by four NOP commands
+const uint32 gpu_dma_nop_terminator[5] = {0x04FFFFFFu, 0u, 0u, 0u, 0u};
 
 enum
 {
@@ -1093,7 +1097,8 @@ static uint32 present_pixels[GPU_DISPLAY_MAX_WIDTH * GPU_DISPLAY_MAX_HEIGHT];
 static uint16 active_tpage;
 static uint32 texture_window;
 static uint32 display_state;
-static sint32 graph_debug_level;
+sint32 graph_debug_level;
+GpuGraphControl gpu_graph_control;
 static sint32 display_x;
 static sint32 display_y;
 static sint32 display_width = 320;
@@ -2062,6 +2067,16 @@ static void gpu_draw_command(void *raw)
         }
         return;
     }
+    if ((p[7] & 0xe0) == 0xa0)
+    {
+        PSX_RECT rectangle;
+        rectangle.x = (sint16)(w[2] & 1023);
+        rectangle.y = (sint16)((w[2] >> 16) & 511);
+        rectangle.w = (sint16)(((w[3] - 1) & 1023) + 1);
+        rectangle.h = (sint16)((((w[3] >> 16) - 1) & 511) + 1);
+        LoadImagePSX(&rectangle, w + 4);
+        return;
+    }
     if ((p[7] & 0xe0u) == 0x80u)
     {
         PSX_RECT source;
@@ -2304,6 +2319,243 @@ static void gpu_draw_command(void *raw)
 #endif
 }
 
+typedef struct GpuPortState
+{
+    uint32 packet[256], count, needed, polyline;
+    uint32 direction, disabled, irq, mask, latch;
+    uint32 x, y, width, height, cursor, transfer;
+    uint32 horizontal_range;
+    XportDeviceOperation upload;
+} GpuPortState;
+
+static GpuPortState gpu_port = {{0}, 0, 0, 0, 0, 1};
+
+static void gpu_port_clear_fifo(void)
+{
+    if (gpu_port.upload.active)
+        xport_device_trace_complete(&gpu_port.upload, 0);
+    gpu_port.count = gpu_port.needed = gpu_port.polyline = 0;
+    gpu_port.cursor = gpu_port.transfer = 0;
+}
+
+static uint32 gpu_port_pixel_address(void)
+{
+    uint32 x = (gpu_port.x + gpu_port.cursor % gpu_port.width) & 1023;
+    uint32 y = (gpu_port.y + gpu_port.cursor / gpu_port.width) & 511;
+    return y * 1024 + x;
+}
+
+static sint32 gpu_port_gp0(uint32 value)
+{
+    uint32 command, vertices, index;
+    if (gpu_port.transfer == 2)
+        return 0;
+    if (gpu_port.transfer == 1)
+    {
+        for (index = 0; index < 2; ++index)
+        {
+            uint32 address = gpu_port_pixel_address();
+            uint16 pixel = (uint16)(value >> (index * 16));
+            if (!(gpu_port.mask & 2) || !(VRAM[address] & 0x8000))
+            {
+                VRAM[address] = pixel | ((gpu_port.mask & 1) << 15);
+                if (gpu_port.upload.active)
+                    xport_device_trace_stage(&gpu_port.upload, XPORT_DEVICE_WRITE, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_VRAM, address * 2, 2, 3);
+            }
+            if (++gpu_port.cursor == gpu_port.width * gpu_port.height)
+            {
+                gpu_port.transfer = 0;
+                if (gpu_port.upload.active)
+                    xport_device_trace_complete(&gpu_port.upload, 1);
+                break;
+            }
+        }
+        gpu_vram_invalidate();
+        return 1;
+    }
+    if (!gpu_port.count)
+    {
+        command = value >> 24;
+        /* Gouraud polylines and this line alias are not implemented by the raster core */
+        if ((command & 0xF8) == 0x58 || (command & 0xFC) == 0x54)
+            return 0;
+        gpu_port.needed = 1;
+        if ((command & 0xE0) == 0x20)
+        {
+            vertices = command & 8 ? 4 : 3;
+            gpu_port.needed = 1 + vertices * (1 + ((command & 4) != 0)) + (command & 16 ? vertices - 1 : 0);
+        }
+        else if ((command & 0xE0) == 0x40)
+        {
+            gpu_port.needed = command & 16 ? 4 : 3;
+            gpu_port.polyline = (command & 8) != 0;
+        }
+        else if ((command & 0xE0) == 0x60)
+            gpu_port.needed = 2 + ((command & 4) != 0) + ((command & 0x18) == 0);
+        else if ((command & 0xE0) == 0x80)
+            gpu_port.needed = 4;
+        else if ((command & 0xE0) == 0xA0 || (command & 0xE0) == 0xC0 || command == 2)
+            gpu_port.needed = 3;
+        else if (command > 0x1F && (command < 0xE0 || command > 0xEF))
+            return 0;
+    }
+    if (gpu_port.count == 255)
+        return 0;
+    gpu_port.packet[++gpu_port.count] = value;
+    command = gpu_port.packet[1] >> 24;
+    if (gpu_port.count < gpu_port.needed)
+        return 1;
+    if (gpu_port.polyline)
+    {
+        uint32 stride = command & 16 ? 2 : 1;
+        if (gpu_port.count == gpu_port.needed || ((gpu_port.count - gpu_port.needed - 1) % stride) || (value & 0xF000F000) != 0x50005000)
+            return 1;
+    }
+    if ((command & 0xE0) == 0xA0 || (command & 0xE0) == 0xC0)
+    {
+        gpu_port.x = gpu_port.packet[2] & 1023;
+        gpu_port.y = (gpu_port.packet[2] >> 16) & 511;
+        gpu_port.width = ((gpu_port.packet[3] - 1) & 1023) + 1;
+        gpu_port.height = (((gpu_port.packet[3] >> 16) - 1) & 511) + 1;
+        gpu_port.cursor = 0;
+        gpu_port.transfer = (command & 0xE0) == 0xA0 ? 1 : 2;
+        if (gpu_port.transfer == 1 && xport_device_trace_enabled())
+        {
+            xport_device_trace_begin(&gpu_port.upload, 0, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_UPLOAD, XPORT_DEVICE_DIRECTION_TO_DEVICE, 2, command);
+            xport_device_trace_stage(&gpu_port.upload, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_CANDIDATE, XPORT_DEVICE_REGION_NONE, 0, XPORT_DEVICE_REGION_VRAM, (gpu_port.y * 1024 + gpu_port.x) * 2, gpu_port.width * gpu_port.height * 2, 3);
+        }
+    }
+    else if (command == 0x1F)
+    {
+        gpu_port.irq = 1;
+    }
+    else if (command == 0xE6)
+        gpu_port.mask = value & 3;
+    else if (command == 0 || command == 1 || (command >= 3 && command <= 0x1E) || command == 0xE0 || (command >= 0xE7 && command <= 0xEF))
+    {
+        /* NOP mirrors and texture-cache invalidation need no raster work */
+    }
+    else
+    {
+        /* The raster core does not yet implement masked primitive/copy writes */
+        if (gpu_port.mask && command < 0xA0 && command != 2)
+            return 0;
+        gpu_port.packet[0] = gpu_port.count << 24;
+        gpu_draw_command(gpu_port.packet);
+    }
+    gpu_port.count = gpu_port.needed = gpu_port.polyline = 0;
+    return 1;
+}
+
+static sint32 gpu_port_gp1(uint32 value)
+{
+    uint32 command = (value >> 24) & 63;
+    uint32 index = value & 15;
+    if (command == 0)
+    {
+        gpu_port_clear_fifo();
+        gpu_reset_graph_state();
+        memset(&gpu_port, 0, sizeof(gpu_port));
+        gpu_port.disabled = 1;
+        gpu_port.horizontal_range = 0xC60260;
+        raster_clip_x1 = raster_clip_y1 = 1;
+        display_state = 2;
+    }
+    else if (command == 1)
+        gpu_port_clear_fifo();
+    else if (command == 2)
+        gpu_port.irq = 0;
+    else if (command == 3)
+    {
+        gpu_port.disabled = value & 1;
+        display_state = (display_state & ~2) | (gpu_port.disabled << 1);
+    }
+    else if (command == 4)
+        gpu_port.direction = value & 3;
+    else if (command >= 5 && command <= 8)
+    {
+        gpu_scanout_poll();
+        gpu_scanout_command(&native_scanout, (command << 24) | (value & 0xFFFFFF));
+        if (command == 5)
+        {
+            display_x = value & 1023;
+            display_y = (value >> 10) & 511;
+        }
+        else if (command == 6)
+            gpu_port.horizontal_range = value & 0xFFFFFF;
+        else if (command == 8)
+        {
+            static const uint32 widths[4] = {256, 320, 512, 640};
+            display_width = value & 64 ? 368 : widths[value & 3];
+            display_height = (value & 0x24) == 0x24 ? 480 : 240;
+            display_state = (display_state & ~4) | ((value & 16) >> 2);
+        }
+    }
+    else if (command >= 0x10 && command <= 0x1F)
+    {
+        if (index == 2)
+            gpu_port.latch = texture_window;
+        else if (index == 3)
+            gpu_port.latch = (raster_clip_x0 + raster_surface_x) | ((raster_clip_y0 + raster_surface_y) << 10);
+        else if (index == 4)
+            gpu_port.latch = (raster_clip_x1 - 1 + raster_surface_x) | ((raster_clip_y1 - 1 + raster_surface_y) << 10);
+        else if (index == 5)
+            gpu_port.latch = ((raster_offset_x + raster_surface_x) & 2047) | (((raster_offset_y + raster_surface_y) & 2047) << 11);
+        else if (index == 7)
+            gpu_port.latch = 2;
+        else if (index == 8)
+            gpu_port.latch = 0;
+    }
+    return 1;
+}
+
+sint32 gpu_port_read(uint32 offset, uint32 *value)
+{
+    uint32 index, status, ready, mode;
+    if (!value || (offset != 0 && offset != 4))
+        return 0;
+    if (!offset)
+    {
+        if (gpu_port.transfer == 2)
+        {
+            gpu_port.latch = 0;
+            for (index = 0; index < 2; ++index)
+            {
+                gpu_port.latch |= (uint32)VRAM[gpu_port_pixel_address()] << (index * 16);
+                if (++gpu_port.cursor == gpu_port.width * gpu_port.height)
+                {
+                    gpu_port.transfer = 0;
+                    break;
+                }
+            }
+        }
+        *value = gpu_port.latch;
+        return 1;
+    }
+    gpu_scanout_poll();
+    mode = native_scanout.mode;
+    ready = gpu_port.transfer != 2 && gpu_port.count < 255;
+    status = (active_tpage & 0x7FF) | (gpu_port.mask << 11) | ((mode & 32 ? native_scanout.field : 1) << 13) | ((mode & 128) << 7) | ((mode & 64) << 10) | ((mode & 63) << 17) | (gpu_port.disabled << 23) | (gpu_port.irq << 24) | (gpu_port.direction << 29);
+    status |= (gpu_port.transfer == 2 ? 0x08000000 : 0) | (ready << 28);
+    if (!gpu_port.count && !gpu_port.transfer)
+        status |= 0x04000000;
+    if ((gpu_port.direction == 3 && gpu_port.transfer == 2) || ((gpu_port.direction == 1 || gpu_port.direction == 2) && ready))
+        status |= 0x02000000;
+    if (native_scanout.line >= native_scanout.start_y && native_scanout.line < native_scanout.end_y)
+        status |= (uint32)gpu_scanout_ode(&native_scanout) << 31;
+    *value = status;
+    return 1;
+}
+
+sint32 gpu_port_write(uint32 offset, uint32 value)
+{
+    if (offset == 0)
+        return gpu_port_gp0(value);
+    if (offset == 4)
+        return gpu_port_gp1(value);
+    return 0;
+}
+
 void gpu_begin(void)
 {
 }
@@ -2365,6 +2617,31 @@ sint32 SetGraphDebug(sint32 level)
     sint32 previous = graph_debug_level;
     graph_debug_level = level;
     return previous;
+}
+
+uint32 _status(void)
+{
+    return r_u32(0x1F801814u);
+}
+
+void _ctl(uint32 command)
+{
+    w_u32(0x1F801814u, command);
+    gpu_graph_control.command_cache[command >> 24] = (uint8)command;
+}
+
+uint32 _getctl(uint32 command)
+{
+    if (command >= sizeof(gpu_graph_control.command_cache))
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "xport: Invalid GPU control cache index %u\n", command);
+#else
+        (void)0;
+#endif
+        abort();
+    }
+    return gpu_graph_control.command_cache[command];
 }
 
 sint32 GetGraphType(void)
@@ -3128,14 +3405,71 @@ DISPENV *SetDefDispEnv(DISPENV *environment, sint32 x, sint32 y, sint32 width, s
     return environment;
 }
 
-void SetDrawArea(DR_AREA *packet, PSX_RECT *rectangle)
+static uint32 draw_area_width_address, draw_area_height_address;
+
+void gpu_bind_draw_area_bounds(uint32 width_address, uint32 height_address)
 {
-    uint32 *words = (uint32 *)packet;
-    if (!words || !rectangle)
+    draw_area_width_address = width_address;
+    draw_area_height_address = height_address;
+}
+
+static uint32 gpu_draw_area_coordinate(sint16 coordinate, uint32 address, sint32 extent)
+{
+    sint32 maximum;
+    uint32 result;
+    if (coordinate < 0)
+        return 0;
+    maximum = (address ? r_s16(address) : extent) - 1;
+    result = (address ? r_u16(address) : (uint32)extent) - 1;
+    return coordinate > maximum ? result : (uint32)coordinate;
+}
+
+static uint32 gpu_draw_area_word(uint32 command, sint16 x, sint16 y)
+{
+    uint32 column = gpu_draw_area_coordinate(x, draw_area_width_address, VRAM_W);
+    uint32 row = gpu_draw_area_coordinate(y, draw_area_height_address, VRAM_H);
+    return command | (column & 1023) | ((row & 1023) << 10);
+}
+
+void SetDrawLoad(DR_LOAD *packet, const PSX_RECT *rectangle)
+{
+    uint8 *bytes = (uint8 *)packet;
+    uint32 words, length, value;
+    sint32 width, height;
+    if (!packet || !rectangle)
         return;
-    words[0] = (words[0] & 0x00ffffffu) | 0x02000000u;
-    words[1] = gpu_env_clip(0xe3000000u, rectangle->x, rectangle->y, 0);
-    words[2] = gpu_env_clip(0xe4000000u, rectangle->x + rectangle->w - 1, rectangle->y + rectangle->h - 1, 0);
+    width = (sint16)xport_load_le16(&rectangle->w);
+    height = (sint16)xport_load_le16(&rectangle->h);
+    words = (uint32)((width * height + 1) / 2);
+    length = words < 13 ? words + 4 : 0;
+    bytes[3] = (uint8)length;
+    xport_store_le32(bytes + 4, 0xA0000000);
+    value = xport_load_le32(rectangle);
+    xport_store_le32(bytes + 8, value);
+    value = xport_load_le32((const uint8 *)rectangle + 4);
+    xport_store_le32(bytes + 12, value);
+    xport_store_le32(bytes + length * 4, 0x01000000);
+}
+
+uint32 SetDrawArea(DR_AREA *packet, const PSX_RECT *rectangle)
+{
+    uint32 x, y, width, height, word;
+    const uint8 *input = (const uint8 *)rectangle;
+    uint8 *output = (uint8 *)packet;
+    if (!packet || !rectangle)
+        return 0;
+    xport_store_u8(output + 3, 2);
+    x = xport_load_le16(input);
+    y = xport_load_le16(input + 2);
+    word = gpu_draw_area_word(0xE3000000, (sint16)x, (sint16)y);
+    xport_store_le32(output + 4, word);
+    x = xport_load_le16(input);
+    width = xport_load_le16(input + 4);
+    y = xport_load_le16(input + 2);
+    height = xport_load_le16(input + 6);
+    word = gpu_draw_area_word(0xE4000000, (sint16)(x + width - 1), (sint16)(y + height - 1));
+    xport_store_le32(output + 8, word);
+    return word;
 }
 
 void SetDrawOffset(void *packet, const sint16 *offset)
@@ -3308,6 +3642,7 @@ typedef struct GPU_PORTABLE_SCALARS
     uint32 clear_image_dimensions;
     uint16 active_draw_flags;
     sint32 graph_debug_level;
+    GpuGraphControl graph_control;
     uint32 sync_head;
     uint32 sync_tail;
     uint32 sync_budget;
@@ -3350,6 +3685,7 @@ int gpu_state_io(FILE *f, int load)
         clear_image_dimensions = scalars.clear_image_dimensions;
         active_draw_flags = scalars.active_draw_flags;
         graph_debug_level = scalars.graph_debug_level;
+        gpu_graph_control = scalars.graph_control;
         sync_head = scalars.sync_head;
         sync_tail = scalars.sync_tail;
         sync_budget = scalars.sync_budget;
@@ -3375,6 +3711,7 @@ int gpu_state_io(FILE *f, int load)
     scalars.clear_image_dimensions = clear_image_dimensions;
     scalars.active_draw_flags = active_draw_flags;
     scalars.graph_debug_level = graph_debug_level;
+    scalars.graph_control = gpu_graph_control;
     scalars.sync_head = sync_head;
     scalars.sync_tail = sync_tail;
     scalars.sync_budget = sync_budget;

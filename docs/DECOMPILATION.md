@@ -20,6 +20,18 @@ Default arguments are forbidden in decompiled C++ declarations and definitions. 
 
 Before representing an original function as an instance method, record its receiver classification from complete original caller setup, object construction and table provenance. On MIPS, an object-like pointer in `$a0` alone does not establish an implicit `this`: an ordinary function uses the same first-argument register. Validate adjusted virtual-call receiver and target pairs when present; for nonvirtual candidates, establish independent owner/receiver evidence. If the distinction remains unresolved, emit a free function in the relevant module with an explicit pointer argument. Do not claim that absence from a virtual table proves an original free or static function. Identify newly written native view/adapter helpers separately from recovered original methods.
 
+## Reuse the existing xport SDK runtime
+
+- This workflow produces a native game port. Existing xport PsyQ implementations are the shared, SDK-reviewed runtime; use their public APIs instead of translating SDK internals again for each game. A coverage/converge request authorizes game translation and integration, not a parallel SDK or a replacement of the shared runtime
+- Use the DRAM, VRAM, scratchpad and SPU RAM already provided by xport through their existing APIs. Reusing native PsyQ wrappers does not require replacing the game's memory model. Do not create a second memory/device model or retire the provided memory domains without a separate explicit user request
+- Before implementing an SDK dependency, locate its existing declaration, implementation and documented contract in xport. Match the classified original callee to the correct API and check the actual caller's arguments, result use, buffer ownership and callbacks. Do not repeat a full SDK implementation audit when the problem is caller wiring
+- Keep one implementation and one owner of SDK state. Do not create duplicate `*_guest.c` modules, a second PsyQ-looking API, per-game copies of SDK algorithms/tables, or mirrors of BIOS, IRQ, SIO, DMA, GPU or SPU driver state to reproduce an original executable's memory layout
+- Guest RAM equality, lockstep mismatches, original SDK scratchpad/stack writes, diagnostics and internal queues do not authorize rebuilding PS1 execution machinery or bypassing a working native API. Treat a mismatch in replaced SDK internals as a boundary-contract issue; preserve the evidence and report any comparison limitation. Never rewrite the runtime merely to make that comparison pass
+- Adapt only the proven game-to-runtime boundary: argument types, bounded buffers, resource formats and callback registration. Prefer a direct existing API call. Keep unavoidable game-specific adapters and addresses in the consuming project; an adapter must delegate the SDK operation and must not reproduce its algorithm or maintain parallel SDK state
+- A suspected missing feature or defect requires a concrete caller/reproducer, the existing implementation and the smallest demonstrated contract gap. Before adding a shared SDK module, replacing an existing implementation, changing SDK state ownership or expanding device emulation, present that evidence and the proposed scope for explicit user authorization. Approval for a local ABI adjustment, original-game bug fix or another subsystem does not authorize that work. Do not create a speculative replacement while awaiting authorization
+- If the existing API suffices, fix the integration and retain the implementation. If a shared change is separately authorized, implement the smallest change in the existing owning subsystem, preserve unrelated consumers and validate the affected contract. Do not treat a new implementation as necessary simply because its interface resembles the original MIPS more closely
+- SDK `SKIP` functions remain mapped replacements with their existing classification and evidence. Do not silently bring them back into the game translation queue, inflate game coverage with duplicated SDK bodies or claim original machine-state equivalence for native SDK calls
+
 ## Guest-memory access
 
 Use the standard xport functions for scalar guest-memory access: `r_u8`, `r_u16`, `r_u32`, `r_s8`, `r_s16`, `r_s32`, `w_u8`, `w_u16` and `w_u32`. Preserve the original width, signedness and access order. Express a read-modify-write through an explicit standard read followed by the matching standard write; evaluate an address with side effects once in a named local.
@@ -63,11 +75,41 @@ For a bounded owner audit, `tools/mips_function_fixture.py` can execute original
 
 Signed `ADD`, `ADDI` and `SUB` reject signed 32-bit overflow before writing their destination, including register zero. `ADDI` sign-extends its 16-bit immediate; `ADDIU` remains wrapping arithmetic. Overflow stops the fixture with `ValueError`; it does not emulate CP0 exception state or a guest exception handler. Run `python -B -m unittest tools.tests.test_mips_function_fixture` from the toolset root after changing instruction semantics.
 
+## Full-pass translation and batch modules
+
+This is the canonical source-allocation and execution policy for ordinary decompilation and `coverage NAME`. More specific user scope and platform restrictions take precedence. Do not apply this full-pass schedule to a requested isolated repair or an explicitly requested strict proof/converge task.
+
+### Scope, order and saved source
+
+- Fix the selected image-qualified game-function set before the pass. Use the function recording's immutable first-call order first, then a deterministic address order for remaining functions in the declared scope. Do not silently expand into deferred images or omit unrecorded functions from an explicitly full-image task
+- Inventory existing complete bodies and reviewed shared SDK replacements once. Resume them in their current modules; do not retranslate or relocate unchanged functions to adopt a new naming scheme. Keep one signature registry and update it when original caller/callee evidence changes
+- Translate the entire selected set before integration. Save each complete original function immediately, with its image-qualified `FUNCTION_MARKER` and source/provenance binding. Preserve original arithmetic, widths, aliases, branch/call order and error returns; use complete pseudocode where available and original MIPS as semantic authority
+- Keep calls to pending game functions as ordinary declared calls. Missing implementations and unresolved symbols are expected during the pass; do not compile early, insert successful stubs, guess implementations or stop the pass at the first unimplemented callee
+- Record genuine semantic gaps explicitly and continue with independent functions. A prototype, partial body, TODO or abort stub is not a complete translated function and cannot close the pass
+
+### Sequential module allocation
+
+- For new C translations use `src/batch_1.c`, `src/batch_2.c`, and so on, with consecutive numeric suffixes. Keep an existing entry/bootstrap module in place. A user-authorized C++ translation uses the same sequence with `.cpp`; honor the recorded language
+- Resume the last active sequential module. Before appending the next complete function, count its existing physical lines, including includes, comments and blank lines. If it already has more than 2000 lines, create the next module and append there; otherwise append to the current module
+- The threshold is soft. Do not predict whether the next function will exceed 2000 lines. A module at exactly 2000 lines still receives the next complete function; a module at 2001 lines starts the next module before the next function
+- Keep each original function whole. A function that takes its module past the threshold, including a function longer than 2000 lines by itself, stays entirely in that module. Start the following function in the next module; do not split bodies or rebalance previous modules
+- Module size is independent of a tooling packet's function count. There is no fixed number of functions per source module and no 16-function translation or build checkpoint
+- Save needed declarations/includes and record new modules as integration inputs during translation. Defer complete build-project registration, caller/SDK wiring and link repair to final integration; recording inputs does not require a build
+
+### Deferred integration and verification
+
+- During the full translation pass do not compile, build, run the game, run runtime tests or invoke build/check/index pipelines after functions or modules. Do not use `code_refresh`, even with skip flags, as a per-module checkpoint. Original-source reading, MIPS/ABI/alias analysis, signature edits, physical-line counting and manual provenance maintenance remain implementation work
+- Do not stop to integrate a completed module or dependency cluster. Continue until every selected function has a saved full body or an explicitly reviewed existing implementation/replacement. Unresolved semantic bodies remain an incomplete pass, not a reason to claim completion
+- Begin integration after the whole pass: register all new modules, reconcile declarations/callers/callbacks and SDK boundaries, remove duplicate implementations and classify dependencies outside the selected scope. Preserve the scope denominator and historical evidence
+- Then run the complete applicable indexing/marker checks, Debug build and agreed native scenarios. Repair real compile/link/runtime failures from original evidence; repeat affected checks after fixes. Final integration and repair may require several builds, but none are per-translation-batch gates
+- Run final Release or other platform builds only as required by the agreed task scope; a narrower user restriction prevails. Builds and observed scenarios prove only their actual scope, never automatic original equivalence
+- Mark draft bodies unverified until the relevant final checks succeed. Preserve historical receipts and invalidate changed-source proof reuse. A full translation pass alone does not complete an integration/runtime deliverable
+
 ## 8. WIP → DONE and regression gates
 
 DONE requires image-verified static MIPS audit plus compatible dynamic evidence in a declared context/range. Record coverage gaps explicitly; one context is not proof of every character/level/branch. SKIP requires justified replacement scope and its validation, not a missed call. TODO is no accepted implementation; WIP includes incomplete or insufficiently proven implementations.
 
-For non-categorical decompilation, a C translation unit has a hard admission limit of 2000 physical lines. Count the complete proposed batch before changing source. Use `game_main.c`, then `game_batch1.c`, `game_batch2.c` and so on. If adding the complete batch would exceed 2000 lines, create and register the next module and place the entire batch there; never split one batch across the old and new module. Corrective audits leave existing functions in their owning modules.
+For ordinary translation, follow [Full-pass translation and batch modules](#full-pass-translation-and-batch-modules). Its soft source-module threshold and deferred integration replace the former hard 2000-line admission limit and indivisible 16-function source batches. Explicit strict-supervisor transactions retain their separate implemented contract in [COVERAGE_STRICT.md](COVERAGE_STRICT.md); they do not define the default translation workflow.
 
 For PsyQ, never assign SKIP by recognizing a familiar `.lst` body, IDA name or call pattern. The immutable listing supplies the exact image/address and original instructions; the reviewed Ghidra masked-signature classification supplies SDK identity. Confirm both layers with `X query 0xADDRESS --image IMAGE`: `function.status` must be `SKIP` and `library_classification` must name the alias, reason and evidence. Pending/ambiguous signatures remain TODO. The complete initial classification and listing-to-SKIP procedure is in `STARTUP.md`.
 

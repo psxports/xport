@@ -125,6 +125,48 @@ class StartupSupervisorTests(unittest.TestCase):
                 '/_build/', '/bin/', '/status/', '/tools/', '/orig/', '/iso/', '/.cursor/',
             ])
 
+    def test_git_index_stages_only_template_gitignore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Project'
+            startup.initialize_project(root, 'Example Game', 'EX', 45560)
+            result = startup.stage_project_gitignore(root)
+            self.assertTrue(result['repository_created'])
+            staged = startup.subprocess.run(['git', '-C', str(root), 'diff', '--cached', '--name-only'],
+                                            capture_output=True, text=True, check=True)
+            self.assertEqual(staged.stdout.splitlines(), ['.gitignore'])
+            indexed = startup.subprocess.run(['git', '-C', str(root), 'show', ':.gitignore'],
+                                             capture_output=True, check=True)
+            self.assertEqual(indexed.stdout, startup.PROJECT_GITIGNORE_TEMPLATE.read_bytes())
+
+    def test_git_index_preserves_existing_staged_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Project'
+            root.mkdir()
+            startup.subprocess.run(['git', '-C', str(root), 'init', '--quiet'], check=True)
+            (root/'user.txt').write_text('Keep staged content', encoding='utf-8')
+            startup.subprocess.run(['git', '-C', str(root), 'add', '--', 'user.txt'], check=True)
+            startup.initialize_project(root, 'Example Game', 'EX', 45570)
+            result = startup.stage_project_gitignore(root)
+            self.assertFalse(result['repository_created'])
+            staged = startup.subprocess.run(['git', '-C', str(root), 'diff', '--cached', '--name-only'],
+                                            capture_output=True, text=True, check=True)
+            self.assertEqual(staged.stdout.splitlines(), ['.gitignore', 'user.txt'])
+
+    def test_git_index_failure_retries_without_reinitializing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Project'
+            with mock.patch.object(startup, 'stage_project_gitignore', side_effect=ValueError('Index locked')):
+                state = startup.start(root, 'Example Game', 'EX', 45580)
+            self.assertEqual(state['status'], 'failed')
+            self.assertEqual(state['failure']['step'], 'git_index')
+            readme = (root/'README.md').read_bytes()
+            with mock.patch.object(startup, 'run_shared', return_value='ok'), \
+                    mock.patch.object(startup.startup_github, 'sync_project', return_value={'issues': []}):
+                state = startup.retry(root, state['revision'])
+            self.assertEqual(state['status'], 'attention')
+            self.assertEqual(state['steps']['git_index']['status'], 'passed')
+            self.assertEqual((root/'README.md').read_bytes(), readme)
+
     def test_initializer_refuses_existing_gitignore(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'ExistingIgnore-xport'
@@ -522,6 +564,25 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(result['schema'], 1)
             self.assertEqual(result['original_image'], 'MAIN.EXE')
 
+    def test_capture_contract_uses_image_profile_extracted_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Example-xport'
+            startup.initialize_project(root, 'Example Game', 'EX', 45320)
+            config = json.loads((root/'xport-project.json').read_text())
+            config['paths']['disc_image'] = 'iso/game.cue'
+            config['lockstep'].update(enabled=True, original_image='DISC1_MAIN.EXE')
+            startup.atomic_json(root/'xport-project.json', config)
+            (root/'iso/game.cue').write_text('FILE game.bin BINARY\n')
+            original = root/'bin/DATA/1/MAIN.EXE'
+            original.parent.mkdir(parents=True, exist_ok=True)
+            original.write_bytes(b'PS-X EXE')
+            profile = root/'tools/ida/DISC1_MAIN.EXE.json'
+            startup.atomic_json(profile, {'image': 'DISC1_MAIN.EXE',
+                                         'loads': [{'path': 'bin/DATA/1/MAIN.EXE', 'base': 2147549184, 'offset': 2048}]})
+            result = startup.validate_capture_contract(root)
+            self.assertEqual(result['original_executable'], 'bin/DATA/1/MAIN.EXE')
+            self.assertFalse((root/'orig/DISC1_MAIN.EXE').exists())
+
     def test_image_review_proposes_psx_profiles_and_boot_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -649,6 +710,18 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt['pid'], 456)
             popen.assert_called_once()
 
+    def test_dispatch_worker_uses_requested_windows_desktop(self):
+        if startup.os.name != 'nt':
+            self.skipTest('Windows desktop startup information')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'Example-xport';(root/'status').mkdir(parents=True)
+            with mock.patch.dict(startup.os.environ, {'XPORT_WINDOWS_DESKTOP': 'WinSta0\\XportConverge'}):
+                with mock.patch('windows_desktop.launch_default_desktop_process', return_value=mock.Mock(pid=456)) as launch:
+                    startup.dispatch_worker(root)
+            self.assertEqual(launch.call_args.kwargs['environment']['XPORT_WINDOWS_DESKTOP'], 'WinSta0\\XportConverge')
+            self.assertFalse(launch.call_args.kwargs['visible'])
+            self.assertEqual(launch.call_args.args[1], root.resolve())
+
     def test_dispatch_worker_keeps_live_windows_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'Example-xport';(root/'status').mkdir(parents=True)
@@ -696,6 +769,7 @@ class StartupSupervisorTests(unittest.TestCase):
             root = Path(directory)/'Example-xport';root.mkdir()
             current = startup.inventory(root)
             current.pop('total_bytes')
+            current.pop('system_configs')
             state = {'schema': 1, 'revision': 7, 'status': 'failed', 'step': 'verify_frontier',
                      'project_root': str(root.resolve()), 'name': 'Example', 'short_name': 'EX',
                      'inventory': current, 'failure': {'step': 'verify_frontier'}, 'steps': {}}
