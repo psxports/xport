@@ -523,5 +523,9 @@ __declspec(noreturn) void WinMainCRTStartup(void)
     for (initializer = xcrt_init_begin + 1; initializer < xcrt_init_end; ++initializer)
         if (*initializer)
             (*initializer)();
-    exit(WinMain(GetModuleHandleA(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT));
+    LPSTR command = "";
+#if defined(_DEBUG) || defined(LOCKSTEP_DEBUG)
+    command = GetCommandLineA();
+#endif
+    exit(WinMain(GetModuleHandleA(NULL), NULL, command, SW_SHOWDEFAULT));
 }

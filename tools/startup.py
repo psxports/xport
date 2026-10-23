@@ -20,6 +20,7 @@ import time
 import uuid
 import startup_github
 import startup_disc
+import convert_video
 from urllib.parse import quote
 
 from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
@@ -1015,7 +1016,7 @@ def apply_response(root, state, response):
         config_path = Path(root)/CONFIG_NAME
         config = read_json(config_path)
         patch = decision.get('config_patch', {})
-        if any(key not in ('paths', 'analysis', 'capabilities', 'lockstep') for key in patch):
+        if any(key not in ('paths', 'analysis', 'capabilities', 'lockstep', 'video') for key in patch):
             raise ValueError('STARTUP_RESPONSE_CONFIG_SCOPE')
         for key, value in patch.items():
             if not isinstance(value, dict):
@@ -1224,6 +1225,12 @@ def advance(root, state):
                 else:
                     result = 'not_requested'
                 record_step(state, step, result, started)
+                state = publish(root, state, step='video')
+            elif step == 'video':
+                result = convert_video.convert(root, project(root))
+                atomic_json(root/'status/startup-video.json', result)
+                record_step(state, step, {'status': result['status'], 'converted': len(result['clips']),
+                                         'unsupported': result['unsupported']}, started)
                 state = publish(root, state, step='ida_export')
             elif step == 'ida_export':
                 state = publish_progress(root, state, 'Running IDA export and independent byte verification')
@@ -1310,7 +1317,7 @@ def advance(root, state):
                               'duckstation': emulator,
                               'convergence': validate_convergence_contract(root),
                               'source_index': state['steps']['verify_frontier']['result']['source_index'],
-                              'next': 'Run function_converge NAME, stop, then coverage NAME'}
+                              'next': 'Run function_coverage NAME, stop, then coverage NAME'}
                 created = datetime.datetime.fromisoformat(state['created_utc'])
                 canonical_result = state['steps'].get('ida_export', {}).get('result', {}).get('canonical', [])
                 classification = state['steps'].get('psyq', {}).get('result', {}).get('classification', {})

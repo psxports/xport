@@ -54,6 +54,8 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     sint32 gpu_linked_submit_failed(void);
     sint32 gpu_execute_linked_dma(uint32 physical_address);
     void gpu_set_raster(sint32 enabled);
+    // Preserve an embedded polygon texture page without emitting geometry
+    void gpu_set_polygon_tpage(uint16 page);
 
     typedef struct GpuLinkedDmaState
     {

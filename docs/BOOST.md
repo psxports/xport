@@ -4,7 +4,7 @@ Normative agent contract for `boost NAME` or bare `boost`. This command produces
 
 ## Input
 
-- `boost NAME`: use `status/function-coverage/NAME/functions.bin` without starting `function_converge`, `coverage` or `converge`
+- `boost NAME`: use `status/function-coverage/NAME/functions.bin` without starting `function_coverage`, `coverage` or `converge`
 - Bare `boost`: use only the explicit image-qualified addresses or project-owned list supplied by the user; otherwise fail `BOOST_FUNCTION_SET_REQUIRED`
 - Bind addresses to `analysis.default_image` and current original hashes
 - Exclude only reviewed PsyQ/SKIP functions

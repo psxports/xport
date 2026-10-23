@@ -56,11 +56,9 @@ sint32 xport_load(void *data, sint32 capacity)
     sint32 result = -1;
     if (!data || capacity <= 0 || !save_path(path, ""))
         return -1;
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
-        return 0;
     file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE)
-        return -1;
+        return 0;
     if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= capacity && ReadFile(file, data, (DWORD)size.QuadPart, &read, NULL) && read == (DWORD)size.QuadPart)
         result = (sint32)read;
     CloseHandle(file);
@@ -172,58 +170,16 @@ uint64 xport_timer_get(void)
     return ticks / frequency * 1000000u + ticks % frequency * 1000000u / frequency;
 }
 
-void xport_timer_wait_frame(uint32 refresh_rate)
+void xport_timer_wait_frame(uint64 target_field)
 {
-    uint64 idx;
-    uint64 now = xport_timer_get();
-    uint64 deadline;
-    if (!refresh_rate || refresh_rate == FIELD_RATE)
-    {
-        xport_frame_fract(&idx);
-        deadline = xport_frame_time(idx + 1);
-    }
-    else
-    {
-        idx = now / 1000000 * refresh_rate + now % 1000000 * refresh_rate / 1000000;
-        deadline = ((idx + 1) * 1000000 + refresh_rate - 1) / refresh_rate;
-    }
-    while (now < deadline)
-    {
-        uint64 remaining = deadline - now;
-        Sleep(remaining > 2000 ? (DWORD)(remaining / 1000 - 1) : 0);
-        now = xport_timer_get();
-    }
+    while (xport_frame() < target_field)
+        Sleep(1);
 }
 
-void xport_render_wait(void)
+sint32 xport_render_wait_until(uint64 limit)
 {
-    static uint64 deadline;
-    static HMONITOR monitor;
-    static uint32 rate = 60;
-    HMONITOR current = MonitorFromWindow(platform_window, MONITOR_DEFAULTTOPRIMARY);
-    if (monitor != current)
-    {
-        MONITORINFOEXW info = {0};
-        DEVMODEW settings = {0};
-        info.cbSize = sizeof(info);
-        settings.dmSize = sizeof(settings);
-        rate = 60;
-        if (GetMonitorInfoW(current, (MONITORINFO *)&info) && EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &settings) && settings.dmDisplayFrequency > 1)
-            rate = settings.dmDisplayFrequency;
-        monitor = current;
-        deadline = 0;
-    }
-    uint64 now = xport_timer_get();
-    uint64 period = 1000000u / rate;
-    if (!deadline || now > deadline + period)
-        deadline = now + period;
-    while (now < deadline)
-    {
-        uint64 remaining = deadline - now;
-        Sleep(remaining > 2000 ? (DWORD)(remaining / 1000 - 1) : 0);
-        now = xport_timer_get();
-    }
-    deadline += period;
+    // SwapBuffers already waits for VSync
+    return xport_timer_get() < limit;
 }
 
 static uint32 key_to_pad(sint32 controller, WPARAM key, LPARAM flags)
@@ -482,6 +438,7 @@ void xport_input_rumble(sint32 controller, uint16 low, uint16 high)
 static void switch_window_mode(void)
 {
     static WINDOWPLACEMENT windowed_placement;
+    static DWORD windowed_style;
     DWORD style;
     if (platform_window == NULL)
         return;
@@ -494,13 +451,14 @@ static void switch_window_mode(void)
         if (GetWindowPlacement(platform_window, &windowed_placement) && GetMonitorInfoA(MonitorFromWindow(platform_window, MONITOR_DEFAULTTOPRIMARY), &monitor))
         {
             const RECT *rectangle = &monitor.rcMonitor;
-            SetWindowLongA(platform_window, GWL_STYLE, (LONG)(style & ~WS_OVERLAPPEDWINDOW));
-            MoveWindow(platform_window, rectangle->left, rectangle->top, rectangle->right - rectangle->left, rectangle->bottom - rectangle->top, FALSE);
+            windowed_style = style;
+            SetWindowLongA(platform_window, GWL_STYLE, (LONG)((style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP));
+            SetWindowPos(platform_window, HWND_TOP, rectangle->left, rectangle->top, rectangle->right - rectangle->left, rectangle->bottom - rectangle->top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
         }
     }
     else if (windowed_placement.length == sizeof(windowed_placement))
     {
-        SetWindowLongA(platform_window, GWL_STYLE, (LONG)(style | WS_OVERLAPPEDWINDOW));
+        SetWindowLongA(platform_window, GWL_STYLE, (LONG)windowed_style);
         SetWindowPlacement(platform_window, &windowed_placement);
         SetWindowPos(platform_window, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
@@ -679,7 +637,7 @@ sint32 xport_window_init(void)
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance;
     window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
-    window_class.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    window_class.hbrBackground = (HBRUSH)(COLOR_WINDOWTEXT + 1);
     window_class.lpszClassName = "XportWindow";
     window_class.hIcon = LoadIcon(instance, "MAINICON");
     if (window_class.hIcon == NULL)
@@ -768,12 +726,13 @@ static sint32 audio_lock_initialized;
 #if XPORT_AUDIO_VBLANK_QUEUE
 enum
 {
-    AUDIO_PCM_CAPACITY = SPU_SAMPLE_RATE * 2
+    AUDIO_PCM_CAPACITY = XPORT_AUDIO_BUFFER_COUNT * XPORT_AUDIO_BUFFER_FRAMES
 };
 
 static sint16 audio_pcm[AUDIO_PCM_CAPACITY * 2];
 static uint64 audio_pcm_read, audio_pcm_write;
 volatile uint32 g_xport_audio_queue_peak;
+volatile uint64 g_xport_audio_dropped_frames;
 
 static sint32 audio_pcm_take(sint16 *samples, uint32 count)
 {
@@ -800,19 +759,17 @@ static void audio_pcm_put(const sint16 *samples, uint32 count)
     uint32 index, queued;
     if (count > AUDIO_PCM_CAPACITY)
         abort();
-    for (;;)
+    xport_audio_lock();
+    queued = audio_pcm_write - audio_pcm_read;
+    if (queued > AUDIO_PCM_CAPACITY)
+        abort();
+    if (count > AUDIO_PCM_CAPACITY - queued)
     {
-        xport_audio_lock();
-        queued = audio_pcm_write - audio_pcm_read;
-        if (queued > AUDIO_PCM_CAPACITY)
-            abort();
-        if (count <= AUDIO_PCM_CAPACITY - queued)
-            break;
-        xport_audio_unlock();
-        // Let WaveOut consume queued samples before publishing another field
-        if (!xport_audio_is_running())
-            abort();
-        Sleep(1);
+        uint32 stale = count - (AUDIO_PCM_CAPACITY - queued);
+        // Retain recent output without making VBlank wait for the sound device
+        audio_pcm_read += stale;
+        g_xport_audio_dropped_frames += stale;
+        queued -= stale;
     }
     for (index = 0; index < count; ++index)
     {
@@ -975,6 +932,7 @@ sint32 xport_audio_init(void)
     WAVEFORMATEX format;
     MMRESULT result;
     sint32 index;
+    sint32 use_null;
 #ifdef _DEBUG
     const char *audible = getenv("XPORT_AUDIO_OUTPUT");
     #if !defined(LOCKSTEP_DEBUG)
@@ -992,16 +950,20 @@ sint32 xport_audio_init(void)
 #if XPORT_AUDIO_VBLANK_QUEUE
     audio_pcm_read = audio_pcm_write = 0;
     g_xport_audio_queue_peak = 0;
+    g_xport_audio_dropped_frames = 0;
 #endif
     g_xport_audio_submitted_buffers = 0;
     g_xport_audio_nonzero_buffers = 0;
     g_xport_audio_peak = 0;
     g_xport_audio_callback_overruns = 0;
-    if (xport_is_headless()
+    use_null = xport_is_headless();
 #if defined(_DEBUG) && !defined(LOCKSTEP_DEBUG)
-        && (backend == NULL || strcmp(backend, "waveout") != 0)
+    if (backend != NULL && strcmp(backend, "null") == 0)
+        use_null = 1;
+    else if (backend != NULL && strcmp(backend, "waveout") == 0)
+        use_null = 0;
 #endif
-    )
+    if (use_null)
     {
         null_active = 1;
         null_frames = 0;

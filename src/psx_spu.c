@@ -245,8 +245,8 @@ static uint32 spu_write_source(const void *source, uint32 byte_count, sint32 all
 {
     uint32 blocks, rounded, guest;
     sint32 host_source;
-    if (byte_count > 0x7eff0u)
-        byte_count = 0x7eff0u;
+    if (byte_count > 0x7f000u)
+        byte_count = 0x7f000u;
     if (!transfer.requested_mode || transfer_failed || !source)
     {
         transfer_failed = 1;
@@ -942,6 +942,9 @@ typedef struct VAB_BANK
     uint8 transferred;
 } VAB_BANK;
 
+// Separate staging slots for the native and sticky parsers under the audio lock
+static VAB_BANK vab_parse_banks[2];
+
 typedef struct LIBSND_VOICE
 {
     sint16 bank;
@@ -987,10 +990,21 @@ typedef struct CD_AUDIO_STATE
     uint8 repeat;
 } CD_AUDIO_STATE;
 
+typedef struct SPU_STREAM_STATE
+{
+    uint32 state;
+    PsxInterruptCallback callbacks[5];
+    uint32 pending[9];
+    uint32 current_voice[5];
+    SpuStEnv environment;
+    uint32 completion[4];
+} SPU_STREAM_STATE;
+
 typedef struct LIBSND_STATE
 {
     VAB_BANK banks[VAB_BANK_COUNT];
     LIBSND_VOICE voices[SPU_VOICE_COUNT];
+    SPU_STREAM_STATE streaming;
     uint32 voice_protection_address;
     uint32 voice_count_address;
     uint32 voice_volume_address;
@@ -1038,6 +1052,32 @@ typedef struct LIBSND_STATE
 
 /* Variables. */
 static LIBSND_STATE libsnd;
+
+SpuStEnv *SpuStInit(void)
+{
+    uint32 index;
+    SPU_STREAM_STATE *stream = &libsnd.streaming;
+    xport_audio_lock();
+    stream->state = 0x10;
+    for (index = 0; index < 5; ++index)
+        stream->callbacks[index] = NULL;
+    for (index = 0; index < 9; ++index)
+        stream->pending[index] = 0;
+    for (index = 0; index < 5; ++index)
+        stream->current_voice[index] = SPU_VOICE_COUNT;
+    for (index = 0; index < SPU_VOICE_COUNT; ++index)
+    {
+        stream->environment.voice[index].status = 6;
+        stream->environment.voice[index].last_size = 0;
+        stream->environment.voice[index].buf_addr = 0;
+        stream->environment.voice[index].data_addr = 0;
+    }
+    stream->environment.size = 0;
+    for (index = 0; index < 4; ++index)
+        stream->completion[index] = 0;
+    xport_audio_unlock();
+    return &stream->environment;
+}
 
 enum
 {
@@ -1275,6 +1315,18 @@ static void libsnd_initialize_runtime(void)
     xport_audio_init();
 }
 
+void SsInitHot(void)
+{
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+    ResetCallback();
+    libsnd_initialize_runtime();
+    SpuInit();
+    spu_sequence_scheduler_initialize(&spu_sequence_scheduler, spu_sequence_vm_initialize);
+#else
+    libsnd_initialize_runtime();
+#endif
+}
+
 void SsInit(void)
 {
 #if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
@@ -1458,6 +1510,46 @@ sint32 spu_download(uint32 byte_address, void *destination, uint32 byte_count)
     spu_irq_check_range(byte_address, byte_count);
     xport_audio_unlock();
     return 1;
+}
+
+uint32 spu_read_blocks(void *destination, uint16 address_units, uint16 blocks)
+{
+    uint8 *output = (uint8 *)destination;
+    uint32 address = (uint32)address_units << 3;
+    uint32 remaining = (uint32)blocks << 6;
+    uint32 bytes;
+    if (native_transfer_binding != SPU_TRANSFER_NATIVE || transfer_failed || transfer_pending || transfer_operation.active || !destination || blocks == 0 || !spu.initialized)
+        abort();
+    xport_audio_lock();
+    while (remaining != 0)
+    {
+        bytes = SPU_RAM_SIZE - address;
+        if (bytes > remaining)
+            bytes = remaining;
+        if (!spu_download(address, output, bytes))
+        {
+            xport_audio_unlock();
+            abort();
+        }
+        output += bytes;
+        remaining -= bytes;
+        address = 0;
+    }
+    *transfer.completion = 1;
+    xport_audio_unlock();
+    spu_sequence_vm_dma();
+    return 1;
+}
+
+sint32 spu_stop_transfer(void)
+{
+    uint16 control;
+    xport_audio_lock();
+    control = r_u16(SPU_REGISTER_BASE + 426);
+    w_u16(SPU_REGISTER_BASE + 426, control & 0x7FCF);
+    w_u16(SPU_REGISTER_BASE + 426, control & 0xFFCF);
+    xport_audio_unlock();
+    return 0;
 }
 
 sint32 SpuReadDecodedData(void *destination, sint32 flags)
@@ -2152,10 +2244,12 @@ void spu_vm_reset(void)
 static void libsnd_reset(void)
 {
     sint32 voice;
+    SPU_STREAM_STATE streaming = libsnd.streaming;
 #if defined(XPORT_NATIVE_SEQUENCE) && XPORT_NATIVE_SEQUENCE
     spu_sequence_reset();
 #endif
     memset(&libsnd, 0, sizeof(libsnd));
+    libsnd.streaming = streaming;
     libsnd.next_sound_ram_address = 0x1010;
     libsnd.vab_transfer_complete = 1;
     libsnd.cd.track = -1;
@@ -2190,7 +2284,7 @@ static const VAB_TONE *vab_get_tone(sint16 bank, sint16 program, sint16 tone)
 static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
 {
     const VAB_HEADER_RECORD *header_record = (const VAB_HEADER_RECORD *)header;
-    VAB_BANK parsed;
+    VAB_BANK *parsed = &vab_parse_banks[0];
     uint16 program_count;
     uint16 tone_count;
     uint16 sample_count;
@@ -2222,13 +2316,13 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
         bank = requested_bank;
     }
 
-    memset(&parsed, 0, sizeof(parsed));
-    memcpy(&parsed.header, header_record, sizeof(parsed.header));
-    memcpy(parsed.tones, (const uint8 *)header + 32 + VAB_PROGRAM_COUNT * 16, (size_t)program_count * sizeof(parsed.tones[0]));
+    memset(parsed, 0, sizeof(*parsed));
+    memcpy(&parsed->header, header_record, sizeof(parsed->header));
+    memcpy(parsed->tones, (const uint8 *)header + 32 + VAB_PROGRAM_COUNT * 16, (size_t)program_count * sizeof(parsed->tones[0]));
     for (program = 0; program < VAB_PROGRAM_COUNT; ++program)
     {
         const VAB_PROGRAM_RECORD *source = (const VAB_PROGRAM_RECORD *)(header_record + 1) + program;
-        VAB_PROGRAM *destination = parsed.programs + program;
+        VAB_PROGRAM *destination = parsed->programs + program;
         uint32 tone;
         memcpy(destination, source, sizeof(*destination));
         // PsyQ reserves the program word at8 for its compact tone group
@@ -2239,7 +2333,7 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
             return -1;
         for (tone = 0; tone < VAB_TONES_PER_PROGRAM; ++tone)
         {
-            VAB_TONE *tone_destination = &parsed.tones[tone_group][tone];
+            VAB_TONE *tone_destination = &parsed->tones[tone_group][tone];
             // Only declared tones participate in playback sample validation
             if (tone < source->tone_count && (tone_destination->sample < 0 || tone_destination->sample > (sint16)sample_count))
                 return -1;
@@ -2253,25 +2347,25 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
     {
         uint32 size = (uint32)read_u16_le(header + size_table_offset + program * 2) * 8u;
         if (program >= 1 && program <= sample_count)
-            parsed.sample_addresses[program] = libsnd.next_sound_ram_address + sample_offset;
+            parsed->sample_addresses[program] = libsnd.next_sound_ram_address + sample_offset;
         sample_offset += size;
         // Program tail halfwords hold SPU sample addresses in eight-byte units
         if (program <= sample_count)
-            xport_store_le16((uint8 *)parsed.programs + (program / 2) * 16 + ((program & 1) ? 14 : 12), (libsnd.next_sound_ram_address + sample_offset) >> 3);
+            xport_store_le16((uint8 *)parsed->programs + (program / 2) * 16 + ((program & 1) ? 14 : 12), (libsnd.next_sound_ram_address + sample_offset) >> 3);
     }
-    parsed.body_size = sample_offset;
-    if (parsed.body_size == 0 || libsnd.next_sound_ram_address > SPU_RAM_SIZE || parsed.body_size > SPU_RAM_SIZE - libsnd.next_sound_ram_address)
+    parsed->body_size = sample_offset;
+    if (parsed->body_size == 0 || libsnd.next_sound_ram_address > SPU_RAM_SIZE || parsed->body_size > SPU_RAM_SIZE - libsnd.next_sound_ram_address)
         return -1;
-    parsed.body_address = libsnd.next_sound_ram_address;
-    parsed.valid = 1;
-    libsnd.banks[bank] = parsed;
-    libsnd.next_sound_ram_address = (libsnd.next_sound_ram_address + parsed.body_size + 7u) & ~7u;
+    parsed->body_address = libsnd.next_sound_ram_address;
+    parsed->valid = 1;
+    libsnd.banks[bank] = *parsed;
+    libsnd.next_sound_ram_address = (libsnd.next_sound_ram_address + parsed->body_size + 7u) & ~7u;
     return bank;
 }
 
 sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16 requested_bank, uint32 body_address)
 {
-    VAB_BANK parsed;
+    VAB_BANK *parsed = &vab_parse_banks[1];
     uint32 magic, capacity, program_count, sample_count, size_offset;
     uint32 program, tone_group, sample, total, length, scale;
     sint32 version;
@@ -2290,21 +2384,22 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
     size_offset = 32 + capacity * 16 + program_count * 512;
     if (size_offset > header_bytes || 512 > header_bytes - size_offset)
         return -1;
-    memset(&parsed, 0, sizeof(parsed));
-    memcpy(&parsed.header, header, sizeof(parsed.header));
-    memcpy(parsed.programs, header + 32, capacity * sizeof(parsed.programs[0]));
-    memcpy(parsed.tones, header + 32 + capacity * 16, program_count * sizeof(parsed.tones[0]));
+    xport_audio_lock();
+    memset(parsed, 0, sizeof(*parsed));
+    memcpy(&parsed->header, header, sizeof(parsed->header));
+    memcpy(parsed->programs, header + 32, capacity * sizeof(parsed->programs[0]));
+    memcpy(parsed->tones, header + 32 + capacity * 16, program_count * sizeof(parsed->tones[0]));
     tone_group = 0;
     for (program = 0; program < capacity; ++program)
     {
-        VAB_PROGRAM *entry = parsed.programs + program;
+        VAB_PROGRAM *entry = parsed->programs + program;
         if (entry->tone_count > VAB_TONES_PER_PROGRAM)
-            return -1;
+            goto failed;
         xport_store_le32((uint8 *)entry + 8, tone_group);
         if (entry->tone_count != 0)
         {
             if (tone_group >= program_count)
-                return -1;
+                goto failed;
             ++tone_group;
         }
     }
@@ -2314,16 +2409,15 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
     {
         length = (uint32)xport_load_le16(header + size_offset + sample * 2) << scale;
         if (length > SPU_RAM_SIZE - body_address - total)
-            return -1;
+            goto failed;
         if (sample != 0)
-            parsed.sample_addresses[sample] = body_address + total;
+            parsed->sample_addresses[sample] = body_address + total;
         total += length;
-        xport_store_le16((uint8 *)parsed.programs + (sample / 2) * 16 + ((sample & 1) ? 14 : 12), (body_address + total) >> 3);
+        xport_store_le16((uint8 *)parsed->programs + (sample / 2) * 16 + ((sample & 1) ? 14 : 12), (body_address + total) >> 3);
     }
-    parsed.body_address = body_address;
-    parsed.body_size = total;
-    parsed.valid = 2;
-    xport_audio_lock();
+    parsed->body_address = body_address;
+    parsed->body_size = total;
+    parsed->valid = 2;
     if (!libsnd.initialized || !libsnd.vab_transfer_complete)
     {
         xport_audio_unlock();
@@ -2349,10 +2443,13 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
         }
         bank = requested_bank;
     }
-    libsnd.banks[bank] = parsed;
+    libsnd.banks[bank] = *parsed;
     libsnd.vab_transfer_complete = 0;
     xport_audio_unlock();
     return bank;
+failed:
+    xport_audio_unlock();
+    return -1;
 }
 
 sint16 spu_vab_trans_body_native(const uint8 *body, uint32 body_bytes, sint16 bank)
@@ -2592,6 +2689,36 @@ sint32 spu_vab_select_native(uint16 bank, sint16 program)
     return 0;
 }
 
+uint32 spu_vab_set_program_volume(sint16 bank, sint16 program, uint8 value)
+{
+    uint32 result;
+    xport_audio_lock();
+    if (spu_vab_select_native((uint16)bank, program) != 0)
+    {
+        xport_audio_unlock();
+        return (uint32)-1;
+    }
+    libsnd.banks[bank].programs[program].volume = value;
+    result = libsnd.banks[bank].programs[program].volume;
+    xport_audio_unlock();
+    return result;
+}
+
+uint32 spu_vab_set_program_pan(sint16 bank, sint16 program, uint8 value)
+{
+    uint32 result;
+    xport_audio_lock();
+    if (spu_vab_select_native((uint16)bank, program) != 0)
+    {
+        xport_audio_unlock();
+        return (uint32)-1;
+    }
+    libsnd.banks[bank].programs[program].pan = value;
+    result = libsnd.banks[bank].programs[program].pan;
+    xport_audio_unlock();
+    return result;
+}
+
 sint16 SsUtGetProgAtr(sint16 bank, sint16 program, ProgAtr *attributes)
 {
     uint8 *destination = (uint8 *)attributes;
@@ -2781,12 +2908,11 @@ uint32 spu_sequence_scheduler_data_entry(SpuSequenceSchedulerTrack *record, sint
     if (record->loop_count_pending == 1 && record->loop_count_set == 0)
     {
         record->loop_remaining = (uint8)(value);
-        record->loop_count_pending = (uint8)(0);
         record->loop_count_set = (uint8)(1);
     }
     else if (record->rpn_phase == 2)
     {
-        if (record->rpn_selector == 0 && program.tones != 0)
+        if (record->rpn_selector == 0 && record->rpn_parameter <= 2 && program.tones != 0)
         {
             index = 0;
             do
@@ -2864,13 +2990,28 @@ uint32 spu_sequence_scheduler_data_entry(SpuSequenceSchedulerTrack *record, sint
     return result;
 }
 
-uint32 spu_vab_nrpn_attr_by_value(uint8 attribute, sint16 bank, sint16 program, sint16 tone, VagAtr attributes, uint8 value)
+uint32 spu_vab_nrpn_attr_by_value(sint16 attribute, sint16 bank, sint16 program, sint16 tone, VagAtr attributes, uint8 value)
 {
     uint16 fields[9];
     uint32 result;
-    if (attribute > 14)
-        return (uint32)-1;
     spu_vab_get_vag_atr_native(bank, program, tone, &attributes);
+    if ((uint16)attribute > 14)
+    {
+        switch (attribute)
+        {
+            case 15:
+                return spu_sequence_vm_reverb_type(value);
+            case 16:
+                return spu_sequence_vm_reverb_depth(value, value);
+            case 17:
+                return spu_sequence_vm_reverb_feedback(value);
+            case 18:
+            case 19:
+                return spu_sequence_vm_reverb_delay(value);
+            default:
+                return 0;
+        }
+    }
     switch (attribute)
     {
         case 0:
@@ -2943,7 +3084,7 @@ uint32 spu_vab_nrpn_attr_by_value(uint8 attribute, sint16 bank, sint16 program, 
             return (uint32)SpuSetReverb(0);
         if (value == 4)
             return (uint32)SpuSetReverb(1);
-        return 4;
+        return value < 4 ? value + 1 : 4;
     }
     return result;
 }
@@ -3198,8 +3339,15 @@ static sint16 start_voice(sint16 voice, sint16 bank, sint16 program, sint16 tone
     return voice;
 }
 
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+static sint16 spu_sequence_vm_key_on_tone(uint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right, sint32 allocate);
+#endif
+
 sint16 SsUtKeyOn(sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right)
 {
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+    return spu_sequence_vm_key_on_tone(0, bank, program, tone, note, fine, left, right, 1);
+#else
     const VAB_TONE *requested_tone;
     sint16 voice;
     sint16 selected = -1;
@@ -3244,6 +3392,7 @@ sint16 SsUtKeyOn(sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 f
     }
     xport_audio_unlock();
     return selected;
+#endif
 }
 
 void xport_libsnd_bind_sequence_table(uint32 table_address)
@@ -3717,11 +3866,15 @@ uint32 SsVoKeyOn(uint32 bank_program, uint32 note_fine, uint16 left, uint16 righ
 
 sint16 SsUtKeyOnV(sint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right)
 {
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+    return spu_sequence_vm_key_on_tone((uint16)voice, bank, program, tone, note, fine, left, right, 0);
+#else
     sint16 result;
     xport_audio_lock();
     result = start_voice(voice, bank, program, tone, note, fine, left, right);
     xport_audio_unlock();
     return result;
+#endif
 }
 
 static void spu_init_native_transfer(void)
@@ -4804,6 +4957,11 @@ void SsUtSetReverbDepth(sint16 left, sint16 right)
     SpuSetReverbDepth(&attribute);
 }
 
+void SsSetRVol(sint16 left, sint16 right)
+{
+    SsUtSetReverbDepth(left, right);
+}
+
 void SpuSetReverbDepth(SpuReverbAttr *attr)
 {
     if (!attr)
@@ -5227,7 +5385,24 @@ void SpuGetCommonAttr(SpuCommonAttr *attr)
     attr->mvolx = attr->mvol;
     attr->cd.volume.left = spu.cd_left;
     attr->cd.volume.right = spu.cd_right;
+    attr->ext.volume.left = spu.ext_left;
+    attr->ext.volume.right = spu.ext_right;
     xport_audio_unlock();
+}
+
+void SsGetSerialVol(uint8 serial, uint16 *volume)
+{
+    SpuCommonAttr attribute = {0};
+    SpuVolume selected;
+    SpuGetCommonAttr(&attribute);
+    if (serial == 0)
+        selected = attribute.cd.volume;
+    else if (serial == 1)
+        selected = attribute.ext.volume;
+    else
+        return;
+    volume[0] = (uint16)(selected.left / 258);
+    volume[1] = (uint16)(selected.right / 258);
 }
 
 void SpuSetVoiceVolume(sint32 voice, sint16 left, sint16 right)
@@ -9098,6 +9273,21 @@ uint32 spu_sequence_scheduler_pan(SpuSequenceScheduler *scheduler, sint16 sequen
     return result;
 }
 
+uint32 spu_sequence_scheduler_expression(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceVoiceVolumeSet set_voice_volume, SpuSequenceHandler read_delta)
+{
+    SpuSequenceSchedulerTrack *record;
+    uint32 channel, result;
+    sint16 packed;
+    record = scheduler->tracks[(uint32)(sint32)sequence] + (uint32)(sint32)separation;
+    channel = record->channel;
+    spu_vab_set_program_volume((sint16)record->bank, record->channel_program[channel], value);
+    packed = (sint16)((uint32)(sint32)sequence | ((uint32)(sint32)separation << 8));
+    set_voice_volume(packed, (sint16)record->bank, record->channel_program[channel], record->channel_volume[channel], record->channel_pan[channel]);
+    result = read_delta(sequence, separation);
+    record->delta = result;
+    return result;
+}
+
 uint32 spu_sequence_scheduler_reset_controllers(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceReverbEnable set_reverb, SpuSequenceHandler read_delta)
 {
     SpuSequenceSchedulerTrack *record;
@@ -9128,7 +9318,6 @@ uint32 spu_sequence_scheduler_nrpn_lsb(SpuSequenceScheduler *scheduler, sint16 s
     if (record->loop_count_pending == 1 && record->loop_count_set == 0)
     {
         record->loop_remaining = (uint8)(value);
-        record->loop_count_pending = (uint8)(0);
         record->loop_count_set = (uint8)(1);
         mode = record->nrpn_selector;
     }
@@ -9139,7 +9328,6 @@ uint32 spu_sequence_scheduler_nrpn_lsb(SpuSequenceScheduler *scheduler, sint16 s
         {
             count = record->nrpn_phase;
             record->nrpn_parameter = (uint8)(value);
-            record->loop_count_pending = (uint8)(0);
             record->nrpn_phase = (uint8)(count + 1);
             mode = record->nrpn_selector;
         }
@@ -9285,8 +9473,15 @@ uint32 spu_sequence_scheduler_control_change(SpuSequenceScheduler *scheduler, si
         case 10:
             return handlers->pan(sequence, separation, (uint8)value);
         case 11:
-        case 64:
             return handlers->expression(sequence, separation, (uint8)value);
+        case 64:
+            if (handlers->damper != NULL)
+                return handlers->damper(sequence, separation, (uint8)value);
+            return handlers->expression(sequence, separation, (uint8)value);
+        case 65:
+            if (handlers->portamento != NULL)
+                return handlers->portamento(sequence, separation, (uint8)value);
+            break;
         case 91:
             return handlers->reverb_depth(sequence, separation, (uint8)value);
         case 98:
@@ -9401,7 +9596,7 @@ uint32 spu_sequence_scheduler_meta_event(SpuSequenceScheduler *scheduler, sint16
     return result;
 }
 
-uint32 spu_sequence_scheduler_read_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceHandler end_of_track)
+static uint32 spu_sequence_read_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceHandler end_of_track, SpuSequenceValueHandler meta_dispatch)
 {
     SpuSequenceSchedulerTrack *record;
     uint32 cursor, event, status, velocity, delta;
@@ -9524,12 +9719,26 @@ uint32 spu_sequence_scheduler_read_event(SpuSequenceScheduler *scheduler, sint16
         case 0xE0:
             return handlers->pitch_bend(sequence, separation);
         case 0xFF:
+            if (meta_dispatch != NULL)
+                return meta_dispatch(sequence, separation, (uint8)event);
             if (event == 0x2F)
                 return end_of_track(sequence, separation);
             return handlers->meta_event(sequence, separation);
         default:
             return status < 0xC1 ? 0xB0 : 0xFF;
     }
+}
+
+uint32 spu_sequence_scheduler_read_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceHandler end_of_track)
+{
+    return spu_sequence_read_event(scheduler, sequence, separation, handlers, read_delta, end_of_track, NULL);
+}
+
+uint32 spu_sequence_scheduler_dispatch_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceValueHandler meta_dispatch)
+{
+    if (meta_dispatch == NULL)
+        abort();
+    return spu_sequence_read_event(scheduler, sequence, separation, handlers, read_delta, NULL, meta_dispatch);
 }
 
 uint32 spu_sequence_scheduler_end_of_track(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandler next_separation, SpuSequencePackedHandler key_off)
@@ -9945,6 +10154,22 @@ void spu_sequence_scheduler_pump(SpuSequenceScheduler *scheduler, const SpuSeque
     scheduler->processing = 0;
 }
 
+static SpuSequencePumpOps sequence_pump_ops;
+
+void spu_sequence_bind_pump(const SpuSequencePumpOps *ops)
+{
+    if (ops == NULL || ops->flush == NULL || ops->play == NULL || ops->crescendo == NULL || ops->decrescendo == NULL || ops->tempo == NULL || ops->pause == NULL || ops->resume == NULL || ops->stop == NULL)
+        abort();
+    sequence_pump_ops = *ops;
+}
+
+void SsSeqCalledTbyT(void)
+{
+    if (sequence_pump_ops.flush == NULL)
+        abort();
+    spu_sequence_scheduler_pump(&spu_sequence_scheduler, &sequence_pump_ops);
+}
+
 static SpuSequenceCallbacks sequence_callbacks;
 
 static SpuSequenceClock sequence_clock = {60, 1, 0, 0, 0, 0, 127, 0};
@@ -10198,6 +10423,8 @@ uint32 spu_sequence_scheduler_open(SpuSequenceScheduler *scheduler, const uint8 
     handlers->reverb_depth = default_handlers->reverb_depth;
     handlers->reset_controllers = default_handlers->reset_controllers;
     handlers->data_entry = default_handlers->data_entry;
+    handlers->damper = default_handlers->damper;
+    handlers->portamento = default_handlers->portamento;
     commands[0].parameter = default_commands[0].parameter;
     commands[1].parameter = default_commands[1].parameter;
     commands[2].parameter = default_commands[2].parameter;
@@ -10399,17 +10626,38 @@ SpuSequenceScheduler spu_sequence_scheduler;
 SpuToneCommand spu_tone_commands[20];
 SpuSequenceHandlers spu_sequence_handlers;
 
+static uint32 spu_sequence_set_volume(sint16 sequence, sint16 left, sint16 right, sint16 mode)
+{
+    return spu_sequence_vm_set_sequence_volume(&spu_sequence_scheduler, sequence, left, right, mode);
+}
+
+sint16 SsIsEos(sint16 sequence, sint16 separation)
+{
+    return spu_sequence_scheduler.tracks[sequence][separation].playback_latch;
+}
+
+void SsSeqSetVol(sint16 sequence, sint16 left, sint16 right)
+{
+    spu_sequence_vm_set_sequence_volume(&spu_sequence_scheduler, sequence, left, right, 1);
+}
+
+uint32 SsSeqPlay(sint16 sequence, uint8 mode, sint16 repetitions)
+{
+    return spu_sequence_scheduler_play_mode(&spu_sequence_scheduler, sequence, 0, mode, repetitions, spu_sequence_set_volume);
+}
+
+void SsSeqStop(sint16 sequence)
+{
+    spu_sequence_scheduler_stop(&spu_sequence_scheduler, sequence, 0, spu_sequence_vm_sequence_key_off);
+}
+
 uint32 spu_sequence_vm_set_sequence_volume(SpuSequenceScheduler *scheduler, sint16 handle, sint16 left, sint16 right, sint16 mode)
 {
     SpuSequenceSchedulerTrack *entry = scheduler->tracks[((uint32)handle & 255)];
     sint32 voice = 0;
     spu_vm_state()->note.sequence = (uint16)(handle);
     entry += (((uint32)handle & 0xFF00) >> 8);
-    if (left == 0)
-        left = 1;
     entry->left_volume = (uint16)(left);
-    if (right == 0)
-        right = 1;
     {
         uint32 valid_left = entry->left_volume < 128;
         entry->right_volume = (uint16)(right);
@@ -10511,16 +10759,20 @@ uint32 spu_sequence_vm_sequence_key_off(sint16 sequence)
 
 uint32 spu_sequence_vm_set_volume(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 volume, uint16 pan)
 {
-    SpuSequenceSchedulerTrack *entry = scheduler->tracks[((uint32)sequence & 255)] + (((uint32)sequence & 0xFF00) >> 8);
+    SpuSequenceSchedulerTrack *entry;
+    uint32 packed = (uint16)sequence;
     uint32 updated = 0;
     sint32 voice = 0;
-    if (spu_vab_select_native((uint16)bank, program) != 0)
-        return (uint32)-1;
+    if ((packed & 255) >= 32 || scheduler->tracks[packed & 255] == NULL || (packed >> 8) >= scheduler->separation_count)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "PsyQ native SEQ: Invalid volume sequence track\n");
+#endif
+        abort();
+    }
+    entry = scheduler->tracks[packed & 255] + (packed >> 8);
+    spu_vab_select_native((uint16)bank, program);
     spu_vm_state()->note.sequence = (uint16)(sequence);
-    if (pan == 0)
-        pan = 1;
-    if (volume == 0)
-        volume = 1;
     if (spu_vm_state()->events.voice_count != 0)
     {
         do
@@ -10760,6 +11012,11 @@ uint16 spu_sequence_vm_note_pitch(void)
     uint32 index, pitch;
     octave = semitone / 12;
     remainder = (sint16)(semitone - octave * 12);
+    if (remainder < 0)
+    {
+        remainder += 12;
+        --octave;
+    }
     if (fine >= 16)
         fine = 15;
     index = (uint32)(remainder * 16) + fine;
@@ -10835,6 +11092,11 @@ uint16 spu_sequence_vm_tone_pitch(uint16 note, uint16 fraction)
     semitone = (sint16)(carry + note + 60 - *(data + 4));
     octave = semitone / 12;
     remainder = (sint16)(semitone - octave * 12);
+    if (remainder < 0)
+    {
+        remainder += 12;
+        --octave;
+    }
     index = (uint32)(remainder * 16 + (sint16)fine);
     if (index >= 192)
     {
@@ -10852,6 +11114,77 @@ uint16 spu_sequence_vm_tone_pitch(uint16 note, uint16 fraction)
     else if (shift < 0)
         pitch >>= (uint32)(0u - (uint32)shift) & 31;
     return (uint16)pitch;
+}
+
+void spu_sequence_vm_voice_bend_offset(uint8 voice, sint16 bend)
+{
+    SpuVoiceState *record;
+    const uint8 *tone;
+    sint32 scaled, quotient, coarse, fraction;
+    uint32 tone_index;
+    uint16 pitch;
+    if (voice >= SPU_VOICE_COUNT)
+        return;
+    record = spu_vm_state()->voices + voice;
+    spu_vm_state()->note.program_tone_index = (uint8)record->program_tone_index;
+    spu_vm_state()->note.voice = voice;
+    spu_vm_state()->note.tone = (uint8)record->tone;
+    tone_index = spu_vm_state()->note.tone + 16 * spu_vm_state()->note.program_tone_index;
+    tone = spu_vab_native_current().tones + tone_index * 32;
+    scaled = bend * tone[bend < 0 ? 12 : 13];
+    quotient = scaled / 127;
+    coarse = record->note + quotient;
+    if (bend < 0)
+    {
+        --coarse;
+        fraction = quotient + 127;
+    }
+    else
+        fraction = scaled - quotient * 127;
+    pitch = spu_sequence_vm_tone_pitch((uint16)coarse, (uint16)fraction);
+    spu_vm_state()->registers[(uint32)voice * 8 + 2] = pitch;
+    spu_vm_state()->dirty[voice] |= 4;
+}
+
+static SpuVoiceState *spu_sequence_vm_matching_voice(uint16 voice, sint16 bank, sint16 program, sint16 note)
+{
+    SpuVoiceState *record;
+    if (voice >= SPU_VOICE_COUNT)
+        return NULL;
+    record = spu_vm_state()->voices + voice;
+    if ((sint16)record->bank != bank)
+        return NULL;
+    if ((sint16)record->program != program)
+        return NULL;
+    if ((sint16)record->note != note)
+        return NULL;
+    return record;
+}
+
+sint32 spu_sequence_vm_voice_set_pitch(uint16 voice, sint16 bank, sint16 program, sint16 note, uint16 new_note, uint16 fine)
+{
+    SpuVoiceState *record = spu_sequence_vm_matching_voice(voice, bank, program, note);
+    uint16 pitch;
+    if (record == NULL)
+        return -1;
+    spu_vab_select_native((uint16)bank, program);
+    spu_vm_state()->note.sequence = 33;
+    spu_vm_state()->note.voice = voice;
+    spu_vm_state()->note.tone = (uint8)record->tone;
+    pitch = spu_sequence_vm_tone_pitch(new_note, fine);
+    spu_vm_state()->registers[(uint32)voice * 8 + 2] = pitch;
+    spu_vm_state()->dirty[voice] |= 4;
+    return 0;
+}
+
+sint32 spu_sequence_vm_voice_set_adsr(uint16 voice, sint16 bank, sint16 program, sint16 note, uint16 adsr1, uint16 adsr2)
+{
+    if (spu_sequence_vm_matching_voice(voice, bank, program, note) == NULL)
+        return -1;
+    spu_vm_state()->registers[(uint32)voice * 8 + 4] = adsr1;
+    spu_vm_state()->registers[(uint32)voice * 8 + 5] = adsr2;
+    spu_vm_state()->dirty[voice] |= 0x30;
+    return 0;
 }
 
 uint32 spu_sequence_vm_voice_bend(sint16 voice, sint16 sequence, sint16 bank, sint16 program, uint16 bend)
@@ -10898,8 +11231,7 @@ uint32 spu_sequence_vm_voice_bend(sint16 voice, sint16 sequence, sint16 bank, si
 uint32 spu_sequence_vm_sequence_bend(sint16 sequence, sint16 bank, sint16 program, uint16 bend)
 {
     uint32 voice = 0, result = 0;
-    if (spu_vab_select_native((uint16)bank, program) != 0)
-        return (uint32)-1;
+    spu_vab_select_native((uint16)bank, program);
     spu_vm_state()->note.sequence = (uint16)((uint16)sequence);
     if (spu_vm_state()->events.voice_count != 0)
     {
@@ -10942,6 +11274,155 @@ uint32 spu_sequence_vm_key_off(sint16 sequence, sint16 bank, sint16 program, uin
 }
 
 SpuReverbAttr spu_reverb_attributes;
+
+static void spu_vm_modulation_start(uint16 *fields, sint16 from, sint16 to, sint16 ticks)
+{
+    sint32 difference, distance, quotient;
+    if (from == to)
+        return;
+    fields[0] = 1;
+    fields[4] = (uint16)from;
+    fields[5] = (uint16)to;
+    difference = (sint32)from - to;
+    distance = difference < 0 ? -difference : difference;
+    if (distance < ticks)
+    {
+        quotient = ticks / difference;
+        fields[1] = 1;
+        fields[2] = (uint16)quotient;
+        fields[3] = (uint16)quotient;
+    }
+    else
+    {
+        if (ticks == 0)
+        {
+            trap(7);
+            abort();
+        }
+        quotient = difference / ticks;
+        fields[2] = 0;
+        fields[1] = (uint16)quotient;
+    }
+}
+
+static sint32 spu_vm_modulation_step(uint16 *fields)
+{
+    uint16 previous, current;
+    sint16 step, target;
+    if ((sint16)fields[2] != 0)
+    {
+        previous = fields[3];
+        fields[3] = (uint16)(previous - 1);
+        if ((sint16)previous > 0)
+            return 0;
+        fields[3] = fields[2];
+    }
+    current = (uint16)(fields[4] + fields[1]);
+    step = (sint16)fields[1];
+    fields[4] = current;
+    if (step > 0)
+    {
+        target = (sint16)fields[5];
+        if ((sint16)current >= target)
+        {
+            fields[4] = (uint16)target;
+            fields[0] = 0;
+        }
+    }
+    else if (step < 0)
+    {
+        target = (sint16)fields[5];
+        if ((sint16)current <= target)
+        {
+            fields[4] = (uint16)target;
+            fields[0] = 0;
+        }
+    }
+    return 1;
+}
+
+static uint32 spu_vm_modulation_pan(uint32 volume, uint32 factor)
+{
+    uint32 product = (uint16)volume * factor;
+    if ((sint32)product < 0)
+        product += 63;
+    return product >> 6;
+}
+
+static void spu_vm_modulation_volume(uint32 voice, sint32 velocity)
+{
+    uint32 master, product, left, right, pan, value;
+    sint32 scaled;
+    const uint8 *header = spu_vab_native_current().header;
+    master = header[24];
+    product = (uint32)velocity * (master * 16383);
+    scaled = (sint32)product / 16129;
+    product = (uint32)scaled * spu_vm_state()->note.program_volume;
+    product *= spu_vm_state()->note.tone_volume;
+    value = product / 16129;
+    pan = spu_vm_state()->note.tone_pan;
+    if (pan < 64)
+    {
+        left = value;
+        right = (value * pan) >> 6;
+    }
+    else
+    {
+        right = value;
+        left = (value * (127 - pan)) >> 6;
+    }
+    pan = spu_vm_state()->note.program_pan;
+    if (pan < 64)
+        right = spu_vm_modulation_pan(right, pan);
+    else
+        left = spu_vm_modulation_pan(left, 127 - pan);
+    pan = spu_vm_state()->note.pan;
+    if (pan < 64)
+        right = spu_vm_modulation_pan(right, pan);
+    else
+        left = spu_vm_modulation_pan(left, 127 - pan);
+    if ((sint16)spu_vm_state()->mono_mode == 1)
+    {
+        if ((uint16)left < (uint16)right)
+            left = right;
+        else
+            right = left;
+    }
+    spu_vm_state()->registers[voice * 8 + 1] = (uint16)right;
+    value = spu_vm_state()->dirty[voice];
+    spu_vm_state()->registers[voice * 8] = (uint16)left;
+    spu_vm_state()->dirty[voice] = (uint8)(value | 3);
+}
+
+void spu_sequence_vm_volume_modulation_start(sint16 voice, sint16 from, sint16 to, sint16 ticks)
+{
+    spu_vm_modulation_start(spu_vm_state()->voices[voice].volume_modulation, from, to, ticks);
+}
+
+void spu_sequence_vm_pan_modulation_start(sint16 voice, sint16 from, sint16 to, sint16 ticks)
+{
+    spu_vm_modulation_start(spu_vm_state()->voices[voice].pitch_modulation, from, to, ticks);
+}
+
+void spu_sequence_vm_volume_modulation_tick(uint32 voice)
+{
+    uint16 *fields = spu_vm_state()->voices[voice].volume_modulation;
+    sint16 velocity;
+    if (!spu_vm_modulation_step(fields))
+        return;
+    velocity = (sint16)fields[4];
+    spu_vm_state()->note.velocity = (uint8)velocity;
+    spu_vm_modulation_volume(voice, velocity);
+}
+
+void spu_sequence_vm_pan_modulation_tick(uint32 voice)
+{
+    uint16 *fields = spu_vm_state()->voices[voice].pitch_modulation;
+    if (!spu_vm_modulation_step(fields))
+        return;
+    spu_vm_state()->note.pan = (uint8)fields[4];
+    spu_vm_modulation_volume(voice, spu_vm_state()->note.velocity);
+}
 
 uint32 spu_sequence_vm_flush(void)
 {
@@ -11138,7 +11619,7 @@ uint32 spu_sequence_vm_initialize(uint8 voices)
 uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 note, uint16 velocity, uint16 pan)
 {
     uint32 packed = (uint16)sequence;
-    SpuSequenceSchedulerTrack *record = scheduler->tracks[(packed & 255)] + (packed >> 8);
+    SpuSequenceSchedulerTrack *record;
     uint8 workspace[256];
     uint8 *samples = workspace;
     uint8 *tones = workspace + 128;
@@ -11156,6 +11637,7 @@ uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, 
         spu_vm_state()->note.velocity = (uint8)(velocity);
     else
     {
+        record = scheduler->tracks[(packed & 255)] + (packed >> 8);
         value = record->channel;
         scaled = (sint32)velocity * (sint16)record->channel_volume[value];
         spu_vm_state()->note.velocity = (uint8)(scaled / 127);
@@ -11240,16 +11722,179 @@ uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, 
     return result;
 }
 
+static uint32 spu_sequence_vm_noise_key_events(uint8 voice, uint32 low, uint32 high, sint32 reset_age)
+{
+    uint32 value, index, upper, pending;
+    value = spu_vm_state()->events.voice_count;
+    spu_vm_state()->voices[(uint32)voice].pitch = (uint16)(10);
+    if (value != 0)
+    {
+        index = 0;
+        do
+        {
+            spu_vm_state()->voices[(sint16)index].status = (uint8)(spu_vm_state()->voices[(sint16)index].status & 1);
+            ++index;
+        } while ((sint16)index < spu_vm_state()->events.voice_count);
+    }
+    spu_vm_state()->voices[(uint32)voice].status = (uint8)(2);
+    value = spu_vm_state()->events.key_on[0];
+    upper = spu_vm_state()->events.key_on[1];
+    if (reset_age)
+        spu_vm_state()->voices[(uint32)voice].age = 0;
+    pending = spu_vm_state()->events.key_off[0];
+    value |= low;
+    upper |= high;
+    spu_vm_state()->events.key_on[0] = (uint16)(value);
+    pending &= ~value;
+    spu_vm_state()->events.key_on[1] = (uint16)(upper);
+    spu_vm_state()->events.key_off[0] = (uint16)(pending);
+    pending = spu_vm_state()->events.key_off[1];
+    return pending & ~upper;
+}
+
+void spu_sequence_vm_noise_key_on_direct(uint8 voice, sint16 left, sint16 right)
+{
+    uint32 low, high, pending;
+    spu_vm_voice(voice);
+    SsUtSetDetVVol(voice, left, right);
+    low = voice < 16 ? 1u << (voice & 31) : 0;
+    high = voice < 16 ? 0 : 1u << ((voice - 16) & 31);
+    pending = spu_sequence_vm_noise_key_events(voice, low, high, 1);
+    spu_vm_state()->events.key_off[1] = (uint16)pending;
+    w_u16(SPU_REGISTER_BASE + 404, low);
+    w_u16(SPU_REGISTER_BASE + 406, high);
+}
+
+void spu_sequence_vm_noise_key_on_allocated(sint16 left, sint16 right)
+{
+    uint32 voice;
+    spu_vm_state()->note.priority = 127;
+    voice = spu_sequence_vm_allocate() & 255;
+    spu_vm_state()->note.voice = (uint16)voice;
+    if (voice < spu_vm_state()->events.voice_count)
+        spu_sequence_vm_noise_key_on_direct((uint8)spu_vm_state()->note.voice, left, right);
+}
+
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+static sint16 spu_sequence_vm_key_on_tone(uint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note, sint16 fine, sint16 left, sint16 right, sint32 allocate)
+{
+    SpuVabNativeView view;
+    SpuVoiceState *record;
+    const uint8 *data;
+    uint32 tone_index, selected;
+    uint16 pitch;
+    sint16 result = -1;
+    xport_audio_lock();
+    if (spu_vm_state()->immediate_key_on_busy == 1)
+    {
+        xport_audio_unlock();
+        return -1;
+    }
+    spu_vm_state()->immediate_key_on_busy = 1;
+    if ((!allocate && voice >= SPU_VOICE_COUNT) || spu_vab_select_native((uint16)bank, program) != 0)
+        goto finished;
+    spu_vm_state()->note.sequence = 33;
+    spu_vm_state()->note.note = (uint8)note;
+    spu_vm_state()->note.note_fraction = (uint8)fine;
+    spu_vm_state()->note.tone = (uint8)tone;
+    if (left == right)
+    {
+        spu_vm_state()->note.pan = 64;
+        spu_vm_state()->note.velocity = (uint8)left;
+    }
+    else if (right < left)
+    {
+        if (left == 0)
+        {
+            trap(7);
+            abort();
+        }
+        spu_vm_state()->note.velocity = (uint8)left;
+        spu_vm_state()->note.pan = (uint8)(((sint32)right * 64) / left);
+    }
+    else
+    {
+        if (right == 0)
+        {
+            trap(7);
+            abort();
+        }
+        spu_vm_state()->note.velocity = (uint8)right;
+        spu_vm_state()->note.pan = (uint8)(127 - ((sint32)left * 64) / right);
+    }
+    view = spu_vab_native_current();
+    data = view.programs + (uint32)(sint32)program * 16;
+    spu_vm_state()->note.program_volume = data[1];
+    spu_vm_state()->note.program_pan = data[4];
+    spu_vm_state()->note.tone_count = data[0];
+    tone_index = 16 * spu_vm_state()->note.program_tone_index + spu_vm_state()->note.tone;
+    if (tone_index >= view.tone_bytes / 32)
+    {
+    #ifndef NDEBUG
+        fprintf(stderr, "PsyQ native VAB: Immediate tone outside bank\n");
+    #endif
+        abort();
+    }
+    data = view.tones + tone_index * 32;
+    spu_vm_state()->note.priority = data[0];
+    spu_vm_state()->note.sample = xport_load_le16(data + 22);
+    spu_vm_state()->note.tone_volume = data[2];
+    spu_vm_state()->note.tone_pan = data[3];
+    spu_vm_state()->note.center_note = data[4];
+    spu_vm_state()->note.fine_tune = data[5];
+    spu_vm_state()->note.tone_mode = data[1];
+    spu_vm_state()->note.min_key = data[6];
+    spu_vm_state()->note.max_key = data[7];
+    if ((sint16)spu_vm_state()->note.sample == 0)
+        goto finished;
+    selected = allocate ? spu_sequence_vm_allocate() & 255 : voice;
+    if (allocate && selected == spu_vm_state()->events.voice_count)
+        goto finished;
+    spu_vm_state()->note.voice = (uint16)selected;
+    record = spu_vm_voice(selected);
+    record->sequence = 33;
+    record->bank = (uint16)bank;
+    record->program = (uint16)program;
+    record->program_tone_index = spu_vm_state()->note.program_tone_index;
+    record->sample = spu_vm_state()->note.sample;
+    record->note = (uint16)note;
+    record->status = 1;
+    record->age = 0;
+    record->tone = spu_vm_state()->note.tone;
+    spu_sequence_vm_prepare_voice();
+    if ((sint16)spu_vm_state()->note.sample == 255)
+        spu_sequence_vm_noise_on(&spu_sequence_scheduler, (uint8)selected);
+    else
+    {
+        pitch = spu_sequence_vm_tone_pitch((uint16)note, (uint16)fine);
+        spu_sequence_vm_key_on_now(&spu_sequence_scheduler, 1, (sint16)pitch);
+    }
+    result = (sint16)selected;
+finished:
+    spu_vm_state()->immediate_key_on_busy = 0;
+    xport_audio_unlock();
+    return result;
+}
+#endif
+
 uint32 spu_sequence_vm_noise_on(SpuSequenceScheduler *scheduler, uint8 voice)
 {
     uint32 packed = spu_vm_state()->note.sequence;
-    SpuSequenceSchedulerTrack *record = scheduler->tracks[(packed & 255)] + (packed >> 8);
+    SpuSequenceSchedulerTrack *record;
+    if (voice >= SPU_VOICE_COUNT || (packed & 255) >= 32 || scheduler->tracks[packed & 255] == NULL || (packed >> 8) >= scheduler->separation_count)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "PsyQ native SEQ: Invalid noise voice or sequence track\n");
+#endif
+        abort();
+    }
+    record = scheduler->tracks[packed & 255] + (packed >> 8);
     uint32 track_left = record->left_volume;
     uint32 program_volume = spu_vm_state()->note.program_volume;
     uint32 left = track_left * 129 * program_volume;
     uint32 right = record->right_volume * 129 * program_volume;
     uint32 tone_volume = spu_vm_state()->note.tone_volume;
-    uint32 control, pan, registers, index, low, high, value, upper, pending;
+    uint32 control, pan, registers, low, high, value, upper, pending;
     left = (left / 127) * tone_volume;
     right = (right / 127) * tone_volume;
     control = r_u16(SPU_REGISTER_BASE + 426);
@@ -11287,30 +11932,9 @@ uint32 spu_sequence_vm_noise_on(SpuSequenceScheduler *scheduler, uint8 voice)
     spu_vm_state()->dirty[voice] = (uint8)(value | 3);
     low = voice < 16 ? 1u << (voice & 31) : 0;
     high = voice < 16 ? 0 : 1u << ((voice - 16) & 31);
-    value = spu_vm_state()->events.voice_count;
-    spu_vm_state()->voices[(uint32)voice].pitch = (uint16)(10);
-    if (value != 0)
-    {
-        index = 0;
-        do
-        {
-            spu_vm_state()->voices[(sint16)index].status = (uint8)(spu_vm_state()->voices[(sint16)index].status & 1);
-            ++index;
-        } while ((sint16)index < spu_vm_state()->events.voice_count);
-    }
-    spu_vm_state()->voices[(uint32)voice].status = (uint8)(2);
-    value = spu_vm_state()->events.key_on[0];
-    upper = spu_vm_state()->events.key_on[1];
-    pending = spu_vm_state()->events.key_off[0];
-    value |= low;
-    upper |= high;
-    spu_vm_state()->events.key_on[0] = (uint16)(value);
-    pending &= ~value;
-    spu_vm_state()->events.key_on[1] = (uint16)(upper);
-    spu_vm_state()->events.key_off[0] = (uint16)(pending);
-    pending = spu_vm_state()->events.key_off[1];
+    pending = spu_sequence_vm_noise_key_events(voice, low, high, 0);
     value = spu_vm_state()->note.tone_mode & 4;
-    spu_vm_state()->events.key_off[1] = (uint16)(pending & ~upper);
+    spu_vm_state()->events.key_off[1] = (uint16)pending;
     if (value != 0)
     {
         value = spu_vm_state()->events.reverb[0];
@@ -11343,11 +11967,11 @@ uint32 spu_sequence_vm_key_on_now(SpuSequenceScheduler *scheduler, uint32 layers
     index = (uint16)((uint32)signed_voice * 8);
     gain /= 16129;
     packed = spu_vm_state()->note.sequence;
-    record = scheduler->tracks[(packed & 255)] + (packed >> 8);
     left = gain;
     right = gain;
     if ((sint16)packed != 33)
     {
+        record = scheduler->tracks[(packed & 255)] + (packed >> 8);
         left = (gain * record->left_volume) / 127;
         right = (gain * record->right_volume) / 127;
     }
@@ -11411,6 +12035,17 @@ uint32 spu_sequence_vm_key_on_now(SpuSequenceScheduler *scheduler, uint32 layers
     value = right & ~upper;
     spu_vm_state()->events.key_off[1] = (uint16)(value);
     return (uint16)value;
+}
+
+PsxInterruptCallback SpuSetTransferCallback(PsxInterruptCallback callback)
+{
+    PsxInterruptCallback previous;
+    xport_audio_lock();
+    previous = spu_native_transfer_state->completion_callback;
+    if (previous != callback)
+        spu_native_transfer_state->completion_callback = callback;
+    xport_audio_unlock();
+    return previous;
 }
 
 uint32 spu_sequence_vm_transfer_mode(uint32 mode)

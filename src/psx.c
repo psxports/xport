@@ -14,6 +14,20 @@ const MATRIX psx_identity_matrix = {{{4096, 0, 0}, {0, 4096, 0}, {0, 0, 4096}}, 
 
 const uint32 psx_identity_rotation_words[5] = {4096, 0, 4096, 0, 4096};
 
+sint32 gte_matrix_near_identity(const MATRIX *matrix)
+{
+    sint32 row, column, difference, distance = 0;
+    for (row = 0; row < 3; ++row)
+    {
+        for (column = 0; column < 3; ++column)
+        {
+            difference = matrix->m[row][column] - psx_identity_matrix.m[row][column];
+            distance += difference < 0 ? -difference : difference;
+        }
+    }
+    return distance < 20;
+}
+
 uint32 PAD_dr(void);
 
 #if defined(XPORT_MEMORY_DIAGNOSTICS)
@@ -40,7 +54,7 @@ uint32 GsSortOtPSX(uint32 source_ot, uint32 destination_ot)
     uint32 slot = destination_base + 4u * (source_offset - destination_offset);
     while (link != 0xFFFFFFu)
     {
-        tail_link = previous;
+        tail_link = current;
         link = r_u32(current);
         previous = current;
         current = link & 0xFFFFFFu;
@@ -555,6 +569,12 @@ uint32 psx_bios_card_write_guest(uint32 channel, uint32 sector, uint32 buffer)
     w_u8(0x7568u + (uint32)port, 4u);
     bios_card_pending_ports |= 1u << port;
     return 1u;
+}
+
+uint32 _card_clear(uint32 channel)
+{
+    _new_card();
+    return psx_bios_card_write_guest(channel, 0x3F, 0);
 }
 
 uint32 psx_bios_card_load_guest(uint32 channel)
@@ -2996,6 +3016,28 @@ void psx_gte_snapshot(PsxGteSnapshot *snapshot)
         *snapshot = gte;
 }
 
+void psx_gte_save_context(PsxGteContext *context)
+{
+    if (!context)
+        return;
+    context->registers = gte;
+    context->lzcs = gte_lzcs;
+    context->lzcr = gte_lzcr;
+    context->ofx_frac = native_gte_ofx_fraction;
+    context->ofy_frac = native_gte_ofy_fraction;
+}
+
+void psx_gte_restore_context(const PsxGteContext *context)
+{
+    if (!context)
+        return;
+    gte = context->registers;
+    gte_lzcs = context->lzcs;
+    gte_lzcr = context->lzcr;
+    native_gte_ofx_fraction = context->ofx_frac;
+    native_gte_ofy_fraction = context->ofy_frac;
+}
+
 static void gte_import_matrix(MATRIX *matrix, const uint32 *registers)
 {
     matrix->m[0][0] = (sint16)(uint16)registers[0];
@@ -3774,14 +3816,9 @@ MATRIX *RotMatrixYXZ(SVECTOR *rotation, MATRIX *matrix)
 }
 
 /* PsyQ RotMatrix order, carried over from de-NFS4's host runtime. */
-MATRIX *RotMatrix(SVECTOR *r, MATRIX *m)
+static MATRIX *gte_rot_matrix_components(sint32 sx, sint32 cx, sint32 sy, sint32 cy, sint32 sz, sint32 cz, MATRIX *m)
 {
-    sint32 sx, cx, sy, cy, sz, cz, nsy, czn, szn;
-    if (!r || !m)
-        return m;
-    rsincos(r->vx, &sx, &cx);
-    rsincos(r->vy, &sy, &cy);
-    rsincos(r->vz, &sz, &cz);
+    sint32 nsy, czn, szn;
     nsy = -sy;
     m->m[0][2] = (sint16)sy;
     m->m[1][2] = (sint16)((-(cy * sx)) >> 12);
@@ -3795,6 +3832,31 @@ MATRIX *RotMatrix(SVECTOR *r, MATRIX *m)
     m->m[1][1] = (sint16)((cz * cx) >> 12) + (sint16)((szn * sx) >> 12);
     m->m[2][1] = (sint16)((cz * sx) >> 12) - (sint16)((szn * cx) >> 12);
     return m;
+}
+
+MATRIX *RotMatrix(SVECTOR *r, MATRIX *m)
+{
+    sint32 sx, cx, sy, cy, sz, cz;
+    if (!r || !m)
+        return m;
+    rsincos(r->vx, &sx, &cx);
+    rsincos(r->vy, &sy, &cy);
+    rsincos(r->vz, &sz, &cz);
+    return gte_rot_matrix_components(sx, cx, sy, cy, sz, cz, m);
+}
+
+MATRIX *gte_rot_matrix_scalar(SVECTOR *rotation, MATRIX *matrix)
+{
+    sint32 sx, cx, sy, cy, sz, cz;
+    if (!rotation || !matrix)
+        return matrix;
+    cx = rcos(rotation->vx);
+    cy = rcos(rotation->vy);
+    cz = rcos(rotation->vz);
+    sx = rsin(rotation->vx);
+    sy = rsin(rotation->vy);
+    sz = rsin(rotation->vz);
+    return gte_rot_matrix_components(sx, cx, sy, cy, sz, cz, matrix);
 }
 
 static sint32 matrix_sra12(uint32 value)
@@ -4276,6 +4338,23 @@ sint32 gte_project(const SVECTOR *v, sint32 *sxy, sint32 *flag)
     return gte_project_full_depth(v, sxy, flag) >> 2;
 }
 
+sint32 RotTransPers4(const SVECTOR *a, const SVECTOR *b, const SVECTOR *c, const SVECTOR *d, sint32 *xy0, sint32 *xy1, sint32 *xy2, sint32 *xy3, sint32 *projection, sint32 *flags)
+{
+    SVECTOR input[3];
+    sint32 screen[3], depth[3], first_flags, last_flags, result;
+    input[0] = *a;
+    input[1] = *b;
+    input[2] = *c;
+    gte_project3_full_depth(input, screen, depth, &first_flags);
+    *xy0 = screen[0];
+    *xy1 = screen[1];
+    *xy2 = screen[2];
+    result = gte_project(d, xy3, &last_flags);
+    *projection = (sint32)xport_gte_read_data(8);
+    *flags = first_flags | last_flags;
+    return result;
+}
+
 static uint32 gte_normal_color_col_step(const SVECTOR *normal, uint32 color)
 {
     sint32 component[3];
@@ -4486,6 +4565,9 @@ static void psx_native_vblank_poll(void)
     {
         --fields;
         psx_vblank_signal();
+        // Keep the host responsive while servicing elapsed fields after a stall
+        if (fields && (fields & 31u) == 0u)
+            xport_poll();
     }
     if (present_field && !vblank_wait_failed)
         gpu_present();
@@ -4536,7 +4618,7 @@ sint32 VSync(sint32 mode)
             uint32 before = vblank_count;
             do
             {
-                xport_timer_wait_frame(FIELD_RATE);
+                xport_timer_wait_frame(xport_frame() + 1);
                 psx_native_vblank_poll();
             } while (vblank_count == before && !vblank_wait_failed);
         }
@@ -4591,11 +4673,7 @@ static uint8 *pad_actuators[2];
 static uint8 pad_actuator_lengths[2];
 static uint8 pad_alignment[2][6];
 static sint32 pad_active;
-#if defined(LOCKSTEP_DEBUG)
 static sint32 pad_main_mode[2];
-#else
-static sint32 pad_main_mode[2] = {1, 1};
-#endif
 static uint8 pad_main_mode_lock[2];
 static uint8 pad_current_id[2];
 static uint32 native_pad_packet_owners[2];
@@ -4749,7 +4827,7 @@ void PadInitDirect(uint8 *pad1, uint8 *pad2)
     pad_packets[1] = pad2;
     memset(pad_current_id, 0, sizeof(pad_current_id));
 #if !defined(LOCKSTEP_DEBUG)
-    pad_main_mode[0] = pad_main_mode[1] = 1;
+    pad_main_mode[0] = pad_main_mode[1] = 0;
     memset(pad_main_mode_lock, 0, sizeof(pad_main_mode_lock));
 #endif
     bios_pad_initialized = 1u;
@@ -6212,37 +6290,54 @@ void xport_missing_sn_constructors(void)
     abort();
 }
 
-sint32 ClearImage2(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
+sint32 ClearImage2(PSX_RECT *rect, uint8 r, uint8 g, uint8 b)
 {
-    (void)rectangle;
-    (void)red;
-    (void)green;
-    (void)blue;
-    abort();
+    static uint32 packet[14];
+    GpuRasterState state;
+    sint32 width_limit = GPU_VRAM_WIDTH - 1;
+    sint32 height_limit = GPU_VRAM_HEIGHT - 1;
+    uint32 color = r | ((uint32)g << 8) | ((uint32)b << 16);
+    uint32 xy, size, mode;
+    if (!rect || !gpu_register_packet_range(packet, sizeof(packet)))
+        abort();
+    rect->w = rect->w < 0 ? 0 : rect->w > width_limit ? (sint16)width_limit : rect->w;
+    rect->h = rect->h < 0 ? 0 : rect->h > height_limit ? (sint16)height_limit : rect->h;
+    xy = (uint16)rect->x | ((uint32)(uint16)rect->y << 16);
+    size = (uint16)rect->w | ((uint32)(uint16)rect->h << 16);
+    gpu_export_raster(&state);
+    mode = 0xE1000400 | ((state.draw_mode | state.draw_flags) & 0x7FF);
+    if (((rect->x | rect->w) & 63) != 0)
+    {
+        packet[0] = 0x08000000 | gpu_packet_link((uintptr_t)(packet + 10));
+        packet[1] = 0xE3000000;
+        packet[2] = 0xE4FFFFFF;
+        packet[3] = 0xE5000000;
+        packet[4] = 0xE6000000;
+        packet[5] = mode;
+        packet[6] = 0x60000000 | color;
+        packet[7] = xy;
+        packet[8] = size;
+        packet[10] = 0x03FFFFFF;
+        packet[11] = 0xE3000000 | state.area[0] | (state.area[1] << 10);
+        packet[12] = 0xE4000000 | state.area[2] | (state.area[3] << 10);
+        packet[13] = 0xE5000000 | ((uint32)state.offset[0] & 0x7FF) | (((uint32)state.offset[1] & 0x7FF) << 11);
+    }
+    else
+    {
+        packet[0] = 0x05FFFFFF;
+        packet[1] = 0xE6000000;
+        packet[2] = mode;
+        packet[3] = 0x02000000 | color;
+        packet[4] = xy;
+        packet[5] = size;
+    }
+    DrawOTag(packet);
+    return 0;
 }
 
 uint32 _bu_init(void)
 {
     return xport_bios_start_card();
-}
-
-uint32 GsInitGraph(uint32 arg0, uint32 arg1, uint32 arg2, uint32 arg3, uint32 arg4)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    abort();
-}
-
-uint32 GsDefDispBuff(uint32 arg0, uint32 arg1, uint32 arg2, uint32 arg3)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    abort();
 }
 
 uint32 PadInitMtap(uint32 arg0, uint32 arg1)
@@ -6537,6 +6632,4030 @@ uint32 xport_psyq_crt_initialize(void)
     abort();
 }
 
+static uint32 *gs_work_cursor;
+static sint32 gs_clip_distance;
+
+void GsSetWorkBase(uint32 *work)
+{
+    gs_work_cursor = work;
+}
+
+uint32 *GsGetWorkBase(void)
+{
+    return gs_work_cursor;
+}
+
+void gs_set_clip_distance(sint32 distance)
+{
+    gs_clip_distance = distance;
+}
+
+sint32 gs_get_clip_distance(void)
+{
+    return gs_clip_distance;
+}
+
+void GsLinkObject4(uint32 model, uint32 object, uint32 index)
+{
+    uint32 data = model + index * 28;
+    uint32 primitive, count, head, processed, group_count, previous, code;
+    w_u32(object + 8, data);
+    primitive = r_u32(data + 16);
+    count = r_u32(data + 20);
+    head = primitive;
+    group_count = 0;
+    previous = 0;
+    for (processed = 0; processed < count; ++processed)
+    {
+        code = r_u8(primitive + 3);
+        if (previous != 0 && code != previous)
+        {
+            w_u16(head, (uint16)group_count);
+            group_count = 0;
+            head = primitive;
+        }
+        switch (code & 0xFD)
+        {
+            case 0x20:
+                primitive += (r_u16(primitive + 2) & 4) != 0 ? 24 : 16;
+                break;
+            case 0x21:
+            case 0x29:
+                primitive += 16;
+                break;
+            case 0x24:
+            case 0x31:
+            case 0x38:
+                primitive += 24;
+                break;
+            case 0x28:
+                primitive += 20;
+                break;
+            case 0x2C:
+            case 0x2D:
+                primitive += 32;
+                break;
+            case 0x30:
+                primitive += (r_u16(primitive + 2) & 4) != 0 ? 28 : 20;
+                break;
+            case 0x25:
+            case 0x34:
+            case 0x39:
+                primitive += 28;
+                break;
+            case 0x35:
+            case 0x3C:
+                primitive += 36;
+                break;
+            case 0x3D:
+                primitive += 44;
+                break;
+            default:
+#ifndef NDEBUG
+                printf("GPU_CODE %02xH not assigned\n", code);
+#endif
+                break;
+        }
+        ++group_count;
+        previous = code;
+    }
+    w_u16(head, (uint16)group_count);
+}
+
+void GsMapModelingData(uint32 model)
+{
+    uint32 flags = r_u32(model);
+    uint32 base, object, vertex, normal, primitive;
+    sint32 count, index;
+    if ((flags & 1) != 0)
+        return;
+    w_u32(model, flags | 1);
+    count = r_s32(model + 4);
+    base = model + 8;
+    object = base;
+    for (index = 0; index < count; ++index)
+    {
+        vertex = r_u32(object);
+        primitive = r_u32(object + 16);
+        w_u32(object, base + vertex);
+        normal = r_u32(object + 8);
+        w_u32(object + 16, base + primitive);
+        w_u32(object + 8, base + normal);
+        object += 28;
+    }
+}
+
+static sint32 gs_screen_width;
+static sint32 gs_screen_height;
+static sint32 gs_light_mode;
+static GsSortAttributes gs_sort_attributes;
+static sint32 gs_subdivision_distance;
+static sint16 gs_subdivision_width = 1023;
+static sint16 gs_subdivision_height = 511;
+
+void gs_set_subdivision_controls(sint32 distance, sint16 width, sint16 height)
+{
+    gs_subdivision_distance = distance;
+    gs_subdivision_width = width;
+    gs_subdivision_height = height;
+}
+
+static uint32 *gs_tmd_work_buffer(uint32 *work, uint32 words)
+{
+    uintptr_t begin = (uintptr_t)&DRAM[0];
+    uintptr_t cursor = (uintptr_t)work;
+    if (work == NULL || words > UINT32_MAX / 4)
+        abort();
+    if (cursor >= begin && cursor - begin < PSX_DRAM_SIZE)
+        return (uint32 *)psx_addr((uint32)(cursor - begin), words * 4);
+    return work;
+}
+
+static void gs_tmd_load_vector(uint32 address, uint32 vertex)
+{
+    xport_gte_write_data(vertex * 2, r_u32(address));
+    xport_gte_write_data(vertex * 2 + 1, r_u32(address + 4));
+}
+
+static uint32 *gs_tmd_fast_f3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices0, indices1, normal, next0, next1, slot, depth, color;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        indices1 = r_u32(primitive + 12);
+        indices0 = (uint32)r_u16(primitive + 10) << 16;
+    }
+    else
+    {
+        indices0 = r_u32(primitive + 8);
+        indices1 = r_u32(primitive + 12);
+    }
+    do
+    {
+        gs_tmd_load_vector(vertices + (indices0 >> 16) * 8, 0);
+        gs_tmd_load_vector(vertices + (indices1 & 0xFFFF) * 8, 1);
+        gs_tmd_load_vector(vertices + (indices1 >> 16) * 8, 2);
+        xport_gte_execute(0x280030);
+        normal = normals + (indices0 & 0xFFFF) * 8;
+        color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+        xport_gte_write_data(lighting == 0 ? 22 : 6, color);
+        primitive += 16;
+        if (lighting == 0)
+        {
+            next1 = r_u32(primitive + 12);
+            next0 = (uint32)r_u16(primitive + 10) << 16;
+        }
+        else
+        {
+            next0 = r_u32(primitive + 8);
+            next1 = r_u32(primitive + 12);
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                if (lighting != 0)
+                    gs_tmd_load_vector(normal, 0);
+                depth = xport_gte_read_data(7);
+                if (lighting != 0)
+                    xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
+                slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                work = gs_tmd_work_buffer(work, 5);
+                xport_store_le32(work, 0x04000000);
+                AddPrim(psx_addr(slot, 4), work);
+                if (lighting == 0)
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                xport_store_le32(work + 2, xport_gte_read_data(12));
+                xport_store_le32(work + 3, xport_gte_read_data(13));
+                xport_store_le32(work + 4, xport_gte_read_data(14));
+                if (lighting != 0)
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                work += 5;
+            }
+        }
+        indices0 = next0;
+        indices1 = next1;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f3(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f3(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f3(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_g3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], index, depth, slot, color, prefetched = 0;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        for (index = 0; index < 3; ++index)
+            indices[index] = (uint32)r_u16(primitive + 10 + index * 4) << 16;
+        prefetched = 1;
+    }
+    do
+    {
+        if (!prefetched)
+            for (index = 0; index < 3; ++index)
+                indices[index] = r_u32(primitive + 8 + index * 4);
+        prefetched = 0;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + (indices[index] >> 16) * 8, index);
+        xport_gte_execute(0x280030);
+        if (lighting == 0)
+        {
+            color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+            xport_gte_write_data(20, color);
+            primitive += 20;
+            for (index = 0; index < 3; ++index)
+                indices[index] = (uint32)r_u16(primitive + 10 + index * 4) << 16;
+            prefetched = 1;
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if (lighting != 0)
+            {
+                color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+                xport_gte_write_data(6, color);
+            }
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                if (lighting != 0)
+                    for (index = 0; index < 3; ++index)
+                        gs_tmd_load_vector(normals + (indices[index] & 0xFFFF) * 8, index);
+                depth = xport_gte_read_data(7);
+                if (lighting != 0)
+                    xport_gte_execute(lighting == 1 ? 0x118043F : 0xF80416);
+                slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                work = gs_tmd_work_buffer(work, 7);
+                xport_store_le32(work, 0x06000000);
+                AddPrim(psx_addr(slot, 4), work);
+                if (lighting != 0)
+                {
+                    primitive += 20;
+                    for (index = 0; index < 3; ++index)
+                        indices[index] = r_u32(primitive + 8 + index * 4);
+                    prefetched = 1;
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                }
+                else
+                {
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20));
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                }
+                work += 7;
+            }
+        }
+        if (!prefetched)
+            primitive += 20;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g3(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g3(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g3(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_f4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices0, indices1, next0, next1, normal, fourth, color, depth, slot;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        indices1 = r_u32(primitive + 12);
+        indices0 = (uint32)r_u16(primitive + 10) << 16;
+    }
+    else
+    {
+        indices0 = r_u32(primitive + 8);
+        indices1 = r_u32(primitive + 12);
+    }
+    do
+    {
+        gs_tmd_load_vector(vertices + (indices0 >> 16) * 8, 0);
+        gs_tmd_load_vector(vertices + (indices1 & 0xFFFF) * 8, 1);
+        gs_tmd_load_vector(vertices + (indices1 >> 16) * 8, 2);
+        xport_gte_execute(0x280030);
+        normal = normals + (indices0 & 0xFFFF) * 8;
+        if (lighting != 0)
+            fourth = r_u16(primitive + 16);
+        color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+        xport_gte_write_data(lighting == 0 ? 22 : 6, color);
+        if (lighting == 0)
+            fourth = r_u16(primitive + 16);
+        fourth = vertices + fourth * 8;
+        primitive += 20;
+        if (lighting == 0)
+        {
+            next1 = r_u32(primitive + 12);
+            next0 = (uint32)r_u16(primitive + 10) << 16;
+        }
+        else
+        {
+            next0 = r_u32(primitive + 8);
+            next1 = r_u32(primitive + 12);
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 6);
+                if (lighting == 0)
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                xport_store_le32(work + 2, xport_gte_read_data(12));
+                xport_store_le32(work + 3, xport_gte_read_data(13));
+                xport_store_le32(work + 4, xport_gte_read_data(14));
+                xport_gte_execute(0x180001);
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    if (lighting != 0)
+                        gs_tmd_load_vector(normal, 0);
+                    depth = xport_gte_read_data(7);
+                    if (lighting != 0)
+                        xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
+                    if (lighting == 0)
+                        xport_store_le32(work + 5, xport_gte_read_data(14));
+                    slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                    xport_store_le32(work, 0x05000000);
+                    AddPrim(psx_addr(slot, 4), work);
+                    if (lighting != 0)
+                    {
+                        xport_store_le32(work + 5, xport_gte_read_data(14));
+                        xport_store_le32(work + 1, xport_gte_read_data(22));
+                    }
+                    work += 6;
+                }
+            }
+        }
+        indices0 = next0;
+        indices1 = next1;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f4(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f4(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_f4(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_tf3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices0, indices1, next0, next1, normal, color, uv0, uv1, uv2, depth, slot;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        indices1 = r_u32(primitive + 20);
+        indices0 = (uint32)r_u16(primitive + 18) << 16;
+    }
+    else
+    {
+        indices0 = r_u32(primitive + 16);
+        indices1 = r_u32(primitive + 20);
+    }
+    do
+    {
+        gs_tmd_load_vector(vertices + (indices0 >> 16) * 8, 0);
+        gs_tmd_load_vector(vertices + (indices1 & 0xFFFF) * 8, 1);
+        gs_tmd_load_vector(vertices + (indices1 >> 16) * 8, 2);
+        xport_gte_execute(0x280030);
+        normal = normals + (indices0 & 0xFFFF) * 8;
+        color = 0x00808080 | (((uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
+        if (lighting != 0)
+            xport_gte_write_data(6, color);
+        uv0 = r_u32(primitive + 4);
+        uv1 = r_u32(primitive + 8);
+        uv2 = r_u32(primitive + 12);
+        work = gs_tmd_work_buffer(work, 8);
+        xport_store_le32(work + 3, uv0);
+        xport_store_le32(work + 5, uv1);
+        xport_store_le32(work + 7, uv2);
+        if (lighting == 0)
+            xport_store_le32(work + 1, color);
+        primitive += 24;
+        if (lighting == 0)
+        {
+            next1 = r_u32(primitive + 20);
+            next0 = (uint32)r_u16(primitive + 18) << 16;
+        }
+        else
+        {
+            next0 = r_u32(primitive + 16);
+            next1 = r_u32(primitive + 20);
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                if (lighting != 0)
+                    gs_tmd_load_vector(normal, 0);
+                depth = xport_gte_read_data(7);
+                if (lighting != 0)
+                    xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
+                slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                xport_store_le32(work, 0x07000000);
+                AddPrim(psx_addr(slot, 4), work);
+                xport_store_le32(work + 2, xport_gte_read_data(12));
+                xport_store_le32(work + 4, xport_gte_read_data(13));
+                xport_store_le32(work + 6, xport_gte_read_data(14));
+                if (lighting != 0)
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                work += 8;
+            }
+        }
+        indices0 = next0;
+        indices1 = next1;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastTF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf3(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf3(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastTF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf3(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_g4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], fourth, fourth_normal, index, depth, slot, color, prefetched = 0;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        for (index = 0; index < 3; ++index)
+            indices[index] = (uint32)r_u16(primitive + 10 + index * 4) << 16;
+        prefetched = 1;
+    }
+    do
+    {
+        if (!prefetched)
+            for (index = 0; index < 3; ++index)
+                indices[index] = r_u32(primitive + 8 + index * 4);
+        prefetched = 0;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + (indices[index] >> 16) * 8, index);
+        xport_gte_execute(0x280030);
+        if (lighting == 0)
+        {
+            color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+            xport_gte_write_data(20, color);
+            fourth = vertices + (uint32)r_u16(primitive + 22) * 8;
+            primitive += 24;
+            for (index = 0; index < 3; ++index)
+                indices[index] = (uint32)r_u16(primitive + 10 + index * 4) << 16;
+            prefetched = 1;
+        }
+        else
+        {
+            fourth = r_u32(primitive + 20);
+            fourth_normal = normals + (fourth & 0xFFFF) * 8;
+            fourth = vertices + (fourth >> 16) * 8;
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 9);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x180001);
+                if (lighting != 0)
+                {
+                    color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+                    xport_gte_write_data(6, color);
+                    gs_tmd_load_vector(normals + (indices[1] & 0xFFFF) * 8, 1);
+                    gs_tmd_load_vector(normals + (indices[2] & 0xFFFF) * 8, 2);
+                }
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    if (lighting != 0)
+                        gs_tmd_load_vector(fourth_normal, 0);
+                    depth = xport_gte_read_data(7);
+                    if (lighting != 0)
+                    {
+                        xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
+                        xport_store_le32(work + 7, xport_gte_read_data(22));
+                        gs_tmd_load_vector(normals + (indices[0] & 0xFFFF) * 8, 0);
+                        xport_gte_execute(lighting == 1 ? 0x118043F : 0xF80416);
+                        primitive += 24;
+                    }
+                    slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                    xport_store_le32(work, 0x08000000);
+                    AddPrim(psx_addr(slot, 4), work);
+                    if (lighting != 0)
+                    {
+                        for (index = 0; index < 3; ++index)
+                            indices[index] = r_u32(primitive + 8 + index * 4);
+                        prefetched = 1;
+                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                        for (index = 0; index < 3; ++index)
+                            xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                    }
+                    else
+                    {
+                        for (index = 0; index < 4; ++index)
+                            xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20));
+                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                    }
+                    work += 9;
+                }
+            }
+        }
+        if (!prefetched)
+            primitive += 24;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g4(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g4(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_g4(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_tf4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 lighting)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices0, indices1, next0, next1, normal, fourth, color, current, uv0, uv1, depth, slot;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    if (lighting == 0)
+    {
+        indices1 = r_u32(primitive + 24);
+        indices0 = (uint32)r_u16(primitive + 22) << 16;
+    }
+    else
+    {
+        indices0 = r_u32(primitive + 20);
+        indices1 = r_u32(primitive + 24);
+    }
+    do
+    {
+        gs_tmd_load_vector(vertices + (indices0 >> 16) * 8, 0);
+        gs_tmd_load_vector(vertices + (indices1 & 0xFFFF) * 8, 1);
+        gs_tmd_load_vector(vertices + (indices1 >> 16) * 8, 2);
+        xport_gte_execute(0x280030);
+        if (lighting != 0)
+        {
+            color = 0x00808080 | (((uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
+            xport_gte_write_data(6, color);
+        }
+        normal = normals + (indices0 & 0xFFFF) * 8;
+        fourth = vertices + (uint32)r_u16(primitive + 28) * 8;
+        current = primitive;
+        primitive += 32;
+        if (lighting == 0)
+        {
+            next1 = r_u32(primitive + 24);
+            next0 = (uint32)r_u16(primitive + 22) << 16;
+        }
+        else
+        {
+            next0 = r_u32(primitive + 20);
+            next1 = r_u32(primitive + 24);
+        }
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 10);
+                xport_store_le32(work + 2, xport_gte_read_data(12));
+                xport_store_le32(work + 4, xport_gte_read_data(13));
+                xport_store_le32(work + 6, xport_gte_read_data(14));
+                xport_gte_execute(0x180001);
+                uv0 = r_u32(current + 4);
+                uv1 = r_u32(current + 8);
+                xport_store_le32(work + 3, uv0);
+                xport_store_le32(work + 5, uv1);
+                uv0 = r_u32(current + 12);
+                uv1 = r_u32(current + 16);
+                xport_store_le32(work + 7, uv0);
+                xport_store_le32(work + 9, uv1);
+                if (lighting == 0)
+                {
+                    color = 0x00808080 | (((uint32)(sint32)r_s8(current + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
+                    xport_store_le32(work + 1, color);
+                }
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    if (lighting != 0)
+                        gs_tmd_load_vector(normal, 0);
+                    depth = xport_gte_read_data(7);
+                    if (lighting != 0)
+                        xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
+                    if (lighting == 0)
+                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                    slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                    xport_store_le32(work, 0x09000000);
+                    AddPrim(psx_addr(slot, 4), work);
+                    if (lighting != 0)
+                    {
+                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                        xport_store_le32(work + 1, xport_gte_read_data(22));
+                    }
+                    work += 10;
+                }
+            }
+        }
+        indices0 = next0;
+        indices1 = next1;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastTF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf4(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf4(primitive, vertices, normals, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastTF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tf4(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+static uint32 *gs_tmd_fast_tg3_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 fog)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], uv[3], index, color, depth, slot, prefetched = 0;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    do
+    {
+        if (!prefetched)
+            for (index = 0; index < 3; ++index)
+                indices[index] = r_u32(primitive + 16 + index * 4);
+        prefetched = 0;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + (indices[index] >> 16) * 8, index);
+        xport_gte_execute(0x280030);
+        color = 0x00808080 | (((uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
+        xport_gte_write_data(6, color);
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                for (index = 0; index < 3; ++index)
+                    gs_tmd_load_vector(normals + (indices[index] & 0xFFFF) * 8, index);
+                depth = xport_gte_read_data(7);
+                xport_gte_execute(fog ? 0xF80416 : 0x118043F);
+                slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                work = gs_tmd_work_buffer(work, 10);
+                xport_store_le32(work, 0x09000000);
+                AddPrim(psx_addr(slot, 4), work);
+                for (index = 0; index < 3; ++index)
+                    uv[index] = r_u32(primitive + 4 + index * 4);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 3 + index * 3, uv[index]);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                primitive += 28;
+                for (index = 0; index < 3; ++index)
+                    indices[index] = r_u32(primitive + 16 + index * 4);
+                prefetched = 1;
+                work += 10;
+            }
+        }
+        if (!prefetched)
+            primitive += 28;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastTG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tg3_lit(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+uint32 *GsTMDfastTG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tg3_lit(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], index, color, depth, slot;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    for (index = 0; index < 3; ++index)
+        indices[index] = r_u16(primitive + 18 + index * 4);
+    do
+    {
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + indices[index] * 8, index);
+        xport_gte_execute(0x280030);
+        for (index = 0; index < 3; ++index)
+            xport_gte_write_data(20 + index, r_u32(primitive + 4 + index * 4));
+        color = 0x25808080 | ((((uint32)(sint32)r_s8(primitive + 3) & 2) | (gs_sort_attributes.bit30 << 1)) << 24);
+        work = gs_tmd_work_buffer(work, 8);
+        xport_store_le32(work + 1, color);
+        primitive += 28;
+        for (index = 0; index < 3; ++index)
+            indices[index] = r_u16(primitive + 18 + index * 4);
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                depth = xport_gte_read_data(7);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 3 + index * 2, xport_gte_read_data(20 + index));
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                xport_store_le32(work, 0x07000000);
+                AddPrim(psx_addr(slot, 4), work);
+                work += 8;
+            }
+        }
+    } while (--count != 0);
+    return work;
+}
+
+static uint32 *gs_tmd_fast_tg4_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 fog)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], fourth, fourth_normal, uv[4], index, color, depth, slot, prefetched = 0;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    do
+    {
+        if (!prefetched)
+            for (index = 0; index < 3; ++index)
+                indices[index] = r_u32(primitive + 20 + index * 4);
+        prefetched = 0;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + (indices[index] >> 16) * 8, index);
+        xport_gte_execute(0x280030);
+        color = 0x00808080 | (((uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
+        xport_gte_write_data(6, color);
+        fourth = r_u32(primitive + 32);
+        fourth_normal = normals + (fourth & 0xFFFF) * 8;
+        fourth = vertices + (fourth >> 16) * 8;
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 13);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x180001);
+                gs_tmd_load_vector(normals + (indices[1] & 0xFFFF) * 8, 1);
+                gs_tmd_load_vector(normals + (indices[2] & 0xFFFF) * 8, 2);
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    gs_tmd_load_vector(fourth_normal, 0);
+                    depth = xport_gte_read_data(7);
+                    xport_gte_execute(fog ? 0xE80413 : 0x108041B);
+                    for (index = 0; index < 4; ++index)
+                        uv[index] = r_u32(primitive + 4 + index * 4);
+                    for (index = 0; index < 4; ++index)
+                        xport_store_le32(work + 3 + index * 3, uv[index]);
+                    xport_store_le32(work + 10, xport_gte_read_data(22));
+                    gs_tmd_load_vector(normals + (indices[0] & 0xFFFF) * 8, 0);
+                    xport_gte_execute(fog ? 0xF80416 : 0x118043F);
+                    slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                    xport_store_le32(work, 0x0C000000);
+                    AddPrim(psx_addr(slot, 4), work);
+                    primitive += 36;
+                    for (index = 0; index < 3; ++index)
+                        indices[index] = r_u32(primitive + 20 + index * 4);
+                    prefetched = 1;
+                    xport_store_le32(work + 11, xport_gte_read_data(14));
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                    work += 13;
+                }
+            }
+        }
+        if (!prefetched)
+            primitive += 36;
+    } while (--count != 0);
+    return work;
+}
+
+uint32 *GsTMDfastTG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tg4_lit(primitive, vertices, normals, work, count, shift, ordering_table, 0);
+}
+
+uint32 *GsTMDfastTG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_tg4_lit(primitive, vertices, normals, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, indices[3], fourth, current, index, color, uv0, uv1, uv2, depth, slot;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    for (index = 0; index < 3; ++index)
+        indices[index] = r_u16(primitive + 22 + index * 4);
+    do
+    {
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(vertices + indices[index] * 8, index);
+        xport_gte_execute(0x280030);
+        fourth = vertices + (uint32)r_u16(primitive + 34) * 8;
+        current = primitive;
+        primitive += 36;
+        for (index = 0; index < 3; ++index)
+            indices[index] = r_u16(primitive + 22 + index * 4);
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 10);
+                xport_store_le32(work + 2, xport_gte_read_data(12));
+                xport_store_le32(work + 4, xport_gte_read_data(13));
+                xport_store_le32(work + 6, xport_gte_read_data(14));
+                xport_gte_execute(0x180001);
+                color = 0x2D808080 | ((((uint32)(sint32)r_s8(current + 3) & 2) | (gs_sort_attributes.bit30 << 1)) << 24);
+                xport_store_le32(work + 1, color);
+                uv0 = r_u32(current + 4);
+                uv1 = r_u32(current + 8);
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    uv2 = r_u32(current + 12);
+                    xport_store_le32(work + 3, uv0);
+                    xport_store_le32(work + 5, uv1);
+                    xport_store_le32(work + 7, uv2);
+                    uv0 = r_u32(current + 16);
+                    depth = xport_gte_read_data(7);
+                    xport_store_le32(work + 9, uv0);
+                    xport_store_le32(work + 8, xport_gte_read_data(14));
+                    slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+                    xport_store_le32(work, 0x09000000);
+                    AddPrim(psx_addr(slot, 4), work);
+                    work += 10;
+                }
+            }
+        }
+    } while (--count != 0);
+    return work;
+}
+
+static uint32 gs_tmd_unlit_texture_color(uint32 primitive, uint32 rgb)
+{
+    uint32 code = (uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1);
+    return (rgb & 0xFFFFFF) | ((code & 0xFE) << 24);
+}
+
+static void gs_tmd_link_unlit(uint32 *work, uint32 base, uint32 bias, uint32 depth, uint32 shift, uint32 words)
+{
+    uint32 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
+    xport_store_le32(work, words << 24);
+    AddPrim(psx_addr(slot, 4), work);
+}
+
+static uint32 *gs_tmd_fast_unlit_triangle(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 kind)
+{
+    static const uint32 index_offsets[4] = {8, 16, 20, 28};
+    static const uint32 packet_words[4] = {5, 7, 8, 10};
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, offset, stride, packed, third, next_packed, next_third, color, uv[3], index, depth, step;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    offset = index_offsets[kind];
+    stride = offset + 8;
+    packed = r_u32(primitive + offset);
+    third = r_u16(primitive + offset + 4);
+    step = kind == 0 ? 1 : kind == 3 ? 3 : 2;
+    do
+    {
+        gs_tmd_load_vector(vertices + (packed & 0xFFFF) * 8, 0);
+        gs_tmd_load_vector(vertices + (packed >> 16) * 8, 1);
+        gs_tmd_load_vector(vertices + third * 8, 2);
+        xport_gte_execute(0x280030);
+        if (kind <= 1)
+        {
+            color = r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25);
+            xport_gte_write_data(kind == 0 ? 22 : 20, color);
+        }
+        else if (kind == 2)
+        {
+            color = r_u32(primitive + 16);
+            xport_gte_write_data(22, gs_tmd_unlit_texture_color(primitive, color));
+        }
+        else
+        {
+            color = (uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1);
+            color = ((color & 0xFE) << 24) | (r_u32(primitive + 16) & 0xFFFFFF);
+            xport_gte_write_data(20, color);
+        }
+        if (kind == 1 || kind == 3)
+        {
+            xport_gte_write_data(21, r_u32(primitive + (kind == 1 ? 8 : 20)));
+            xport_gte_write_data(22, r_u32(primitive + (kind == 1 ? 12 : 24)));
+        }
+        if (kind >= 2)
+        {
+            for (index = 0; index < 3; ++index)
+                uv[index] = r_u32(primitive + 4 + index * 4);
+            work = gs_tmd_work_buffer(work, packet_words[kind]);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 3 + index * step, uv[index]);
+        }
+        primitive += stride;
+        next_packed = r_u32(primitive + offset);
+        next_third = r_u16(primitive + offset + 4);
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                xport_gte_execute(0x158002D);
+                depth = xport_gte_read_data(7);
+                work = gs_tmd_work_buffer(work, packet_words[kind]);
+                if (kind == 0 || kind == 2)
+                {
+                    gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                }
+                else
+                {
+                    if (kind == 1)
+                        for (index = 0; index < 3; ++index)
+                            xport_store_le32(work + 1 + index * step, xport_gte_read_data(20 + index));
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                    if (kind == 3)
+                        for (index = 0; index < 3; ++index)
+                            xport_store_le32(work + 1 + index * step, xport_gte_read_data(20 + index));
+                    gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
+                }
+                work += packet_words[kind];
+            }
+        }
+        packed = next_packed;
+        third = next_third;
+    } while (--count != 0);
+    return work;
+}
+
+static uint32 *gs_tmd_fast_unlit_quad(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 kind)
+{
+    static const uint32 index_offsets[4] = {8, 20, 24, 36};
+    static const uint32 packet_words[4] = {6, 9, 10, 13};
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 bias, offset, stride, packed, third, next_packed, next_third, fourth, current, color, uv0, uv1, uv2, index, depth, step;
+    if (count == 0)
+        return work;
+    bias = r_u32(ordering_table + 8);
+    offset = index_offsets[kind];
+    stride = offset + 8;
+    packed = r_u32(primitive + offset);
+    third = r_u16(primitive + offset + 4);
+    step = kind == 0 ? 1 : kind == 3 ? 3 : 2;
+    do
+    {
+        gs_tmd_load_vector(vertices + (packed & 0xFFFF) * 8, 0);
+        gs_tmd_load_vector(vertices + (packed >> 16) * 8, 1);
+        gs_tmd_load_vector(vertices + third * 8, 2);
+        xport_gte_execute(0x280030);
+        if (kind == 0)
+            xport_gte_write_data(22, r_u32(primitive + 4) | (gs_sort_attributes.bit30 << 25));
+        else if (kind == 2)
+        {
+            color = r_u32(primitive + 20);
+            fourth = r_u16(primitive + offset + 6);
+            color = gs_tmd_unlit_texture_color(primitive, color);
+            work = gs_tmd_work_buffer(work, packet_words[kind]);
+            xport_store_le32(work + 1, color);
+        }
+        else if (kind == 3)
+        {
+            color = (uint32)(sint32)r_s8(primitive + 3) | (gs_sort_attributes.bit30 << 1);
+            color = ((color & 0xFE) << 24) | (r_u32(primitive + 20) & 0xFFFFFF);
+            xport_gte_write_data(20, color);
+            xport_gte_write_data(21, r_u32(primitive + 24));
+            xport_gte_write_data(22, r_u32(primitive + 28));
+            xport_gte_write_data(6, r_u32(primitive + 32));
+        }
+        if (kind != 2)
+            fourth = r_u16(primitive + offset + 6);
+        fourth = vertices + fourth * 8;
+        current = primitive;
+        primitive += stride;
+        next_packed = r_u32(primitive + offset);
+        next_third = r_u16(primitive + offset + 4);
+        if ((sint32)xport_gte_read_flag() >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            gs_tmd_load_vector(fourth, 0);
+            if ((sint32)xport_gte_read_data(24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, packet_words[kind]);
+                if (kind == 0)
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x180001);
+                if (kind == 1)
+                {
+                    color = r_u32(current + 4) | (gs_sort_attributes.bit30 << 25);
+                    uv0 = r_u32(current + 8);
+                    uv1 = r_u32(current + 12);
+                    xport_store_le32(work + 1, color);
+                    xport_store_le32(work + 3, uv0);
+                    xport_store_le32(work + 5, uv1);
+                }
+                else if (kind >= 2)
+                {
+                    uv0 = r_u32(current + 4);
+                    uv1 = r_u32(current + 8);
+                    if (kind == 2)
+                    {
+                        xport_store_le32(work + 3, uv0);
+                        xport_store_le32(work + 5, uv1);
+                        uv0 = r_u32(current + 12);
+                        uv1 = r_u32(current + 16);
+                        xport_store_le32(work + 7, uv0);
+                        xport_store_le32(work + 9, uv1);
+                    }
+                }
+                if ((sint32)xport_gte_read_flag() >= 0)
+                {
+                    xport_gte_execute(0x168002E);
+                    if (kind == 1)
+                    {
+                        color = r_u32(current + 16);
+                        depth = xport_gte_read_data(7);
+                        xport_store_le32(work + 7, color);
+                    }
+                    else if (kind == 3)
+                    {
+                        uv2 = r_u32(current + 12);
+                        xport_store_le32(work + 3, uv0);
+                        xport_store_le32(work + 6, uv1);
+                        xport_store_le32(work + 9, uv2);
+                        uv0 = r_u32(current + 16);
+                        depth = xport_gte_read_data(7);
+                        xport_store_le32(work + 12, uv0);
+                    }
+                    else
+                        depth = xport_gte_read_data(7);
+                    xport_store_le32(work + 2 + 3 * step, xport_gte_read_data(14));
+                    if (kind == 3)
+                    {
+                        for (index = 0; index < 3; ++index)
+                            xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                        xport_store_le32(work + 10, xport_gte_read_data(6));
+                    }
+                    gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
+                    work += packet_words[kind];
+                }
+            }
+        }
+        packed = next_packed;
+        third = next_third;
+    } while (--count != 0);
+    return work;
+}
+
+static uint32 *gs_tmd_fast_gradient_nl(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 gouraud)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 index, addresses[3], flag, slot, color, depth, depth_shift;
+    w_u32(scratch + 12, shift);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + 18 + index * (gouraud ? 4 : 2)) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        color = r_u32(primitive + 4);
+        if (!gouraud)
+            color = (color & 0xFFFFFF) | 0x30000000;
+        work = gs_tmd_work_buffer(work, 7);
+        xport_store_le32(work + 1, color);
+        flag = xport_gte_read_flag();
+        w_u32(scratch + 36, flag);
+        if (r_s32(scratch + 36) >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            xport_store_le32(work + 3, r_u32(primitive + 8));
+            w_u32(scratch + 24, xport_gte_read_data(24));
+            if (r_s32(scratch + 24) > 0)
+            {
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x158002D);
+                xport_store_le32(work + 5, r_u32(primitive + 12));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                depth = r_u32(scratch + 24);
+                depth_shift = r_u32(scratch + 12);
+                slot = (uint32)((sint32)depth >> (depth_shift & 31));
+                slot = (slot << 2) + r_u32(scratch + 16);
+                w_u32(scratch + 52, slot);
+                xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+                w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+                work += 7;
+            }
+        }
+        primitive += gouraud ? 28 : 24;
+        --count;
+    }
+    return work;
+}
+
+uint32 *GsTMDfastF3GNL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_tmd_fast_gradient_nl(primitive, vertices, work, count, shift, ordering_table, scratch, 0);
+}
+
+void gs_subdivision_midpoint(uint32 destination, uint32 left, uint32 right)
+{
+    uint32 offset;
+    sint32 first, second;
+    for (offset = 0; offset < 6; offset += 2)
+    {
+        first = r_s16(left + offset);
+        second = r_s16(right + offset);
+        w_u16(destination + offset, (uint32)((first + second) / 2));
+    }
+}
+
+uint32 gs_subdivision_triangle_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset;
+    sint32 first, second, third, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 12 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 40 + offset, r_u16(packet + 12 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 40 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 12 + offset));
+        }
+        third = r_s16(packet + 16 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < third)
+            w_u16(scratch + 44 + offset, (uint32)third);
+        else
+        {
+            bound = r_s16(scratch + 40 + offset);
+            if (third < bound)
+                w_u16(scratch + 40 + offset, (uint32)third);
+        }
+        extent = r_s16(scratch + 48 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 40 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static void gs_subdivision_copy_vector(uint32 destination, uint32 source)
+{
+    uint32 first = r_u32(source);
+    uint32 second = r_u32(source + 4);
+    w_u32(destination, first);
+    w_u32(destination + 4, second);
+}
+
+static uint32 gs_subdivision_slot(uint32 scratch)
+{
+    uint32 depth = r_u32(scratch + 24);
+    uint32 shift = r_u32(scratch + 12);
+    uint32 slot = (uint32)((sint32)depth >> (shift & 31));
+    slot = (slot << 2) + r_u32(scratch + 16);
+    w_u32(scratch + 52, slot);
+    return slot;
+}
+
+static void gs_subdivision_link_f3(uint32 **cursor, uint32 scratch, uint32 slot)
+{
+    uint32 *work = gs_tmd_work_buffer(*cursor, 5);
+    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x04000000);
+    w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+    *cursor = work + 5;
+}
+
+static void gs_subdivision_emit_f3(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 5);
+    xport_store_le32(work + 1, r_u32(scratch + 60));
+    ((uint8 *)work)[3] = 4;
+    ((uint8 *)work)[7] = 0x20;
+    w_u32(scratch + 36, xport_gte_read_flag());
+    if (r_s32(scratch + 36) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_f3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_f3(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 24, index, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 8, index);
+    xport_gte_execute(0x280030);
+    w_u32(scratch + 36, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 64 + index * 4, xport_gte_read_data(12 + index));
+    xport_gte_execute(0x158002D);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_triangle_bounds(scratch + 56, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 36) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 36) >= 0)
+    {
+        maximum = r_s16(scratch + 44);
+        minimum = r_s16(scratch + 40);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 46);
+            minimum = r_s16(scratch + 42);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 5);
+        for (index = 0; index < 5; ++index)
+            xport_store_le32(work + index, r_u32(scratch + 56 + index * 4));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_f3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_vector(next, vertices);
+    gs_subdivision_midpoint(next + 8, vertices, vertices + 8);
+    gs_subdivision_midpoint(next + 16, vertices, vertices + 16);
+    gs_subdivision_emit_f3(vertices, vertices + 8, next + 8, scratch, cursor);
+    gs_subdivision_recurse_f3(next, scratch, level, cursor);
+    gs_subdivision_midpoint(next, vertices + 8, vertices + 16);
+    gs_subdivision_recurse_f3(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next + 16, vertices + 8);
+    gs_subdivision_emit_f3(vertices + 8, vertices + 16, next, scratch, cursor);
+    gs_subdivision_recurse_f3(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next + 8, vertices + 16);
+    gs_subdivision_midpoint(next + 16, vertices, vertices + 16);
+    gs_subdivision_emit_f3(vertices + 16, vertices, next + 16, scratch, cursor);
+    gs_subdivision_recurse_f3(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_f3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], normal, slot, depth, flags, threshold, subdivide;
+    uint32 index_offset = mode == 3 ? 8 : 10;
+    w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    w_u16(scratch + 32, (uint32)gs_subdivision_width);
+    if (mode != 3)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u32(scratch + 12, shift);
+    w_u8(scratch + 59, 4);
+    if (mode == 3)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u8(scratch + 63, 0x20);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        if (mode == 1 || mode == 2)
+            xport_gte_write_data(6, r_u32(primitive + 4));
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            flags = r_u32(scratch + 36);
+            if ((flags & 0x40000) == 0)
+            {
+                work = gs_tmd_work_buffer(work, 5);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x158002D);
+                if (mode == 0 || mode == 3)
+                    xport_store_le32(work + 1, r_u32(primitive + 4));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                if (mode == 1 || mode == 2)
+                {
+                    normal = normals + (uint32)r_u16(primitive + 8) * 8;
+                    gs_tmd_load_vector(normal, 0);
+                    xport_gte_execute(mode == 2 ? 0xE80413 : 0x108041B);
+                    slot = gs_subdivision_slot(scratch);
+                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    depth = r_u32(scratch + 24);
+                    threshold = r_u32(scratch + 28);
+                    subdivide = (sint32)depth < (sint32)threshold;
+                }
+                else
+                {
+                    depth = r_u32(scratch + 24);
+                    flags = r_u32(scratch + 12);
+                    base = r_u32(scratch + 16);
+                    threshold = r_u32(scratch + 28);
+                    slot = (uint32)((sint32)depth >> (flags & 31)) << 2;
+                    depth = r_u32(scratch + 24);
+                    slot += base;
+                    subdivide = (sint32)depth < (sint32)threshold;
+                    w_u32(scratch + 52, slot);
+                }
+                if (subdivide || r_s32(scratch + 36) < 0)
+                {
+                    if (mode == 1 || mode == 2)
+                        w_u32(scratch + 60, xport_gte_read_data(22));
+                    else
+                        w_u32(scratch + 60, r_u32(primitive + 4));
+                    for (index = 0; index < 3; ++index)
+                    {
+                        normal = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+                        gs_subdivision_copy_vector(scratch + 76 + index * 8, normal);
+                    }
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    gs_subdivision_recurse_f3(scratch + 76, scratch, 0, &work);
+                }
+                else
+                    gs_subdivision_link_f3(&work, scratch, slot);
+            }
+        }
+        primitive += 16;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_f3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 3);
+}
+
+static void gs_subdivision_midpoint_color(uint32 destination, uint32 left, uint32 right)
+{
+    uint32 offset, first, second;
+    gs_subdivision_midpoint(destination, left, right);
+    for (offset = 8; offset < 11; ++offset)
+    {
+        first = r_u8(left + offset);
+        second = r_u8(right + offset);
+        w_u8(destination + offset, (first + second) >> 1);
+    }
+    w_u8(destination + 11, r_u8(left + 11));
+}
+
+static void gs_subdivision_copy_color_vertex(uint32 destination, uint32 source)
+{
+    uint32 first = r_u32(source);
+    uint32 second = r_u32(source + 4);
+    uint32 color = r_u32(source + 8);
+    w_u32(destination, first);
+    w_u32(destination + 4, second);
+    w_u32(destination + 8, color);
+}
+
+static uint32 gs_subdivision_g3_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset;
+    sint32 first, second, third, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 16 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 40 + offset, r_u16(packet + 16 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 40 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 16 + offset));
+        }
+        third = r_s16(packet + 24 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < third)
+            w_u16(scratch + 44 + offset, (uint32)third);
+        else
+        {
+            bound = r_s16(scratch + 40 + offset);
+            if (third < bound)
+                w_u16(scratch + 40 + offset, (uint32)third);
+        }
+        extent = r_s16(scratch + 48 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 40 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static void gs_subdivision_link_g3(uint32 **cursor, uint32 scratch, uint32 slot)
+{
+    uint32 *work = gs_tmd_work_buffer(*cursor, 7);
+    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+    w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+    *cursor = work + 7;
+}
+
+static void gs_subdivision_emit_g3(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 7);
+    xport_store_le32(work + 1, r_u32(first + 8));
+    ((uint8 *)work)[3] = 6;
+    ((uint8 *)work)[7] = 0x30;
+    w_u32(scratch + 36, xport_gte_read_flag());
+    if (r_s32(scratch + 36) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u32(second + 8));
+        xport_store_le32(work + 5, r_u32(third + 8));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_g3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_g3(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 36, index, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 12, index);
+    xport_gte_execute(0x280030);
+    w_u32(scratch + 36, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 64 + index * 8, xport_gte_read_data(12 + index));
+    xport_gte_execute(0x158002D);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_g3_bounds(scratch + 56, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 36) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 36) >= 0)
+    {
+        maximum = r_s16(scratch + 44);
+        minimum = r_s16(scratch + 40);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 46);
+            minimum = r_s16(scratch + 42);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 7);
+        xport_store_le32(work, r_u32(scratch + 56));
+        for (index = 0; index < 3; ++index)
+        {
+            xport_store_le32(work + 1 + index * 2, r_u32(vertices + 8 + index * 12));
+            xport_store_le32(work + 2 + index * 2, r_u32(scratch + 64 + index * 8));
+        }
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_g3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_color_vertex(next, vertices);
+    gs_subdivision_midpoint_color(next + 12, vertices, vertices + 12);
+    gs_subdivision_midpoint_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_emit_g3(vertices, vertices + 12, next + 12, scratch, cursor);
+    gs_subdivision_recurse_g3(next, scratch, level, cursor);
+    gs_subdivision_midpoint_color(next, vertices + 12, vertices + 24);
+    gs_subdivision_recurse_g3(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next + 24, vertices + 12);
+    gs_subdivision_emit_g3(vertices + 12, vertices + 24, next, scratch, cursor);
+    gs_subdivision_recurse_g3(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next + 12, vertices + 24);
+    gs_subdivision_midpoint_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_emit_g3(vertices + 24, vertices, next + 24, scratch, cursor);
+    gs_subdivision_recurse_g3(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_g3_unlit(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 distinct_colors)
+{
+    uint32 base, index, addresses[3], slot, depth, flags, threshold, subdivide, color;
+    w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    w_u16(scratch + 32, (uint32)gs_subdivision_width);
+    if (!distinct_colors)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u32(scratch + 12, shift);
+    w_u8(scratch + 59, 6);
+    if (distinct_colors)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u8(scratch + 63, 0x30);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + (distinct_colors ? 16 + index * 2 : 10 + index * 4)) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        work = gs_tmd_work_buffer(work, 7);
+        color = r_u32(primitive + 4);
+        if (distinct_colors)
+            color |= 0x30000000;
+        xport_store_le32(work + 1, color);
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        xport_store_le32(work + 3, r_u32(primitive + (distinct_colors ? 8 : 4)));
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            flags = r_u32(scratch + 36);
+            if ((flags & 0x40000) == 0)
+            {
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x158002D);
+                if (!distinct_colors)
+                    xport_store_le32(work + 5, r_u32(primitive + 4));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                if (distinct_colors)
+                    xport_store_le32(work + 5, r_u32(primitive + 12));
+                depth = r_u32(scratch + 24);
+                flags = r_u32(scratch + 12);
+                base = r_u32(scratch + 16);
+                threshold = r_u32(scratch + 28);
+                slot = (uint32)((sint32)depth >> (flags & 31)) << 2;
+                depth = r_u32(scratch + 24);
+                slot += base;
+                subdivide = (sint32)depth < (sint32)threshold;
+                w_u32(scratch + 52, slot);
+                if (subdivide || r_s32(scratch + 36) < 0)
+                {
+                    gs_subdivision_copy_vector(scratch + 84, vertices + (uint32)r_u16(primitive + (distinct_colors ? 16 : 10)) * 8);
+                    if (distinct_colors)
+                        for (index = 0; index < 3; ++index)
+                            w_u32(scratch + 92 + index * 12, xport_load_le32(work + 1 + index * 2) | 0x30000000);
+                    else
+                    {
+                        color = r_u32(primitive + 4);
+                        w_u32(scratch + 92, color);
+                        w_u32(scratch + 104, color);
+                        w_u32(scratch + 116, color);
+                    }
+                    for (index = 1; index < 3; ++index)
+                        gs_subdivision_copy_vector(scratch + 84 + index * 12, vertices + (uint32)r_u16(primitive + (distinct_colors ? 16 + index * 2 : 10 + index * 4)) * 8);
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    gs_subdivision_recurse_g3(scratch + 84, scratch, 0, &work);
+                }
+                else
+                    gs_subdivision_link_g3(&work, scratch, slot);
+            }
+        }
+        primitive += distinct_colors ? 24 : 20;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_g3_unlit(primitive, vertices, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g3_unlit(primitive, vertices, work, count, shift, ordering_table, scratch, 1);
+}
+
+static uint32 *gs_a4_div_g3_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 fog)
+{
+    uint32 base, index, addresses[3], slot, depth, threshold, vertex;
+    w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    w_u16(scratch + 32, (uint32)gs_subdivision_width);
+    w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u32(scratch + 12, shift);
+    w_u8(scratch + 59, 6);
+    w_u8(scratch + 63, 0x30);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        xport_gte_write_data(6, r_u32(primitive + 4));
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0 && (r_u32(scratch + 36) & 0x40000) == 0)
+        {
+            work = gs_tmd_work_buffer(work, 7);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            xport_gte_execute(0x158002D);
+            w_u32(scratch + 24, xport_gte_read_data(7));
+            for (index = 0; index < 3; ++index)
+                addresses[index] = normals + (uint32)r_u16(primitive + 8 + index * 4) * 8;
+            for (index = 0; index < 3; ++index)
+                gs_tmd_load_vector(addresses[index], index);
+            xport_gte_execute(fog ? 0xF80416 : 0x118043F);
+            slot = gs_subdivision_slot(scratch);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+            depth = r_u32(scratch + 24);
+            threshold = r_u32(scratch + 28);
+            if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0)
+            {
+                for (index = 0; index < 3; ++index)
+                {
+                    vertex = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
+                    gs_subdivision_copy_vector(scratch + 84 + index * 12, vertex);
+                    w_u32(scratch + 92 + index * 12, xport_load_le32(work + 1 + index * 2));
+                }
+                w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                gs_subdivision_recurse_g3(scratch + 84, scratch, 0, &work);
+            }
+            else
+                gs_subdivision_link_g3(&work, scratch, slot);
+        }
+        primitive += 20;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g3_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g3_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1);
+}
+
+static uint32 gs_subdivision_f4_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset, index;
+    sint32 first, second, coordinate, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 12 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 48 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 12 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 48 + offset, r_u16(packet + 12 + offset));
+        }
+        for (index = 2; index < 4; ++index)
+        {
+            coordinate = r_s16(packet + 8 + index * 4 + offset);
+            bound = r_s16(scratch + 48 + offset);
+            if (bound < coordinate)
+                w_u16(scratch + 48 + offset, (uint32)coordinate);
+            else
+            {
+                bound = r_s16(scratch + 44 + offset);
+                if (coordinate < bound)
+                    w_u16(scratch + 44 + offset, (uint32)coordinate);
+            }
+        }
+        extent = r_s16(scratch + 52 + offset);
+        bound = r_s16(scratch + 48 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 44 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static uint32 gs_subdivision_f4_slot(uint32 scratch)
+{
+    uint32 depth = r_u32(scratch + 24);
+    uint32 shift = r_u32(scratch + 12);
+    uint32 slot = (uint32)((sint32)depth >> (shift & 31));
+    slot = (slot << 2) + r_u32(scratch + 16);
+    w_u32(scratch + 56, slot);
+    return slot;
+}
+
+static void gs_subdivision_f4_link(uint32 **cursor, uint32 scratch, uint32 slot, uint32 words)
+{
+    uint32 *work = gs_tmd_work_buffer(*cursor, words);
+    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | ((words - 1) << 24));
+    w_u32(r_u32(scratch + 56), gpu_packet_link((uintptr_t)work));
+    *cursor = work + words;
+}
+
+static void gs_subdivision_f4_emit_triangle(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 5);
+    xport_store_le32(work + 1, r_u32(scratch + 64));
+    ((uint8 *)work)[3] = 4;
+    ((uint8 *)work)[7] = 0x20;
+    w_u32(scratch + 40, xport_gte_read_flag());
+    if (r_s32(scratch + 40) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 5);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_f4(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 32, index, flags, last_flags, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 8, index);
+    xport_gte_execute(0x280030);
+    w_u32(scratch + 40, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 68 + index * 4, xport_gte_read_data(12 + index));
+    gs_tmd_load_vector(vertices + 24, 0);
+    xport_gte_execute(0x180001);
+    w_u32(scratch + 36, xport_gte_read_flag());
+    w_u32(scratch + 80, xport_gte_read_data(14));
+    xport_gte_execute(0x168002E);
+    flags = r_u32(scratch + 40);
+    last_flags = r_u32(scratch + 36);
+    w_u32(scratch + 40, flags | last_flags);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_f4_bounds(scratch + 60, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 40) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 40) >= 0)
+    {
+        maximum = r_s16(scratch + 48);
+        minimum = r_s16(scratch + 44);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 50);
+            minimum = r_s16(scratch + 46);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 6);
+        for (index = 0; index < 6; ++index)
+            xport_store_le32(work + index, r_u32(scratch + 60 + index * 4));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 6);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_vector(next, vertices);
+    gs_subdivision_midpoint(next + 8, vertices, vertices + 8);
+    gs_subdivision_midpoint(next + 16, vertices, vertices + 16);
+    gs_subdivision_midpoint(next + 24, vertices, vertices + 24);
+    gs_subdivision_f4_emit_triangle(vertices, vertices + 8, next + 8, scratch, cursor);
+    gs_subdivision_recurse_f4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 8);
+    gs_subdivision_midpoint(next + 16, vertices + 8, vertices + 24);
+    gs_subdivision_f4_emit_triangle(vertices + 8, vertices + 24, next + 16, scratch, cursor);
+    gs_subdivision_recurse_f4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 24);
+    gs_subdivision_midpoint(next + 8, vertices + 24, vertices + 16);
+    gs_subdivision_f4_emit_triangle(vertices + 24, vertices + 16, next + 8, scratch, cursor);
+    gs_subdivision_recurse_f4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 16);
+    gs_subdivision_midpoint(next + 16, vertices, vertices + 16);
+    gs_subdivision_f4_emit_triangle(vertices + 16, vertices, next + 16, scratch, cursor);
+    gs_subdivision_recurse_f4(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_f4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], slot, depth, flags, threshold, subdivide, vertex;
+    uint32 index_offset = mode == 3 ? 8 : 10;
+    uint32 *packet;
+    base = r_u32(ordering_table + 4);
+    if (mode == 2)
+    {
+        w_u32(scratch + 12, shift);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    }
+    else
+    {
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        if (mode == 3)
+        {
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+            w_u32(scratch + 12, shift);
+            w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        }
+        else
+        {
+            w_u16(scratch + 32, (uint32)gs_subdivision_width);
+            w_u32(scratch + 12, shift);
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        }
+    }
+    w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+    if (mode == 3)
+        w_u32(scratch + 16, base);
+    w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+    w_u8(scratch + 63, 5);
+    w_u8(scratch + 67, 0x28);
+    if (mode != 3)
+        w_u32(scratch + 16, base);
+    if (mode == 2)
+        xport_gte_write_data(6, r_u32(primitive + 4));
+    while ((sint32)count > 0)
+    {
+        if (mode == 1)
+            xport_gte_write_data(6, r_u32(primitive + 4));
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            if (mode == 1 || mode == 2)
+            {
+                vertex = normals + (uint32)r_u16(primitive + 8) * 8;
+                gs_tmd_load_vector(vertex, 0);
+                xport_gte_execute(mode == 2 ? 0xE80413 : 0x108041B);
+            }
+            work = gs_tmd_work_buffer(work, 6);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+            vertex = vertices + (uint32)r_u16(primitive + index_offset + 6) * 8;
+            gs_tmd_load_vector(vertex, 0);
+            xport_gte_execute(0x180001);
+            w_u32(scratch + 40, xport_gte_read_flag());
+            flags = r_u32(scratch + 40) & 0x40000;
+            if (flags == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
+            {
+                xport_store_le32(work + 5, xport_gte_read_data(14));
+                xport_gte_execute(0x168002E);
+                if (mode == 0 || mode == 3)
+                    xport_store_le32(work + 1, r_u32(primitive + 4));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                depth = r_u32(scratch + 24);
+                flags = r_u32(scratch + 12);
+                base = r_u32(scratch + 16);
+                threshold = r_u32(scratch + 28);
+                slot = (uint32)((sint32)depth >> (flags & 31)) << 2;
+                depth = r_u32(scratch + 24);
+                slot += base;
+                subdivide = (sint32)depth < (sint32)threshold;
+                w_u32(scratch + 56, slot);
+                if (subdivide || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
+                {
+                    if (mode == 1 || mode == 2)
+                        w_u32(scratch + 64, xport_gte_read_data(22));
+                    else
+                        w_u32(scratch + 64, r_u32(primitive + 4));
+                    for (index = 0; index < 4; ++index)
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+                        gs_subdivision_copy_vector(scratch + 84 + index * 8, vertex);
+                    }
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    gs_subdivision_recurse_f4(scratch + 84, scratch, 0, &work);
+                }
+                else
+                {
+                    packet = work;
+                    gs_subdivision_f4_link(&work, scratch, slot, 6);
+                    if (mode == 1 || mode == 2)
+                        xport_store_le32(packet + 1, xport_gte_read_data(22));
+                }
+            }
+        }
+        primitive += mode == 3 ? 16 : 20;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_f4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_f4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 3);
+}
+
+static uint32 gs_subdivision_g4_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset, index;
+    sint32 first, second, coordinate, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 16 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 48 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 16 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 48 + offset, r_u16(packet + 16 + offset));
+        }
+        for (index = 2; index < 4; ++index)
+        {
+            coordinate = r_s16(packet + 8 + index * 8 + offset);
+            bound = r_s16(scratch + 48 + offset);
+            if (bound < coordinate)
+                w_u16(scratch + 48 + offset, (uint32)coordinate);
+            else
+            {
+                bound = r_s16(scratch + 44 + offset);
+                if (coordinate < bound)
+                    w_u16(scratch + 44 + offset, (uint32)coordinate);
+            }
+        }
+        extent = r_s16(scratch + 52 + offset);
+        bound = r_s16(scratch + 48 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 44 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static void gs_subdivision_g4_emit_triangle(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 7);
+    xport_store_le32(work + 1, r_u32(first + 8));
+    ((uint8 *)work)[3] = 6;
+    ((uint8 *)work)[7] = 0x30;
+    w_u32(scratch + 40, xport_gte_read_flag());
+    if ((r_u32(scratch + 40) & 0x60000) == 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u32(second + 8));
+        xport_store_le32(work + 5, r_u32(third + 8));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 7);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_g4(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 48, index, flags, last_flags, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 12, index);
+    xport_gte_execute(0x280030);
+    w_u32(scratch + 40, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 68 + index * 8, xport_gte_read_data(12 + index));
+    gs_tmd_load_vector(vertices + 36, 0);
+    xport_gte_execute(0x180001);
+    w_u32(scratch + 36, xport_gte_read_flag());
+    w_u32(scratch + 92, xport_gte_read_data(14));
+    xport_gte_execute(0x168002E);
+    flags = r_u32(scratch + 40);
+    last_flags = r_u32(scratch + 36);
+    w_u32(scratch + 40, flags | last_flags);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_g4_bounds(scratch + 60, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 40) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 40) >= 0)
+    {
+        maximum = r_s16(scratch + 48);
+        minimum = r_s16(scratch + 44);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 50);
+            minimum = r_s16(scratch + 46);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 9);
+        xport_store_le32(work, r_u32(scratch + 60));
+        for (index = 0; index < 4; ++index)
+        {
+            xport_store_le32(work + 1 + index * 2, r_u32(vertices + 8 + index * 12));
+            xport_store_le32(work + 2 + index * 2, r_u32(scratch + 68 + index * 8));
+        }
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 9);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_color_vertex(next, vertices);
+    gs_subdivision_midpoint_color(next + 12, vertices, vertices + 12);
+    gs_subdivision_midpoint_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_midpoint_color(next + 36, vertices, vertices + 36);
+    gs_subdivision_g4_emit_triangle(vertices, vertices + 12, next + 12, scratch, cursor);
+    gs_subdivision_recurse_g4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 12);
+    gs_subdivision_midpoint_color(next + 24, vertices + 12, vertices + 36);
+    gs_subdivision_g4_emit_triangle(vertices + 12, vertices + 36, next + 24, scratch, cursor);
+    gs_subdivision_recurse_g4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 36);
+    gs_subdivision_midpoint_color(next + 12, vertices + 36, vertices + 24);
+    gs_subdivision_g4_emit_triangle(vertices + 36, vertices + 24, next + 12, scratch, cursor);
+    gs_subdivision_recurse_g4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 24);
+    gs_subdivision_midpoint_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_g4_emit_triangle(vertices + 24, vertices, next + 24, scratch, cursor);
+    gs_subdivision_recurse_g4(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_g4_unlit(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 multicolor)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, flags, threshold, color;
+    uint32 index_offset = multicolor ? 20 : 10;
+    uint32 index_stride = multicolor ? 2 : 4;
+    w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    w_u16(scratch + 32, (uint32)gs_subdivision_width);
+    if (!multicolor)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u32(scratch + 12, shift);
+    w_u8(scratch + 63, 8);
+    if (multicolor)
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u8(scratch + 67, 0x38);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        if (!multicolor)
+        {
+            work = gs_tmd_work_buffer(work, 9);
+            xport_store_le32(work + 1, r_u32(primitive + 4));
+            xport_store_le32(work + 3, r_u32(primitive + 4));
+        }
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        if (!multicolor)
+            xport_store_le32(work + 5, r_u32(primitive + 4));
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            work = gs_tmd_work_buffer(work, 9);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            vertex = vertices + (uint32)r_u16(primitive + index_offset + 3 * index_stride) * 8;
+            gs_tmd_load_vector(vertex, 0);
+            xport_gte_execute(0x180001);
+            if (multicolor)
+                xport_store_le32(work + 1, r_u32(primitive + 4) | 0x38000000);
+            w_u32(scratch + 40, xport_gte_read_flag());
+            flags = r_u32(scratch + 40) & 0x40000;
+            if (flags == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
+            {
+                xport_store_le32(work + 8, xport_gte_read_data(14));
+                xport_gte_execute(0x168002E);
+                if (multicolor)
+                {
+                    for (index = 1; index < 4; ++index)
+                        xport_store_le32(work + 1 + index * 2, r_u32(primitive + 4 + index * 4));
+                }
+                else
+                    xport_store_le32(work + 7, r_u32(primitive + 4));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                depth = r_u32(scratch + 24);
+                flags = r_u32(scratch + 12);
+                base = r_u32(scratch + 16);
+                threshold = r_u32(scratch + 28);
+                slot = (uint32)((sint32)depth >> (flags & 31)) << 2;
+                depth = r_u32(scratch + 24);
+                slot += base;
+                w_u32(scratch + 56, slot);
+                if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
+                {
+                    if (multicolor)
+                    {
+                        for (index = 0; index < 4; ++index)
+                            w_u32(scratch + 104 + index * 12, r_u32(primitive + 4 + index * 4) | 0x38000000);
+                    }
+                    else
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + 10) * 8;
+                        gs_subdivision_copy_vector(scratch + 96, vertex);
+                        color = r_u32(primitive + 4);
+                        for (index = 0; index < 4; ++index)
+                            w_u32(scratch + 104 + index * 12, color);
+                    }
+                    for (index = multicolor ? 0 : 1; index < 4; ++index)
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+                        gs_subdivision_copy_vector(scratch + 96 + index * 12, vertex);
+                    }
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    gs_subdivision_recurse_g4(scratch + 96, scratch, 0, &work);
+                }
+                else
+                    gs_subdivision_f4_link(&work, scratch, slot, 9);
+            }
+        }
+        primitive += multicolor ? 28 : 24;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_g4_unlit(primitive, vertices, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g4_unlit(primitive, vertices, work, count, shift, ordering_table, scratch, 1);
+}
+
+static uint32 *gs_a4_div_g4_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 fog)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, threshold;
+    w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    if (fog)
+    {
+        w_u32(scratch + 12, shift);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    }
+    else
+    {
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 12, shift);
+    }
+    w_u8(scratch + 63, 8);
+    w_u8(scratch + 67, 0x38);
+    w_u32(scratch + 16, base);
+    if (fog)
+        xport_gte_write_data(6, r_u32(primitive + 4));
+    while ((sint32)count > 0)
+    {
+        if (!fog)
+            xport_gte_write_data(6, r_u32(primitive + 4));
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            work = gs_tmd_work_buffer(work, 9);
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            vertex = vertices + (uint32)r_u16(primitive + 22) * 8;
+            gs_tmd_load_vector(vertex, 0);
+            xport_gte_execute(0x180001);
+            w_u32(scratch + 40, xport_gte_read_flag());
+            if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
+            {
+                xport_store_le32(work + 8, xport_gte_read_data(14));
+                xport_gte_execute(0x168002E);
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                for (index = 0; index < 3; ++index)
+                    addresses[index] = normals + (uint32)r_u16(primitive + 8 + index * 4) * 8;
+                for (index = 0; index < 3; ++index)
+                    gs_tmd_load_vector(addresses[index], index);
+                xport_gte_execute(fog ? 0xF80416 : 0x118043F);
+                slot = gs_subdivision_f4_slot(scratch);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                vertex = normals + (uint32)r_u16(primitive + 20) * 8;
+                gs_tmd_load_vector(vertex, 0);
+                xport_gte_execute(fog ? 0xE80413 : 0x108041B);
+                xport_store_le32(work + 7, xport_gte_read_data(22));
+                depth = r_u32(scratch + 24);
+                threshold = r_u32(scratch + 28);
+                if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
+                {
+                    for (index = 0; index < 4; ++index)
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
+                        gs_subdivision_copy_vector(scratch + 96 + index * 12, vertex);
+                        w_u32(scratch + 104 + index * 12, xport_load_le32(work + 1 + index * 2));
+                    }
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    gs_subdivision_recurse_g4(scratch + 96, scratch, 0, &work);
+                }
+                else
+                    gs_subdivision_f4_link(&work, scratch, slot, 9);
+            }
+        }
+        primitive += 24;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g4_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_g4_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1);
+}
+
+static void gs_subdivision_link_tf3(uint32 **cursor, uint32 scratch, uint32 slot)
+{
+    uint32 *work = gs_tmd_work_buffer(*cursor, 8);
+    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x07000000);
+    w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+    *cursor = work + 8;
+}
+
+static void gs_subdivision_midpoint_uv(uint32 destination, uint32 left, uint32 right)
+{
+    uint32 offset, first, second;
+    gs_subdivision_midpoint(destination, left, right);
+    for (offset = 6; offset < 8; ++offset)
+    {
+        first = r_u8(left + offset);
+        second = r_u8(right + offset);
+        w_u8(destination + offset, (first + second) >> 1);
+    }
+}
+
+static void gs_subdivision_emit_tf3(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 8);
+    xport_store_le32(work + 1, r_u32(scratch + 60));
+    ((uint8 *)work)[3] = 7;
+    ((uint8 *)work)[7] = 0x24;
+    w_u32(scratch + 36, xport_gte_read_flag());
+    if (r_s32(scratch + 36) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u16(first + 6));
+        xport_store_le32(work + 5, r_u16(second + 6));
+        xport_store_le32(work + 7, r_u16(third + 6));
+        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 70));
+        xport_store_le16((uint8 *)work + 22, r_u16(scratch + 78));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_tf3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_tf3(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 24, index, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 8, index);
+    xport_gte_execute(0x280030);
+    for (index = 0; index < 3; ++index)
+        w_u16(scratch + 68 + index * 8, r_u16(vertices + 6 + index * 8));
+    w_u32(scratch + 36, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 64 + index * 8, xport_gte_read_data(12 + index));
+    xport_gte_execute(0x158002D);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_g3_bounds(scratch + 56, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 36) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 36) >= 0)
+    {
+        maximum = r_s16(scratch + 44);
+        minimum = r_s16(scratch + 40);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 46);
+            minimum = r_s16(scratch + 42);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 8);
+        for (index = 0; index < 8; ++index)
+            xport_store_le32(work + index, r_u32(scratch + 56 + index * 4));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_tf3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_vector(next, vertices);
+    gs_subdivision_midpoint_uv(next + 8, vertices, vertices + 8);
+    gs_subdivision_midpoint_uv(next + 16, vertices, vertices + 16);
+    gs_subdivision_recurse_tf3(next, scratch, level, cursor);
+    gs_subdivision_emit_tf3(vertices, vertices + 8, next + 8, scratch, cursor);
+    gs_subdivision_midpoint_uv(next, vertices + 8, vertices + 16);
+    gs_subdivision_recurse_tf3(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next + 16, vertices + 8);
+    gs_subdivision_recurse_tf3(next, scratch, level, cursor);
+    gs_subdivision_emit_tf3(vertices + 8, vertices + 16, next, scratch, cursor);
+    gs_subdivision_copy_vector(next + 8, vertices + 16);
+    gs_subdivision_midpoint_uv(next + 16, vertices, vertices + 16);
+    gs_subdivision_recurse_tf3(next, scratch, level, cursor);
+    gs_subdivision_emit_tf3(vertices + 16, vertices, next + 16, scratch, cursor);
+}
+
+static uint32 *gs_a4_div_tf3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, threshold;
+    uint32 colored = mode == 1;
+    uint32 lit = mode >= 2;
+    uint32 index_offset = colored ? 20 : 18;
+    w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    w_u32(scratch + 12, mode == 3 ? shift + 2 : shift);
+    w_u16(scratch + 32, (uint32)gs_subdivision_width);
+    w_u16(scratch + 34, (uint32)gs_subdivision_height);
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+    w_u8(scratch + 59, 7);
+    w_u8(scratch + 63, 0x24);
+    if (!colored)
+    {
+        w_u8(scratch + 60, 0x80);
+        w_u8(scratch + 61, 0x80);
+        w_u8(scratch + 62, 0x80);
+    }
+    w_u32(scratch + 16, base);
+    xport_gte_write_data(6, r_u32(scratch + 60));
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        work = gs_tmd_work_buffer(work, 8);
+        xport_store_le32(work + 3, r_u32(primitive + 4));
+        xport_store_le32(work + 7, r_u32(primitive + 12));
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0 && (r_u32(scratch + 36) & 0x40000) == 0)
+        {
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            xport_gte_execute(0x158002D);
+            if (colored)
+                xport_store_le32(work + 1, r_u32(primitive + 16) | 0x24000000);
+            w_u32(scratch + 24, xport_gte_read_data(7));
+            if (lit)
+            {
+                vertex = normals + (uint32)r_u16(primitive + 16) * 8;
+                gs_tmd_load_vector(vertex, 0);
+                xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
+            }
+            xport_store_le32(work + 5, r_u32(primitive + 8));
+            slot = gs_subdivision_slot(scratch);
+            if (!colored)
+                xport_store_le32(work + 1, lit ? xport_gte_read_data(22) : 0x24808080);
+            depth = r_u32(scratch + 24);
+            threshold = r_u32(scratch + 28);
+            if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0)
+            {
+                if (lit)
+                    w_u32(scratch + 60, xport_gte_read_data(22));
+                else if (colored)
+                    w_u32(scratch + 60, xport_load_le32(work + 1));
+                for (index = 0; index < 3; ++index)
+                {
+                    vertex = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+                    gs_subdivision_copy_vector(scratch + 88 + index * 8, vertex);
+                }
+                for (index = 0; index < 3; ++index)
+                    w_u16(scratch + 94 + index * 8, r_u16(primitive + 4 + index * 4));
+                w_u16(scratch + 70, r_u16(primitive + 6));
+                w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                w_u16(scratch + 78, r_u16(primitive + 10));
+                gs_subdivision_recurse_tf3(scratch + 88, scratch, 0, &work);
+            }
+            else
+                gs_subdivision_link_tf3(&work, scratch, slot);
+        }
+        primitive += colored ? 28 : 24;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divTF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_tf3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divTNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divTF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divTF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 3);
+}
+
+static void gs_subdivision_tf4_emit_triangle(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 8);
+    xport_store_le32(work + 1, r_u32(scratch + 64));
+    ((uint8 *)work)[3] = 7;
+    ((uint8 *)work)[7] = 0x24;
+    w_u32(scratch + 40, xport_gte_read_flag());
+    if (r_s32(scratch + 40) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u16(first + 6));
+        xport_store_le32(work + 5, r_u16(second + 6));
+        xport_store_le32(work + 7, r_u16(third + 6));
+        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 74));
+        xport_store_le16((uint8 *)work + 22, r_u16(scratch + 82));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 8);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_tf4(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 32, index, flags, last_flags, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 8, index);
+    xport_gte_execute(0x280030);
+    for (index = 0; index < 3; ++index)
+        w_u16(scratch + 72 + index * 8, r_u16(vertices + 6 + index * 8));
+    w_u32(scratch + 40, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 68 + index * 8, xport_gte_read_data(12 + index));
+    gs_tmd_load_vector(vertices + 24, 0);
+    xport_gte_execute(0x180001);
+    w_u16(scratch + 96, r_u16(vertices + 30));
+    w_u32(scratch + 36, xport_gte_read_flag());
+    flags = r_u32(scratch + 40);
+    last_flags = r_u32(scratch + 36);
+    w_u32(scratch + 40, flags | last_flags);
+    w_u32(scratch + 92, xport_gte_read_data(14));
+    xport_gte_execute(0x168002E);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_g4_bounds(scratch + 60, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 40) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 40) >= 0)
+    {
+        maximum = r_s16(scratch + 48);
+        minimum = r_s16(scratch + 44);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 50);
+            minimum = r_s16(scratch + 46);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 10);
+        for (index = 0; index < 10; ++index)
+            xport_store_le32(work + index, r_u32(scratch + 60 + index * 4));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 10);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_vector(next, vertices);
+    gs_subdivision_midpoint_uv(next + 8, vertices, vertices + 8);
+    gs_subdivision_midpoint_uv(next + 16, vertices, vertices + 16);
+    gs_subdivision_midpoint_uv(next + 24, vertices, vertices + 24);
+    gs_subdivision_tf4_emit_triangle(vertices, vertices + 8, next + 8, scratch, cursor);
+    gs_subdivision_recurse_tf4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 8);
+    gs_subdivision_midpoint_uv(next + 16, vertices + 8, vertices + 24);
+    gs_subdivision_tf4_emit_triangle(vertices + 8, vertices + 24, next + 16, scratch, cursor);
+    gs_subdivision_recurse_tf4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 24);
+    gs_subdivision_midpoint_uv(next + 8, vertices + 24, vertices + 16);
+    gs_subdivision_tf4_emit_triangle(vertices + 24, vertices + 16, next + 8, scratch, cursor);
+    gs_subdivision_recurse_tf4(next, scratch, level, cursor);
+    gs_subdivision_copy_vector(next, vertices + 16);
+    gs_subdivision_midpoint_uv(next + 16, vertices, vertices + 16);
+    gs_subdivision_tf4_emit_triangle(vertices + 16, vertices, next + 16, scratch, cursor);
+    gs_subdivision_recurse_tf4(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, threshold;
+    uint32 *packet;
+    uint32 colored = mode == 1;
+    uint32 lit = mode >= 2;
+    uint32 index_offset = colored ? 24 : 22;
+    base = r_u32(ordering_table + 4);
+    if (lit)
+    {
+        w_u32(scratch + 12, shift);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+        w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+        w_u8(scratch + 63, 9);
+        w_u8(scratch + 67, 0x2C);
+        w_u8(scratch + 64, 0x80);
+        w_u8(scratch + 65, 0x80);
+        w_u8(scratch + 66, 0x80);
+        w_u32(scratch + 16, base);
+        xport_gte_write_data(6, r_u32(scratch + 64));
+    }
+    else
+    {
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        if (colored)
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        else
+            w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u32(scratch + 12, shift);
+        if (colored)
+            w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        else
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+        if (colored)
+            w_u32(scratch + 16, base);
+        w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+        w_u8(scratch + 63, 9);
+        w_u8(scratch + 67, 0x2C);
+        if (!colored)
+        {
+            w_u8(scratch + 64, 0x80);
+            w_u8(scratch + 65, 0x80);
+            w_u8(scratch + 66, 0x80);
+            w_u32(scratch + 16, base);
+        }
+    }
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        work = gs_tmd_work_buffer(work, 10);
+        xport_store_le32(work + 3, r_u32(primitive + 4));
+        if (lit)
+            xport_store_le32(work + 7, r_u32(primitive + 12));
+        if (colored)
+            xport_store_le32(work + 5, r_u32(primitive + 8));
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        if (colored)
+            xport_store_le32(work + 7, r_u32(primitive + 12));
+        else
+            xport_store_le32(work + 9, r_u32(primitive + 16));
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            if (lit)
+            {
+                vertex = normals + (uint32)r_u16(primitive + 20) * 8;
+                gs_tmd_load_vector(vertex, 0);
+                xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
+                xport_store_le32(work + 5, r_u32(primitive + 8));
+            }
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            vertex = vertices + (uint32)r_u16(primitive + index_offset + 6) * 8;
+            gs_tmd_load_vector(vertex, 0);
+            xport_gte_execute(0x180001);
+            if (colored)
+                xport_store_le32(work + 9, r_u32(primitive + 16));
+            else if (!lit)
+                xport_store_le32(work + 5, r_u32(primitive + 8));
+            w_u32(scratch + 40, xport_gte_read_flag());
+            if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
+            {
+                xport_store_le32(work + 8, xport_gte_read_data(14));
+                xport_gte_execute(0x168002E);
+                if (colored)
+                    xport_store_le32(work + 1, r_u32(primitive + 20) | 0x2C000000);
+                else if (!lit)
+                    xport_store_le32(work + 7, r_u32(primitive + 12));
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                slot = gs_subdivision_f4_slot(scratch);
+                if (!colored && !lit)
+                    xport_store_le32(work + 1, 0x2C808080);
+                depth = r_u32(scratch + 24);
+                threshold = r_u32(scratch + 28);
+                if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
+                {
+                    if (lit)
+                        w_u32(scratch + 64, xport_gte_read_data(22));
+                    else if (colored)
+                        w_u32(scratch + 64, xport_load_le32(work + 1));
+                    for (index = 0; index < 4; ++index)
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
+                        gs_subdivision_copy_vector(scratch + 100 + index * 8, vertex);
+                    }
+                    for (index = 0; index < 4; ++index)
+                        w_u16(scratch + 106 + index * 8, r_u16(primitive + 4 + index * 4));
+                    w_u16(scratch + 74, r_u16(primitive + 6));
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    w_u16(scratch + 82, r_u16(primitive + 10));
+                    gs_subdivision_recurse_tf4(scratch + 100, scratch, 0, &work);
+                }
+                else
+                {
+                    packet = work;
+                    gs_subdivision_f4_link(&work, scratch, slot, 10);
+                    if (lit)
+                        xport_store_le32(packet + 1, xport_gte_read_data(22));
+                }
+            }
+        }
+        primitive += 32;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divTF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_tf4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divTNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divTF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divTF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tf4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 3);
+}
+
+static uint32 gs_subdivision_tg3_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset;
+    sint32 first, second, third, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 20 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 40 + offset, r_u16(packet + 20 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 40 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 20 + offset));
+        }
+        third = r_s16(packet + 32 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < third)
+            w_u16(scratch + 44 + offset, (uint32)third);
+        else
+        {
+            bound = r_s16(scratch + 40 + offset);
+            if (third < bound)
+                w_u16(scratch + 40 + offset, (uint32)third);
+        }
+        extent = r_s16(scratch + 48 + offset);
+        bound = r_s16(scratch + 44 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 40 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static void gs_subdivision_link_tg3(uint32 **cursor, uint32 scratch, uint32 slot)
+{
+    uint32 *work = gs_tmd_work_buffer(*cursor, 10);
+    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x09000000);
+    w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+    *cursor = work + 10;
+}
+
+static void gs_subdivision_midpoint_uv_color(uint32 destination, uint32 left, uint32 right)
+{
+    uint32 offset, first, second;
+    gs_subdivision_midpoint_color(destination, left, right);
+    for (offset = 6; offset < 8; ++offset)
+    {
+        first = r_u8(left + offset);
+        second = r_u8(right + offset);
+        w_u8(destination + offset, (first + second) >> 1);
+    }
+}
+
+static void gs_subdivision_emit_tg3(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 10);
+    xport_store_le32(work + 1, r_u32(first + 8));
+    ((uint8 *)work)[3] = 9;
+    ((uint8 *)work)[7] = 0x34;
+    w_u32(scratch + 36, xport_gte_read_flag());
+    if (r_s32(scratch + 36) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u16(first + 6));
+        xport_store_le32(work + 6, r_u16(second + 6));
+        xport_store_le32(work + 9, r_u16(third + 6));
+        xport_store_le32(work + 4, r_u32(second + 8));
+        xport_store_le32(work + 7, r_u32(third + 8));
+        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 70));
+        xport_store_le16((uint8 *)work + 26, r_u16(scratch + 82));
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_tg3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_tg3(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 36, index, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 12, index);
+    xport_gte_execute(0x280030);
+    for (index = 0; index < 3; ++index)
+        w_u16(scratch + 68 + index * 12, r_u16(vertices + 6 + index * 12));
+    w_u32(scratch + 36, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 64 + index * 12, xport_gte_read_data(12 + index));
+    xport_gte_execute(0x158002D);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_tg3_bounds(scratch + 56, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 36) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 36) >= 0)
+    {
+        maximum = r_s16(scratch + 44);
+        minimum = r_s16(scratch + 40);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 46);
+            minimum = r_s16(scratch + 42);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 10);
+        xport_store_le32(work, r_u32(scratch + 56));
+        for (index = 0; index < 3; ++index)
+        {
+            xport_store_le32(work + 1 + index * 3, r_u32(vertices + 8 + index * 12));
+            xport_store_le32(work + 2 + index * 3, r_u32(scratch + 64 + index * 12));
+            xport_store_le32(work + 3 + index * 3, r_u32(scratch + 68 + index * 12));
+        }
+        slot = gs_subdivision_slot(scratch);
+        gs_subdivision_link_tg3(cursor, scratch, slot);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_color_vertex(next, vertices);
+    gs_subdivision_midpoint_uv_color(next + 12, vertices, vertices + 12);
+    gs_subdivision_midpoint_uv_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_emit_tg3(vertices, vertices + 12, next + 12, scratch, cursor);
+    gs_subdivision_recurse_tg3(next, scratch, level, cursor);
+    gs_subdivision_midpoint_uv_color(next, vertices + 12, vertices + 24);
+    gs_subdivision_recurse_tg3(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next + 24, vertices + 12);
+    gs_subdivision_emit_tg3(vertices + 12, vertices + 24, next, scratch, cursor);
+    gs_subdivision_recurse_tg3(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next + 12, vertices + 24);
+    gs_subdivision_midpoint_uv_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_emit_tg3(vertices + 24, vertices, next + 24, scratch, cursor);
+    gs_subdivision_recurse_tg3(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_tg3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, threshold;
+    uint32 colored = mode == 1;
+    uint32 lit = mode >= 2;
+    uint32 index_offset = colored ? 28 : 18;
+    uint32 index_stride = colored ? 2 : 4;
+    w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    if (lit)
+    {
+        w_u32(scratch + 12, shift);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u8(scratch + 59, 9);
+        w_u8(scratch + 63, 0x34);
+        for (index = 0; index < 3; ++index)
+        {
+            w_u8(scratch + 60 + index * 12, 0x80);
+            w_u8(scratch + 61 + index * 12, 0x80);
+            w_u8(scratch + 62 + index * 12, 0x80);
+        }
+        w_u32(scratch + 16, base);
+        xport_gte_write_data(6, r_u32(scratch + 60));
+    }
+    else
+    {
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        if (!colored)
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 12, shift);
+        w_u8(scratch + 59, 9);
+        if (colored)
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u8(scratch + 63, 0x34);
+        w_u32(scratch + 16, base);
+    }
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        work = gs_tmd_work_buffer(work, 10);
+        xport_store_le32(work + 3, r_u32(primitive + 4));
+        if (colored)
+            xport_store_le32(work + 6, r_u32(primitive + 8));
+        else
+            xport_store_le32(work + 9, r_u32(primitive + 12));
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        if (colored)
+            xport_store_le32(work + 9, r_u32(primitive + 12));
+        else if (!lit)
+            xport_store_le32(work + 4, 0x808080);
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0 && (r_u32(scratch + 36) & 0x40000) == 0)
+        {
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+            xport_gte_execute(0x158002D);
+            if (colored)
+                xport_store_le32(work + 1, r_u32(primitive + 16) | 0x34000000);
+            else if (!lit)
+                xport_store_le32(work + 7, 0x808080);
+            w_u32(scratch + 24, xport_gte_read_data(7));
+            if (lit)
+            {
+                for (index = 0; index < 3; ++index)
+                    addresses[index] = normals + (uint32)r_u16(primitive + 16 + index * 4) * 8;
+                for (index = 0; index < 3; ++index)
+                    gs_tmd_load_vector(addresses[index], index);
+                xport_gte_execute(mode == 3 ? 0xF80416 : 0x118043F);
+            }
+            if (colored)
+            {
+                xport_store_le32(work + 4, r_u32(primitive + 20));
+                xport_store_le32(work + 7, r_u32(primitive + 24));
+            }
+            else
+            {
+                vertex = r_u32(primitive + 8);
+                if (!lit)
+                    xport_store_le32(work + 1, 0x34808080);
+                xport_store_le32(work + 6, vertex);
+            }
+            slot = gs_subdivision_slot(scratch);
+            if (lit)
+            {
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+            }
+            if (colored)
+            {
+                index = r_u32(scratch + 36);
+                if ((sint32)index < 0)
+                    goto subdivide;
+            }
+            depth = r_u32(scratch + 24);
+            threshold = r_u32(scratch + 28);
+            if ((sint32)depth < (sint32)threshold || (!colored && r_s32(scratch + 36) < 0))
+            {
+            subdivide:
+                for (index = 0; index < 3; ++index)
+                {
+                    vertex = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+                    gs_subdivision_copy_vector(scratch + 96 + index * 12, vertex);
+                    w_u32(scratch + 104 + index * 12, lit ? xport_load_le32(work + 1 + index * 3) : colored ? xport_load_le32(work + 1 + index * 3) | 0x34000000 : 0x34808080);
+                }
+                for (index = 0; index < 3; ++index)
+                    w_u16(scratch + 102 + index * 12, r_u16(primitive + 4 + index * 4));
+                w_u16(scratch + 70, r_u16(primitive + 6));
+                w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                w_u16(scratch + 82, r_u16(primitive + 10));
+                gs_subdivision_recurse_tg3(scratch + 96, scratch, 0, &work);
+            }
+            else
+                gs_subdivision_link_tg3(&work, scratch, slot);
+        }
+        primitive += colored ? 36 : 28;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_tg3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divTNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg3(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divTG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divTG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg3(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 3);
+}
+
+static uint32 gs_subdivision_tg4_bounds(uint32 packet, uint32 scratch)
+{
+    uint32 offset, index;
+    sint32 first, second, coordinate, bound, extent;
+    for (offset = 0; offset < 4; offset += 2)
+    {
+        first = r_s16(packet + 8 + offset);
+        second = r_s16(packet + 20 + offset);
+        if (second < first)
+        {
+            w_u16(scratch + 48 + offset, (uint32)first);
+            w_u16(scratch + 44 + offset, r_u16(packet + 20 + offset));
+        }
+        else
+        {
+            w_u16(scratch + 44 + offset, (uint32)first);
+            w_u16(scratch + 48 + offset, r_u16(packet + 20 + offset));
+        }
+        for (index = 2; index < 4; ++index)
+        {
+            coordinate = r_s16(packet + 8 + index * 12 + offset);
+            bound = r_s16(scratch + 48 + offset);
+            if (bound < coordinate)
+                w_u16(scratch + 48 + offset, (uint32)coordinate);
+            else
+            {
+                bound = r_s16(scratch + 44 + offset);
+                if (coordinate < bound)
+                    w_u16(scratch + 44 + offset, (uint32)coordinate);
+            }
+        }
+        extent = r_s16(scratch + 52 + offset);
+        bound = r_s16(scratch + 48 + offset);
+        if (bound < -extent)
+            return 1;
+        bound = r_s16(scratch + 44 + offset);
+        if (extent < bound)
+            return 1;
+    }
+    return 0;
+}
+
+static void gs_subdivision_tg4_emit_triangle(uint32 first, uint32 second, uint32 third, uint32 scratch, uint32 **cursor)
+{
+    uint32 *work, index, slot;
+    gs_tmd_load_vector(first, 0);
+    gs_tmd_load_vector(second, 1);
+    gs_tmd_load_vector(third, 2);
+    xport_gte_execute(0x280030);
+    work = gs_tmd_work_buffer(*cursor, 10);
+    xport_store_le32(work + 1, r_u32(first + 8));
+    ((uint8 *)work)[3] = 9;
+    ((uint8 *)work)[7] = 0x34;
+    w_u32(scratch + 40, xport_gte_read_flag());
+    if (r_s32(scratch + 40) >= 0)
+    {
+        xport_gte_execute(0x158002D);
+        for (index = 0; index < 3; ++index)
+            xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+        w_u32(scratch + 24, xport_gte_read_data(7));
+        xport_store_le32(work + 3, r_u16(first + 6));
+        xport_store_le32(work + 6, r_u16(second + 6));
+        xport_store_le32(work + 9, r_u16(third + 6));
+        xport_store_le32(work + 4, r_u32(second + 8));
+        xport_store_le32(work + 7, r_u32(third + 8));
+        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 74));
+        xport_store_le16((uint8 *)work + 26, r_u16(scratch + 86));
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 10);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+    }
+}
+
+static void gs_subdivision_recurse_tg4(uint32 vertices, uint32 scratch, uint32 level, uint32 **cursor)
+{
+    uint32 next = vertices + 48, index, flags, last_flags, emit = 0, slot;
+    sint32 maximum, minimum, limit;
+    for (index = 0; index < 3; ++index)
+        gs_tmd_load_vector(vertices + index * 12, index);
+    xport_gte_execute(0x280030);
+    for (index = 0; index < 3; ++index)
+        w_u16(scratch + 72 + index * 12, r_u16(vertices + 6 + index * 12));
+    w_u32(scratch + 40, xport_gte_read_flag());
+    for (index = 0; index < 3; ++index)
+        w_u32(scratch + 68 + index * 12, xport_gte_read_data(12 + index));
+    gs_tmd_load_vector(vertices + 36, 0);
+    xport_gte_execute(0x180001);
+    w_u16(scratch + 108, r_u16(vertices + 42));
+    w_u32(scratch + 36, xport_gte_read_flag());
+    flags = r_u32(scratch + 40);
+    last_flags = r_u32(scratch + 36);
+    w_u32(scratch + 40, flags | last_flags);
+    w_u32(scratch + 104, xport_gte_read_data(14));
+    xport_gte_execute(0x168002E);
+    w_u32(scratch + 24, (uint32)((sint32)xport_gte_read_data(19) >> 2));
+    if (gs_subdivision_tg4_bounds(scratch + 60, scratch) != 0)
+        return;
+    if (r_u32(scratch) == level)
+    {
+        if (r_s32(scratch + 40) < 0)
+            return;
+        emit = 1;
+    }
+    else if (r_s32(scratch + 40) >= 0)
+    {
+        maximum = r_s16(scratch + 48);
+        minimum = r_s16(scratch + 44);
+        limit = r_s16(scratch + 32);
+        if (maximum - minimum < limit)
+        {
+            maximum = r_s16(scratch + 50);
+            minimum = r_s16(scratch + 46);
+            limit = r_s16(scratch + 34);
+            if (maximum - minimum < limit)
+                emit = 1;
+        }
+    }
+    if (emit)
+    {
+        uint32 *work = gs_tmd_work_buffer(*cursor, 13);
+        xport_store_le32(work, r_u32(scratch + 60));
+        for (index = 0; index < 4; ++index)
+        {
+            xport_store_le32(work + 1 + index * 3, r_u32(vertices + 8 + index * 12));
+            xport_store_le32(work + 2 + index * 3, r_u32(scratch + 68 + index * 12));
+            xport_store_le32(work + 3 + index * 3, r_u32(scratch + 72 + index * 12));
+        }
+        slot = gs_subdivision_f4_slot(scratch);
+        gs_subdivision_f4_link(cursor, scratch, slot, 13);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
+        return;
+    }
+    ++level;
+    gs_subdivision_copy_color_vertex(next, vertices);
+    gs_subdivision_midpoint_uv_color(next + 12, vertices, vertices + 12);
+    gs_subdivision_midpoint_uv_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_midpoint_uv_color(next + 36, vertices, vertices + 36);
+    gs_subdivision_tg4_emit_triangle(vertices, vertices + 12, next + 12, scratch, cursor);
+    gs_subdivision_recurse_tg4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 12);
+    gs_subdivision_midpoint_uv_color(next + 24, vertices + 12, vertices + 36);
+    gs_subdivision_tg4_emit_triangle(vertices + 12, vertices + 36, next + 24, scratch, cursor);
+    gs_subdivision_recurse_tg4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 36);
+    gs_subdivision_midpoint_uv_color(next + 12, vertices + 36, vertices + 24);
+    gs_subdivision_tg4_emit_triangle(vertices + 36, vertices + 24, next + 12, scratch, cursor);
+    gs_subdivision_recurse_tg4(next, scratch, level, cursor);
+    gs_subdivision_copy_color_vertex(next, vertices + 24);
+    gs_subdivision_midpoint_uv_color(next + 24, vertices, vertices + 24);
+    gs_subdivision_tg4_emit_triangle(vertices + 24, vertices, next + 24, scratch, cursor);
+    gs_subdivision_recurse_tg4(next, scratch, level, cursor);
+}
+
+static uint32 *gs_a4_div_tg4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
+{
+    uint32 base, index, addresses[3], vertex, slot, depth, threshold;
+    uint32 colored = mode == 1;
+    uint32 lit = mode >= 2;
+    uint32 index_offset = colored ? 36 : 22;
+    uint32 index_stride = colored ? 2 : 4;
+    w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
+    w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
+    base = r_u32(ordering_table + 4);
+    if (lit)
+    {
+        w_u32(scratch + 12, shift);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u8(scratch + 63, 12);
+        w_u8(scratch + 67, 0x3C);
+        for (index = 0; index < 4; ++index)
+        {
+            w_u8(scratch + 64 + index * 12, 0x80);
+            w_u8(scratch + 65 + index * 12, 0x80);
+            w_u8(scratch + 66 + index * 12, 0x80);
+        }
+        w_u32(scratch + 16, base);
+        xport_gte_write_data(6, r_u32(scratch + 64));
+    }
+    else
+    {
+        w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+        w_u32(scratch + 28, (uint32)gs_subdivision_distance);
+        w_u16(scratch + 32, (uint32)gs_subdivision_width);
+        if (!colored)
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u32(scratch + 12, shift);
+        w_u8(scratch + 63, 12);
+        if (colored)
+            w_u16(scratch + 34, (uint32)gs_subdivision_height);
+        w_u8(scratch + 67, 0x3C);
+        w_u32(scratch + 16, base);
+    }
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        work = gs_tmd_work_buffer(work, 13);
+        xport_store_le32(work + 3, r_u32(primitive + 4));
+        xport_store_le32(work + (lit ? 9 : 6), r_u32(primitive + (lit ? 12 : 8)));
+        w_u32(scratch + 36, xport_gte_read_flag());
+        xport_gte_execute(0x1400006);
+        xport_store_le32(work + (lit ? 12 : 9), r_u32(primitive + (lit ? 16 : 12)));
+        w_u32(scratch + 24, xport_gte_read_data(24));
+        if (r_s32(scratch + 24) > 0)
+        {
+            for (index = 0; index < 3; ++index)
+                xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+            vertex = vertices + (uint32)r_u16(primitive + index_offset + 3 * index_stride) * 8;
+            gs_tmd_load_vector(vertex, 0);
+            xport_gte_execute(0x180001);
+            if (!lit && colored)
+            {
+                xport_store_le32(work + 12, r_u32(primitive + 16));
+                xport_store_le32(work + 1, r_u32(primitive + 20) | 0x3C000000);
+            }
+            else if (!lit)
+            {
+                vertex = r_u32(primitive + 16);
+                xport_store_le32(work + 1, 0x3C808080);
+                xport_store_le32(work + 12, vertex);
+            }
+            w_u32(scratch + 40, xport_gte_read_flag());
+            if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
+            {
+                xport_store_le32(work + 11, xport_gte_read_data(14));
+                xport_gte_execute(0x168002E);
+                if (!lit)
+                {
+                    for (index = 1; index < 4; ++index)
+                        xport_store_le32(work + 1 + index * 3, colored ? r_u32(primitive + 20 + index * 4) : 0x808080);
+                }
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                if (lit)
+                {
+                    for (index = 0; index < 3; ++index)
+                        addresses[index] = normals + (uint32)r_u16(primitive + 20 + index * 4) * 8;
+                    for (index = 0; index < 3; ++index)
+                        gs_tmd_load_vector(addresses[index], index);
+                    xport_gte_execute(mode == 3 ? 0xF80416 : 0x118043F);
+                    xport_store_le32(work + 6, r_u32(primitive + 8));
+                }
+                slot = gs_subdivision_f4_slot(scratch);
+                if (lit)
+                {
+                    for (index = 0; index < 3; ++index)
+                        xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                    vertex = normals + (uint32)r_u16(primitive + 32) * 8;
+                    gs_tmd_load_vector(vertex, 0);
+                    xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
+                    xport_store_le32(work + 10, xport_gte_read_data(22));
+                }
+                depth = r_u32(scratch + 24);
+                threshold = r_u32(scratch + 28);
+                if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
+                {
+                    for (index = 0; index < 4; ++index)
+                    {
+                        vertex = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
+                        gs_subdivision_copy_vector(scratch + 112 + index * 12, vertex);
+                        w_u32(scratch + 120 + index * 12, lit ? xport_load_le32(work + 1 + index * 3) : colored ? xport_load_le32(work + 1 + index * 3) | 0x3C000000 : 0x3C808080);
+                    }
+                    for (index = 0; index < 4; ++index)
+                        w_u16(scratch + 118 + index * 12, r_u16(primitive + 4 + index * 4));
+                    w_u16(scratch + 74, r_u16(primitive + 6));
+                    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+                    w_u16(scratch + 86, r_u16(primitive + 10));
+                    gs_subdivision_recurse_tg4(scratch + 112, scratch, 0, &work);
+                }
+                else
+                    gs_subdivision_f4_link(&work, scratch, slot, 13);
+            }
+        }
+        primitive += colored ? 44 : 36;
+        --count;
+    }
+    w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
+    return work;
+}
+
+uint32 *GsA4divTG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_a4_div_tg4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 0);
+}
+
+uint32 *GsA4divTNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg4(primitive, vertices, 0, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsA4divTG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 2);
+}
+
+uint32 *GsA4divTG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_a4_div_tg4(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 3);
+}
+
+static uint32 *gs_tmd_fast_gradient_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 gouraud, uint32 fog)
+{
+    uint32 base = r_u32(ordering_table + 4);
+    uint32 index, addresses[3], normal, slot, depth, depth_shift;
+    w_u32(scratch + 12, shift);
+    w_u32(scratch + 16, base);
+    while ((sint32)count > 0)
+    {
+        for (index = 0; index < 3; ++index)
+            addresses[index] = vertices + (uint32)r_u16(primitive + 18 + index * (gouraud ? 4 : 2)) * 8;
+        for (index = 0; index < 3; ++index)
+            gs_tmd_load_vector(addresses[index], index);
+        xport_gte_execute(0x280030);
+        if (!gouraud)
+        {
+            w_u32(scratch, r_u32(primitive + 4));
+            w_u8(scratch + 3, 0x30);
+        }
+        w_u32(scratch + 36, xport_gte_read_flag());
+        if (r_s32(scratch + 36) >= 0)
+        {
+            xport_gte_execute(0x1400006);
+            w_u32(scratch + 24, xport_gte_read_data(24));
+            if (r_s32(scratch + 24) > 0)
+            {
+                work = gs_tmd_work_buffer(work, 7);
+                for (index = 0; index < 3; ++index)
+                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                xport_gte_execute(0x158002D);
+                w_u32(scratch + 24, xport_gte_read_data(7));
+                xport_gte_write_data(6, r_u32(gouraud ? primitive + 4 : scratch));
+                normal = (uint32)r_u16(primitive + 16) * 8 + normals;
+                gs_tmd_load_vector(normal, 0);
+                xport_gte_execute(fog ? 0xE80413 : 0x108041B);
+                depth = r_u32(scratch + 24);
+                depth_shift = r_u32(scratch + 12);
+                slot = (uint32)((sint32)depth >> (depth_shift & 31));
+                slot = (slot << 2) + r_u32(scratch + 16);
+                w_u32(scratch + 52, slot);
+                xport_store_le32(work + 1, xport_gte_read_data(22));
+                xport_gte_write_data(6, r_u32(primitive + 8));
+                normal = (uint32)r_u16(primitive + (gouraud ? 20 : 16)) * 8 + normals;
+                gs_tmd_load_vector(normal, 0);
+                xport_gte_execute(fog ? 0xE80413 : 0x108041B);
+                slot = r_u32(scratch + 52);
+                xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+                xport_store_le32(work + 3, xport_gte_read_data(22));
+                xport_gte_write_data(6, r_u32(primitive + 12));
+                normal = (uint32)r_u16(primitive + (gouraud ? 24 : 16)) * 8 + normals;
+                gs_tmd_load_vector(normal, 0);
+                xport_gte_execute(fog ? 0xE80413 : 0x108041B);
+                w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
+                xport_store_le32(work + 5, xport_gte_read_data(22));
+                work += 7;
+            }
+        }
+        primitive += gouraud ? 28 : 24;
+        --count;
+    }
+    return work;
+}
+
+uint32 *GsTMDfastF3GL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_tmd_fast_gradient_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 0, 0);
+}
+
+uint32 *GsTMDfastF3GLFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_tmd_fast_gradient_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 0, 1);
+}
+
+uint32 *GsTMDfastG3GL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_tmd_fast_gradient_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1, 0);
+}
+
+uint32 *GsTMDfastG3GLFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    return gs_tmd_fast_gradient_lit(primitive, vertices, normals, work, count, shift, ordering_table, scratch, 1, 1);
+}
+
+uint32 *GsTMDfastG3GNL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch)
+{
+    (void)normals;
+    return gs_tmd_fast_gradient_nl(primitive, vertices, work, count, shift, ordering_table, scratch, 1);
+}
+
+uint32 *GsTMDfastNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_triangle(primitive, vertices, work, count, shift, ordering_table, 0);
+}
+
+uint32 *GsTMDfastNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_triangle(primitive, vertices, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_triangle(primitive, vertices, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastTNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_triangle(primitive, vertices, work, count, shift, ordering_table, 3);
+}
+
+uint32 *GsTMDfastNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_quad(primitive, vertices, work, count, shift, ordering_table, 0);
+}
+
+uint32 *GsTMDfastNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_quad(primitive, vertices, work, count, shift, ordering_table, 1);
+}
+
+uint32 *GsTMDfastTNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_quad(primitive, vertices, work, count, shift, ordering_table, 2);
+}
+
+uint32 *GsTMDfastTNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table)
+{
+    return gs_tmd_fast_unlit_quad(primitive, vertices, work, count, shift, ordering_table, 3);
+}
+
+#define GS_BIND_PRIMITIVE(adapter, target, arguments) \
+    static uint32 *adapter(GsSortAttributes *attributes, uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch) \
+    { \
+        (void)attributes; \
+        (void)normals; \
+        (void)scratch; \
+        return target arguments; \
+    }
+
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3l, GsTMDfastF3L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3lfg, GsTMDfastF3LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3nl, GsTMDfastF3NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf3l, GsA4divF3L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf3lfg, GsA4divF3LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf3nl, GsA4divF3NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastnf3, GsTMDfastNF3, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divnf3, GsA4divNF3, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3l, GsTMDfastG3L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3lfg, GsTMDfastG3LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3nl, GsTMDfastG3NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg3l, GsA4divG3L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg3lfg, GsA4divG3LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg3nl, GsA4divG3NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastng3, GsTMDfastNG3, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divng3, GsA4divNG3, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf3l, GsTMDfastTF3L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf3lfg, GsTMDfastTF3LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf3nl, GsTMDfastTF3NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf3l, GsA4divTF3L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf3lfg, GsA4divTF3LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf3nl, GsA4divTF3NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttnf3, GsTMDfastTNF3, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtnf3, GsA4divTNF3, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg3l, GsTMDfastTG3L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg3lfg, GsTMDfastTG3LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg3nl, GsTMDfastTG3NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg3l, GsA4divTG3L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg3lfg, GsA4divTG3LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg3nl, GsA4divTG3NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttng3, GsTMDfastTNG3, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtng3, GsA4divTNG3, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf4l, GsTMDfastF4L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf4lfg, GsTMDfastF4LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf4nl, GsTMDfastF4NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf4l, GsA4divF4L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf4lfg, GsA4divF4LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divf4nl, GsA4divF4NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastnf4, GsTMDfastNF4, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divnf4, GsA4divNF4, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg4l, GsTMDfastG4L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg4lfg, GsTMDfastG4LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg4nl, GsTMDfastG4NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg4l, GsA4divG4L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg4lfg, GsA4divG4LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divg4nl, GsA4divG4NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastng4, GsTMDfastNG4, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divng4, GsA4divNG4, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf4l, GsTMDfastTF4L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf4lfg, GsTMDfastTF4LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttf4nl, GsTMDfastTF4NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf4l, GsA4divTF4L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf4lfg, GsA4divTF4LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtf4nl, GsA4divTF4NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttnf4, GsTMDfastTNF4, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtnf4, GsA4divTNF4, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg4l, GsTMDfastTG4L, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg4lfg, GsTMDfastTG4LFG, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttg4nl, GsTMDfastTG4NL, (primitive, vertices, normals, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg4l, GsA4divTG4L, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg4lfg, GsA4divTG4LFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtg4nl, GsA4divTG4NL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfasttng4, GsTMDfastTNG4, (primitive, vertices, work, count, shift, ordering_table))
+GS_BIND_PRIMITIVE(gs_dispatch_a4divtng4, GsA4divTNG4, (primitive, vertices, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3gl, GsTMDfastF3GL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3glfg, GsTMDfastF3GLFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastf3gnl, GsTMDfastF3GNL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3gl, GsTMDfastG3GL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3glfg, GsTMDfastG3GLFG, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+GS_BIND_PRIMITIVE(gs_dispatch_tmdfastg3gnl, GsTMDfastG3GNL, (primitive, vertices, normals, work, count, shift, ordering_table, scratch))
+
+#undef GS_BIND_PRIMITIVE
+
+const GsPrimitiveHandler gs_primitive_handlers[70] = {
+    gs_dispatch_tmdfastf3l, gs_dispatch_tmdfastf3lfg, gs_dispatch_tmdfastf3nl, gs_dispatch_a4divf3l,   gs_dispatch_a4divf3lfg, gs_dispatch_a4divf3nl,  gs_dispatch_tmdfastnf3,   gs_dispatch_a4divnf3,    gs_dispatch_tmdfastg3l, gs_dispatch_tmdfastg3lfg, gs_dispatch_tmdfastg3nl, gs_dispatch_a4divg3l,   gs_dispatch_a4divg3lfg, gs_dispatch_a4divg3nl,   gs_dispatch_tmdfastng3,    gs_dispatch_a4divng3,     gs_dispatch_tmdfasttf3l, gs_dispatch_tmdfasttf3lfg, gs_dispatch_tmdfasttf3nl, gs_dispatch_a4divtf3l,   gs_dispatch_a4divtf3lfg, gs_dispatch_a4divtf3nl,  gs_dispatch_tmdfasttnf3,   gs_dispatch_a4divtnf3,    gs_dispatch_tmdfasttg3l, gs_dispatch_tmdfasttg3lfg, gs_dispatch_tmdfasttg3nl, gs_dispatch_a4divtg3l,   gs_dispatch_a4divtg3lfg, gs_dispatch_a4divtg3nl,  gs_dispatch_tmdfasttng3,   gs_dispatch_a4divtng3,    gs_dispatch_tmdfastf4l,  gs_dispatch_tmdfastf4lfg,  gs_dispatch_tmdfastf4nl,
+    gs_dispatch_a4divf4l,   gs_dispatch_a4divf4lfg,   gs_dispatch_a4divf4nl,   gs_dispatch_tmdfastnf4, gs_dispatch_a4divnf4,   gs_dispatch_tmdfastg4l, gs_dispatch_tmdfastg4lfg, gs_dispatch_tmdfastg4nl, gs_dispatch_a4divg4l,   gs_dispatch_a4divg4lfg,   gs_dispatch_a4divg4nl,   gs_dispatch_tmdfastng4, gs_dispatch_a4divng4,   gs_dispatch_tmdfasttf4l, gs_dispatch_tmdfasttf4lfg, gs_dispatch_tmdfasttf4nl, gs_dispatch_a4divtf4l,   gs_dispatch_a4divtf4lfg,   gs_dispatch_a4divtf4nl,   gs_dispatch_tmdfasttnf4, gs_dispatch_a4divtnf4,   gs_dispatch_tmdfasttg4l, gs_dispatch_tmdfasttg4lfg, gs_dispatch_tmdfasttg4nl, gs_dispatch_a4divtg4l,   gs_dispatch_a4divtg4lfg,   gs_dispatch_a4divtg4nl,   gs_dispatch_tmdfasttng4, gs_dispatch_a4divtng4,   gs_dispatch_tmdfastf3gl, gs_dispatch_tmdfastf3glfg, gs_dispatch_tmdfastf3gnl, gs_dispatch_tmdfastg3gl, gs_dispatch_tmdfastg3glfg, gs_dispatch_tmdfastg3gnl,
+};
+
+typedef struct GsNativeState
+{
+    DRAWENV draw;
+    DISPENV display;
+    MATRIX world;
+    MATRIX screen;
+    MATRIX view;
+    MATRIX saved_view;
+    MATRIX light_directions;
+    MATRIX light_colors;
+    PSX_RECT clip;
+    sint16 buffer_x[2];
+    sint16 buffer_y[2];
+    sint16 sprite_x[2];
+    sint16 sprite_y[2];
+    sint16 center_x;
+    sint16 center_y;
+    sint16 screen_offset_x;
+    sint16 screen_offset_y;
+    uint32 mode;
+    uint32 active;
+    uint32 frame;
+    uint32 depth_limit;
+    uint32 clear_packets[2][4];
+} GsNativeState;
+
+static GsNativeState gs_state;
+
+static void gs_apply_clip(void)
+{
+    gs_state.draw.clip.x = (sint16)(gs_state.clip.x + gs_state.buffer_x[gs_state.active]);
+    gs_state.draw.clip.y = (sint16)(gs_state.clip.y + gs_state.buffer_y[gs_state.active]);
+    gs_state.draw.clip.w = gs_state.clip.w;
+    gs_state.draw.clip.h = gs_state.clip.h;
+    PutDrawEnv(&gs_state.draw);
+}
+
+static void gs_apply_center(void)
+{
+    sint32 x, y;
+    if ((gs_state.mode & 4) != 0)
+    {
+        gs_state.screen_offset_x = 0;
+        gs_state.screen_offset_y = 0;
+        gs_state.draw.ofs[0] = (sint16)(gs_state.center_x + gs_state.buffer_x[gs_state.active]);
+        gs_state.draw.ofs[1] = (sint16)(gs_state.center_y + gs_state.buffer_y[gs_state.active]);
+        PutDrawEnv(&gs_state.draw);
+    }
+    else
+    {
+        x = gs_state.center_x + gs_state.buffer_x[gs_state.active == 0 ? 1 : 0];
+        y = gs_state.center_y + gs_state.buffer_y[gs_state.active == 0 ? 1 : 0];
+        SetGeomOffset(x, y);
+        gs_state.screen_offset_x = (sint16)x;
+        gs_state.screen_offset_y = (sint16)y;
+    }
+}
+
+void gs_set_screen_dimensions(sint32 width, sint32 height)
+{
+    gs_screen_width = width;
+    gs_screen_height = height;
+}
+
+void GsSetLightMode(sint32 mode)
+{
+    if (mode >= 0 && mode <= 3)
+        gs_light_mode = mode;
+    else
+    {
+#ifndef NDEBUG
+        printf("not supported light mode %d\n", mode);
+#endif
+    }
+}
+
+void gs_sort_object4(uint32 object, uint32 ordering_table, uint32 shift, uint32 scratch)
+{
+    uint32 value, fog, lighting, model, primitive, remaining, vertices, normals;
+    uint32 code, slot, stride, count, flags;
+    uint32 *next_work;
+    value = r_u32(object);
+    if ((sint32)value < 0)
+        return;
+    flags = r_u32(object);
+    gs_sort_attributes.bits3_4 = (value >> 3) & 3;
+    value = r_u32(object);
+    gs_sort_attributes.bit5 = (flags >> 5) & 1;
+    flags = r_u32(object);
+    gs_sort_attributes.bit6 = (value >> 6) & 1;
+    value = r_u32(object);
+    gs_sort_attributes.bits9_11 = (flags >> 9) & 7;
+    gs_sort_attributes.bit30 = (value >> 30) & 1;
+    fog = gs_sort_attributes.bits9_11 != 0;
+    if (fog != 0)
+    {
+        value = (uint32)gs_screen_width;
+        flags = (uint32)gs_screen_height;
+        w_u32(scratch, gs_sort_attributes.bits9_11);
+        w_u32(scratch + 4, value);
+        w_u32(scratch + 8, flags);
+    }
+    if (gs_sort_attributes.bit6 == 1)
+        lighting = 2;
+    else if ((gs_sort_attributes.bit5 == 0 && gs_light_mode == 1) || (gs_sort_attributes.bit5 == 1 && gs_sort_attributes.bits3_4 == 1))
+        lighting = 1;
+    else
+        lighting = 0;
+    model = r_u32(object + 8);
+    primitive = r_u32(model + 16);
+    remaining = r_u32(model + 20);
+    vertices = r_u32(model);
+    normals = r_u32(model + 8);
+    while (remaining != 0)
+    {
+        code = r_u8(primitive + 3) & 0xFD;
+        switch (code)
+        {
+            case 0x20:
+                flags = r_u16(primitive + 2);
+                if ((flags & 4) != 0)
+                {
+                    slot = 64 + lighting;
+                    stride = 24;
+                }
+                else
+                {
+                    slot = lighting + fog * 3;
+                    stride = 16;
+                }
+                break;
+            case 0x21:
+                slot = 6 + fog;
+                stride = 16;
+                break;
+            case 0x24:
+                slot = 16 + lighting + fog * 3;
+                stride = 24;
+                break;
+            case 0x25:
+                slot = 22 + fog;
+                stride = 28;
+                break;
+            case 0x28:
+                slot = 32 + lighting + fog * 3;
+                stride = 20;
+                break;
+            case 0x29:
+                slot = 38 + fog;
+                stride = 16;
+                break;
+            case 0x2C:
+                slot = 48 + lighting + fog * 3;
+                stride = 32;
+                break;
+            case 0x2D:
+                slot = 54 + fog;
+                stride = 32;
+                break;
+            case 0x30:
+                flags = r_u16(primitive + 2);
+                if ((flags & 4) != 0)
+                {
+                    slot = 67 + lighting;
+                    stride = 28;
+                }
+                else
+                {
+                    slot = 8 + lighting + fog * 3;
+                    stride = 20;
+                }
+                break;
+            case 0x31:
+                slot = 14 + fog;
+                stride = 24;
+                break;
+            case 0x34:
+                slot = 24 + lighting + fog * 3;
+                stride = 28;
+                break;
+            case 0x35:
+                slot = 30 + fog;
+                stride = 36;
+                break;
+            case 0x38:
+                slot = 40 + lighting + fog * 3;
+                stride = 24;
+                break;
+            case 0x39:
+                slot = 46 + fog;
+                stride = 28;
+                break;
+            case 0x3C:
+                slot = 56 + lighting + fog * 3;
+                stride = 36;
+                break;
+            case 0x3D:
+                slot = 62 + fog;
+                stride = 44;
+                break;
+            default:
+#ifndef NDEBUG
+                printf("non supported code %x %x\n", code, primitive);
+#endif
+                continue;
+        }
+        count = r_u16(primitive);
+        next_work = gs_primitive_handlers[slot](&gs_sort_attributes, primitive, vertices, normals, GsGetWorkBase(), count, shift, ordering_table, scratch);
+        GsSetWorkBase(next_work);
+        count = r_u16(primitive);
+        remaining -= count;
+        primitive += count * stride;
+    }
+}
+
 static MATRIX *gte_gs_light_directions;
 static MATRIX *gte_gs_light_colors;
 
@@ -6544,6 +10663,31 @@ void gte_bind_gs_light_matrices(MATRIX *directions, MATRIX *colors)
 {
     gte_gs_light_directions = directions;
     gte_gs_light_colors = colors;
+}
+
+void GsSetLightMatrix(const MATRIX *matrix)
+{
+    MATRIX light;
+    if (matrix == NULL || gte_gs_light_directions == NULL)
+        abort();
+    light = *gte_gs_light_directions;
+    PushMatrix();
+    MulMatrix0(&light, (MATRIX *)matrix, &light);
+    PopMatrix();
+    SetLightMatrix(&light);
+}
+
+void GsSetAmbient(sint32 red, sint32 green, sint32 blue)
+{
+    SetBackColor(red >> 4, green >> 4, blue >> 4);
+}
+
+void GsSetFogParam(const void *parameters)
+{
+    const uint8 *fog = (const uint8 *)parameters;
+    xport_gte_write_control(27, (uint32)(sint32)(sint16)xport_load_le16(fog));
+    xport_gte_write_control(28, xport_load_le32(fog + 4));
+    SetFarColor(fog[8], fog[9], fog[10]);
 }
 
 sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light)
@@ -6602,9 +10746,508 @@ sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light)
     return 0;
 }
 
+static void gs_compose_matrices(MATRIX *left, MATRIX *right, MATRIX *destination)
+{
+    VECTOR input, translation;
+    input.vx = right->t[0];
+    input.vy = right->t[1];
+    input.vz = right->t[2];
+    ApplyMatrixLV(left, &input, &translation);
+    MulMatrix0(left, right, destination);
+    destination->t[0] = (sint32)((uint32)translation.vx + (uint32)left->t[0]);
+    destination->t[1] = (sint32)((uint32)translation.vy + (uint32)left->t[1]);
+    destination->t[2] = (sint32)((uint32)translation.vz + (uint32)left->t[2]);
+}
+
+static void gs_get_local_world(uint32 coordinate, MATRIX *world)
+{
+    uint32 path[100];
+    uint32 depth = 0, last_dirty = 100, parent, flag, unwind, node;
+    MATRIX local;
+    for (;;)
+    {
+        if (depth >= sizeof(path) / sizeof(path[0]))
+            abort();
+        path[depth] = coordinate;
+        parent = r_u32(coordinate + 72);
+        flag = r_u32(coordinate);
+        if (parent == 0)
+        {
+            if (flag == gs_state.frame || flag == 0)
+            {
+                memcpy(world, psx_addr(coordinate + 4, sizeof(*world)), sizeof(*world));
+                if (!xport_guest_copy(xport_guest_ref(coordinate + 36), xport_host_ref(world), sizeof(*world)))
+                    abort();
+                w_u32(coordinate, gs_state.frame);
+                unwind = depth;
+            }
+            else if (last_dirty == 100)
+            {
+                memcpy(world, psx_addr(path[0] + 36, sizeof(*world)), sizeof(*world));
+                unwind = 0;
+            }
+            else
+            {
+                unwind = last_dirty + 1;
+                memcpy(world, psx_addr(path[unwind] + 36, sizeof(*world)), sizeof(*world));
+            }
+            break;
+        }
+        if (flag == gs_state.frame)
+        {
+            memcpy(world, psx_addr(coordinate + 36, sizeof(*world)), sizeof(*world));
+            unwind = depth;
+            break;
+        }
+        if (flag == 0)
+            last_dirty = depth;
+        coordinate = parent;
+        ++depth;
+    }
+    while (unwind != 0)
+    {
+        node = path[--unwind];
+        memcpy(&local, psx_addr(node + 4, sizeof(local)), sizeof(local));
+        gs_compose_matrices(world, &local, world);
+        if (!xport_guest_copy(xport_guest_ref(node + 36), xport_host_ref(world), sizeof(*world)))
+            abort();
+        w_u32(node, gs_state.frame);
+    }
+}
+
+static void gs_view_coordinates(uint32 view, sint32 coordinates[6])
+{
+    sint32 maximum, magnitude, value;
+    uint32 index, bits = 0, shift;
+    maximum = r_s32(view);
+    if (maximum < 0)
+        maximum = (sint32)(0 - (uint32)maximum);
+    for (index = 1; index < 6; ++index)
+    {
+        magnitude = r_s32(view + index * 4);
+        if (magnitude < 0)
+            magnitude = (sint32)(0 - (uint32)magnitude);
+        if (magnitude > maximum)
+            maximum = magnitude;
+    }
+    for (value = maximum; value > 0; value >>= 1)
+        ++bits;
+    shift = bits >= 16 ? bits - 15 : 0;
+    for (index = 0; index < 6; ++index)
+        coordinates[index] = r_s32(view + index * 4) >> shift;
+}
+
+sint32 GsSetRefView2(uint32 view)
+{
+    MATRIX rotation = {0}, parent_world, inverse = {0};
+    VECTOR input, output;
+    sint32 coordinates[6], roll, angle, sine, cosine;
+    uint32 dx, dy, dz, horizontal, length, parent;
+    sint16 sine_axis, cosine_axis;
+    gs_state.view = gs_state.screen;
+    roll = (sint32)(0 - r_u32(view + 24));
+    angle = roll / 360;
+    cosine = rcos(angle);
+    sine = rsin(angle);
+    if (roll != 0)
+    {
+        rotation.m[0][0] = (sint16)cosine;
+        rotation.m[0][1] = (sint16)(0 - (uint32)sine);
+        rotation.m[1][0] = (sint16)sine;
+        rotation.m[1][1] = (sint16)cosine;
+        rotation.m[2][2] = 4096;
+        MulMatrix0(&gs_state.view, &rotation, &gs_state.view);
+    }
+    gs_view_coordinates(view, coordinates);
+    dx = (uint32)coordinates[3] - (uint32)coordinates[0];
+    dy = (uint32)coordinates[4] - (uint32)coordinates[1];
+    dz = (uint32)coordinates[5] - (uint32)coordinates[2];
+    length = SquareRoot0((sint32)(dx * dx + dy * dy + dz * dz));
+    if (length == 0)
+        return 1;
+    sine_axis = (sint16)(0 - (uint32)((sint32)((0 - dy) << 12) / (sint32)length));
+    horizontal = SquareRoot0((sint32)(dx * dx + dz * dz));
+    cosine_axis = (sint16)((sint32)(horizontal << 12) / (sint32)length);
+    rotation = gs_state.world;
+    rotation.m[1][1] = cosine_axis;
+    rotation.m[2][2] = cosine_axis;
+    rotation.m[1][2] = (sint16)(0 - (uint32)sine_axis);
+    rotation.m[2][1] = sine_axis;
+    MulMatrix0(&gs_state.view, &rotation, &gs_state.view);
+    if (horizontal != 0)
+    {
+        sine_axis = (sint16)(0 - (uint32)((sint32)(dx << 12) / (sint32)horizontal));
+        cosine_axis = (sint16)((sint32)(dz << 12) / (sint32)horizontal);
+        rotation = gs_state.world;
+        rotation.m[0][0] = cosine_axis;
+        rotation.m[2][2] = cosine_axis;
+        rotation.m[0][2] = sine_axis;
+        rotation.m[2][0] = (sint16)(0 - (uint32)sine_axis);
+        MulMatrix0(&gs_state.view, &rotation, &gs_state.view);
+    }
+    input.vx = (sint32)(0 - r_u32(view));
+    input.vy = (sint32)(0 - r_u32(view + 4));
+    input.vz = (sint32)(0 - r_u32(view + 8));
+    ApplyMatrixLV(&gs_state.view, &input, &output);
+    gs_state.view.t[0] = output.vx;
+    gs_state.view.t[1] = output.vy;
+    gs_state.view.t[2] = output.vz;
+    parent = r_u32(view + 28);
+    if (parent != 0)
+    {
+        gs_get_local_world(parent, &parent_world);
+        TransposeMatrix(&parent_world, &inverse);
+        input.vx = parent_world.t[0];
+        input.vy = parent_world.t[1];
+        input.vz = parent_world.t[2];
+        ApplyMatrixLV(&inverse, &input, &output);
+        inverse.t[0] = (sint32)(0 - (uint32)output.vx);
+        inverse.t[1] = (sint32)(0 - (uint32)output.vy);
+        inverse.t[2] = (sint32)(0 - (uint32)output.vz);
+        gs_compose_matrices(&gs_state.view, &inverse, &inverse);
+        gs_state.view = inverse;
+    }
+    gs_state.saved_view = gs_state.view;
+    return 0;
+}
+
+void GsGetLs(uint32 coordinate, MATRIX *screen)
+{
+    gs_get_local_world(coordinate, screen);
+    gs_compose_matrices(&gs_state.view, screen, screen);
+}
+
+void GsGetLws(uint32 coordinate, MATRIX *world, MATRIX *screen)
+{
+    gs_get_local_world(coordinate, world);
+    if (screen != world)
+        memcpy(screen, world, sizeof(*screen));
+    gs_compose_matrices(&gs_state.view, screen, screen);
+}
+
+void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24)
+{
+    uint32 index;
+    width = (uint16)width;
+    height = (uint16)height;
+    mode = (uint16)mode;
+    SetDispMask(0);
+    gs_state.draw.ofs[0] = 0;
+    gs_state.draw.ofs[1] = 0;
+    memset(&gs_state.draw.tw, 0, sizeof(gs_state.draw.tw));
+    gs_state.draw.tpage = 0;
+    gs_state.draw.dtd = (uint8)dither;
+    gs_state.draw.dfe = 0;
+    gs_state.draw.isbg = 0;
+    PutDrawEnv(&gs_state.draw);
+    gs_state.display.disp.x = 0;
+    gs_state.display.disp.y = 0;
+    gs_state.display.disp.w = (sint16)width;
+    gs_state.display.disp.h = (sint16)height;
+    memset(&gs_state.display.screen, 0, sizeof(gs_state.display.screen));
+    if (GetVideoMode() == 1)
+    {
+        gs_state.display.screen.y = 24;
+        gs_state.display.pad0 = 1;
+    }
+    gs_state.display.isinter = (uint8)(mode & 1);
+    gs_state.display.isrgb24 = (uint8)rgb24;
+    gs_state.mode = mode & 4;
+    PutDispEnv(&gs_state.display);
+    InitGeom();
+    SetFarColor(0, 0, 0);
+    SetGeomOffset(0, 0);
+    gs_state.screen_offset_x = 0;
+    gs_state.screen_offset_y = 0;
+    gs_state.active = 0;
+    gs_set_screen_dimensions((sint32)width, (sint32)height);
+    if (width == 0)
+        abort();
+    gs_state.world = psx_identity_matrix;
+    gs_state.screen = gs_state.world;
+    gs_state.screen.m[1][1] = (sint16)((height << 14) / width / 3);
+    memset(&gs_state.light_directions, 0, sizeof(gs_state.light_directions));
+    memset(&gs_state.light_colors, 0, sizeof(gs_state.light_colors));
+    if (gte_gs_light_directions == NULL || gte_gs_light_colors == NULL)
+        gte_bind_gs_light_matrices(&gs_state.light_directions, &gs_state.light_colors);
+    else
+    {
+        *gte_gs_light_directions = gs_state.light_directions;
+        *gte_gs_light_colors = gs_state.light_colors;
+    }
+    memset(gs_state.sprite_x, 0, sizeof(gs_state.sprite_x));
+    memset(gs_state.sprite_y, 0, sizeof(gs_state.sprite_y));
+    gs_state.center_x = 0;
+    gs_state.center_y = 0;
+    gs_state.clip.x = 0;
+    gs_state.clip.y = 0;
+    gs_state.clip.w = (sint16)width;
+    gs_state.clip.h = (sint16)height;
+    for (index = 0; index < 2; ++index)
+    {
+        gs_state.clear_packets[index][0] = (gs_state.clear_packets[index][0] & 0xFFFFFF) | 0x03000000;
+        gs_state.clear_packets[index][1] = (gs_state.clear_packets[index][1] & 0xFFFFFF) | 0x02000000;
+    }
+    gs_state.frame = 1;
+    gs_apply_clip();
+    gs_apply_center();
+}
+
+void GsDefDispBuff(uint32 x0, uint32 y0, uint32 x1, uint32 y1)
+{
+    gs_state.buffer_x[0] = (sint16)x0;
+    gs_state.buffer_x[1] = (sint16)x1;
+    gs_state.buffer_y[0] = (sint16)y0;
+    gs_state.buffer_y[1] = (sint16)y1;
+    if ((gs_state.mode & 4) != 0)
+    {
+        gs_state.sprite_x[0] = 0;
+        gs_state.sprite_x[1] = 0;
+        gs_state.sprite_y[0] = 0;
+        gs_state.sprite_y[1] = 0;
+    }
+    else
+    {
+        gs_state.sprite_x[0] = (sint16)x0;
+        gs_state.sprite_x[1] = (sint16)x1;
+        gs_state.sprite_y[0] = (sint16)y0;
+        gs_state.sprite_y[1] = (sint16)y1;
+    }
+    gs_apply_clip();
+    gs_apply_center();
+}
+
 sint32 GsInit3D(void)
 {
-    abort();
+    gs_state.center_x = (sint16)(gs_screen_width / 2);
+    gs_state.center_y = (sint16)(gs_screen_height / 2);
+    gs_apply_center();
+    gs_set_clip_distance(10);
+    gs_light_mode = 0;
+    gs_state.depth_limit = 0x3FFF;
+    return 0x3FFF;
+}
+
+uint32 GsGetActiveBuff(void)
+{
+    return gs_state.active;
+}
+
+void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
+{
+    const uint8 *descriptor = (const uint8 *)ordering_table;
+    uint32 *packet = gs_state.clear_packets[gs_state.active];
+    uint32 width = (uint32)gs_screen_width;
+    if (!gpu_register_packet_range(gs_state.clear_packets, sizeof(gs_state.clear_packets)))
+        abort();
+    xport_store_u8((uint8 *)packet + 4, red);
+    xport_store_u8((uint8 *)packet + 5, green);
+    xport_store_u8((uint8 *)packet + 6, blue);
+    xport_store_le16((uint8 *)packet + 8, (uint16)gs_state.buffer_x[gs_state.active]);
+    xport_store_le16((uint8 *)packet + 14, (uint16)gs_screen_height);
+    xport_store_le16((uint8 *)packet + 10, (uint16)gs_state.buffer_y[gs_state.active]);
+    if (gs_state.display.isrgb24 != 0)
+        width = width * 3 / 2;
+    xport_store_le16((uint8 *)packet + 12, (uint16)width);
+    AddPrim(psx_addr(xport_load_le32(descriptor + 16), 4), packet);
+}
+
+static uint32 *gs_work_packet(uint32 words)
+{
+    uintptr_t begin = (uintptr_t)&DRAM[0];
+    uintptr_t cursor = (uintptr_t)gs_work_cursor;
+    if (gs_work_cursor == NULL)
+        abort();
+    if (cursor >= begin && cursor - begin < PSX_DRAM_SIZE)
+        return (uint32 *)psx_addr((uint32)(cursor - begin), words * 4);
+    return gs_work_cursor;
+}
+
+static void gs_sort_packet(uint32 *packet, const void *ordering_table, uint16 priority, uint8 words, sint32 add_length)
+{
+    const uint8 *descriptor = (const uint8 *)ordering_table;
+    uint32 depth = (uint32)priority - xport_load_le32(descriptor + 8);
+    uint32 slot = xport_load_le32(descriptor + 4) + depth * 4;
+#ifndef NDEBUG
+    if (!add_length && (sint32)depth < 0)
+        printf("ps_sort_sprite,bg: z resolution overflow\n");
+#endif
+    xport_store_le32(packet, ((uint32)words + (add_length ? r_u32(slot) >> 24 : 0)) << 24);
+    AddPrim(psx_addr(slot, 4), packet);
+    w_u8(slot + 3, 0);
+    gs_work_cursor = packet + (uint32)words + 1;
+}
+
+void GsSortBoxFill(const void *box, void *ordering_table, uint32 priority)
+{
+    const uint8 *descriptor = (const uint8 *)box;
+    uint32 attribute = xport_load_le32(descriptor);
+    uint32 *packet;
+    uint8 *output;
+    if ((sint32)attribute < 0)
+        return;
+    packet = gs_work_packet(5);
+    output = (uint8 *)packet;
+    xport_store_le32(output + 4, 0xE1000200 | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60));
+    xport_store_u8(output + 8, descriptor[12]);
+    xport_store_u8(output + 9, descriptor[13]);
+    xport_store_u8(output + 11, (uint8)(0x60 | ((attribute >> 29) & 2)));
+    xport_store_u8(output + 10, descriptor[14]);
+    xport_store_le16(output + 12, (uint16)(xport_load_le16(descriptor + 4) + gs_state.screen_offset_x));
+    xport_store_le16(output + 14, (uint16)(xport_load_le16(descriptor + 6) + gs_state.screen_offset_y));
+    xport_store_le16(output + 16, xport_load_le16(descriptor + 8));
+    xport_store_le16(output + 18, xport_load_le16(descriptor + 10));
+    gs_sort_packet(packet, ordering_table, (uint16)priority, 4, 0);
+}
+
+void GsSortFastSprite(const void *sprite, void *ordering_table, uint32 priority)
+{
+    const uint8 *descriptor = (const uint8 *)sprite;
+    uint32 attribute = xport_load_le32(descriptor);
+    uint32 *packet;
+    uint32 mode, x, y, red, green, blue, uv, clut_y, clut_x, width, height;
+    if ((sint32)attribute < 0 || xport_load_le16(descriptor + 8) == 0 || xport_load_le16(descriptor + 10) == 0)
+        return;
+    mode = (xport_load_le16(descriptor + 12) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60) | 0xE1000200;
+    y = xport_load_le16(descriptor + 6);
+    x = xport_load_le16(descriptor + 4);
+    packet = gs_work_packet(6);
+    xport_store_le32(packet + 1, mode);
+    blue = descriptor[22];
+    green = descriptor[21];
+    red = descriptor[20];
+    x += (uint16)gs_state.screen_offset_x;
+    y += (uint16)gs_state.screen_offset_y;
+    xport_store_le32(packet + 3, (x & 0xFFFF) | (y << 16));
+    xport_store_le32(packet + 2, 0x64000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | (blue << 16) | (green << 8) | red);
+    uv = descriptor[14] | ((uint32)descriptor[15] << 8);
+    clut_y = (uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22;
+    clut_x = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000;
+    xport_store_le32(packet + 4, uv | clut_y | clut_x);
+    height = xport_load_le16(descriptor + 10);
+    width = xport_load_le16(descriptor + 8);
+    xport_store_le32(packet + 5, width | (height << 16));
+    gs_sort_packet(packet, ordering_table, (uint16)priority, 5, 1);
+}
+
+void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority)
+{
+    const uint8 *descriptor = (const uint8 *)sprite;
+    uint32 attribute = xport_load_le32(descriptor);
+    uint32 scale_word, rotation_word, simple, *packet, color, clut;
+    uint32 u0, u1, v0, v1, tpage;
+    sint32 x, y, origin_x, origin_y, angle, high, projection, flags;
+    uint16 width, height;
+    MATRIX matrix = {0};
+    VECTOR vector;
+    SVECTOR angles = {0}, vertices[4] = {{0}};
+    sint32 screen[4];
+    if ((sint32)attribute < 0 || xport_load_le16(descriptor + 8) == 0 || xport_load_le16(descriptor + 10) == 0)
+        return;
+    scale_word = xport_load_le32(descriptor + 28);
+    rotation_word = xport_load_le32(descriptor + 32);
+    simple = (attribute >> 27) & 1;
+    if (scale_word == 0x10001000 && rotation_word == 0 && (attribute & 0x00C00000) == 0)
+        simple = 1;
+    if (simple != 0)
+    {
+        packet = gs_work_packet(6);
+        x = (sint16)xport_load_le16(descriptor + 4);
+        y = (sint16)xport_load_le16(descriptor + 6);
+        xport_store_le32(packet + 1, 0xE1000200 | (xport_load_le16(descriptor + 12) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60));
+        color = 0x64000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | ((uint32)descriptor[22] << 16) | ((uint32)descriptor[21] << 8) | descriptor[20];
+        xport_store_le32(packet + 2, color);
+        origin_x = (sint16)xport_load_le16(descriptor + 24);
+        origin_y = (sint16)xport_load_le16(descriptor + 26);
+        x = x + gs_state.screen_offset_x - origin_x;
+        y = y + gs_state.screen_offset_y - origin_y;
+        xport_store_le32(packet + 3, ((uint32)x & 0xFFFF) | ((uint32)y << 16));
+        clut = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22) | (((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000);
+        xport_store_le32(packet + 4, xport_load_le16(descriptor + 14) | clut);
+        xport_store_le32(packet + 5, xport_load_le16(descriptor + 8) | ((uint32)xport_load_le16(descriptor + 10) << 16));
+        gs_sort_packet(packet, ordering_table, (uint16)priority, 5, 0);
+        return;
+    }
+    packet = gs_work_packet(10);
+    if (rotation_word == 0)
+        matrix = gs_state.world;
+    else
+    {
+        angle = (sint32)rotation_word;
+        high = (sint32)(((sint64)angle * (sint32)0xB60B60B7) >> 32);
+        angles.vz = (sint16)(((sint32)((uint32)high + rotation_word) >> 8) - (angle >> 31));
+        RotMatrix(&angles, &matrix);
+    }
+    if (xport_load_le32(descriptor + 28) != 0x10001000)
+    {
+        vector.vx = (sint16)xport_load_le16(descriptor + 28);
+        vector.vy = (sint16)xport_load_le16(descriptor + 30);
+        vector.vz = 0;
+        ScaleMatrix(&matrix, &vector);
+    }
+    vector.vx = (sint16)xport_load_le16(descriptor + 4);
+    vector.vy = (sint16)xport_load_le16(descriptor + 6);
+    vector.vz = (sint32)xport_gte_read_control(26);
+    TransMatrix(&matrix, &vector);
+    SetRotMatrix(&matrix);
+    SetTransMatrix(&matrix);
+    origin_x = (sint16)xport_load_le16(descriptor + 24);
+    origin_y = (sint16)xport_load_le16(descriptor + 26);
+    width = xport_load_le16(descriptor + 8);
+    height = xport_load_le16(descriptor + 10);
+    vertices[0].vx = (sint16)-origin_x;
+    vertices[0].vy = (sint16)-origin_y;
+    vertices[1].vx = (sint16)(width - origin_x);
+    vertices[1].vy = (sint16)-origin_y;
+    vertices[2].vx = (sint16)-origin_x;
+    vertices[2].vy = (sint16)(height - origin_y);
+    vertices[3].vx = (sint16)(width - origin_x);
+    vertices[3].vy = (sint16)(height - origin_y);
+    RotTransPers4(&vertices[0], &vertices[1], &vertices[2], &vertices[3], &screen[0], &screen[1], &screen[2], &screen[3], &projection, &flags);
+    u0 = descriptor[14];
+    u1 = u0 + descriptor[8] - 1;
+    if ((attribute & 0x00800000) != 0)
+    {
+        u1 = descriptor[14];
+        u0 = u1 + descriptor[8] - 1;
+    }
+    v0 = descriptor[15];
+    v1 = v0 + descriptor[10] - 1;
+    if ((attribute & 0x00400000) != 0)
+    {
+        v1 = descriptor[15];
+        v0 = v1 + descriptor[10] - 1;
+    }
+    u0 &= 255;
+    u1 &= 255;
+    v0 = (v0 & 255) << 8;
+    v1 = (v1 & 255) << 8;
+    color = 0x2C000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | ((uint32)descriptor[22] << 16) | ((uint32)descriptor[21] << 8) | descriptor[20];
+    xport_store_le32(packet + 2, (uint32)screen[0]);
+    xport_store_le32(packet + 1, color);
+    clut = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22) | (((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000);
+    xport_store_le32(packet + 4, (uint32)screen[1]);
+    xport_store_le32(packet + 3, u0 | v0 | clut);
+    tpage = (xport_load_le16(descriptor + 12) & 0x1F) << 16;
+    xport_store_le32(packet + 6, (uint32)screen[2]);
+    xport_store_le32(packet + 7, u0 | v1);
+    xport_store_le32(packet + 8, (uint32)screen[3]);
+    xport_store_le32(packet + 9, u1 | v1);
+    xport_store_le32(packet + 5, u1 | v0 | tpage | ((attribute >> 1) & 0x01800000) | ((attribute >> 7) & 0x00600000));
+    gs_sort_packet(packet, ordering_table, (uint16)priority, 9, 0);
+}
+
+uint32 GsSwapDispBuff(void)
+{
+    gs_state.display.disp.x = gs_state.buffer_x[gs_state.active];
+    gs_state.display.disp.y = gs_state.buffer_y[gs_state.active];
+    PutDispEnv(&gs_state.display);
+    DrawSync(1);
+    gs_state.active = gs_state.active == 0 ? 1 : 0;
+    gs_apply_clip();
+    gs_apply_center();
+    ++gs_state.frame;
+    return (uint32)-40;
 }
 
 void xport_missing_guest_vsync_callback(uint32 callback_address)
@@ -7896,6 +12539,19 @@ sint32 erase(const char *path)
     abort();
 }
 
+sint32 format(const char *path)
+{
+    if (!path)
+        return 0;
+    /* The native BIOS filesystem has no mounted card medium */
+    if (strncmp(path, "bu00:", 5) == 0 || strncmp(path, "bu10:", 5) == 0)
+        return 0;
+#ifndef NDEBUG
+    fprintf(stderr, "Unsupported native BIOS format device: %s\n", path);
+#endif
+    abort();
+}
+
 sint32 closePSX(sint32 descriptor)
 {
     (void)descriptor;
@@ -8403,6 +13059,22 @@ void xport_gte_execute(uint32 command)
                 native_gte_mac_ir(row, (sint64)gte.ir[row] * gte.ir[row], shift, lm);
             finish_flag();
             return;
+        case 0x29:
+            if (command != 0x680029)
+                break;
+            // DCPL multiplies each input IR channel before depth interpolation
+            for (row = 0; row < 3; ++row)
+            {
+                sint64 base = (sint64)((gte.rgbc >> (row * 8)) & 255) * gte.ir[row] * 16;
+                sint64 difference = native_gte_wrap44((sint64)gte.far_color[row] * 4096 - base, row);
+                sint32 delta = clamp_ir((sint32)native_gte_floor_shift(difference, 12), 1u << (24 - row));
+                sint64 value = native_gte_wrap44(base + (sint64)gte.ir0 * delta, row);
+                gte.mac[row] = (sint32)native_gte_floor_shift(value, 12);
+                gte.ir[row] = clamp_ir(gte.mac[row], 1u << (24 - row));
+            }
+            push_rgb_from_mac();
+            finish_flag();
+            return;
         case 0x3Du:
         case 0x3Eu:
             for (row = 0u; row < 3u; ++row)
@@ -8651,6 +13323,33 @@ sint32 SetVideoMode(sint32 mode)
 sint32 GetVideoMode(void)
 {
     return native_video_mode;
+}
+
+uint32 memmovePSX(uint32 destination, uint32 source, sint32 bytes)
+{
+    uint32 remaining;
+    if (bytes <= 0)
+        return destination;
+    remaining = (uint32)bytes;
+    if (destination < source)
+    {
+        while (remaining != 0)
+        {
+            w_u8(destination, r_u8(source));
+            ++destination;
+            ++source;
+            --remaining;
+        }
+    }
+    else
+    {
+        while (remaining != 0)
+        {
+            --remaining;
+            w_u8(destination + remaining, r_u8(source + remaining));
+        }
+    }
+    return destination;
 }
 
 /* Native PsyQ PC file-server handles */

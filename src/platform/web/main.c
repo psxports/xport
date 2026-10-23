@@ -121,7 +121,7 @@ static uint8 platform_pad_analog[2][6];
 static uint32 platform_touch_buttons;
 static sint32 platform_pad_override;
 static uint32 platform_override_buttons;
-static uint64 platform_poll_deadline;
+static uint64 platform_poll_field = ~(uint64)0;
 static sint32 audio_active;
 static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
@@ -414,28 +414,24 @@ uint64 xport_timer_get(void)
     return now - start;
 }
 
-EM_ASYNC_JS(void, xport_render_wait, (void), { await new Promise(function(wake) { requestAnimationFrame(wake); }); });
+EM_ASYNC_JS(void, platform_wait_frame, (void), { await new Promise(function(wake) { requestAnimationFrame(wake); }); });
 
-void xport_timer_wait_frame(uint32 refresh_rate)
+sint32 xport_render_wait_until(uint64 deadline)
 {
-    uint64 idx;
+    if (deadline <= xport_timer_get())
+        return 0;
+    platform_wait_frame();
     uint64 now = xport_timer_get();
-    uint64 deadline;
-    if (!refresh_rate || refresh_rate == FIELD_RATE)
+    platform_poll_field = xport_frame();
+    return now < deadline;
+}
+
+void xport_timer_wait_frame(uint64 target_field)
+{
+    while (xport_frame() < target_field)
     {
-        xport_frame_fract(&idx);
-        deadline = xport_frame_time(idx + 1);
-    }
-    else
-    {
-        idx = now / 1000000 * refresh_rate + now % 1000000 * refresh_rate / 1000000;
-        deadline = ((idx + 1) * 1000000 + refresh_rate - 1) / refresh_rate;
-    }
-    while (now < deadline)
-    {
-        emscripten_sleep((unsigned)((deadline - now + 999u) / 1000u));
-        now = xport_timer_get();
-        platform_poll_deadline = now + 1000000u / FIELD_RATE;
+        emscripten_sleep(1);
+        platform_poll_field = xport_frame();
     }
 }
 
@@ -451,6 +447,10 @@ sint32 xport_input_init(void)
     platform_touch_buttons = 0;
     platform_pad_override = 0;
     platform_override_buttons = 0;
+    // PAD reinitialization must replace listeners instead of accumulating callbacks
+    emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, NULL);
+    emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, NULL);
+    emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, NULL);
     emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, key_event);
     emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, key_event);
     emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, 1, blur_event);
@@ -460,10 +460,10 @@ sint32 xport_input_init(void)
 sint32 xport_poll(void)
 {
     // Frame waits already dispatch browser events without an extra clamped timer
-    if (xport_timer_get() >= platform_poll_deadline)
+    if (xport_frame() != platform_poll_field)
     {
         emscripten_sleep(0);
-        platform_poll_deadline = xport_timer_get() + 1000000u / FIELD_RATE;
+        platform_poll_field = xport_frame();
     }
     return !platform_quit;
 }

@@ -4,6 +4,10 @@ For the reusable OG/HD migration, float math, shader and batching workflow used 
 
 ## Build
 
+Windows VID calls `wglSwapIntervalEXT(1)` when the extension is available; its absence or a failed call does not reject initialization. `SwapBuffers` paces presentation when VSync is active; Windows render-wait helpers add no software FPS limiter. Physical PS1 field timing stays independent. Web continues using `requestAnimationFrame`.
+
+Use `xport_render_wait_until(deadline)` after rendering; `~(uint64)0` means no deadline. It returns zero if the deadline has passed. Windows only checks time after presentation. Web checks time, yields to the next animation frame, then checks time again; it has no timeout race and may resume after a finite deadline. Hidden browser tabs follow the browser's animation-frame throttling. The separate `xport_render_wait` API is removed.
+
 - Compile `src/vid_ogl.c` and define `GAPI_OGL` for Windows and Web
 - Windows links `opengl32.lib`, `gdi32.lib` and `user32.lib`; base GL functions use DLL imports, extended GL/WGL functions use the supplied `src/libs/gl` function-pointer types and dynamic lookup
 - Windows requires an OpenGL 3.3 core context; Web requires WebGL 2.0 and `MIN_WEBGL_VERSION=2`, `MAX_WEBGL_VERSION=2`
@@ -20,6 +24,8 @@ For the reusable OG/HD migration, float math, shader and batching workflow used 
 
 Games register application resource cleanup through `xport_set_cleanup(callback)`. The host clears the callback before invoking it once during `xport_shutdown`, before audio/VID/context teardown. Passing NULL removes the registration. Windows window-close unwinding returns to host shutdown without requiring the game stack to return normally. No game-specific callback is required from other projects
 
+Windows Alt+Enter stores the current window style and placement, enters a monitor-sized `WS_POPUP` window through `SetWindowPos` with `SWP_FRAMECHANGED`, and restores the exact stored style and placement on exit. Removing `WS_OVERLAPPEDWINDOW` alone does not establish this fullscreen contract. Verify the actual presentation mode with ETW/PresentMon; a monitor-sized rectangle does not prove hardware flip or exclusive presentation. Preserve the requested swap interval and game clock during this transition
+
 `vid.h` is the common public interface. Resource layouts, context ownership and GL objects are private to `vid_ogl.c`. Rendering uses vertex buffers and shaders; no fixed-function pipeline is permitted.
 
 ## OG output
@@ -29,6 +35,8 @@ Games register application resource cleanup through `xport_set_cleanup(callback)
 `vid_resize(width, height)` synchronizes the drawable size and returns physical pixel dimensions. Web uses the canvas CSS size multiplied by device pixel ratio. A minimized zero-sized drawable suppresses output without destroying the context.
 
 `vid_begin` records the drawable dimensions used by the frame's viewport coordinates. If the drawable changes before `vid_end`, VID scales the queued viewport edges to the new dimensions. Shared split edges use the same integer calculation, including odd drawable sizes. The next frame uses newly generated geometry and the current viewport aspect
+
+`gpu_set_polygon_tpage(uint16 page)` preserves the native software GPU state effect of an embedded textured-polygon page without emitting geometry: replace `active_tpage` bits `0x09ff`, retain all other page bits and the independently stored draw flags. It does not write VRAM, rasterize, update the PsyQ DRAWENV cache or emit a GP0 transfer. The original software primitive dispatcher uses the same operation before raster suppression. Native HD producers can use it at the original ordering boundary after required full E1 state commands; it is not a replacement for those commands or a guest packet submission API. The `gpu_observer` HD raster-policy check covers page selection with independent draw flags and unchanged VRAM.
 
 ## Resources
 
@@ -54,6 +62,20 @@ Games register application resource cleanup through `xport_set_cleanup(callback)
 
 The game stores semantic resource selections and VID references. It never allocates GPU objects, performs GPU uploads or inspects GL handles.
 
+## GPU image feedback
+
+- Create a `VID_TARGET` with `vid_target_create`; release it with `vid_target_free`
+- After `vid_begin`, call `vid_target_select(target)` before recording any draw, pass or probe. Selection fails for NULL/released targets, an existing selection, a nonempty queue or a target image referenced by queued draws
+- `vid_end` renders color and depth into the selected target at the actual drawable size, presents its color image, and retains the completed image after presentation. Targets are opt-in; ordinary `vid_begin` and OG `vid_blit` keep their existing destination
+- `vid_target_select_offscreen(target)` uses the same selection validation and target lifetime. `vid_end` completes the target without copying its color to the previous framebuffer or swapping the window. Use this for native frozen-scene reconstruction at an image-capture boundary while OG remains selected; do not use it to render an extra scene every tick
+- Allocation and resizing occur on execution. A minimized frame leaves the previous target image unchanged. `vid_cancel` releases the selection and preserves the previous completed image
+- `vid_target_texture` returns a borrowed RGBA8 texture. Do not free or commit this texture; `vid_tex_data` returns NULL. Materials retain it through the ordinary texture ownership contract. UV origin is bottom-left, unlike top-row-first uploaded CPU images
+- Sample a target only after a successful rendered frame or copy. Draw/pass recording rejects sampling the selected output as the primary or auxiliary texture
+- Outside an active frame, `vid_target_copy(destination, source)` copies the last completed source image on the GPU. It preserves source dimensions, rejects self-copy, uncompleted/released sources and destinations referenced by queued draws, and returns zero on failure
+- Copy only at a real image-capture boundary. Subsequent source renders do not modify the copy. Color fades alone use geometry and do not allocate targets
+- A selected target retains its owner until end/cancellation. Freeing the caller reference while selected defers destruction. A material can retain a completed texture after its target is freed
+- The backend owns framebuffer, depth, texture storage and presentation operations. Games do not read GL handles or copy full images through CPU memory
+
 ## HD frames
 
 1. Call `vid_begin` with the clear color
@@ -65,6 +87,8 @@ The game stores semantic resource selections and VID references. It never alloca
 An explicit pass snapshots viewport, fog, material and current draw uniforms. Each subsequent `vid_submit` snapshots its current draw uniforms; zero vectors leave the pass/object uniforms unchanged. Change viewport/fog by starting another pass. A legacy `vid_draw` ends the explicit-pass recording scope; call `vid_pass` again before another submit. Keep referenced mesh/index/material data immutable while commands are queued. `vid_sample` uses its own viewport and preserves command order; begin a new pass after a probe before resuming geometry
 
 The renderer sets viewport/scissor, depth/blend/cull, program and textures once per explicit pass. Submissions bind their mesh VAO, upload changed resources and object uniforms, and issue the draw. Mesh attribute layout is configured once in its owned VAO. There is no GL state cache or draw-statistics subsystem
+
+Vertex-buffer uploads use `GL_STATIC_DRAW`; the committed version still determines uploads, and later commits remain valid. Do not change this hint to `GL_DYNAMIC_DRAW` without an actual WebGL indexed-identity regression test. On ANGLE/D3D11, dynamic vertex storage can add the minimum element index twice to `gl_VertexID`, while fetching the correct vertex attributes. A shader that indexes material/morph textures through `gl_VertexID` then reads another face. Verify nonzero minimum indices, including values above 65535, against shader-reported integer identities and rendered material pixels. Do not subtract an observed offset in game shaders. Reproducer and actual browser evidence: Pandemonium2-xport `status/enhance/checks/web-vertex-id-isolation` and `status/enhance/web-indexed-vertex-identity.json`.
 
 The draw list preserves submission order. Materials select depth test/write, blending and nearest/linear filtering. `repeat=0` clamps UV to the image edges; `repeat=1` repeats the complete texture on both axes, including UV outside 0..1. The producer selects clip coordinates or source geometry plus a custom vertex stage. VID stores no camera motion history, interpolation or reset policy. `cull=0` disables face culling; `cull=1` retains clockwise triangles; `cull=2` retains counterclockwise triangles
 
@@ -93,6 +117,8 @@ RapidRacer submits the sun before world geometry and the six lens ghosts after w
 ## OG/HD transition
 
 Windows and Web initialize `extern int xport_hd` to 1. The host toggles it on a non-repeated Tab keydown or an L3 press from either player controller. Each controller tracks its own press edge; holding L3 does not repeat the toggle. Tab and L3 are consumed by the host rather than mapped into game PAD buttons. The game latches its frame path at a complete producer boundary.
+
+Web `xport_input_init` can run at host startup and again from PsyQ PAD initialization. Remove the previous Emscripten keydown, keyup and blur registrations before registering their replacements. Registering a non-NULL callback appends another listener; duplicated Tab callbacks can toggle twice and leave the original mode selected. Preserve PAD state reset on every initialization. `tests.test_pad_ports` checks six initializations, one retained listener per event type, one Tab toggle, autorepeat rejection and PAD isolation; also verify the actual Emscripten callback registration in a browser.
 
 Paused-scene ownership belongs to the game. RapidRacer renders a fresh HD scene and full-window pause overlay without dispatching simulation callbacks; it queries the current projection and cached target indicator and preserves game RNG/render sampling/trail state around render-only work. Switching to OG during pause constructs a complete OG scene and creates its software capture once. VID retains no pause, simulation or interpolation history
 

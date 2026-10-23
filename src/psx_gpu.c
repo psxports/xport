@@ -973,6 +973,23 @@ static sint32 gpu_native_low24_to_guest(uint32 link, uint32 *address)
     return 0;
 }
 
+void GsClearOt(uint32 offset, uint32 point, void *ordering_table)
+{
+    uint8 *descriptor = (uint8 *)ordering_table;
+    uint32 rank = xport_load_le32(descriptor);
+    uint32 address, count, bytes;
+    xport_store_le32(descriptor + 8, offset & 0xFFFF);
+    address = xport_load_le32(descriptor + 4);
+    xport_store_le32(descriptor + 12, point & 0xFFFF);
+    bytes = 4u << (rank & 31);
+    count = 1u << (xport_load_le32(descriptor) & 31);
+    xport_store_le32(descriptor + 16, address + bytes - 4);
+    address = xport_load_le32(descriptor + 4);
+    if (count > PSX_DRAM_SIZE / 4)
+        abort();
+    ClearOTagR((uint32 *)psx_addr(address, count * 4), (sint32)count);
+}
+
 uint32 *ClearOTagR(uint32 *ot, sint32 count)
 {
     sint32 index;
@@ -1095,6 +1112,12 @@ typedef struct
 
 static uint32 present_pixels[GPU_DISPLAY_MAX_WIDTH * GPU_DISPLAY_MAX_HEIGHT];
 static uint16 active_tpage;
+
+void gpu_set_polygon_tpage(uint16 page)
+{
+    active_tpage = (uint16)((active_tpage & ~0x09ffu) | (page & 0x09ffu));
+}
+
 static uint32 texture_window;
 static uint32 display_state;
 sint32 graph_debug_level;
@@ -2120,7 +2143,7 @@ static void gpu_draw_command(void *raw)
     {
         uint16 mode = (uint16)read_s16_le_at(p, (code & 0x10) ? 26 : 22);
         /* Polygon texture attributes also select the page for following sprites */
-        active_tpage = (uint16)((active_tpage & ~0x09ffu) | (mode & 0x09ffu));
+        gpu_set_polygon_tpage(mode);
     }
     if (gpu_frame_skipped() || !raster_enabled())
         return;
@@ -2616,6 +2639,30 @@ sint32 SetGraphDebug(sint32 level)
 {
     sint32 previous = graph_debug_level;
     graph_debug_level = level;
+    return previous;
+}
+
+sint32 SetGraphReverse(sint32 reverse)
+{
+    uint8 previous = gpu_graph_control.reverse;
+    uint32 mode;
+    gpu_graph_control.reverse = (uint8)reverse;
+    mode = _getctl(8);
+    _ctl(mode | (gpu_graph_control.reverse != 0 ? 0x08000080 : 0x08000000));
+    if (GetGraphType() == 2)
+        _ctl(gpu_graph_control.reverse != 0 ? 0x20000501 : 0x20000504);
+    return previous;
+}
+
+sint32 SetGraphQue(sint32 enabled)
+{
+    uint8 previous = gpu_graph_control.queue_enabled;
+    if (enabled != gpu_graph_control.queue_enabled)
+    {
+        ResetGraph(1);
+        gpu_graph_control.queue_enabled = (uint8)enabled;
+        DMACallback(2, NULL);
+    }
     return previous;
 }
 

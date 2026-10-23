@@ -19,7 +19,7 @@ record SLOT NAME
 stop
 ```
 
-This `stop` applies only to the active `record SLOT NAME` operation. After `function_converge NAME`, route `stop` through [FUNCTION_COVERAGE.md](FUNCTION_COVERAGE.md); never call the recorder stop path for a function-coverage session.
+This `stop` applies only to the active `record SLOT NAME` operation. After `function_coverage NAME`, route `stop` through [FUNCTION_COVERAGE.md](FUNCTION_COVERAGE.md); never call the recorder stop path for a function-coverage session.
 
 `SLOT` is an integer from `1` through `10`. It identifies
 `tools/duckstation/data/ROLE/savestates/SERIAL_SLOT.sav`, where `ROLE` and

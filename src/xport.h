@@ -156,14 +156,16 @@ extern "C"
         return (float)(fraction % period) / (float)period;
     }
 
-    static __inline uint64 xport_frame_time(uint64 idx)
+    static __inline uint64 xport_frame(void)
     {
-        uint64 scaled = idx * FIELD_RATE_DENOMINATOR;
-        return scaled / FIELD_RATE_NUMERATOR * 1000000 + (scaled % FIELD_RATE_NUMERATOR * 1000000 + FIELD_RATE_NUMERATOR - 1) / FIELD_RATE_NUMERATOR;
+        uint64 idx;
+        xport_frame_fract(&idx);
+        return idx;
     }
 
-    void xport_timer_wait_frame(uint32 refresh_rate);
-    void xport_render_wait(void);
+    void xport_timer_wait_frame(uint64 target_field);
+    /* Web yields to the next animation frame; Windows presentation already waits for VSync */
+    sint32 xport_render_wait_until(uint64 deadline);
     sint32 xport_input_init(void);
     sint32 xport_poll(void);
     uint32 xport_input_read(sint32 controller);

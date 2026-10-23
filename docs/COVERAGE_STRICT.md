@@ -9,7 +9,7 @@ Normative extension of `../AGENTS.md` for the chat command:
 coverage NAME
 ```
 
-`coverage NAME` consumes the completed `status/function-coverage/NAME/functions.bin` produced by `function_converge NAME`. It translates and proves only the recorded game functions in first-call order. Direct game dependencies absent from the recording receive supervisor-generated link-only TODO stubs; they do not expand the audit set. Coverage never launches DuckStation and never invokes Codex CLI or another model process.
+`coverage NAME` consumes the completed `status/function-coverage/NAME/functions.bin` produced by `function_coverage NAME`. It translates and proves only the recorded game functions in first-call order. Direct game dependencies absent from the recording receive supervisor-generated link-only TODO stubs; they do not expand the audit set. Coverage never launches DuckStation and never invokes Codex CLI or another model process.
 
 Before any audit work, create one active goal whose terminal condition is a complete coverage state and a successful final Release build. Keep that goal active across all batches. Mark it complete only after `X coverage status NAME` reports `status: complete`. An explicit user stop is the only normal early termination.
 

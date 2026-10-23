@@ -69,6 +69,7 @@ extern "C"
 
     sint32 closePSX(sint32 descriptor);
     sint32 erase(const char *path);
+    sint32 format(const char *path);
 
     void gte_write_h(uint16 h);
     uint16 gte_read_h(void);
@@ -194,6 +195,7 @@ extern "C"
     typedef uint16 ushort;
 
     typedef struct PsxGteSnapshot PsxGteSnapshot;
+    typedef struct PsxGteContext PsxGteContext;
 
 #define PSX_DRAM_SIZE 0x200000u
 #define PSX_CLOCK_EVENTS 32u
@@ -309,6 +311,7 @@ extern "C"
 
     extern const MATRIX psx_identity_matrix;
     extern const uint32 psx_identity_rotation_words[5];
+    sint32 gte_matrix_near_identity(const MATRIX *matrix);
 
     typedef struct
     {
@@ -379,6 +382,13 @@ extern "C"
         sint32 dqb;
     };
 
+    struct PsxGteContext
+    {
+        PsxGteSnapshot registers;
+        uint32 lzcs, lzcr;
+        uint16 ofx_frac, ofy_frac;
+    };
+
 #include "xport_trace.h"
 
 #if defined(__cplusplus)
@@ -403,6 +413,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 /* PsyQ LIBETC offsets are 32-bit words in the single shared scratchpad */
 #define getScratchAddr(offset) (&SCRATCHPAD[(uint32)(offset)])
         void psx_gte_snapshot(PsxGteSnapshot *snapshot);
+        void psx_gte_save_context(PsxGteContext *context);
+        void psx_gte_restore_context(const PsxGteContext *context);
         sint32 psx_gte_import_control_registers(const uint32 registers[32]);
         sint32 psx_bios_bind_events(uint32 address, uint32 bytes);
         sint32 psx_bios_events_failed(void);
@@ -428,6 +440,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 psx_bios_bind_card_read(uint32 read_handler, uint32 new_card_flag);
         sint32 _card_read(sint32 channel, sint32 sector, uint8 *buffer);
         void _new_card(void);
+        uint32 _card_clear(uint32 channel);
         void psx_clock_init(PsxClock *clock, uint64 now, PsxClockAdvance advance, void *context);
         sint32 psx_clock_schedule(PsxClock *clock, uint32 id, uint64 due, PsxClockEvent callback, void *context);
         sint32 psx_clock_cancel(PsxClock *clock, uint32 id);
@@ -786,16 +799,34 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
     typedef struct
     {
         XY xy;
-        UV uv;
-        uint16 attr;
+
+        union
+        {
+            struct
+            {
+                UV uv;
+                uint16 attr;
+            };
+
+            uint32 uv_attr;
+        };
     } POINT_T;
 
     typedef struct
     {
         RGBC rgbc;
         XY xy;
-        UV uv;
-        uint16 attr;
+
+        union
+        {
+            struct
+            {
+                UV uv;
+                uint16 attr;
+            };
+
+            uint32 uv_attr;
+        };
     } POINT_CT;
 
     typedef struct
@@ -930,7 +961,16 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 tag;
         RGBC rgbc;
         XY p[1];
-        sint16 w, h;
+
+        union
+        {
+            struct
+            {
+                sint16 w, h;
+            };
+
+            uint32 wh;
+        };
     } TILE;
 
     typedef struct
@@ -1084,6 +1124,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 AverageZ3(sint32 z0, sint32 z1, sint32 z2);
         sint32 AverageZ4(sint32 z0, sint32 z1, sint32 z2, sint32 z3);
         sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue);
+        sint32 ClearImage2(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue);
         uint32 *ClearOTag(uint32 *ot, sint32 count);
         uint32 ClearOTagPSX(uint32 ot, uint32 count, uint32 header_address, uint32 header_target, uint32 debug_flag_address, uint32 debug_callback_slot, uint32 debug_format_address);
         uint32 SetDrawMovePSX(uint32 destination, uint32 rectangle, uint32 x, uint32 y);
@@ -1112,8 +1153,117 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
             uint8 r, g, b, pad;
         } GsF_LIGHT;
 
+        typedef struct GsSortAttributes
+        {
+            uint32 bits3_4;
+            uint32 bit5;
+            uint32 bit6;
+            uint32 bits9_11;
+            uint32 bit30;
+        } GsSortAttributes;
+
+        typedef uint32 *(*GsPrimitiveHandler)(GsSortAttributes *attributes, uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        extern const GsPrimitiveHandler gs_primitive_handlers[70];
+        uint32 *GsTMDfastF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastF3GNL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsTMDfastF3GL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        void gs_subdivision_midpoint(uint32 destination, uint32 left, uint32 right);
+        void gs_set_subdivision_controls(sint32 distance, sint16 width, sint16 height);
+        uint32 *GsA4divF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTG3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF3L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTF3LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divTNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divF4L(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divF4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsA4divNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 gs_subdivision_triangle_bounds(uint32 packet, uint32 scratch);
+        uint32 *GsTMDfastF3GLFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsTMDfastG3GL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsTMDfastG3GLFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsTMDfastG3GNL(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch);
+        uint32 *GsTMDfastNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTNF3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTNF4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        uint32 *GsTMDfastTNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table);
+        void gs_set_screen_dimensions(sint32 width, sint32 height);
+        void GsMapModelingData(uint32 model);
+        void GsLinkObject4(uint32 model, uint32 object, uint32 index);
+        void GsClearOt(uint32 offset, uint32 point, void *ordering_table);
+        void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24);
+        void GsDefDispBuff(uint32 x0, uint32 y0, uint32 x1, uint32 y1);
+        sint32 GsInit3D(void);
+        uint32 GsGetActiveBuff(void);
+        uint32 GsSwapDispBuff(void);
+        void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table);
+        void GsSortBoxFill(const void *box, void *ordering_table, uint32 priority);
+        void GsSortFastSprite(const void *sprite, void *ordering_table, uint32 priority);
+        void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority);
+        void GsGetLs(uint32 coordinate, MATRIX *screen);
+        void GsGetLws(uint32 coordinate, MATRIX *world, MATRIX *screen);
+        sint32 GsSetRefView2(uint32 view);
+        void GsSetLightMode(sint32 mode);
+        void gs_sort_object4(uint32 object, uint32 ordering_table, uint32 shift, uint32 scratch);
         void gte_bind_gs_light_matrices(MATRIX *directions, MATRIX *colors);
+        void GsSetLightMatrix(const MATRIX *matrix);
+        void GsSetAmbient(sint32 red, sint32 green, sint32 blue);
+        void GsSetFogParam(const void *parameters);
         sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light);
+        void GsSetWorkBase(uint32 *work);
+        uint32 *GsGetWorkBase(void);
+        void gs_set_clip_distance(sint32 distance);
+        sint32 gs_get_clip_distance(void);
         uint32 GsSortOtPSX(uint32 source_ot, uint32 destination_ot);
         void rsincos(sint32 angle, sint32 *sine, sint32 *cosine);
         sint32 ratan2(sint32 y, sint32 x);
@@ -1147,6 +1297,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 GetRCnt(uint32 counter);
         uint16 GetTPage(sint32 depth, sint32 abr, sint32 x, sint32 y);
         sint32 GetGraphType(void);
+        sint32 krom_bind_font(const uint8 *pixels, uint32 bytes, uint32 first_offset, uint32 kanji_offset);
+        const uint8 *Krom2RawAdd2(uint32 character);
         void FntLoad(sint32 x, sint32 y);
         sint32 FntOpen(sint32 x, sint32 y, sint32 w, sint32 h, sint32 bg, sint32 n);
         void SetDumpFnt(sint32 id);
@@ -1258,6 +1410,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void trapIntrVSync(void);
         void psx_interrupt_raise(uint32 interrupt);
         MATRIX *RotMatrix(SVECTOR *rotation, MATRIX *matrix);
+        MATRIX *gte_rot_matrix_scalar(SVECTOR *rotation, MATRIX *matrix);
         MATRIX *RotMatrixX(sint32 angle, MATRIX *matrix);
         MATRIX *RotMatrixY(sint32 angle, MATRIX *matrix);
         MATRIX *RotMatrixZ(sint32 rotation, MATRIX *matrix);
@@ -1268,6 +1421,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         MATRIX *MulMatrix2(MATRIX *source, MATRIX *destination);
         void RotTrans(SVECTOR *input, VECTOR *output, sint32 *flags);
         sint32 RotTransPers(SVECTOR *input, sint32 *screen_xy, sint32 *projection, sint32 *flags);
+        sint32 RotTransPers4(const SVECTOR *a, const SVECTOR *b, const SVECTOR *c, const SVECTOR *d, sint32 *xy0, sint32 *xy1, sint32 *xy2, sint32 *xy3, sint32 *projection, sint32 *flags);
         void RotTransSV(SVECTOR *input, SVECTOR *output, sint32 *flags);
         MATRIX *ScaleMatrix(MATRIX *matrix, VECTOR *scale);
         void SetDispMask(sint32 enabled);
@@ -1285,6 +1439,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SetGeomOffset(sint32 x, sint32 y);
         void SetGeomScreen(sint32 distance);
         sint32 SetGraphDebug(sint32 level);
+        sint32 SetGraphReverse(sint32 reverse);
+        sint32 SetGraphQue(sint32 enabled);
         void SetBackColor(sint32 red, sint32 green, sint32 blue);
         void gte_set_back_color_raw(sint32 red, sint32 green, sint32 blue);
         void gte_set_far_color_raw(sint32 red, sint32 green, sint32 blue);
@@ -1390,6 +1546,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
         void SsQueueRegisters(sint32 voice, SndRegisterAttr *attributes);
         void SsInit(void);
+        void SsInitHot(void);
         void SsQuit(void);
         void SsSetMVol(sint16 left, sint16 right);
         void SsSetSerialVol(sint8 serial, sint16 left, sint16 right);
@@ -1527,6 +1684,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 VectorNormalS(VECTOR *input, SVECTOR *output);
         sint32 SetVideoMode(sint32 mode);
         sint32 GetVideoMode(void);
+        uint32 memmovePSX(uint32 destination, uint32 source, sint32 bytes);
         sint32 gte_project(const SVECTOR *input, sint32 *screen_xy, sint32 *flags);
         sint32 gte_project_full_depth(const SVECTOR *input, sint32 *screen_xy, sint32 *flags);
         void gte_project3_full_depth(const SVECTOR input[3], sint32 screen_xy[3], sint32 depth[3], sint32 *flags);

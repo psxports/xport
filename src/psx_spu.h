@@ -98,6 +98,24 @@ extern "C"
         SpuMallocRecord *records;
     } SpuMallocState;
 
+    /* PsyQ 3.3/3.4 streaming environment, before low_priority was added */
+    typedef struct SpuStVoiceAttr
+    {
+        uint8 status;
+        uint8 pad[3];
+        sint32 last_size;
+        uint32 buf_addr;
+        uint32 data_addr;
+    } SpuStVoiceAttr;
+
+    typedef struct SpuStEnv
+    {
+        sint32 size;
+        SpuStVoiceAttr voice[SPU_VOICE_COUNT];
+    } SpuStEnv;
+
+    SpuStEnv *SpuStInit(void);
+
     typedef struct SpuSequenceStream
     {
         const uint8 *data;
@@ -228,6 +246,8 @@ extern "C"
         SpuSequenceValueHandler registered_parameter_msb;
         SpuSequenceValueHandler reverb_depth;
         SpuSequenceHandler reset_controllers;
+        SpuSequenceValueHandler damper;
+        SpuSequenceValueHandler portamento;
     } SpuSequenceHandlers;
 
     extern SpuSequenceScheduler spu_sequence_scheduler;
@@ -243,6 +263,9 @@ extern "C"
     uint32 spu_sequence_scheduler_request_pause(SpuSequenceScheduler *scheduler, uint32 sequence, uint32 track, SpuSequenceVolumeGet get_volume);
     uint32 spu_sequence_scheduler_close(SpuSequenceScheduler *scheduler, sint16 sequence, SpuSequenceVolumeSet set_volume, SpuSequencePackedHandler key_off);
     void spu_sequence_scheduler_pump(SpuSequenceScheduler *scheduler, const SpuSequencePumpOps *ops);
+    void spu_sequence_bind_pump(const SpuSequencePumpOps *ops);
+    void SsSeqCalledTbyT(void);
+    uint32 spu_sequence_scheduler_dispatch_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceValueHandler meta_dispatch);
     uint32 spu_sequence_scheduler_volume(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceVoiceVolumeSet set_voice_volume, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_pan(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceVoiceVolumeSet set_voice_volume, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_reset_controllers(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceReverbEnable set_reverb, SpuSequenceHandler read_delta);
@@ -252,6 +275,8 @@ extern "C"
     uint32 spu_sequence_scheduler_nrpn_msb(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_rpn_lsb(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_rpn_msb(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceHandler read_delta);
+    uint32 spu_sequence_scheduler_expression(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceVoiceVolumeSet set_voice_volume, SpuSequenceHandler read_delta);
+    uint32 spu_sequence_scheduler_damper(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 value, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_control_change(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, uint8 controller, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_meta_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandler read_delta);
     uint32 spu_sequence_scheduler_read_event(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 separation, SpuSequenceHandlers *handlers, SpuSequenceHandler read_delta, SpuSequenceHandler end_of_track);
@@ -281,6 +306,11 @@ extern "C"
     } SpuVoiceModulationCallbacks;
 
     extern SpuVoiceModulationCallbacks spu_voice_modulation_callbacks;
+
+    void spu_sequence_vm_volume_modulation_start(sint16 voice, sint16 from, sint16 to, sint16 ticks);
+    void spu_sequence_vm_pan_modulation_start(sint16 voice, sint16 from, sint16 to, sint16 ticks);
+    void spu_sequence_vm_volume_modulation_tick(uint32 voice);
+    void spu_sequence_vm_pan_modulation_tick(uint32 voice);
 
     typedef struct SpuNoteContext
     {
@@ -333,6 +363,7 @@ extern "C"
         uint32 protection;
         uint16 release_offset;
         uint16 mono_mode;
+        uint32 immediate_key_on_busy;
     } SpuVmState;
 
     SpuVmState *spu_vm_state(void);
@@ -497,6 +528,10 @@ extern "C"
     void spu_sequence_scheduler_start_timer(SpuSequenceClock *clock, uint32 mode, PsxInterruptCallback irq0, PsxInterruptCallback half_rate);
 
     uint32 spu_sequence_vm_set_sequence_volume(SpuSequenceScheduler *scheduler, sint16 handle, sint16 left, sint16 right, sint16 mode);
+    sint16 SsIsEos(sint16 sequence, sint16 separation);
+    void SsSeqSetVol(sint16 sequence, sint16 left, sint16 right);
+    uint32 SsSeqPlay(sint16 sequence, uint8 mode, sint16 repetitions);
+    void SsSeqStop(sint16 sequence);
     uint32 spu_sequence_vm_get_sequence_volume(SpuSequenceScheduler *scheduler, sint16 handle, uint16 *left, uint16 *right);
     uint32 spu_sequence_vm_sequence_key_off(sint16 sequence);
     uint32 spu_sequence_vm_set_volume(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 volume, uint16 pan);
@@ -509,6 +544,9 @@ extern "C"
     uint32 spu_sequence_vm_select_tones(uint8 *tones, uint8 *samples);
     uint16 spu_sequence_vm_tone_pitch(uint16 note, uint16 fraction);
     uint32 spu_sequence_vm_voice_bend(sint16 voice, sint16 sequence, sint16 bank, sint16 program, uint16 bend);
+    void spu_sequence_vm_voice_bend_offset(uint8 voice, sint16 bend);
+    sint32 spu_sequence_vm_voice_set_pitch(uint16 voice, sint16 bank, sint16 program, sint16 note, uint16 new_note, uint16 fine);
+    sint32 spu_sequence_vm_voice_set_adsr(uint16 voice, sint16 bank, sint16 program, sint16 note, uint16 adsr1, uint16 adsr2);
     uint32 spu_sequence_vm_sequence_bend(sint16 sequence, sint16 bank, sint16 program, uint16 bend);
     uint32 spu_sequence_vm_key_off(sint16 sequence, sint16 bank, sint16 program, uint16 note);
 
@@ -518,7 +556,10 @@ extern "C"
     uint32 spu_sequence_vm_initialize(uint8 voices);
     uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 note, uint16 velocity, uint16 pan);
     uint32 spu_sequence_vm_noise_on(SpuSequenceScheduler *scheduler, uint8 voice);
+    void spu_sequence_vm_noise_key_on_direct(uint8 voice, sint16 left, sint16 right);
+    void spu_sequence_vm_noise_key_on_allocated(sint16 left, sint16 right);
     uint32 spu_sequence_vm_key_on_now(SpuSequenceScheduler *scheduler, uint32 layers, sint16 pitch);
+    PsxInterruptCallback SpuSetTransferCallback(PsxInterruptCallback callback);
     uint32 spu_sequence_vm_transfer_mode(uint32 mode);
     uint32 spu_sequence_vm_reverb_depth(sint16 left, sint16 right);
     uint32 spu_sequence_vm_reverb_type(uint32 mode);
@@ -624,6 +665,8 @@ extern "C"
     uint32 SpuSetNoiseVoice(sint32 mode, uint32 mask);
     sint16 SsUtSetReverbType(sint16 type);
     void SsUtSetReverbDepth(sint16 left, sint16 right);
+    void SsSetRVol(sint16 left, sint16 right);
+    void SsGetSerialVol(uint8 serial, uint16 *volume);
     sint32 SpuInitMalloc(sint32 count, char *records);
     sint32 SpuMalloc(sint32 bytes);
     void SpuFree(uint32 address);
@@ -715,6 +758,8 @@ extern "C"
     sint32 SpuSetTransferMode(sint32 mode);
     uint32 SpuSetTransferStartAddr(uint32 address);
     uint32 SpuWrite(const void *source, uint32 byte_count);
+    sint32 spu_stop_transfer(void);
+    uint32 spu_read_blocks(void *destination, uint16 address_units, uint16 blocks);
     sint32 SpuReadDecodedData(void *destination, sint32 flags);
     uint32 spu_write_host(const void *source, uint32 byte_count);
     sint32 SpuIsTransferCompleted(sint32 mode);
@@ -750,8 +795,10 @@ extern "C"
     sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16 bank, uint32 body_address);
     sint16 spu_vab_trans_body_native(const uint8 *body, uint32 body_bytes, sint16 bank);
     sint32 spu_vab_select_native(uint16 bank, sint16 program);
+    uint32 spu_vab_set_program_volume(sint16 bank, sint16 program, uint8 value);
+    uint32 spu_vab_set_program_pan(sint16 bank, sint16 program, uint8 value);
     sint16 spu_vab_get_vag_atr_native(sint16 bank, sint16 program, sint16 tone, VagAtr *output);
-    uint32 spu_vab_nrpn_attr_by_value(uint8 attribute, sint16 bank, sint16 program, sint16 tone, VagAtr attributes, uint8 value);
+    uint32 spu_vab_nrpn_attr_by_value(sint16 attribute, sint16 bank, sint16 program, sint16 tone, VagAtr attributes, uint8 value);
     sint32 spu_vab_native_view(sint16 bank, SpuVabNativeView *view);
     void spu_vab_reset_native(void);
     uint32 spu_vab_close_sticky(sint16 bank);

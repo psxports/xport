@@ -24,7 +24,7 @@ This file is the only agent entrypoint for xport. Resolve `[XPORT_ROOT]` from a 
 - `commit decomp`: read [docs/COMMIT.md](docs/COMMIT.md); batch commit/push initialized sibling projects only, with the exact message `decomp progress`
 - `startup FULL_NAME SHORT_NAME`, project creation, ownership, layout, build gates and music conversion: read [docs/STARTUP.md](docs/STARTUP.md)
 - `record SLOT NAME`, `stop` and capture validation: read [docs/RECORDING.md](docs/RECORDING.md)
-- `function_converge NAME` and its matching `stop`: read [docs/FUNCTION_COVERAGE.md](docs/FUNCTION_COVERAGE.md)
+- `function_coverage NAME` and its matching `stop`: read [docs/FUNCTION_COVERAGE.md](docs/FUNCTION_COVERAGE.md)
 - `boost NAME` or `boost` with an explicitly supplied function set: read [docs/BOOST.md](docs/BOOST.md); run one fast three-agent draft translation pass without a goal, audit, build or runtime workflow
 - `coverage NAME`: read [docs/COVERAGE.md](docs/COVERAGE.md) and its canonical translation rules in [docs/DECOMPILATION.md](docs/DECOMPILATION.md#full-pass-translation-and-batch-modules); complete the selected function pass before integration/builds. Preserve saved bodies/proof history and separate translation counts from proof counts. No workers without explicit authorization; strict gates only for an explicitly requested strict deliverable
 - `converge NAME`: create an active goal, then read [docs/CONVERGENCE.md](docs/CONVERGENCE.md); keep the same supervisor alive and under event-driven observation until full-record `MATCH`, required user input or an explicit user stop; mark the goal complete only after verified `MATCH`

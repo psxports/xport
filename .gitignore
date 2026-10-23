@@ -1,11 +1,2 @@
-tools/duckstation/source/
-tools/duckstation/dependencies/
-tools/duckstation/distribution/
-tools/duckstation/.distribution-new-*/
-tools/duckstation/.distribution-old-*/
-tools/duckstation/builds/
-__pycache__/
-tools/adpcm-xq/*.exe
-tools/adpcm-xq/*.obj
-tools/adpcm-xq/.build.json
-tools/emsdk/
+/_build/
+/.cursor/

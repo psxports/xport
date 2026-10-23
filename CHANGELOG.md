@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22
+
+- Fixed native queued-audio recovery after long host/debugger stops: physical PCM overflow retires oldest output without blocking VBlank or the game thread;queue capacity follows the two output buffers and `g_xport_audio_dropped_frames` records loss. SPU/SEQ/capture processing retains every field. Native field catch-up polls host events at least once per32fields. Rebuild consumers using `XPORT_AUDIO_VBLANK_QUEUE=1`;legacy worker-rendered audio is unchanged. Shared audio/timing/render-wait/PAD checks pass;P2 Debug x86 real WaveOut recovers after an8second process stop. Evidence: `Pandemonium2-xport/status/enhance/audio-stall-recovery.json`. This does not certify other games or audible output
+
 ## 2026-10-16 18:19:31 UTC
 
 - Added `r_masked_u32` for aligned word reads with explicit LWL/LWR observation byte lanes. Existing scalar and MMIO contracts are unchanged; partial MMIO is rejected because the device read callback has no mask. No new consumer binding, serialized state or required migration. Native x86/x64 and x86 LOCKSTEP_DEBUG contract tests pass; FF texture-loader raw/C comparison passes37 cases including two unaligned sources with exact ordered masks. Contract: docs/MASKED_MEMORY.md. Evidence: FightingForce-xport/status/implementation-completion/masked-memory-compatibility-review.json and texture-loader-full-review.json. Other consumers' gameplay and physical bus timing are not certified

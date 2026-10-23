@@ -35,6 +35,16 @@ struct VID_TEXTURE
     uint32 refs, released, draw_refs;
 };
 
+struct VID_TARGET
+{
+    VID_TARGET *next;
+    VID_TEXTURE *texture;
+    uint32 framebuffer, depth, refs, released, ready;
+};
+
+static VID_TARGET *targets, *frame_target;
+static sint32 frame_target_present = 1;
+
 struct VID_SHADER
 {
     struct VID_SHADER *next;
@@ -152,6 +162,28 @@ static PFNGLACTIVETEXTUREPROC vid_glActiveTexture;
     #define glActiveTexture vid_glActiveTexture
 static PFNGLBLENDEQUATIONPROC vid_glBlendEquation;
     #define glBlendEquation vid_glBlendEquation
+static PFNGLGENFRAMEBUFFERSPROC vid_glGenFramebuffers;
+    #define glGenFramebuffers vid_glGenFramebuffers
+static PFNGLBINDFRAMEBUFFERPROC vid_glBindFramebuffer;
+    #define glBindFramebuffer vid_glBindFramebuffer
+static PFNGLDELETEFRAMEBUFFERSPROC vid_glDeleteFramebuffers;
+    #define glDeleteFramebuffers vid_glDeleteFramebuffers
+static PFNGLFRAMEBUFFERTEXTURE2DPROC vid_glFramebufferTexture2D;
+    #define glFramebufferTexture2D vid_glFramebufferTexture2D
+static PFNGLCHECKFRAMEBUFFERSTATUSPROC vid_glCheckFramebufferStatus;
+    #define glCheckFramebufferStatus vid_glCheckFramebufferStatus
+static PFNGLGENRENDERBUFFERSPROC vid_glGenRenderbuffers;
+    #define glGenRenderbuffers vid_glGenRenderbuffers
+static PFNGLBINDRENDERBUFFERPROC vid_glBindRenderbuffer;
+    #define glBindRenderbuffer vid_glBindRenderbuffer
+static PFNGLDELETERENDERBUFFERSPROC vid_glDeleteRenderbuffers;
+    #define glDeleteRenderbuffers vid_glDeleteRenderbuffers
+static PFNGLRENDERBUFFERSTORAGEPROC vid_glRenderbufferStorage;
+    #define glRenderbufferStorage vid_glRenderbufferStorage
+static PFNGLFRAMEBUFFERRENDERBUFFERPROC vid_glFramebufferRenderbuffer;
+    #define glFramebufferRenderbuffer vid_glFramebufferRenderbuffer
+static PFNGLBLITFRAMEBUFFERPROC vid_glBlitFramebuffer;
+    #define glBlitFramebuffer vid_glBlitFramebuffer
 
 static PROC vid_proc(const char *name)
 {
@@ -250,6 +282,19 @@ static sint32 vid_load_gl(void)
         return 0;
     vid_glBlendEquation = (PFNGLBLENDEQUATIONPROC)vid_proc("glBlendEquation");
     if (!vid_glBlendEquation)
+        return 0;
+    vid_glGenFramebuffers = (PFNGLGENFRAMEBUFFERSPROC)vid_proc("glGenFramebuffers");
+    vid_glBindFramebuffer = (PFNGLBINDFRAMEBUFFERPROC)vid_proc("glBindFramebuffer");
+    vid_glDeleteFramebuffers = (PFNGLDELETEFRAMEBUFFERSPROC)vid_proc("glDeleteFramebuffers");
+    vid_glFramebufferTexture2D = (PFNGLFRAMEBUFFERTEXTURE2DPROC)vid_proc("glFramebufferTexture2D");
+    vid_glCheckFramebufferStatus = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)vid_proc("glCheckFramebufferStatus");
+    vid_glGenRenderbuffers = (PFNGLGENRENDERBUFFERSPROC)vid_proc("glGenRenderbuffers");
+    vid_glBindRenderbuffer = (PFNGLBINDRENDERBUFFERPROC)vid_proc("glBindRenderbuffer");
+    vid_glDeleteRenderbuffers = (PFNGLDELETERENDERBUFFERSPROC)vid_proc("glDeleteRenderbuffers");
+    vid_glRenderbufferStorage = (PFNGLRENDERBUFFERSTORAGEPROC)vid_proc("glRenderbufferStorage");
+    vid_glFramebufferRenderbuffer = (PFNGLFRAMEBUFFERRENDERBUFFERPROC)vid_proc("glFramebufferRenderbuffer");
+    vid_glBlitFramebuffer = (PFNGLBLITFRAMEBUFFERPROC)vid_proc("glBlitFramebuffer");
+    if (!vid_glGenFramebuffers || !vid_glBindFramebuffer || !vid_glDeleteFramebuffers || !vid_glFramebufferTexture2D || !vid_glCheckFramebufferStatus || !vid_glGenRenderbuffers || !vid_glBindRenderbuffer || !vid_glDeleteRenderbuffers || !vid_glRenderbufferStorage || !vid_glFramebufferRenderbuffer || !vid_glBlitFramebuffer)
         return 0;
     return 1;
 }
@@ -384,11 +429,10 @@ static sint32 vid_context_init(void *window)
         vid_context_free();
         return 0;
     }
-    // Preserve the game clock independently of the desktop swap interval
     {
         PFNWGLSWAPINTERVALEXTPROC swap_interval = (PFNWGLSWAPINTERVALEXTPROC)vid_proc("wglSwapIntervalEXT");
         if (swap_interval)
-            swap_interval(0);
+            swap_interval(1);
     }
 #endif
     vertex = vid_compile_shader(GL_VERTEX_SHADER, vid_vertex_source);
@@ -465,6 +509,7 @@ static sint32 vid_swap(void)
     return glGetError() == GL_NO_ERROR;
 #else
     return SwapBuffers(vid_device) && glGetError() == GL_NO_ERROR;
+
 #endif
 }
 
@@ -547,13 +592,55 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
 }
 
+static sint32 vid_target_storage(VID_TARGET *target, uint32 width, uint32 height)
+{
+    VID_TEXTURE *texture = target->texture;
+    if (texture->draw_refs || width == 0 || height == 0)
+        return 0;
+    if (!target->framebuffer)
+        glGenFramebuffers(1, &target->framebuffer);
+    if (!target->depth)
+        glGenRenderbuffers(1, &target->depth);
+    if (!texture->object)
+        glGenTextures(1, &texture->object);
+    glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+    if (!texture->allocated || width != texture->width || height != texture->height)
+    {
+        target->ready = 0;
+        glBindTexture(GL_TEXTURE_2D, texture->object);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindRenderbuffer(GL_RENDERBUFFER, target->depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+        texture->width = width;
+        texture->height = height;
+        texture->allocated = 1;
+        texture->uploaded = texture->version;
+    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture->object, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target->depth);
+    return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE && glGetError() == GL_NO_ERROR;
+}
+
 static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame_width, sint32 frame_height)
 {
     sint32 width, height;
+    GLint previous_read = 0, previous_draw = 0;
     const VID_MATERIAL_DATA *pass = NULL;
     vid_update_size(&width, &height);
     if (width <= 0 || height <= 0)
         return 1;
+    if (frame_target)
+    {
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
+        if (!vid_target_storage(frame_target, width, height))
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+            return 0;
+        }
+        frame_target->ready = 0;
+    }
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
     glClearColor(clear[0], clear[1], clear[2], 1.0f);
@@ -671,7 +758,8 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
         if (geometry->uploaded != geometry->version)
         {
             glBindBuffer(GL_ARRAY_BUFFER, geometry->object);
-            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)geometry->count * geometry->stride), geometry->vertices, GL_DYNAMIC_DRAW);
+            // ANGLE dynamic vertex storage rebases gl_VertexID twice for indexed draws
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)geometry->count * geometry->stride), geometry->vertices, GL_STATIC_DRAW);
             geometry->uploaded = geometry->version;
         }
         if (draws->indices)
@@ -697,7 +785,16 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
         draws = draws->next;
     }
     glDisable(GL_SCISSOR_TEST);
-    return vid_swap();
+    if (frame_target)
+    {
+        frame_target->ready = glGetError() == GL_NO_ERROR;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, frame_target->framebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+        if (frame_target_present)
+            glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+    }
+    return frame_target && !frame_target_present ? glGetError() == GL_NO_ERROR : vid_swap();
 }
 
 static void vid_mesh_delete(VID_GEOMETRY *geometry)
@@ -1014,7 +1111,7 @@ uint8 *vid_tex_data(VID_TEXTURE *texture)
 
 void vid_tex_commit(VID_TEXTURE *texture)
 {
-    if (!texture || texture->released)
+    if (!texture || texture->released || !texture->pixels)
         abort();
     if (!++texture->version)
         texture->version = 1;
@@ -1029,6 +1126,83 @@ void vid_tex_free(VID_TEXTURE *texture)
         abort();
     texture->released = 1;
     texture_release(texture);
+}
+
+VID_TARGET *vid_target_create(void)
+{
+    VID_TARGET *target = calloc(1, sizeof(*target));
+    VID_TEXTURE *texture;
+    if (!target)
+        return NULL;
+    texture = calloc(1, sizeof(*texture));
+    if (!texture)
+    {
+        free(target);
+        return NULL;
+    }
+    texture->refs = texture->version = 1;
+    texture->next = textures;
+    textures = texture;
+    target->texture = texture;
+    target->refs = 1;
+    target->next = targets;
+    targets = target;
+    return target;
+}
+
+VID_TEXTURE *vid_target_texture(VID_TARGET *target)
+{
+    return target && !target->released ? target->texture : NULL;
+}
+
+static void target_release(VID_TARGET *target)
+{
+    VID_TARGET **link;
+    if (--target->refs)
+        return;
+    link = &targets;
+    while (*link != target)
+        link = &(*link)->next;
+    *link = target->next;
+    if (target->framebuffer)
+        glDeleteFramebuffers(1, &target->framebuffer);
+    if (target->depth)
+        glDeleteRenderbuffers(1, &target->depth);
+    vid_tex_free(target->texture);
+    free(target);
+}
+
+void vid_target_free(VID_TARGET *target)
+{
+    if (!target)
+        return;
+    if (target->released)
+        abort();
+    target->released = 1;
+    target_release(target);
+}
+
+sint32 vid_target_copy(VID_TARGET *destination, const VID_TARGET *source)
+{
+    GLint previous_read, previous_draw;
+    sint32 result;
+    if (!initialized || frame_active || !destination || !source || destination == source || destination->released || source->released || !source->ready || destination->texture->draw_refs)
+        return 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
+    result = vid_target_storage(destination, source->texture->width, source->texture->height);
+    destination->ready = 0;
+    if (result)
+    {
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+        glBlitFramebuffer(0, 0, source->texture->width, source->texture->height, 0, 0, source->texture->width, source->texture->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        result = glGetError() == GL_NO_ERROR;
+        destination->ready = result;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+    return result;
 }
 
 VID_SHADER *vid_shader_create(const char *vertex_source, const char *fragment)
@@ -1257,6 +1431,23 @@ sint32 vid_begin(float r, float g, float b)
     return 1;
 }
 
+sint32 vid_target_select(VID_TARGET *target)
+{
+    if (!frame_active || draw_head || frame_target || !target || target->released || target->texture->draw_refs)
+        return 0;
+    frame_target = target;
+    ++target->refs;
+    return 1;
+}
+
+sint32 vid_target_select_offscreen(VID_TARGET *target)
+{
+    if (!vid_target_select(target))
+        return 0;
+    frame_target_present = 0;
+    return 1;
+}
+
 void vid_viewport(VID_RECT viewport)
 {
     if (!frame_active || viewport.w <= 0 || viewport.h <= 0)
@@ -1283,6 +1474,8 @@ static sint32 vid_record(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 firs
     if (pass != 1 && (indices ? indices->released || first > indices->count || count > indices->count - first : first > geometry->count || count > geometry->count - first))
         return 0;
     if (pass != 2 && (!material || material->released || material->data.texture != material->held_texture || material->data.shader != material->held_shader || material->data.aux[0] != material->held_aux[0] || material->data.aux[1] != material->held_aux[1]))
+        return 0;
+    if (pass != 2 && frame_target && (material->data.texture == frame_target->texture || material->data.aux[0] == frame_target->texture || material->data.aux[1] == frame_target->texture))
         return 0;
     draw = draw_pool;
     if (draw)
@@ -1419,7 +1612,13 @@ void vid_cancel(void)
         draw_pool = draw;
     }
     draw_tail = NULL;
+    if (frame_target)
+    {
+        target_release(frame_target);
+        frame_target = NULL;
+    }
     frame_active = 0;
+    frame_target_present = 1;
     memset(frame_fog, 0, sizeof(frame_fog));
 }
 
@@ -1445,6 +1644,8 @@ void vid_free(void)
 {
     VID_DRAW *draw;
     vid_cancel();
+    while (targets)
+        vid_target_free(targets);
     while (samples)
         vid_sample_free(samples);
     while (materials)

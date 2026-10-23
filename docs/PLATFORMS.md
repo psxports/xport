@@ -76,6 +76,8 @@ The fixture links `/NODEFAULTLIB`, checks startup, actual global C++ constructio
 
 ## Minimal XCRT and C++ lifetime
 
+Ordinary Release startup passes an empty command line to `WinMain`; only `_DEBUG` or `LOCKSTEP_DEBUG` startup reads `GetCommandLineA`. Keep `atexit` callbacks and static destruction available to shared consumers.
+
 `WinMainCRTStartup` initializes the heap, walks linker-sorted `.CRT$XCA` through `.CRT$XCZ` C++ initializers and calls `exit` after `WinMain`. `atexit` retains callbacks in a heap-backed LIFO list; callbacks run outside its lock and may register additional callbacks. `abort` does not run exit callbacks. This is ordinary C++ static lifetime support, independent of STL.
 
 Release excludes diagnostic formatting, output and diagnostic strings at compile time. Keep failure conditions and termination outside Debug-only output blocks. XCRT must not implement `printf`, `fprintf`, `vfprintf`, `fputs`, `fflush` or `__acrt_iob_func`; do not replace them with success stubs or pull in the standard CRT to satisfy diagnostic calls. Debug may use normal CRT diagnostics. BIOS standard-output writes validate their arguments and discard their payload in Release. Native XCRT file writes are synchronous and unbuffered; actual resource/save writes retain their byte-count checks.

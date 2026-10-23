@@ -9,6 +9,7 @@ typedef struct VID_INDEX VID_INDEX;
 typedef struct VID_MATERIAL VID_MATERIAL;
 typedef struct VID_SHADER VID_SHADER;
 typedef struct VID_SAMPLE VID_SAMPLE;
+typedef struct VID_TARGET VID_TARGET;
 
 enum
 {
@@ -128,9 +129,17 @@ extern "C"
     VID_SAMPLE *vid_sample_create(void);
     void vid_sample_free(VID_SAMPLE *sample);
     uint32 vid_sample_color(const VID_SAMPLE *sample);
+    VID_TARGET *vid_target_create(void);
+    // Borrowed GPU image, with bottom-left UV origin and no CPU data
+    VID_TEXTURE *vid_target_texture(VID_TARGET *target);
+    sint32 vid_target_copy(VID_TARGET *destination, const VID_TARGET *source);
+    void vid_target_free(VID_TARGET *target);
 
     // Frame references retain resources until end or cancellation
     sint32 vid_begin(float r, float g, float b);
+    // Select before recording commands; end presents and retains the completed image
+    sint32 vid_target_select(VID_TARGET *target);
+    sint32 vid_target_select_offscreen(VID_TARGET *target);
     void vid_viewport(VID_RECT viewport);
     // Draw commands copy these vectors before the caller changes them
     void vid_uniforms(const float *values, uint32 vectors);

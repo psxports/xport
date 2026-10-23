@@ -28,16 +28,17 @@ def is_excluded(target, patterns):
     return any(fnmatch.fnmatchcase(target.as_posix().lower(), pattern) for pattern in patterns)
 
 
-def collect_files(project_root):
+def collect_files(project_root, include_str=()):
     files = []
     root = project_root / "bin" / "DATA"
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         relative = path.relative_to(root)
-        if path.suffix.lower() == ".str":
+        target = Path("/") / "DATA" / relative
+        if path.suffix.lower() == ".str" and not is_excluded(target, include_str):
             continue
-        files.append((path, Path("/") / "DATA" / relative, path.stat().st_size))
+        files.append((path, target, path.stat().st_size))
     return sorted(files, key=lambda item: (-item[2], item[1].as_posix()))
 
 
@@ -84,6 +85,7 @@ def main():
     parser.add_argument("--index-template", required=True, type=Path)
     parser.add_argument("--extra-file", nargs=2, action="append", default=[], metavar=("SOURCE", "TARGET"))
     parser.add_argument("--exclude", action="append", default=[], metavar="VIRTUAL_PATH_GLOB")
+    parser.add_argument("--include-str", action="append", default=[], metavar="VIRTUAL_PATH_GLOB")
     args = parser.parse_args()
 
     output = args.output.resolve()
@@ -94,7 +96,8 @@ def main():
 def build_lazy(args, output):
     project = args.project.resolve()
     excluded = exclusion_patterns(getattr(args, 'exclude', []))
-    files = collect_files(project)
+    included_str = exclusion_patterns(getattr(args, 'include_str', []))
+    files = collect_files(project, included_str)
     for source_text, target_text in getattr(args, 'extra_file', []):
         source = Path(source_text).resolve()
         target_name = target_text.replace('\\', '/').strip('/')
@@ -115,7 +118,7 @@ def build_lazy(args, output):
             name = '/'.join(part for part in name.split('/') if part and part != '.')
             if not name.lower().startswith('data/'):
                 continue
-            if Path(name).suffix.lower() == '.str':
+            if Path(name).suffix.lower() == '.str' and not is_excluded(Path('/') / name, included_str):
                 continue
             if is_excluded(Path('/') / name, excluded):
                 continue

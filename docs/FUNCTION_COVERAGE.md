@@ -3,11 +3,11 @@
 Normative extension of `../AGENTS.md` for the chat command:
 
 ```text
-function_converge NAME
+function_coverage NAME
 stop
 ```
 
-`function_converge NAME` starts one interactive DuckStation run from disc without a save state and records the first execution of every registered function in the configured `analysis.default_image`. `NAME` identifies `status/function-coverage/NAME`; it must contain 1 through 64 ASCII letters, digits, `.`, `_` or `-`, must be one path component and must not equal `.` or `..`.
+`function_coverage NAME` starts one interactive DuckStation run from disc without a save state and records the first execution of every registered function in the configured `analysis.default_image`. `NAME` identifies `status/function-coverage/NAME`; it must contain 1 through 64 ASCII letters, digits, `.`, `_` or `-`, must be one path component and must not equal `.` or `..`.
 
 Resolve `PROJECT_ROOT` from the current working directory's nearest ancestor containing `xport-project.json`, or from a project path explicitly supplied by the user. If the working directory is a shared parent or the xport toolset and no project path was supplied, ask for the project path before starting. Do not select a sibling project using `NAME`, a game title, previous coverage receipts or available artifacts. Use that resolved `PROJECT_ROOT` for `X` and all runtime checks.
 
@@ -21,7 +21,7 @@ The launcher uses DuckStation's default CPU-driven timing. `-standard-timing` re
 
 Resolve `IMAGE` from `xport-project.json` key `analysis.default_image`. Do not assume `MAIN.EXE`. Wait for JSON status `running` before asking the user to play. DuckStation must be visible on `WinSta0\Default`. Do not launch it hidden and do not move it between desktops.
 
-The exact user command `stop` following `function_converge NAME` means:
+The exact user command `stop` following `function_coverage NAME` means:
 
 ```text
 X function_coverage stop
