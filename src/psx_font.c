@@ -337,7 +337,7 @@ static sint32 krom_character_index(uint32 character)
     return -1;
 }
 
-const uint8 *Krom2RawAdd2(uint32 character)
+static const uint8 *krom_lookup_glyph(uint32 character, int fallback)
 {
     uint32 code = character & 0xFFFF;
     uint32 base, offset;
@@ -357,8 +357,20 @@ const uint8 *Krom2RawAdd2(uint32 character)
         base = krom_kanji_offset;
         index = krom_character_index(code);
     }
+    if (index < 0 && !fallback)
+        return NULL;
     offset = index < 0 ? krom_first_offset : base + (uint32)index * 30;
     if (offset > krom_pixel_bytes || 30 > krom_pixel_bytes - offset)
         abort();
     return krom_pixels + offset;
+}
+
+const uint8 *Krom2RawAdd2(uint32 character)
+{
+    return krom_lookup_glyph(character, 1);
+}
+
+const uint8 *Krom2RawAdd(uint32 character)
+{
+    return krom_lookup_glyph(character, 0);
 }

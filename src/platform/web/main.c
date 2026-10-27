@@ -358,8 +358,42 @@ static uint32 key_to_pad(sint32 controller, const char *code)
     return 0;
 }
 
+static XportFunctionKeyHandler function_key_handler;
+static uint32 function_keys;
+
+void xport_set_function_key_handler(XportFunctionKeyHandler handler)
+{
+    function_key_handler = handler;
+}
+
 static EM_BOOL key_event(sint32 type, const EmscriptenKeyboardEvent *event, void *user)
 {
+    if (!event->altKey && !event->ctrlKey && event->code[0] == 'F' && function_key_handler != NULL)
+    {
+        char *end;
+        long key = strtol(event->code + 1, &end, 10);
+        if (*end == 0 && key >= 1 && key <= 12)
+        {
+            uint32 bit = 1u << (key - 1);
+            if (type == EMSCRIPTEN_EVENT_KEYUP)
+            {
+                uint32 handled = function_keys & bit;
+                function_keys &= ~bit;
+                if (handled)
+                    return EM_TRUE;
+            }
+            else if (!event->repeat)
+            {
+                if (function_key_handler((uint32)key))
+                {
+                    function_keys |= bit;
+                    return EM_TRUE;
+                }
+            }
+            else if (function_keys & bit)
+                return EM_TRUE;
+        }
+    }
     if (!strcmp(event->code, "Tab"))
     {
         if (type == EMSCRIPTEN_EVENT_KEYDOWN && !event->repeat)
@@ -395,6 +429,7 @@ static EM_BOOL blur_event(sint32 type, const EmscriptenFocusEvent *event, void *
     (void)type;
     (void)event;
     (void)user;
+    function_keys = 0;
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     xport_input_rumble(0, 0, 0);
     xport_input_rumble(1, 0, 0);
@@ -416,14 +451,16 @@ uint64 xport_timer_get(void)
 
 EM_ASYNC_JS(void, platform_wait_frame, (void), { await new Promise(function(wake) { requestAnimationFrame(wake); }); });
 
+void xport_present_complete(void)
+{
+    platform_wait_frame();
+    platform_poll_field = xport_frame();
+}
+
 sint32 xport_render_wait_until(uint64 deadline)
 {
-    if (deadline <= xport_timer_get())
-        return 0;
-    platform_wait_frame();
-    uint64 now = xport_timer_get();
-    platform_poll_field = xport_frame();
-    return now < deadline;
+    // Presentation already yielded to the browser animation frame
+    return xport_timer_get() < deadline;
 }
 
 void xport_timer_wait_frame(uint64 target_field)
@@ -437,6 +474,7 @@ void xport_timer_wait_frame(uint64 target_field)
 
 sint32 xport_input_init(void)
 {
+    function_keys = 0;
     memset(platform_pad_buttons, 0, sizeof(platform_pad_buttons));
     memset(platform_gamepad_buttons, 0, sizeof(platform_gamepad_buttons));
     memset(platform_input_type, 0, sizeof(platform_input_type));
@@ -695,6 +733,11 @@ void xport_message_error(const char *title, const char *message)
 void xport_set_cleanup(void (*cleanup)(void))
 {
     platform_cleanup = cleanup;
+}
+
+XportCleanup xport_get_cleanup(void)
+{
+    return platform_cleanup;
 }
 
 void xport_shutdown(void)

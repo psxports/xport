@@ -54,7 +54,7 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets"><Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" /></ImportGroup>
-<ItemGroup><ClCompile Include="@@SHARED_SOURCE@@\psx_mdec.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_press.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_vlc.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_stream.c" /></ItemGroup>
+<ItemGroup><ClCompile Include="@@SHARED_SOURCE@@\psx_mdec.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_press.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_vlc.c" /><ClCompile Include="@@SHARED_SOURCE@@\psx_stream.c" /><ClCompile Include="@@SHARED_SOURCE@@\xport_fmv.c" /></ItemGroup>
 
   <Target Name="XportSelectNativeArch" BeforeTargets="PrepareForBuild">
     <ReadLinesFromFile File="$(ProjectDir)..\..\..\_build\native-$(Configuration).arch" Condition="Exists('$(ProjectDir)..\..\..\_build\native-$(Configuration).arch')">

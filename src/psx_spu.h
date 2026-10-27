@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include "psx.h"
+#include "psx_xa.h"
 
 #define SPU_RAM_SIZE 0x80000u
 #define SPU_VOICE_COUNT 24
@@ -25,6 +26,8 @@ extern "C"
 #endif
 
     void cd_dispatch_ready_event(void);
+    sint32 xport_xa_play_file(const char *path, sint32 repeat);
+    sint32 xport_xa_file_position(CdlLOC *position, uint32 *frames);
     sint32 CdInit(void);
     sint32 CdLastCom(void);
     sint32 cd_mount_cue(const char *cue_path);
@@ -689,7 +692,9 @@ extern "C"
         uint32 pending_state;
         uint16 key_on[2];
         uint16 key_off[2];
+        uint16 pitch_mask[2];
         uint16 noise_mask[2];
+        uint16 reverb_mask[2];
     } SpuKeyControl;
 
     extern SpuKeyControl *const spu_key_control;
@@ -752,6 +757,7 @@ extern "C"
 
     sint32 spu_bind_transfer(const SpuTransferBinding *binding);
     sint32 spu_clear_reverb_transfer(sint32 mode, const void *source, const SpuTransferBinding *binding, uint32 *direction);
+    sint32 spu_clear_reverb_work_area(sint32 mode, const SpuTransferBinding *binding, uint32 *direction);
     sint32 spu_clear_reverb_guest(const SpuNativeTransferGuestBinding *guest, uint32 begin, uint32 bytes, uint32 source, uint32 direction);
     sint32 spu_clear_reverb_native(uint32 begin, uint32 bytes);
     sint32 spu_transfer_failed(void);
@@ -811,6 +817,12 @@ extern "C"
     uint16 spu_voice_envelope(sint32 voice);
     void spu_mix(sint32 *interleaved_stereo, uint32 frame_count);
     void spu_render(sint16 *interleaved_stereo, uint32 frame_count);
+    typedef uint32 (*SpuCdPcmSource)(void *context, sint16 *output, uint32 frames);
+    // Supply 44100 Hz stereo PCM through the existing CD volume and reverb path
+    void spu_set_cd_pcm_source(SpuCdPcmSource source, void *context);
+    sint32 spu_take_xa_pcm(XportFmvAudioRemainder *audio);
+    sint32 spu_save_xa_pcm(void);
+    void spu_discard_xa_pcm(void);
     void spu_render_vblank(sint16 *interleaved_stereo, uint32 frame_count);
     int spu_state_io(FILE *file, int load);
     int spu_lockstep_portable_io(FILE *file, int load);

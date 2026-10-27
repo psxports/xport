@@ -33,6 +33,7 @@ struct VID_TEXTURE
     uint8 *pixels;
     uint32 width, height, format, version, uploaded, object, allocated;
     uint32 refs, released, draw_refs;
+    uint32 sampler_flags;
 };
 
 struct VID_TARGET
@@ -586,10 +587,18 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
     }
     if (texture->format >= VID_R8UI)
         filter = repeat = 0;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    uint32 sampler = 4 | (filter ? 2 : 0) | (repeat ? 1 : 0);
+    if (!(texture->sampler_flags & 4) || ((texture->sampler_flags ^ sampler) & 2))
+    {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter ? GL_LINEAR : GL_NEAREST);
+    }
+    if (!(texture->sampler_flags & 4) || ((texture->sampler_flags ^ sampler) & 1))
+    {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    }
+    texture->sampler_flags = sampler;
 }
 
 static sint32 vid_target_storage(VID_TARGET *target, uint32 width, uint32 height)
@@ -1625,10 +1634,20 @@ void vid_cancel(void)
 sint32 vid_end(void)
 {
     sint32 result;
+#if defined(AP_WEB)
+    sint32 present;
+#endif
     if (!frame_active)
         return 0;
+#if defined(AP_WEB)
+    present = initialized && (!frame_target || frame_target_present);
+#endif
     result = initialized ? vid_render(draw_head, frame_clear, frame_width, frame_height) : xport_is_headless();
     vid_cancel();
+#if defined(AP_WEB)
+    if (result && present)
+        xport_present_complete();
+#endif
     return result;
 }
 
@@ -1734,5 +1753,12 @@ sint32 vid_blit(const uint32 *pixels, sint32 width, sint32 height, VID_RECT src)
     vid_vertices(vid_blit_buffer, sizeof(VID_VERTEX), vid_array);
     glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 6);
-    return vid_swap();
+    {
+        sint32 result = vid_swap();
+#if defined(AP_WEB)
+        if (result)
+            xport_present_complete();
+#endif
+        return result;
+    }
 }

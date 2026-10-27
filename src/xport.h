@@ -142,7 +142,52 @@ extern "C"
 
     /* Platform services implemented by the selected backend */
     extern int xport_hd;
+    typedef sint32 (*XportFunctionKeyHandler)(uint32 key);
+    // Deliver non-repeating F1..F12 presses; return one to consume the key
+    void xport_set_function_key_handler(XportFunctionKeyHandler handler);
     void xport_set_cleanup(void (*cleanup)(void));
+    typedef void (*XportCleanup)(void);
+    XportCleanup xport_get_cleanup(void);
+    // Fullscreen playback returns 1 at EOF, 2 when interrupted and -1 on failure
+    sint32 xport_fmv_play(const char *path);
+    // Include the final source frame; zero selects physical EOF
+    sint32 xport_fmv_play_range(const char *path, uint32 last_frame, sint32 repeat);
+
+    typedef struct XportFmvPresentation
+    {
+        uint32 width, height, bottom_rows;
+        sint32 video_x, video_y;
+        sint32 screen_x, screen_y;
+        uint32 screen_width, screen_height;
+        sint32 interlace;
+        uint32 controllers, skip_buttons;
+        sint32 skip_held;
+        void *context;
+        sint32 (*frame)(void *context, uint32 number);
+        sint32 (*strip)(void *context, uint32 word_x, uint8 *rgb, uint32 rows);
+        sint32 (*tick)(void *context);
+        sint32 (*finish)(void *context, uint32 step);
+    } XportFmvPresentation;
+
+    sint32 xport_fmv_play_presented(const char *path, uint32 last_frame, sint32 repeat, const XportFmvPresentation *presentation);
+    sint32 xport_fmv_ready(void);
+    typedef struct XportFmvAudioRemainder XportFmvAudioRemainder;
+    // Take native XA audio once after successful synchronous playback
+    sint32 xport_fmv_take_audio(XportFmvAudioRemainder *audio);
+    void xport_fmv_discard_audio(void);
+#if defined(AP_WEB)
+    typedef struct XportFmvFrame
+    {
+        uint32 width, height, number;
+    } XportFmvFrame;
+
+    // Registered MP4 session without an owned game loop
+    sint32 xport_fmv_open(const char *path);
+    // Return 0 while waiting, 1 for RGB24, 2 at EOF and -1 on error
+    sint32 xport_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame);
+    void xport_fmv_pause(sint32 paused);
+    void xport_fmv_close(void);
+#endif
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
 
@@ -166,6 +211,8 @@ extern "C"
     void xport_timer_wait_frame(uint64 target_field);
     /* Web yields to the next animation frame; Windows presentation already waits for VSync */
     sint32 xport_render_wait_until(uint64 deadline);
+    // Yield after a completed screen presentation on browser hosts
+    void xport_present_complete(void);
     sint32 xport_input_init(void);
     sint32 xport_poll(void);
     uint32 xport_input_read(sint32 controller);

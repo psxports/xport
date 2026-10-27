@@ -159,6 +159,11 @@ void gpu_set_raster(sint32 enabled)
 #endif
 }
 
+sint32 gpu_get_raster(void)
+{
+    return frame_raster;
+}
+
 void gpu_set_frame_skip(sint32 enabled)
 {
     memset(&frame_skip, 0, sizeof(frame_skip));
@@ -237,6 +242,8 @@ static uint64 scanout_last_us;
 static uint32 scanout_fraction, scanout_clock_started;
 static DISPENV native_disp_cache;
 static uint32 native_disp_cached;
+static DRAWENV native_draw_cache;
+static uint32 native_draw_cached;
 
 void gpu_scanout_reset(GpuScanoutState *state)
 {
@@ -2162,6 +2169,8 @@ static void gpu_draw_command(void *raw)
             sint32 dx = abs(b.x - a.x), dy = -abs(b.y - a.y);
             sint32 sx = a.x < b.x ? 1 : -1, sy = a.y < b.y ? 1 : -1;
             sint32 err = dx + dy, e;
+            if (dx >= 1024 || dy <= -512)
+                continue;
             for (;;)
             {
                 if ((uint32)(a.x + raster_surface_x) < VRAM_W && (uint32)(a.y + raster_surface_y) < VRAM_H)
@@ -2196,6 +2205,8 @@ static void gpu_draw_command(void *raw)
         sint32 steps = dx > -dy ? dx : -dy, step = 0;
         sint32 err = dx + dy, e;
         cb = packet_rgb(p, 12);
+        if (dx >= 1024 || dy <= -512)
+            return;
         for (;;)
         {
             uint32 color = 0u, channel;
@@ -2887,6 +2898,11 @@ static void gpu_put_draw_env_native(DRAWENV *environment, sint32 surface_x, sint
         gpu_draw_env_native(environment, surface_x, surface_y);
     if (psyq_bound)
         memcpy(psx_addr(psyq_binding.draw_cache, 92u), environment, 92u);
+    else
+    {
+        memcpy(&native_draw_cache, environment, sizeof(native_draw_cache));
+        native_draw_cached = 1u;
+    }
 }
 
 void gpu_put_draw_env(uint32 env, sint32 surface_x, sint32 surface_y)
@@ -3312,7 +3328,7 @@ void gpu_init_empty(void)
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
-    scanout_fraction = native_disp_cached = 0u;
+    scanout_fraction = native_disp_cached = native_draw_cached = 0u;
     display_state = 0;
     gpu_vram_invalidate();
     memset(VRAM, 0, sizeof(VRAM));
@@ -3357,7 +3373,7 @@ void gpu_reset_graph_state(void)
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
-    scanout_fraction = native_disp_cached = 0u;
+    scanout_fraction = native_disp_cached = native_draw_cached = 0u;
     display_state = 0;
     active_tpage = 0;
     active_draw_flags = 0;
@@ -3408,11 +3424,11 @@ uint32 gpu_set_def_disp_env(uint32 env, sint32 x, sint32 y, sint32 w, sint32 h)
 
 DRAWENV *SetDefDrawEnv(DRAWENV *environment, sint32 x, sint32 y, sint32 width, sint32 height)
 {
-    sint32 graph_type;
+    sint32 video_mode;
 
     if (!environment)
         return 0;
-    graph_type = GetGraphType();
+    video_mode = GetVideoMode();
     xport_store_le16(&environment->clip.x, (uint16)x);
     xport_store_le16(&environment->clip.y, (uint16)y);
     xport_store_le16(&environment->clip.w, (uint16)width);
@@ -3425,7 +3441,7 @@ DRAWENV *SetDefDrawEnv(DRAWENV *environment, sint32 x, sint32 y, sint32 width, s
     xport_store_u8(&environment->b0, 0u);
     xport_store_u8(&environment->dtd, 1u);
     xport_store_le16(&environment->clip.h, (uint16)height);
-    xport_store_u8(&environment->dfe, (uint8)(height < (graph_type ? 289 : 257)));
+    xport_store_u8(&environment->dfe, (uint8)(height < (video_mode ? 289 : 257)));
     xport_store_le16(&environment->ofs[0], (uint16)x);
     xport_store_le16(&environment->ofs[1], (uint16)y);
     xport_store_le16(&environment->tpage, 10u);
@@ -3566,6 +3582,14 @@ void SetDrawStp(DR_STP *packet, sint32 enabled)
     words[2] = 0;
 }
 
+DRAWENV *GetDrawEnv(DRAWENV *environment)
+{
+    if (!environment || (!psyq_bound && !native_draw_cached))
+        return NULL;
+    memcpy(environment, psyq_bound ? psx_addr(psyq_binding.draw_cache, sizeof(DRAWENV)) : &native_draw_cache, sizeof(DRAWENV));
+    return environment;
+}
+
 DRAWENV *PutDrawEnv(DRAWENV *environment)
 {
     if (!environment)
@@ -3657,6 +3681,14 @@ DISPENV *PutDispEnv(DISPENV *environment)
     gpu_set_display(environment->disp.x, environment->disp.y, environment->disp.w, environment->disp.h);
     display_state = (display_state & ~4u) | (environment->isrgb24 ? 4u : 0u);
     return environment;
+}
+
+sint32 gpu_get_display_env(DISPENV *environment)
+{
+    if (!environment || (!psyq_bound && !native_disp_cached))
+        return 0;
+    memcpy(environment, psyq_bound ? psx_addr(psyq_binding.display_cache, sizeof(DISPENV)) : &native_disp_cache, sizeof(DISPENV));
+    return 1;
 }
 
 void gpu_clear_menu_surfaces(void)

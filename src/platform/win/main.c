@@ -182,6 +182,11 @@ sint32 xport_render_wait_until(uint64 limit)
     return xport_timer_get() < limit;
 }
 
+void xport_present_complete(void)
+{
+    // SwapBuffers owns native presentation pacing
+}
+
 static uint32 key_to_pad(sint32 controller, WPARAM key, LPARAM flags)
 {
     if (controller == 1)
@@ -464,6 +469,13 @@ static void switch_window_mode(void)
     }
 }
 
+static XportFunctionKeyHandler function_key_handler;
+
+void xport_set_function_key_handler(XportFunctionKeyHandler handler)
+{
+    function_key_handler = handler;
+}
+
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
     uint32 button;
@@ -512,6 +524,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KEYDOWN:
         case WM_KEYUP:
+            if (message == WM_KEYDOWN && !(lparam & (1L << 30)) && wparam >= VK_F1 && wparam <= VK_F12 &&
+                function_key_handler != NULL && function_key_handler((uint32)(wparam - VK_F1 + 1)))
+                return 0;
             if (wparam == VK_TAB)
             {
                 if (message == WM_KEYDOWN)
@@ -1239,6 +1254,11 @@ void xport_message_error(const char *title, const char *message)
 void xport_set_cleanup(void (*cleanup)(void))
 {
     platform_cleanup = cleanup;
+}
+
+XportCleanup xport_get_cleanup(void)
+{
+    return platform_cleanup;
 }
 
 void xport_shutdown(void)

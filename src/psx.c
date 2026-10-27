@@ -2277,18 +2277,48 @@ sint32 VectorNormal(VECTOR *input, VECTOR *output)
 
 sint32 VectorNormalS(VECTOR *input, SVECTOR *output)
 {
-    sint32 x;
-    sint32 y;
-    sint32 z;
-    sint32 result;
+    SVECTOR loaded;
+    VECTOR product;
+    sint64 sum_wide;
+    sint32 sum;
+    uint32 leading;
+    uint32 normalized;
+    uint32 shift;
+    sint16 coefficient;
 
     if (!output)
         return 0;
-    result = vector_normal_components(input, &x, &y, &z);
-    output->vx = (sint16)x;
-    output->vy = (sint16)y;
-    output->vz = (sint16)z;
-    return result;
+    loaded.vx = (sint16)input->vx;
+    loaded.vy = (sint16)input->vy;
+    loaded.vz = (sint16)input->vz;
+    loaded.pad = 0;
+    xport_gte_write_data(9u, (uint32)(sint32)loaded.vx);
+    xport_gte_write_data(10u, (uint32)(sint32)loaded.vy);
+    xport_gte_write_data(11u, (uint32)(sint32)loaded.vz);
+    xport_gte_execute(0xa00428u);
+    sum_wide = (sint64)(sint32)xport_gte_read_data(25u);
+    sum_wide += (sint32)xport_gte_read_data(26u);
+    sum_wide += (sint32)xport_gte_read_data(27u);
+    /* Nonnegative SQR results make either signed ADD overflow terminal */
+    if (sum_wide > INT32_MAX)
+    {
+#ifndef NDEBUG
+        fprintf(stderr, "VectorNormalS squared-norm overflow\n");
+#endif
+        abort();
+    }
+    sum = (sint32)sum_wide;
+    xport_gte_write_data(30u, (uint32)sum);
+    leading = xport_gte_read_data(31u) & ~1u;
+    normalized = leading < 24u ? (uint32)sum >> (24u - leading) : (uint32)sum << (leading - 24u);
+    /* Retain the defined native zero policy instead of reading before the table */
+    coefficient = sum ? psyq_rsqrt_table[normalized - 64u] : 0;
+    shift = (uint32)((31 - (sint32)leading) >> 1) & 31u;
+    gte_gpf0(&loaded, coefficient, &product);
+    output->vx = (sint16)(product.vx >> shift);
+    output->vy = (sint16)(product.vy >> shift);
+    output->vz = (sint16)(product.vz >> shift);
+    return sum;
 }
 
 VECTOR *OuterProduct0(VECTOR *left, VECTOR *right, VECTOR *output)
@@ -2331,6 +2361,31 @@ sint32 Lzc(sint32 value)
         ++count;
     }
     return count;
+}
+
+/* Original PsyQ 4.3 integer logarithm */
+sint32 cln(sint32 value)
+{
+    static const uint32 corrections[6] = {1661u, 914u, 482u, 248u, 126u, 63u};
+    sint32 exponent = 20 - Lzc(value);
+    uint32 normalized;
+    uint32 correction = 0;
+    uint32 step;
+
+    if (exponent >= 0)
+        normalized = (uint32)(value >> ((uint32)exponent & 31u));
+    else
+        normalized = (uint32)value << ((0u - (uint32)exponent) & 31u);
+    for (step = 1; step < 7; ++step)
+    {
+        uint32 candidate = normalized + (uint32)((sint32)normalized >> step);
+        if ((sint32)candidate < 4096)
+        {
+            normalized = candidate;
+            correction -= corrections[step - 1];
+        }
+    }
+    return (sint32)(correction + normalized - 4096u + (uint32)exponent * 2839u);
 }
 
 /* PsyQ-compatible GTE implementation. */
@@ -3219,6 +3274,52 @@ void ReadRotMatrix(MATRIX *m)
     }
 }
 
+void ReadLightMatrix(MATRIX *matrix)
+{
+    uint32 rotation[5];
+    uint32 background[3];
+    uint32 index;
+    uint8 *output = (uint8 *)matrix;
+
+    for (index = 0; index < 5; ++index)
+        rotation[index] = xport_gte_read_control(8 + index);
+    for (index = 0; index < 5; ++index)
+        xport_store_le32(output + index * 4, rotation[index]);
+    for (index = 0; index < 3; ++index)
+        background[index] = xport_gte_read_control(13 + index);
+    for (index = 0; index < 3; ++index)
+        xport_store_le32(output + 20 + index * 4, background[index]);
+}
+
+void ReadColorMatrix(MATRIX *matrix)
+{
+    uint32 colors[5], far_color[3], index;
+    uint8 *output = (uint8 *)matrix;
+    for (index = 0; index < 5; ++index)
+        colors[index] = xport_gte_read_control(16 + index);
+    for (index = 0; index < 5; ++index)
+        xport_store_le32(output + index * 4, colors[index]);
+    for (index = 0; index < 3; ++index)
+        far_color[index] = xport_gte_read_control(21 + index);
+    for (index = 0; index < 3; ++index)
+        xport_store_le32(output + 20 + index * 4, far_color[index]);
+}
+
+void ColorMatCol(SVECTOR *normal, CVECTOR *color, CVECTOR *output, sint32 matc)
+{
+    uint32 remaining = matc > 0 ? (uint32)matc : 1;
+
+    xport_gte_write_data(0, xport_load_le32((const uint8 *)normal));
+    xport_gte_write_data(1, xport_load_le32((const uint8 *)normal + 4));
+    xport_gte_execute(0x4A4A6412);
+    do {
+        xport_gte_execute(0x4AA80428);
+    } while (--remaining);
+    xport_gte_write_data(6, xport_load_le32((const uint8 *)color));
+    xport_gte_execute(0x4B38041C);
+    xport_store_le32((uint8 *)output, xport_gte_read_data(22));
+}
+
 MATRIX *TransposeMatrix(MATRIX *source, MATRIX *destination)
 {
     const uint8 *input = (const uint8 *)source;
@@ -3946,6 +4047,31 @@ MATRIX *ScaleMatrix(MATRIX *m, VECTOR *v)
     return m;
 }
 
+MATRIX *ScaleMatrixL(MATRIX *matrix, VECTOR *scale)
+{
+    uint32 factors[3], index;
+    if (!matrix || !scale)
+        return matrix;
+    factors[0] = (uint32)scale->vx;
+    factors[1] = (uint32)scale->vy;
+    factors[2] = (uint32)scale->vz;
+    for (index = 0; index < 5; ++index)
+    {
+        uint32 packed, low, scaled;
+        memcpy(&packed, (const uint8 *)matrix + index * 4, sizeof(packed));
+        low = (uint32)(sint32)(sint16)(packed & 0xffff);
+        scaled = (uint32)mac_shift12((sint32)(low * factors[(index * 2) / 3]));
+        if (index < 4)
+        {
+            uint32 high = (uint32)(sint32)(sint16)(packed >> 16);
+            uint32 upper = (uint32)mac_shift12((sint32)(high * factors[(index * 2 + 1) / 3]));
+            scaled = (scaled & 0xffff) | (upper << 16);
+        }
+        memcpy((uint8 *)matrix + index * 4, &scaled, sizeof(scaled));
+    }
+    return matrix;
+}
+
 void gte_transform(const SVECTOR *v, VECTOR *out, sint32 *flag)
 {
     VECTOR q;
@@ -4299,6 +4425,34 @@ void gte_project3_full_depth(const SVECTOR input[3], sint32 screen_xy[3], sint32
         *flag = gte.flag;
 }
 
+void RotTransPers3N(const SVECTOR *vertices, sint32 *screen_xy, uint16 *depth, uint16 *flags, sint32 groups)
+{
+    SVECTOR input[3];
+    sint32 screen[3];
+    sint32 full_depth[3];
+    sint32 flag;
+
+    do
+    {
+        memcpy(input, vertices, sizeof(input));
+        gte_project3_full_depth(input, screen, full_depth, &flag);
+        vertices += 3;
+        if (groups == INT32_MIN)
+            abort();
+        --groups;
+        screen_xy[0] = screen[0];
+        screen_xy[1] = screen[1];
+        screen_xy[2] = screen[2];
+        depth[0] = (uint16)full_depth[0];
+        depth[1] = (uint16)full_depth[1];
+        depth[2] = (uint16)full_depth[2];
+        flags[0] = (uint16)((uint32)flag >> 12);
+        screen_xy += 3;
+        depth += 3;
+        ++flags;
+    } while (groups > 0);
+}
+
 static sint32 gte_interpolate_component(sint32 first, sint32 second, uint32 flag_bit)
 {
     sint32 difference = clamp_ir(second - first, flag_bit);
@@ -4468,7 +4622,13 @@ void gte_normal_color_col3(const SVECTOR normals[3], uint32 color, uint32 output
 
 void RotTrans(SVECTOR *v, VECTOR *out, sint32 *flag)
 {
-    gte_transform(v, out, flag);
+    VECTOR transformed;
+    gte_transform(v, &transformed, 0);
+    out->vx = gte.mac[0];
+    out->vy = gte.mac[1];
+    out->vz = gte.mac[2];
+    if (flag)
+        *flag = gte.flag;
 }
 
 void RotTransSV(SVECTOR *v, SVECTOR *out, sint32 *flag)
@@ -4825,6 +4985,7 @@ void PadInitDirect(uint8 *pad1, uint8 *pad2)
     }
     pad_packets[0] = pad1;
     pad_packets[1] = pad2;
+    memset(pad_alignment, 0xFF, sizeof(pad_alignment));
     memset(pad_current_id, 0, sizeof(pad_current_id));
 #if !defined(LOCKSTEP_DEBUG)
     pad_main_mode[0] = pad_main_mode[1] = 0;
@@ -4987,6 +5148,63 @@ static void pad_update_rumble(uint32 port)
     xport_input_rumble((sint32)port, low, high);
 }
 
+void psx_pad_prepare_actuators(uint32 owner, uint32 budget)
+{
+    uint32 slot, motor, count, mode, packet;
+
+    for (slot = 0; slot < 6; ++slot)
+        w_u8(owner + 87 + slot, 0);
+    mode = r_u16(owner + 230);
+    packet = r_u32(owner + 40);
+    if (mode && packet)
+    {
+        count = r_u8(owner + 52);
+        if (count > 6)
+            count = 6;
+        for (motor = 0; motor < r_u8(owner + 233); ++motor)
+        {
+            uint32 descriptor = r_u32(owner + 4) + motor * 5;
+            uint32 mask = r_u8(descriptor + 2) ? 255 : 1;
+            uint32 active = 0;
+            for (slot = 0; slot < count; ++slot)
+                if (r_u8(owner + 93 + slot) == motor && (r_u8(packet + slot) & mask))
+                {
+                    active = 1;
+                    break;
+                }
+            if (active)
+            {
+                uint32 total = r_u32(budget) + r_u8(descriptor + 3);
+                if ((sint32)total < 61)
+                {
+                    w_u32(budget, total);
+                    for (slot = 0; slot < count; ++slot)
+                        if (r_u8(owner + 93 + slot) == motor)
+                            w_u8(owner + 87 + slot, 1);
+                }
+            }
+        }
+    }
+    else
+    {
+        uint32 type = r_u8(owner + 232);
+        if ((type == 4 || type == 5 || type == 7) && !mode && r_u8(owner + 52) >= 2)
+        {
+            if ((r_u8(packet) & 0xc0) == 0x40 && (r_u8(packet + 1) & 1) && (sint32)(r_u32(budget) + 10) < 61)
+            {
+                w_u8(owner + 88, 1);
+                w_u8(owner + 87, 1);
+                w_u32(budget, r_u32(budget) + 10);
+            }
+        }
+        else if (type == 3)
+            w_u8(owner + 87, 1);
+        else if (!mode)
+            for (slot = 6; slot != 0; --slot)
+                w_u8(owner + 86 + slot, 1);
+    }
+}
+
 static void bios_native_pad_poll(void)
 {
     if (pad_replay_bound && pad_active)
@@ -5101,61 +5319,7 @@ static void bios_native_pad_poll(void)
                 }
                 if (native_pad_actuator_budget && !(native_pad_multitap_enable && r_u32(native_pad_multitap_enable) && (r_u8(received) >> 4) == 8 && !r_u8(packet_owner + 55)))
                 {
-                    uint32 owner = packet_owner;
-                    uint32 budget = native_pad_actuator_budget;
-                    uint32 slot, motor, count, mode, packet;
-
-                    for (slot = 0; slot < 6; ++slot)
-                        w_u8(owner + 87 + slot, 0);
-                    mode = r_u16(owner + 230);
-                    packet = r_u32(owner + 40);
-                    if (mode && packet)
-                    {
-                        count = r_u8(owner + 52);
-                        if (count > 6)
-                            count = 6;
-                        for (motor = 0; motor < r_u8(owner + 233); ++motor)
-                        {
-                            uint32 descriptor = r_u32(owner + 4) + motor * 5;
-                            uint32 mask = r_u8(descriptor + 2) ? 255 : 1;
-                            uint32 active = 0;
-                            for (slot = 0; slot < count; ++slot)
-                                if (r_u8(owner + 93 + slot) == motor && (r_u8(packet + slot) & mask))
-                                {
-                                    active = 1;
-                                    break;
-                                }
-                            if (active)
-                            {
-                                uint32 total = r_u32(budget) + r_u8(descriptor + 3);
-                                if ((sint32)total < 61)
-                                {
-                                    w_u32(budget, total);
-                                    for (slot = 0; slot < count; ++slot)
-                                        if (r_u8(owner + 93 + slot) == motor)
-                                            w_u8(owner + 87 + slot, 1);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        uint32 type = r_u8(owner + 232);
-                        if ((type == 4 || type == 5 || type == 7) && !mode && r_u8(owner + 52) >= 2)
-                        {
-                            if ((r_u8(packet) & 0xc0) == 0x40 && (r_u8(packet + 1) & 1) && (sint32)(r_u32(budget) + 10) < 61)
-                            {
-                                w_u8(owner + 88, 1);
-                                w_u8(owner + 87, 1);
-                                w_u32(budget, r_u32(budget) + 10);
-                            }
-                        }
-                        else if (type == 3)
-                            w_u8(owner + 87, 1);
-                        else if (!mode)
-                            for (slot = 6; slot != 0; --slot)
-                                w_u8(owner + 86 + slot, 1);
-                    }
+                    psx_pad_prepare_actuators(packet_owner, native_pad_actuator_budget);
                 }
 
                 /* The next synchronous exchange samples physical input */
@@ -5478,7 +5642,11 @@ void PadSetAct(sint32 port, uint8 *actuator, sint32 length)
 sint32 PadSetActAlign(sint32 port, uint8 *alignment)
 {
     sint32 index = pad_index(port);
-    if (PadGetState(port) == 0 || (pad_packets[index][1] >> 4) == 4u)
+    sint32 digital_rumble = 0;
+#if !defined(LOCKSTEP_DEBUG)
+    digital_rumble = !pad_replay_bound && xport_input_rumble_supported(index);
+#endif
+    if (PadGetState(port) == 0 || ((pad_packets[index][1] >> 4) == 4u && !digital_rumble))
         return 0;
     if (alignment == 0)
         return 0;
@@ -10469,6 +10637,25 @@ typedef struct GsNativeState
 
 static GsNativeState gs_state;
 
+void GsSetOrign(sint16 x, sint16 y)
+{
+    gs_state.center_x = x;
+    gs_state.center_y = y;
+}
+
+void GsSetFarClip(uint32 distance)
+{
+    gs_state.depth_limit = distance;
+}
+
+void GsSetClip2D(const PSX_RECT *rectangle)
+{
+    gs_state.clip.x = rectangle->x;
+    gs_state.clip.y = rectangle->y;
+    gs_state.clip.w = rectangle->w;
+    gs_state.clip.h = rectangle->h;
+}
+
 static void gs_apply_clip(void)
 {
     gs_state.draw.clip.x = (sint16)(gs_state.clip.x + gs_state.buffer_x[gs_state.active]);
@@ -11242,11 +11429,13 @@ uint32 GsSwapDispBuff(void)
     gs_state.display.disp.x = gs_state.buffer_x[gs_state.active];
     gs_state.display.disp.y = gs_state.buffer_y[gs_state.active];
     PutDispEnv(&gs_state.display);
-    DrawSync(1);
+    SetDispMask(1);
+    ++gs_state.frame;
+    if (gs_state.frame == 0)
+        gs_state.frame = 1;
     gs_state.active = gs_state.active == 0 ? 1 : 0;
     gs_apply_clip();
     gs_apply_center();
-    ++gs_state.frame;
     return (uint32)-40;
 }
 
@@ -12822,14 +13011,10 @@ static void native_gte_matrix(const MATRIX *matrix, const sint32 input[3], const
     }
 }
 
-static void native_gte_normal_color(const SVECTOR *normal, uint32 depth)
+static void native_gte_color_col(const sint32 input[3], uint32 depth, uint32 shift, uint32 lm)
 {
-    sint32 input[3] = {normal->vx, normal->vy, normal->vz};
     uint32 row;
-    native_gte_matrix(&gte.light, input, NULL, 1u, 1u);
-    for (row = 0; row < 3u; ++row)
-        input[row] = gte.ir[row];
-    native_gte_matrix(&gte.color, input, gte.back_color, 1u, 1u);
+    native_gte_matrix(&gte.color, input, gte.back_color, shift, lm);
     for (row = 0; row < 3u; ++row)
     {
         sint64 base = (sint64)((gte.rgbc >> (row * 8u)) & 255u) * gte.ir[row] * 16;
@@ -12840,9 +13025,19 @@ static void native_gte_normal_color(const SVECTOR *normal, uint32 depth)
             sint32 delta = clamp_ir(mac_shift12(difference), 1u << (24u - row));
             value = base + (sint64)gte.ir0 * delta;
         }
-        native_gte_mac_ir(row, value, 1u, 1u);
+        native_gte_mac_ir(row, value, shift, lm);
     }
     push_rgb_from_mac();
+}
+
+static void native_gte_normal_color(const SVECTOR *normal, uint32 depth)
+{
+    sint32 input[3] = {normal->vx, normal->vy, normal->vz};
+    uint32 row;
+    native_gte_matrix(&gte.light, input, NULL, 1u, 1u);
+    for (row = 0; row < 3u; ++row)
+        input[row] = gte.ir[row];
+    native_gte_color_col(input, depth, 1u, 1u);
 }
 
 static uint32 native_gte_screen_offset_raw(uint32 axis)
@@ -13054,6 +13249,13 @@ void xport_gte_execute(uint32 command)
             }
             finish_flag();
             return;
+        case 0x1Cu:
+        {
+            sint32 input[3] = {gte.ir[0], gte.ir[1], gte.ir[2]};
+            native_gte_color_col(input, 0u, shift, lm);
+            finish_flag();
+            return;
+        }
         case 0x28u:
             for (row = 0u; row < 3u; ++row)
                 native_gte_mac_ir(row, (sint64)gte.ir[row] * gte.ir[row], shift, lm);
@@ -13297,6 +13499,15 @@ void SetFogNear(sint32 distance, sint32 projection)
 {
     uint32 product = (uint32)distance * 320u;
     sint32 numerator = (sint32)(0u - product);
+    if (!projection || (numerator == INT32_MIN && projection == -1))
+        abort();
+    xport_gte_write_control(27u, (uint32)(numerator / projection));
+    xport_gte_write_control(28u, 0x01400000u);
+}
+
+void SetFogFar(sint32 distance, sint32 projection)
+{
+    sint32 numerator = (sint32)((0u - (uint32)distance) << 6);
     if (!projection || (numerator == INT32_MIN && projection == -1))
         abort();
     xport_gte_write_control(27u, (uint32)(numerator / projection));
@@ -14542,7 +14753,7 @@ uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
             w_u8(destination + count++, '%');
             continue;
         }
-        if (character != 'd' || consumed != 0u)
+        if ((character != 'd' && character != 'x' && character != 's') || consumed != 0u)
         {
 #ifdef _DEBUG
             fprintf(stderr, "sprintfPSX: Unsupported one-argument format conversion %02X\n", character);
@@ -14550,7 +14761,30 @@ uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
             abort();
         }
         consumed = 1u;
+        if (character == 's')
+        {
+            uint32 string = value;
+            if (string != 0u)
+            {
+                while ((character = r_u8(string++)) != 0u)
+                    w_u8(destination + count++, character);
+            }
+            continue;
+        }
         magnitude = value;
+        if (character == 'x')
+        {
+            digits = 0u;
+            do
+            {
+                uint32 digit = magnitude & 15;
+                decimal[digits++] = (uint8)(digit < 10 ? '0' + digit : 'a' + digit - 10);
+                magnitude >>= 4;
+            } while (magnitude != 0u);
+            while (digits != 0u)
+                w_u8(destination + count++, decimal[--digits]);
+            continue;
+        }
         if ((sint32)value < 0)
         {
             w_u8(destination + count++, '-');

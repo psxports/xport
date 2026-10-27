@@ -35,7 +35,9 @@
   database.then(db => {
     if (!db) return;
     indexedDB.deleteDatabase('XPORT_PRELOAD_CACHE_' + manifest.name);
-    const valid = new Set(manifest.packages.map((_, i) => 'data/' + i).concat(Object.keys(manifest.music).map(track => 'music/' + track)));
+    const valid = new Set(manifest.packages.map((_, i) => 'data/' + i)
+      .concat(Object.keys(manifest.music).map(track => 'music/' + track))
+      .concat(Object.keys(manifest.video || {}).map(videoCacheKey)));
     const request = db.transaction('assets', 'readwrite').objectStore('assets').openCursor();
     request.onsuccess = () => {
       const cursor = request.result;
@@ -44,6 +46,87 @@
       cursor.continue();
     };
   }).catch(() => {});
+
+  const videoLoads = new Map();
+
+  function videoCacheKey(source) {
+    return 'video/' + source.replace(/\\/g, '/').replace(/^\/+/, '').toUpperCase();
+  }
+
+  async function checksum(data) {
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', data)),
+      byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  Module.xportLoadVideo = function (source, asset) {
+    const key = videoCacheKey(source);
+    const identity = key + '/' + asset.hash;
+    if (videoLoads.has(identity)) return videoLoads.get(identity);
+    const listeners = new Set();
+    const state = {data: new Uint8Array(asset.size), received: 0, complete: false, failed: false, error: null};
+    function notifyOne(callback) {
+      try { callback(state); } catch (error) { console.error(error); }
+    }
+    function notify() { for (const callback of listeners) notifyOne(callback); }
+    state.subscribe = function (callback) {
+      listeners.add(callback);
+      Promise.resolve().then(() => { if (listeners.has(callback)) notifyOne(callback); });
+      return () => listeners.delete(callback);
+    };
+    videoLoads.set(identity, state);
+    state.done = (async () => {
+      let reader;
+      try {
+        const chunks = asset.chunks || [{offset: 0, size: asset.size, hash: asset.hash}];
+        let end = 0;
+        for (const chunk of chunks) {
+          if (!Number.isSafeInteger(chunk.offset) || !Number.isSafeInteger(chunk.size) ||
+              chunk.offset !== end || chunk.size <= 0 || !/^[a-f0-9]{64}$/.test(chunk.hash))
+            throw new Error('Invalid movie chunk index');
+          end += chunk.size;
+        }
+        if (end !== asset.size) throw new Error('Incomplete movie chunk index');
+        const hit = await cached(key, asset);
+        if (hit && hit.byteLength === asset.size && await checksum(hit) === asset.hash) {
+          state.data = new Uint8Array(hit);
+          state.received = asset.size;
+          state.complete = true;
+          notify();
+          return state;
+        }
+        const response = await fetch(asset.url);
+        if (!response.ok) throw new Error('Movie HTTP ' + response.status);
+        reader = response.body.getReader();
+        let downloaded = 0, index = 0;
+        for (;;) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          if (value.byteLength > asset.size - downloaded) throw new Error('Movie exceeds expected size');
+          state.data.set(value, downloaded);
+          downloaded += value.byteLength;
+          while (index < chunks.length && downloaded >= chunks[index].offset + chunks[index].size) {
+            const chunk = chunks[index++];
+            if (await checksum(state.data.subarray(chunk.offset, chunk.offset + chunk.size)) !== chunk.hash)
+              throw new Error('Movie chunk checksum mismatch');
+            state.received = chunk.offset + chunk.size;
+            notify();
+          }
+        }
+        if (downloaded !== asset.size || state.received !== asset.size) throw new Error('Incomplete movie');
+        await save(key, asset, state.data);
+        state.complete = true;
+      } catch (error) {
+        state.failed = true;
+        state.error = String(error && error.message || error);
+        if (reader) { try { await reader.cancel(); } catch (_) {} }
+      } finally {
+        videoLoads.delete(identity);
+        notify();
+      }
+      return state;
+    })();
+    return state;
+  };
 
   async function download(asset, progress) {
     const response = await fetch(asset.url);
@@ -139,18 +222,15 @@
   });
 
   Module.xportMusic = new Map();
-  Module.xportMusicOpen = async track => {
+  Module.xportMusicOpen = track => {
     const asset = manifest.music[track];
     if (!asset) return null;
     const state = {data: new Uint8Array(asset.size), received: 0, failed: false};
-    let notify;
-    const ready = new Promise(resolve => notify = resolve);
     (async () => {
       const existing = await cached('music/' + track, asset);
       if (existing) {
         state.data.set(existing);
         state.received = asset.size;
-        notify(state);
         return;
       }
       const response = await fetch(asset.url);
@@ -161,12 +241,10 @@
         if (done) break;
         state.data.set(value, state.received);
         state.received += value.length;
-        if (state.received >= Math.min(asset.size, 128 * 1024)) notify(state);
       }
       if (state.received !== asset.size) throw new Error('Incomplete music');
       await save('music/' + track, asset, state.data);
-      notify(state);
-    })().catch(() => { state.failed = true; notify(null); });
-    return ready;
+    })().catch(error => { state.failed = true; console.error('Music download failed:', track, error); });
+    return state;
   };
 })();

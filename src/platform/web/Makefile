@@ -14,6 +14,7 @@ OUTPUT := $(DIST_DIR)/xport-runtime.js
 
 XPORT_SOURCES := \
 	$(XPORT_WEB_DIR)/main.c \
+	$(XPORT_WEB_DIR)/video.c \
 	$(XPORT_ROOT)/src/psx.c \
 	$(XPORT_ROOT)/src/psx_gpu.c \
 	$(XPORT_ROOT)/src/vid_ogl.c \
@@ -25,6 +26,7 @@ XPORT_SOURCES := \
 	$(XPORT_ROOT)/src/psx_press.c \
 	$(XPORT_ROOT)/src/psx_vlc.c \
 	$(XPORT_ROOT)/src/psx_stream.c \
+	$(XPORT_ROOT)/src/xport_fmv.c \
 	$(XPORT_ROOT)/src/xport_trace.c
 SOURCES := $(XPORT_SOURCES) $(APP_SOURCES)
 OBJ_DIR := ../../../_build/web/$(CONFIG)

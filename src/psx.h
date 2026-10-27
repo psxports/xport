@@ -53,6 +53,7 @@ extern "C"
     void psx_pad_bind_callbacks(const PsxPadCallbackBinding *bindings, uint32 count);
     uint32 psx_pad_owner_cleanup(uint32 owner);
     uint32 psx_pad_owner_begin(uint32 owner, uint32 cleanup_target);
+    void psx_pad_prepare_actuators(uint32 owner, uint32 budget);
     void psx_pad_bind_owner_packets(uint32 owner0, uint32 owner1, uint32 cleanup_callback, uint32 delay_cache, uint32 multitap_enable, uint32 actuator_budget);
     void psx_pad_bind_main_mode_commands(uint32 send_target, uint32 receive_target);
 
@@ -430,6 +431,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 DisableEvent(sint32 event_handle);
         sint32 CloseEvent(sint32 event_handle);
         sint32 CdStatus(void);
+        sint32 CdMode(void);
+        sint32 CdLastStreamCom(void);
         void *nextfile(void *record);
         sint32 TestEvent(sint32 event_handle);
         void DeliverEvent(uint32 event_class, uint32 spec);
@@ -530,6 +533,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #define SPU_COMMON_MVOLMODER (0x01u << 3)
 #define SPU_COMMON_CDVOLL (0x01u << 6)
 #define SPU_COMMON_CDVOLR (0x01u << 7)
+#define SPU_COMMON_CDREV (0x01u << 8)
 #define SPU_COMMON_CDMIX (0x01u << 9)
 
 #define SPU_REV_MODE (0x01u << 0)
@@ -1244,6 +1248,9 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24);
         void GsDefDispBuff(uint32 x0, uint32 y0, uint32 x1, uint32 y1);
         sint32 GsInit3D(void);
+        void GsSetOrign(sint16 x, sint16 y);
+        void GsSetClip2D(const PSX_RECT *rectangle);
+        void GsSetFarClip(uint32 distance);
         uint32 GsGetActiveBuff(void);
         uint32 GsSwapDispBuff(void);
         void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table);
@@ -1299,6 +1306,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 GetGraphType(void);
         sint32 krom_bind_font(const uint8 *pixels, uint32 bytes, uint32 first_offset, uint32 kanji_offset);
         const uint8 *Krom2RawAdd2(uint32 character);
+        const uint8 *Krom2RawAdd(uint32 character);
         void FntLoad(sint32 x, sint32 y);
         sint32 FntOpen(sint32 x, sint32 y, sint32 w, sint32 h, sint32 bg, sint32 n);
         void SetDumpFnt(sint32 id);
@@ -1307,6 +1315,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 GetODE(void);
         void InitGeom(void);
         sint32 Lzc(sint32 value);
+        sint32 cln(sint32 value);
         void xport_gte_write_data(uint32 register_index, uint32 value);
         void xport_gte_mvmva(uint32 command);
         void xport_gte_write_control(uint32 index, uint32 value);
@@ -1355,6 +1364,8 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void ReadGeomOffset(sint32 *x, sint32 *y);
         sint32 ReadGeomScreen(void);
         void ReadRotMatrix(MATRIX *matrix);
+        void ReadLightMatrix(MATRIX *matrix);
+        void ReadColorMatrix(MATRIX *matrix);
         sint32 ResetGraph(sint32 mode);
         sint32 psx_pc_set_root(const char *root, sint32 uppercase);
         sint32 PCinit(void);
@@ -1424,6 +1435,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 RotTransPers4(const SVECTOR *a, const SVECTOR *b, const SVECTOR *c, const SVECTOR *d, sint32 *xy0, sint32 *xy1, sint32 *xy2, sint32 *xy3, sint32 *projection, sint32 *flags);
         void RotTransSV(SVECTOR *input, SVECTOR *output, sint32 *flags);
         MATRIX *ScaleMatrix(MATRIX *matrix, VECTOR *scale);
+        MATRIX *ScaleMatrixL(MATRIX *matrix, VECTOR *scale);
         void SetDispMask(sint32 enabled);
         DISPENV *SetDefDispEnv(DISPENV *environment, sint32 x, sint32 y, sint32 width, sint32 height);
         DRAWENV *SetDefDrawEnv(DRAWENV *environment, sint32 x, sint32 y, sint32 width, sint32 height);
@@ -1435,6 +1447,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SetDrawStp(DR_STP *packet, sint32 enabled);
         void SetFarColor(sint32 red, sint32 green, sint32 blue);
         void SetFogNear(sint32 distance, sint32 projection);
+        void SetFogFar(sint32 distance, sint32 projection);
         uint32 SetFogNearFar(sint32 near_distance, sint32 far_distance, sint32 projection);
         void SetGeomOffset(sint32 x, sint32 y);
         void SetGeomScreen(sint32 distance);
@@ -1457,6 +1470,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void SetLightMatrix(MATRIX *matrix);
         void SetRotMatrix(MATRIX *matrix);
         void SetTransMatrix(MATRIX *matrix);
+        void ColorMatCol(SVECTOR *normal, CVECTOR *color, CVECTOR *output, sint32 matc);
         uint32 gte_normal_color_col(const SVECTOR *normal, uint32 color);
         uint32 gte_normal_color_col_depth(const SVECTOR *normal, uint32 color);
         void gte_normal_color_col3(const SVECTOR normals[3], uint32 color, uint32 output[3]);
@@ -1467,6 +1481,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 PutDispEnvPSX(uint32 environment, uint32 debug_level_address, uint32 debug_callback_address, uint32 debug_format_address, uint32 driver_table_address, uint32 cache_address, uint32 reverse_flag_address, uint32 divisors_address, uint32 ranges_address, uint32 guest_gp, uint32 guest_entry, sint32 (*get_video_mode)(void), uint32 (*copy_bytes)(uint32 destination, uint32 source, uint32 bytes));
         PsxInterruptCallback DrawSyncCallback(PsxInterruptCallback callback);
         DRAWENV *PutDrawEnv(DRAWENV *environment);
+        DRAWENV *GetDrawEnv(DRAWENV *environment);
         void SsEnd(void);
 
         typedef struct SndVolume2
@@ -1687,6 +1702,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         uint32 memmovePSX(uint32 destination, uint32 source, sint32 bytes);
         sint32 gte_project(const SVECTOR *input, sint32 *screen_xy, sint32 *flags);
         sint32 gte_project_full_depth(const SVECTOR *input, sint32 *screen_xy, sint32 *flags);
+        void RotTransPers3N(const SVECTOR *vertices, sint32 *screen_xy, uint16 *depth, uint16 *flags, sint32 groups);
         void gte_project3_full_depth(const SVECTOR input[3], sint32 screen_xy[3], sint32 depth[3], sint32 *flags);
         void gte_interpolate_project3(const SVECTOR first[3], const SVECTOR second[3], sint32 screen_xy[3], sint32 depth[3], sint32 *flags);
         void gte_rotate_packed(const uint32 registers[5], uint32 xy, uint32 z, sint32 output[3]);
