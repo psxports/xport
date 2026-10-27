@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-26
+
+- Added native pending pitch/reverb masks to `SpuKeyControl`. With no guest-key binding and `event_mode & 1`, `SpuSetReverbVoice` updates or queries the pending reverb mask under the audio lock; only modes0/1 set event flag8. Existing mode8, guest binding, immediate register helper and noise contracts remain unchanged. Rebuild header consumers and invalidate old raw checkpoints; portable SPU state version2 rejects version1. FF advances its native checkpoint ABI to282. Exact SDK-only R2 static review received from AgentArmstrong, Pandemonium2, RapidRacer, AceCombat3 and TestDrive5; compiled/runtime compatibility checks remain deferred
+- Added `spu_clear_reverb_work_area(mode, binding, direction)` for synchronous clearing with caller-owned transfer/event fields and the existing private zero source. It delegates to the existing clear core without global rebinding; existing PsyQ APIs, import/restore, reservation and serialized layouts are unchanged. No required consumer migration. Preserve native source provenance and binding/context lifetime as documented in `docs/LIBRARY.md`. Static consumer review recorded; compilation and runtime validation remain deferred
+
+## 2026-10-24
+
+- Restored original SQR/LZCS/GPF sequencing in the existing `VectorNormalS`, using the existing immutable reciprocal table and rejecting signed squared-length overflow. Signature, native zero-factor policy and serialized layouts are unchanged; `VectorNormal` and `VectorNormalSS` are unchanged. No new API or binding is required. FF evidence and cross-consumer review status: `FightingForce-xport/status/refactoring/current.json`; final compilation/runtime checks remain deferred during its structural refactoring
+
 ## 2026-10-22
 
 - Fixed native queued-audio recovery after long host/debugger stops: physical PCM overflow retires oldest output without blocking VBlank or the game thread;queue capacity follows the two output buffers and `g_xport_audio_dropped_frames` records loss. SPU/SEQ/capture processing retains every field. Native field catch-up polls host events at least once per32fields. Rebuild consumers using `XPORT_AUDIO_VBLANK_QUEUE=1`;legacy worker-rendered audio is unchanged. Shared audio/timing/render-wait/PAD checks pass;P2 Debug x86 real WaveOut recovers after an8second process stop. Evidence: `Pandemonium2-xport/status/enhance/audio-stall-recovery.json`. This does not certify other games or audible output

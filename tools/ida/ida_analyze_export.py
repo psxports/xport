@@ -85,22 +85,36 @@ def apply_function_boundaries(cfg):
 
 def apply_gp(cfg):
  directive=getattr(idc,'process_config_line',ida_idp.process_config_directive)
- for line in ('MIPS_GP=0x%X'%cfg['gp'],'MIPS_SIMPLIFY_GP=YES','MIPS_SIMPLIFY=YES','MIPS_STRICT=NO'):
+ local_gp=False
+ for lo,hi in cfg['code_ranges']:
+  for ea in range(lo+4,hi,4):
+   word=ida_bytes.get_dword(ea)
+   if (word>>21)&31==28 and word>>26 in (32,33,35,36,37,40,41,43) and ida_bytes.get_dword(ea-4)>>16==0x3c1c:
+    local_gp=True;break
+  if local_gp:break
+ for line in ('MIPS_GP=0x%X'%cfg['gp'],'MIPS_SIMPLIFY_GP='+('NO' if local_gp else 'YES'),'MIPS_SIMPLIFY=YES','MIPS_STRICT=NO'):
   result=directive(line)
   if result not in (None,0,''):raise RuntimeError('MIPS configuration rejected: '+line+': '+str(result))
 
 def verify_gp(cfg):
  checked=[];failures=[]
  for lo,hi in cfg['code_ranges']:
-  for ea in idautils.Heads(lo,hi):
-   if not ida_bytes.is_code(ida_bytes.get_full_flags(ea)):continue
-   word=ida_bytes.get_dword(ea)
-   if (word>>21)&31!=28 or word>>26 not in (32,33,35,36,37,40,41,43):continue
-   imm=word&0xffff;imm=imm-0x10000 if imm&0x8000 else imm
-   target=(cfg['gp']+imm)&0xffffffff
-   row=dict(site=ea,target=target,refs=list(idautils.DataRefsFrom(ea)))
-   checked.append(row)
-   if target not in row['refs']:failures.append(row)
+  for head in idautils.Heads(lo,hi):
+   if not ida_bytes.is_code(ida_bytes.get_full_flags(head)):continue
+   size=ida_bytes.get_item_size(head)
+   if size%4:raise RuntimeError('Unaligned MIPS instruction during GP verification')
+   for ea in range(head,min(head+size,hi),4):
+    word=ida_bytes.get_dword(ea)
+    if (word>>21)&31!=28 or word>>26 not in (32,33,35,36,37,40,41,43):continue
+    imm=word&0xffff;imm=imm-0x10000 if imm&0x8000 else imm
+    base=cfg['gp'];origin='reviewed_default'
+    previous=ida_bytes.get_dword(ea-4)
+    if previous>>16==0x3c1c:
+     base=(previous&0xffff)<<16;origin='adjacent_lui_gp'
+    target=(base+imm)&0xffffffff
+    row=dict(site=ea,head=head,target=target,base=base,origin=origin,refs=sorted(set(idautils.DataRefsFrom(ea))|set(idautils.DataRefsFrom(head))))
+    checked.append(row)
+    if target not in row['refs']:failures.append(row)
  if failures:raise RuntimeError('GP reference verification failed: '+json.dumps(failures[:8]))
  return dict(assigned_after_segment_creation=True,gp=cfg['gp'],checked=len(checked),mismatches=0,samples=checked[:8])
 

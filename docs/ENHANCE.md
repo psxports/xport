@@ -1,5 +1,7 @@
 # Graphics enhancement (`enhance`)
 
+Use the common SQLite commands in `../AGENTS.md`; stage selector: `enhance`. Read current subsystem findings before investigating. Record exact checked properties and configuration; distinguish pixels, VRAM/state preservation, performance and user acceptance. Link existing reports/fixtures instead of describing every action. Update only the current stage task and expensive unresolved questions.
+
 Use this workflow for graphics work tracked with the GitHub label `enhance`. It applies to existing xport games, including racing, action and first-person games. Keep game-specific algorithms, constants, visibility data and verification evidence in the consuming project.
 
 Inputs: a working original renderer, identified simulation/render boundaries, original assets and a reproducible scene. Outputs: an independently selectable HD producer, unchanged gameplay state, VID-owned graphics resources and evidence for both producers. [VID.md](VID.md) defines the exact API and resource contracts; [LIBRARY.md](LIBRARY.md) defines shared timing, GPU and input behavior.
@@ -81,7 +83,7 @@ The physical rate follows the shared PAL/NTSC profile: nominal `FIELD_RATE=50` s
 
 Run logic for pending `frame_index` steps. Render independently using `frame_fract` between the two most recent complete states, N-1 and N. At 0 the image shows N-1; at 1 it shows N. This adds up to one tick of visual latency. It does not predict N+1 or modify physics. Use the host render wait separately from logic timing; native `VSync(-1)` observes field delivery without imposing another blocking field per HD redraw.
 
-When preserving an original game-owned counter deadline, use `xport_render_wait_until(uint64 deadline)` for the intervening HD redraws. Its argument is an absolute `xport_timer_get` microsecond deadline. Return 1 selects a monitor/render event; return 0 selects the supplied deadline. Windows preserves its monitor schedule across earlier deadline returns; Web races requestAnimationFrame against a timeout and cancels the losing callback. Operating-system or browser delays can deliver either event late: service the original clock and recheck the game deadline before drawing. If a render event is delivered at or after the game deadline, retain one pending presentation request, process the due logic tick and consume that request after collecting the completed scene. Returning to logic must not discard an event already consumed from the host schedule; clear pending requests on producer reset or OG return. The function does not advance game logic or poll game PAD APIs. Retain the original counter configuration, wait fractions and logical update count; do not replace an independently clocked original simulation with one update per physical field. The unbounded `xport_render_wait()` remains available. Verify the actual implementations with `python -B -m unittest tests.test_render_wait tests.test_native_timing tests.test_web_timing tests.test_pad_ports -v` from the toolset `tools` directory.
+Preserve the game's independently clocked logic and counter deadlines. Render completed HD samples while waiting for the next due tick; each successful screen presentation performs its own platform pacing: swap interval on Windows and one requestAnimationFrame yield after frame closure on Web. Do not call game-side render-wait helpers after present, impose a second monitor schedule, or advance simulation from a render event. Offscreen work does not wait. Process due logic from the original field/counter domain and reseed at scene/resume boundaries; browser delays must not become an unbounded catch-up loop. `xport_render_wait_until` is a compatibility deadline comparison only. Verify presentation and clock boundaries using the existing `tests.test_render_wait`, `tests.test_native_timing`, `tests.test_web_timing` and `tests.test_pad_ports` suites.
 
 Capture only values that move: object/camera position and orientation, animated scale, procedural parameters and necessary effect state. Interpolate positions/scales linearly and orientations with normalized quaternions/Slerp. Preserve camera modes and real projection changes. Reset previous=current on creation, teleport, respawn, camera discontinuity, scene change and OG/HD reseeding.
 
@@ -97,7 +99,7 @@ Use the current viewport aspect for projection and coarse visibility. Remove ori
 
 At 4:3, preserve the original UI/HUD size and placement. At wider aspects, use vertical resolution as the UI scale, keep menus centered, anchor edge HUD elements to their respective sides and retain center-aligned notices in the center. Draw UI directly at native resolution; do not upscale a software UI framebuffer. Each split-screen viewport uses its own aspect, anchors and original layout rules. Shared edges must remain consistent at odd drawable dimensions.
 
-Enable filtering by content category, not globally. UI, world geometry and full-screen backdrops can require different sampling. Clamp filtering to a logical image region so an atlas neighbor or repeat seam does not create a line on the horizon. Preserve the chosen half-texel conventions and verify moving/scaled UI at fractional display scale.
+Select sampling by content category through the bilinear-filtering stage below. Preserve the chosen half-texel conventions and verify moving/scaled UI at fractional display scale; native-resolution UI does not imply filtered UI.
 
 ## 7. Move transforms and lighting into vertex shaders
 
@@ -148,6 +150,50 @@ Decode original 4-bit, 8-bit and 16-bit texture addressing in the game fragment 
 Page and CLUT must be vertex metadata rather than per-material uniforms. Different textures can then share a draw when their actual GPU state and object parameters agree. Atlas-adjusted UVs can remove part of page addressing only if indexed-palette lookup and page format still have enough metadata.
 
 Later replacement textures/models/materials can use separate VID resources. Keep that remaster layer separate from the original-asset HD path so OG remains available for comparison.
+
+### 9.1. Add selective bilinear filtering
+
+Inputs: a correct nearest-sampled HD path, known texture formats/CLUT addressing, logical image bounds, STP masks and blend/depth passes. Output: a per-surface sampling choice that smooths decoded texture colors while preserving addressing, transparent coverage and pass classification. Keep OG sampling and gameplay unchanged. Implement this stage after VRAM decoding is correct and before treating filtering as a default for a content category.
+
+Apply the following category policy:
+
+- Enable filtering for textured 3D objects, characters, vehicles and props when their original artwork does not require a pixel-sharp appearance
+- Enable filtering for environment surfaces, terrain, architecture and continuous procedural surfaces such as water; preserve tiled regions and animated UV addressing
+- Enable filtering for visual backdrops, sky/horizon images and large decorative backgrounds after checking their image bounds; a backdrop displayed behind a menu is a separate category from menu text and controls
+- Evaluate effects individually: sun sprites, lens flares, fire, smoke, particles, decals and trails can benefit, but first establish their transparent/STP classes and alpha/additive/subtractive behavior. An effect name does not determine its blend mode or whether filtering is appropriate
+- Keep nearest sampling by default for UI/HUD text, digits, fonts, small icons, cursors, selection markers, pixel-art borders and intentionally pixel-sharp images. Filtering these assets softens strokes, can reduce contrast and can expose adjacent atlas content. Change their policy only on explicit visual requirements and asset-level verification
+
+Choose sampling at the surface/material construction boundary. Carry the choice with the texture metadata so nearest and filtered surfaces can coexist in a batch. Avoid a global GL filter toggle or a broad rule that every textured primitive, sprite or menu element must be filtered. Share the implementation between world and effect/UI shaders that need it; do not duplicate subtly different CLUT/addressing algorithms.
+
+Use `src/vid_psx_sampling.h` for shared shader-source helpers. [VID_PSX_SAMPLING.md](VID_PSX_SAMPLING.md) defines the word-transport hook, rectangular regions, local texel-space UV, independent repeat axes, STP classes, opaque image exception and native/WebGL fixture. Keep game metadata packing and resource adapters outside the helper.
+
+#### Decode colors before interpolation
+
+Keep packed VRAM reads exact through `texelFetch`. Do not enable `GL_LINEAR` on packed PS1 words or interpolate palette indices: neither operation interpolates the intended colors. The common `VID_MATERIAL_DATA.filter` supports ordinary decoded textures; it does not implement palette-aware filtering. The original-asset path needs its fragment shader to perform the following steps:
+
+1. Resolve page format, CLUT, logical region, UV convention and pass flags from flat vertex metadata
+2. For normalized region UV, form texel-center coordinates `p = uv * region_size - 0.5`, integer base `floor(p)` and fractional weights `fract(p)`. Apply the equivalent convention if UVs are stored in texel units; do not introduce another global half-texel correction
+3. Address all four neighboring texels within the logical region, then decode each 4-bit/8-bit palette lookup or direct 16-bit color. Expand channels consistently with the nearest path
+4. Classify each decoded PS1 word for transparent zero and the current STP pass before blending colors. A palette index of zero is not itself proof of transparency; the decoded color word determines it
+5. Bilinearly mix the four decoded samples using the fractional weights, then apply the existing vertex modulation and material/pass behavior
+
+For clamp, clamp each integer neighbor to the image's last valid texel. For repeat, wrap each neighbor modulo the region extent, including negative coordinates. Never let a filtering neighbor escape into another atlas image, CLUT row or unused padding. Global VRAM wrapping does not replace logical-region bounds. Record whether the shader represents square regions only or independent width/height; do not pass arbitrary rectangles into a square-only encoding. Animated palettes and uploads continue using the shared VRAM invalidation/version path; no per-material VRAM scans or decoded texture cache are required.
+
+#### Preserve coverage and PS1 blending
+
+Retain the established opaque/non-STP and semi-transparent/STP pass separation. Do not interpolate the STP bit or choose blend/depth state from a filtered alpha value. A nonzero black STP texel is distinct from a transparent zero word.
+
+The initial cutout-preserving policy uses the nearest texel's visibility/STP classification to decide whether the fragment belongs to the pass. For color filtering, represent zero words and neighbors excluded from that pass as zero RGBA; represent contributing neighbors as decoded RGB with coverage one. Interpolate these samples, discard zero total coverage, then divide RGB by the interpolated coverage. This prevents transparent black and the other STP class from darkening or tinting the retained color. Keep the pass's existing alpha, vertex alpha and depth-write rules; do not multiply framebuffer alpha by that coverage again. This smooths color inside a hard nearest-sampled mask, not the silhouette itself.
+
+For PS1 semi-transparency preserve the established factors/equations: half foreground plus half background, additive, subtractive, and quarter foreground plus background. Filtering must not turn an opaque contribution into alpha blending or add a second contributing pass. Soft silhouette coverage is a separate enhancement requiring an explicit alpha/depth policy and new verification, not an incidental consequence of bilinear color sampling.
+
+#### Verification and completion
+
+Use current-source shader/pixel fixtures on native OpenGL and WebGL 2.0. Cover 4-bit, 8-bit and direct-color samples; animated CLUT/VRAM updates; zero words and nonzero black STP words; mixed STP classes; every blend equation; and the material/vertex alpha combinations actually used. Test region corners, clamp/repeat, negative/scrolled UVs and a neighboring atlas region filled with a contrasting color. Include fractional magnification and minification; bilinear sampling alone does not provide mipmapping or anisotropic filtering.
+
+Compare nearest and filtered output at the same logical state for representative objects, environment surfaces, repeated surfaces, backdrops and effects. Check for seams, dark fringes, brightness changes, missing contributions and changed occlusion. Confirm UI/HUD fonts, digits and icons retain nearest sampling at native and fractional display scales. Toggle OG/HD to verify original behavior remains available; do not require filtered HD pixels to equal nearest OG pixels.
+
+Complete this stage only when the selected categories use their intended sampling, all four taps respect image bounds, transparency/STP/pass invariants survive, and actual shaders compile and produce checked pixels on both platforms. Record fixture results separately from user acceptance of the appearance. Mipmaps, anisotropy, soft cutout edges and replacement textures remain separate enhancements.
 
 ## 10. Replace polygon-sized draws with persistent geometry and passes
 

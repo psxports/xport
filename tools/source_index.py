@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 
-PARSER_VERSION='c-cpp-source-index-v10'
+PARSER_VERSION='c-cpp-source-index-v12'
 CODE_EXTENSIONS=('.c','.cpp')
 HEADER_EXTENSIONS=('.h','.hpp')
 SOURCE_EXTENSIONS=CODE_EXTENSIONS+HEADER_EXTENSIONS
@@ -130,8 +130,11 @@ def functions(text,path):
                 name=qualified_name or name_match.group(1);body=text[start:end+1]
                 markers=[(int(a,16),image) for a,image in re.findall(r'\b(?:FF_)?FUNCTION_MARKER(?:_ARGS)?\b\s*\(\s*0x([0-9A-Fa-f]{8})u?\s*,\s*"([^"]+)"',body)]
                 prefix=text[max(0,start-512):start]
-                original_match=re.search(r'/\*\s*Original:\s*([A-Za-z_]\w*?_([0-9A-Fa-f]{8}))\.\s*\*/\s*$',prefix,re.S)
-                originals=[(original_match.group(1),int(original_match.group(2),16))] if original_match else []
+                original_match=re.search(r'/\*\s*Original:\s*(?:([A-Za-z0-9_.-]+):)?([A-Za-z_]\w*?_([0-9A-Fa-f]{8}))\.\s*\*/\s*$',prefix,re.S)
+                originals=[(original_match.group(2),int(original_match.group(3),16))] if original_match else []
+                if original_match and original_match.group(1):
+                    identity=(int(original_match.group(3),16),original_match.group(1))
+                    if identity not in markers:markers.append(identity)
                 result.append(dict(path=path,name=name,start=start,end=end+1,
                     start_line=line_number(text,start),end_line=line_number(text,end),
                     sha256=sha(body.encode()),identifiers=sorted(set(IDENT.findall(mask_c(body)))),markers=markers,originals=originals))
@@ -279,7 +282,8 @@ def populate(db,root,ledger):
     for source in paths:
         rel=source_relative(root,source);raw=source.read_bytes();text=raw.decode('utf-8-sig')
         texts[rel]=text;db.execute('INSERT INTO source_files VALUES(?,?,?,?)',(rel,sha(raw),len(raw),PARSER_VERSION))
-        parsed[rel]=functions(text,rel) if source.suffix.lower() in CODE_EXTENSIONS else []
+        from marker_names import canonicalize
+        parsed[rel]=canonicalize(root,functions(text,rel)) if source.suffix.lower() in CODE_EXTENSIONS else []
         decls.extend(declarations(text,rel,source.suffix.lower() in HEADER_EXTENSIONS))
     declaration_ids=defaultdict(list)
     for item in decls:
@@ -345,7 +349,8 @@ def incremental_source_refresh(db,root,ledger,changed):
     retired={(entry['address'],entry['image']) for entry in ledger if entry.get('native_retirement') is not None}
     for relative in changed:
         path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower() in HEADER_EXTENSIONS
-        parsed=[] if is_header else functions(text,relative)
+        from marker_names import canonicalize
+        parsed=[] if is_header else canonicalize(root,functions(text,relative))
         if any(identity in retired for item in parsed for identity in item['markers']):
             raise ValueError('Native retirement conflicts with current marker in '+relative)
         if is_header:changed_headers.add(relative)
@@ -428,7 +433,8 @@ def indexed_source_changes(db,root):
 
 
 def index_needs_refresh(root, database, ledger_path):
-    if not database.is_file() or not ledger_path.is_file():
+    from project_context import ledger_bytes
+    if not database.is_file():
         return True
     try:
         with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as db:
@@ -440,11 +446,11 @@ def index_needs_refresh(root, database, ledger_path):
                 return True
             metadata=dict(db.execute('SELECT key,value FROM metadata'))
             if (metadata.get('source_index_parser')!=PARSER_VERSION or
-                    metadata.get('source_index_ledger_sha256')!=sha(ledger_path.read_bytes())):
+                    metadata.get('source_index_ledger_sha256')!=sha(ledger_bytes(root))):
                 return True
             current,indexed,_=indexed_source_changes(db,root)
             return current!=indexed
-    except sqlite3.DatabaseError:
+    except (sqlite3.DatabaseError, ValueError, TypeError, KeyError):
         return True
 
 
@@ -481,7 +487,8 @@ def rebuild(format_changed=True):
     from xport_project import load_project, project_path
     root,_=load_project();source=project_path('analysis_database','status/analysis.sqlite');temporary=source.with_suffix('.source-index.tmp')
     if temporary.exists():raise ValueError('Unowned source-index temporary database exists: '+str(temporary))
-    ledger_path=root/'status/translation-ledger.json';ledger_raw=ledger_path.read_bytes();ledger=json.loads(ledger_raw.decode('utf-8-sig'))['entries'];ledger_sha=sha(ledger_raw)
+    from project_context import ledger_bytes
+    ledger_path=root/'status/translation-ledger.json';ledger_raw=ledger_bytes(root);ledger=json.loads(ledger_raw.decode('utf-8-sig'))['entries'];ledger_sha=sha(ledger_raw)
     original=sqlite3.connect(source.as_uri()+'?mode=ro',uri=True);db=sqlite3.connect(temporary)
     try:
         original.backup(db);db.execute('PRAGMA foreign_keys=ON')

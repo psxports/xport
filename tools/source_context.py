@@ -145,7 +145,8 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
         callers=list(db.execute('SELECT e.source_image,e.source_function,e.site,e.kind,e.resolution FROM edges e JOIN edge_candidates c ON c.edge=e.id WHERE c.target_image=? AND c.target_function=? ORDER BY e.source_image,e.source_function,e.site',(image,address)))
         peers=list(db.execute('SELECT peer_image,peer_address,kind,size_delta,control_shape_equal,risks FROM function_reuse WHERE image=? AND address=? ORDER BY kind,peer_image,peer_address',(image,address)))
         identifiers=[r[0] for r in db.execute('SELECT identifier FROM implementation_identifiers WHERE image=? AND address=? ORDER BY identifier',(image,address))]
-        ledger=json.loads((root/'status/translation-ledger.json').read_text(encoding='utf-8-sig'))
+        from project_context import ledger_document
+        ledger=ledger_document(root)
         evidence=next((x for x in ledger.get('entries',[]) if x['image']==image and x['address']==address),None)
         semantic=[dict(row) for row in db.execute('SELECT * FROM semantic_aliases WHERE image=? AND address=? ORDER BY kind,semantic_name',(image,address))] if 'semantic_aliases' in tables else []
         result=dict(schema=1,image=image,address=hex(address),function=dict(function),implementation=body_view or dict(path=impl['source_path'],mapping_status=impl['mapping_status'],mapping_basis=impl['mapping_basis']),
@@ -159,7 +160,12 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
     if result['pseudocode'].get('review'):result['gaps'].append('Reviewed incomplete pseudocode: '+result['pseudocode']['review']['reason'])
     if impl['mapping_status']!='mapped':result['gaps'].append('No unique explicit address-to-C-function mapping: '+impl['mapping_basis'])
     if function['boundary_status']!='audited':result['gaps'].append('Original boundary status: '+function['boundary_status'])
-    if function['status']!='DONE':result['gaps'].append('Implementation status is '+function['status'])
+    from project_context import function_summary, show
+    result['translation']=function_summary(root,project,image,address)
+    if not full_original:
+        result['project_context']=show(root,project,image=image,address=address,limit=3)
+    result['function'].pop('status',None)
+    if not result['translation']['decompiled']:result['gaps'].append('No current complete translation binding; partial bodies do not count')
     if body_view and not body_view['complete']:result['gaps'].append('C body exceeds bounded view; use --full-source or --source-line')
     if full_original and len(json.dumps(result,ensure_ascii=True).encode())>budget:
         raise ValueError('Complete MIPS, pseudocode and C context does not fit requested budget')

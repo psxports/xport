@@ -8,6 +8,13 @@ def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
 def write(p,d):p.write_text(json.dumps(d,indent=2)+'\n',encoding='utf8')
 def main(no_format=False):
  _,project_config=load_project(R)
+ if project_config.get('analysis',{}).get('function_queue') not in (None,'image_qualified','unique_exact_bodies','operand_templates'):
+  raise ValueError('Unsupported analysis.function_queue mode')
+ from ida_index import select_exports, index_profile
+ index_exports=select_exports(R,project_config)
+ index_inputs=[dict(image=read(out/'export-report.json')['image'],path=out.relative_to(R).as_posix(),
+                    functions_sha256=hashlib.sha256((out/'functions.json').read_bytes()).hexdigest())
+               for out in index_exports]
  from source_index import format_sources
  source_paths=[p.relative_to(R).as_posix() for p in (R/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')]
  source_format=(dict(files=[],trimmed_files=[],formatter=None,style_sha256=hashlib.sha256((Path(__file__).resolve().parents[1]/"src/.clang-format").read_bytes()).hexdigest())
@@ -16,7 +23,8 @@ def main(no_format=False):
  classifications=read(classification_path)['accepted'] if classification_path.exists() else []
  sdk={(x['image'],x['address']):x for x in classifications}
  ledger_path=R/'status/translation-ledger.json'
- ledger=read(ledger_path)['entries'] if ledger_path.exists() else []
+ from project_context import ledger_document, ledger_bytes
+ ledger=ledger_document(R)['entries']
  translations={(x['image'],x['address']):x for x in ledger}
  assert len(translations)==len(ledger),'Duplicate translation identity'
  translated_seen=set()
@@ -49,8 +57,8 @@ def main(no_format=False):
  CREATE VIEW variables AS SELECT * FROM symbols WHERE kind='data';
  ''')
  exported={};configs={};by_address={};metrics=[];graph=[];nodes=[];failures=[];gaps=[]
- for out in sorted(project_path('ida_exports', 'status/ida/images').iterdir()):
-  image=out.name;cfg=read(project_path('ida_configs', 'tools/ida')/(image+'.json'));configs[image]=cfg;src=cfg['loads'][-1];source_path=Path(src['path']);source_path=source_path if source_path.is_absolute() else R/source_path;raw=source_path.read_bytes();offset=src.get('offset',0);base=src['base']
+ for out in index_exports:
+  image=read(out/'export-report.json')['image'];cfg=read(index_profile(R,project_config,image));configs[image]=cfg;src=cfg['loads'][-1];source_path=Path(src['path']);source_path=source_path if source_path.is_absolute() else R/source_path;raw=source_path.read_bytes();offset=src.get('offset',0);base=src['base']
   db.execute('INSERT INTO images VALUES(?,?,?,?,?,?,?,?)',(image,str(source_path.resolve()),hashlib.sha256(raw).hexdigest(),base,offset,len(raw),cfg['gp'],cfg['entry']))
   funcs=read(out/'functions.json');exported[image]=funcs
   for f in funcs:
@@ -62,7 +70,9 @@ def main(no_format=False):
     t=translations[key]
     assert t['sha256']==f['sha256'],'Stale translation evidence: '+str(key)
     assert t['status'] in ['TODO','WIP','DONE','SKIP']
-    assert (R/t['source']).is_file() and all((R/p).is_file() for p in t['evidence'])
+    from source_index import ledger_source
+    ledger_source(R,t)
+    assert all((R/p).is_file() for p in t['evidence'])
     if t['status']=='DONE':
      assert t.get('static_evidence') and t.get('runtime_evidence'),'DONE needs static and runtime evidence'
     f=dict(f,status=t['status']);translated_seen.add(key)
@@ -111,6 +121,8 @@ def main(no_format=False):
    db.executemany('INSERT INTO ctree_lvars VALUES(?,?,?,?,?,?,?)',[(image,function,row['id'],row['name'],json.dumps(row['type'],sort_keys=True),row['location'],int(row['is_argument'])) for row in document['lvars']])
    db.executemany('INSERT INTO ctree_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[(image,function,row['id'],row['kind'],row['op'],row['op_name'],row['ea'],row['parent'],json.dumps(row['children']),json.dumps(row.get('type'),sort_keys=True),json.dumps(row.get('variable'),sort_keys=True),row.get('number')) for row in document['nodes']])
    ctree_count+=1
+ from analysis_images import resident_parents, resident_targets
+ parents=resident_parents(project_config,configs)
  for image,funcs in exported.items():
   for f in funcs:
    seen=set()
@@ -128,7 +140,9 @@ def main(no_format=False):
     if not local:
      local=[(image,z['address']) for z in exported[image] if any(lo<=target<hi for lo,hi in z['chunks'])]
     if local:chosen=local;resolution='same_image'
-    else:chosen=[];resolution='unresolved_target'
+    else:
+     chosen=resident_targets(image,target,parents,exported,by_address)
+     resolution='resident_parent' if chosen else 'unresolved_target'
     cur=db.execute('INSERT INTO edges(source_image,source_function,site,target,kind,resolution) VALUES(?,?,?,?,?,?)',(image,f['address'],a,target,kind,resolution));eid=cur.lastrowid
     db.executemany('INSERT INTO edge_candidates VALUES(?,?,?)',[(eid,c[0],c[1]) for c in chosen])
     graph.append(dict(source='%s:%08X'%(image,f['address']),site=a,target=target,kind=kind,resolution=resolution,candidates=['%s:%08X'%c for c in chosen]))
@@ -142,8 +156,14 @@ def main(no_format=False):
   seen=set()
   for item in semantic.get('functions',[]):
    key=(item['image'],item['address'],item['kind'],item['semantic_name']);assert key not in seen,'Duplicate semantic alias';seen.add(key)
-   assert item['binding'] in ['bound','pending_image_inventory']
-   if item['binding']=='bound':
+   assert item['binding'] in ['bound','pending_image_inventory','retired_native_copy']
+   if item['binding']=='retired_native_copy':
+    from source_index import ledger_source
+    assert item.get('source') is None and item.get('native_retirement') is not None
+    assert ledger_source(R,item)==(None,None)
+   else:
+    assert item.get('native_retirement') is None,'Retirement requires explicit retired binding'
+   if item['binding'] in ['bound','retired_native_copy']:
     match=db.execute('SELECT sha256 FROM functions WHERE image=? AND address=?',(item['image'],item['address'])).fetchone()
     assert match and item.get('sha256')==match[0],'Stale bound semantic alias: '+str(key)
    if item.get('source'):assert (R/item['source']).is_file(),'Missing semantic source: '+item['source']
@@ -151,24 +171,32 @@ def main(no_format=False):
   for item in semantic.get('structures',[]):
    source=R/item['source'];assert source.is_file(),'Missing semantic structure source: '+item['source']
    db.execute('INSERT INTO semantic_structures VALUES(?,?,?,?,?)',(item['name'],item['source'],item['start_line'],item['definition_sha256'],item['status']))
- from function_similarity import run as compare_mips_functions
- similarity_summary=compare_mips_functions(db)
+ if project_config.get('analysis',{}).get('function_queue') in ('unique_exact_bodies','operand_templates'):
+  from function_work_units import populate as populate_work_units
+  similarity_summary=populate_work_units(db,R,project_config)
+  if project_config['analysis']['function_queue']=='operand_templates':
+   from operand_template_queue import populate as populate_templates
+   populate_templates(db,R,project_config)
+ else:
+  from function_similarity import run as compare_mips_functions
+  similarity_summary=compare_mips_functions(db)
  from source_index import populate as index_sources
  source_summary=index_sources(db,R,ledger)
- for k,v in {'schema_version':'5','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'TODO unless evidence-backed PsyQ replacement SKIP; aliases stored separately','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','ctree_functions':str(ctree_count),'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
+ for k,v in {'schema_version':'5','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'Historical strict-proof metadata; ordinary queue uses project.sqlite complete source bindings','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_bytes(R)).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','ctree_functions':str(ctree_count),'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
+ db.execute('INSERT INTO metadata VALUES(?,?)',('original_index_exports',json.dumps(dict(inputs=index_inputs,selection=project_config.get('analysis',{}).get('index_exports',[]),additional=project_config.get('analysis',{}).get('additional_index_exports',[])),sort_keys=True)))
  db.commit();assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok';assert not db.execute('PRAGMA foreign_key_check').fetchall()
  totals={k:sum(x[k] for x in metrics) for k in ['functions','pseudocode','failures','instruction_words','symbols','data_refs']};totals['edges']=len(graph);totals['indirect_transfers']=db.execute('SELECT count(*) FROM indirect_transfers').fetchone()[0];totals['unresolved_targets']=sum(e['resolution']=='unresolved_target' for e in graph);totals['overlay_context_edges']=sum(e['resolution']=='overlay_context_required' for e in graph)
  totals['semantic_aliases']=len(semantic.get('functions',[]));totals['semantic_structures']=len(semantic.get('structures',[]))
  totals['ctree_functions']=ctree_count
+ totals['resident_parent_edges']=sum(e['resolution']=='resident_parent' for e in graph)
  totals['reviewed_indirect_calls']=indirect_summary
- statuses={s:0 for s in ['TODO','WIP','DONE','SKIP']};statuses.update(dict(db.execute('SELECT status,count(*) FROM functions GROUP BY status')))
  db.close();tmp.replace(path)
  write(project_path('callgraph', 'status/callgraph.json'),dict(identity='image:address',nodes=nodes,edges=graph));write(R/'status/code-gaps.json',gaps);write(R/'status/decompilation-failures.json',failures)
- progress=dict(phase='environment preparation',decompilation_status=statuses,metrics=metrics,totals=totals,limitations=['Function boundaries and code/data classification are discovery results, not fully audited.','Indirect transfers and overlay-context edges require future proof.','Hex-Rays failures are explicit and do not suppress MIPS listings.','Runtime status is recorded separately; static exports do not validate gameplay.'])
+ from project_context import queue
+ progress=dict(phase='environment preparation',translation_queue=queue(R,project_config,limit=1)['counts'],metrics=metrics,totals=totals,limitations=['Function boundaries and code/data classification are discovery results, not fully audited.','Indirect transfers and overlay-context edges require future proof.','Hex-Rays failures are explicit and do not suppress MIPS listings.','Runtime checks are separate from complete translation bindings.'])
  progress['function_similarity']=similarity_summary
  progress['source_index']=source_summary
- if ledger_path.exists():
-  progress['translation_ledger']=read(ledger_path)
+ if ledger:
   progress['phase']='native decompilation'
  progress['source_format']=source_format
  write(R/'status/progress-data.json',progress)

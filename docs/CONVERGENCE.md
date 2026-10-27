@@ -1,5 +1,7 @@
 # Lockstep convergence
 
+Use the common SQLite commands in `../AGENTS.md`; stage selector: `converge`. Read the current function/case context before diagnosis; keep the supervisor as source-change owner. Terminal and attention transitions save concise scoped run checks automatically. Rebind a complete game body only after the supervisor accepts the corresponding full audit; SQL presence does not grant MATCH.
+
 `trace_workflow converge NAME` requires an `xport-lockstep-record-v1` record and a migrated
 project. It never routes to the prior trace worker.
 

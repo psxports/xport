@@ -15,10 +15,21 @@ def settings_for_role(role, default_role, port, template=None):
     ini.optionxform = str
     if not ini.read(template, encoding='utf-8'):
         raise ValueError('DuckStation settings template is missing: '+str(template))
+    bios_directory = ini.get('BIOS', 'SearchDirectory', fallback=None)
+    if bios_directory is None:
+        bios_directory = ini.get('Folders', 'BIOS', fallback=None)
+    if bios_directory is not None:
+        bios = Path(bios_directory).expanduser()
+        if not bios.is_absolute():
+            bios = (Path(template).resolve().parent / bios).resolve()
+        ini['BIOS']['SearchDirectory'] = str(bios)
+        if ini.has_section('Folders'):
+            ini.remove_option('Folders', 'BIOS')
     ini['Main']['EmulationSpeed'] = '1' if role == default_role else '0'
     ini['Debug']['GDBServerPort'] = str(port)
     if role != default_role:
         ini['Main'].pop('FastForwardSpeed', None)
+        ini['Audio']['OutputMuted'] = 'true'
         ini.remove_section('Pad1')
         ini.remove_section('Hotkeys')
     return ini

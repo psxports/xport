@@ -28,4 +28,4 @@ Source, expanded dependencies, build workspaces and distribution are generated a
 
 Close processes executing the shared distribution executable before publishing. The publisher checks the resolved executable path; a retained runtime in another directory does not block replacement. If a matching process name has no readable executable path, publication fails closed. The bootstrap never terminates an emulator and preserves the existing distribution if build, validation or atomic replacement fails.
 
-Preserve the upstream `LICENSE`, contributor attribution and third-party notices when distributing the binary. Runtime BIOS, settings, memory cards, logs, saves and traces remain project-owned and are never part of the shared distribution.
+Preserve the upstream `LICENSE`, contributor attribution and third-party notices when distributing the binary. Runtime settings, memory cards, logs, saves and traces remain project-owned and are never part of the shared distribution. The user-supplied BIOS may use an explicitly configured external path, currently `C:\Projects\xports\scph5502.bin`; deployment references it without copying it into projects or the shared distribution.

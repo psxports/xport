@@ -102,6 +102,26 @@ Statuses are `equivalent`, `difference_detected` and `unknown`, with exact reaso
 
 The first verifier deliberately does not support instruction/block reordering, arbitrary register SSA joins or SMT. These cases remain `unknown`. The default HTML view and `potential-differences.json` omit only `equivalent`; byte-identical and similarity-100% functions with unresolved dependencies remain visible. CSV and full JSON retain all functions and proof details.
 
+## Operand-specialization planning across indexed images
+
+Use an explicit project with a current `analysis.sqlite`, `status/decompilation-units.json` and selected independent Ghidra body evidence. These commands read original bytes and the existing image-qualified index; they do not export, translate, bind sources or change the decompilation queue.
+
+```powershell
+python -B "[XPORT_ROOT]/tools/classify_operand_templates.py" --project . --output status/operand-templates
+python -B "[XPORT_ROOT]/tools/verify_operand_templates.py" --project . --input status/operand-templates
+python -B "[XPORT_ROOT]/tools/summarize_operand_templates.py" --project . --input status/operand-templates
+```
+
+The classifier retains physical opcode/register fields, local branch/jump destinations by instruction index, direct SP/GP adjustments, direct SP-relative slots, chunk layout, embedded bytes and coprocessor options. Its tiers permit address/direct-call substitutions, then additional scalar/shift parameters, then non-stack memory offsets. Address pairs require an adjacent LUI/low operation and an indexed matching data reference. Only declared same-image/resident-parent function entries resolve direct calls. Unresolved targets, non-return indirect dispatch, observed/repurposed RA, external conditional branches, missing delay slots, undecoded words and independent boundary disagreement keep the existing exact-body unit separate. Context-dependent template assignments also keep that unit separate.
+
+`variants.jsonl` records every image-qualified operand binding. Family reports retain all exact-body unit memberships. The independent verifier reconstructs each shared variant from a common fixed-word skeleton and its recorded operand bits, checks original bytes, local control topology, call bindings, embedded bytes and complete function coverage, and writes `verification.json`. The summarizer requires that current verification, writes scoped counts to `plan.json` and records per-function substitutions in `scalar-specialization-catalogue.jsonl`.
+
+Terminal condition: original-byte coverage and common-skeleton reconstruction pass for the entire indexed inventory; the existing exact queue hash is unchanged. Counts describe lossless specialization templates, not a proven minimum of native C algorithms or accepted implementation reuse. Audit complete original MIPS and each image's data/aliasing, call ABI/types, RA behavior and residency before sharing native C. Memory-offset specialization additionally requires layout/access review. SDK identity and source completeness remain occurrence-specific.
+
+When the user authorizes activation, set `analysis.function_queue: operand_templates` and bind `analysis.function_queue_templates` to a SHA-256 selection with schema `xport-operand-template-queue-v1`, tier `scalar_constants`. The selection binds report, verification, plan, exact-body manifest, family report, substitution catalogue and full variants, and enumerates every original occurrence and its exact-body unit exactly once. Import through `operand_template_queue.populate` or `X build_database`; the latter reproduces exact-body and template tables from accepted inputs. Missing/stale evidence, source hashes or incomplete/contradictory membership block import.
+
+`function_templates` and `function_template_members` provide a separate queue layer; preserve `function_work_units`, all original relationships and per-occurrence source/SDK accounting. `X project_context queue` groups by template and exposes separate image-qualified counts plus substitution links; `X query ADDRESS --image IMAGE` includes the template binding. A partially completed family stays uncovered, and an unreviewed member of an SDK-related family stays uncovered. Queue representatives may differ from the catalogue baseline; always apply substitutions relative to the explicit `template.baseline`.
+
 ## Verification and terminal condition
 
 ```powershell

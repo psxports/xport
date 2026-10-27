@@ -136,7 +136,7 @@ def set_attention(root, state, kind, summary, required, context=None, proposed_d
 
 
 def validate_names(name, short_name):
-    if not name or any(c in name for c in '/\\:";\r\n'):
+    if not name or any(c in name for c in '/\\";\r\n'):
         raise ValueError('Invalid project name')
     if not SHORT_NAME_PATTERN.fullmatch(short_name or '') or short_name.upper() in WINDOWS_RESERVED_NAMES:
         raise ValueError('Short name must be a non-reserved Windows name starting with a letter and containing 1..16 ASCII letters, digits or underscores')
@@ -305,7 +305,7 @@ def initialize_project(root, name, short_name, first_port=2400):
                                 'native_working_directory': 'bin',
                                 'native_solution': 'src/platform/win/'+short_name+'.sln', 'native_build': '_build',
                                 'ida_exports': 'orig/images', 'ida_configs': 'tools/ida',
-                                'sdk_classification': 'status/ghidra/classification.json'},
+                                'sdk_classification': 'status/psyq-analyzer/classification.json'},
                       'duckstation': {'host': '127.0.0.1', 'gdb_port': ports['user'], 'reserved_gdb_ports': ports,
                                       'default_role': 'user', 'data_directory': 'tools/duckstation/data/user',
                                       'data_directories': {role: 'tools/duckstation/data/'+role for role in ports}},
@@ -501,6 +501,18 @@ def validate_gp_config(root, profile):
     if type(gp) is not int or not 0 < gp <= 0xffffffff:
         raise ValueError('IDA config requires a reviewed nonzero runtime GP')
     evidence = profile.get('gp_evidence')
+    if isinstance(evidence, dict) and evidence.get('source') == 'inherited_archive_loader':
+        from overlay_gp_archive import validate as validate_archive_loader
+        return validate_archive_loader(root, profile, evidence)
+    if isinstance(evidence, dict) and evidence.get('source') == 'entry_runtime_initializer':
+        from entry_gp import validate as validate_entry_gp
+        return validate_entry_gp(root, profile, evidence)
+    if isinstance(evidence, dict) and evidence.get('source') == 'inherited_copy_loader':
+        from overlay_gp_copy import validate as validate_copy_loader
+        return validate_copy_loader(root, profile, evidence)
+    if isinstance(evidence, dict) and evidence.get('source') in ('inherited_named_loader', 'inherited_resource_loader'):
+        from overlay_gp_named import validate as validate_named_loader
+        return validate_named_loader(root, profile, evidence)
     if isinstance(evidence, dict) and evidence.get('source') in ('inherited_runtime_initializer', 'accepted_overlay_profile', 'inherited_static_loader'):
         from overlay_gp import validate as validate_overlay_gp
         return validate_overlay_gp(root, profile, evidence)
@@ -628,10 +640,8 @@ def validate_convergence_contract(root):
     root = Path(root).resolve()
     config = project(root)
     capture = validate_capture_contract(root)
-    progress_path = root/'status/progress-data.json'
-    if not progress_path.is_file():
-        raise ValueError('Generate current translation progress before convergence review')
-    decompilation = read_json(progress_path).get('decompilation_status', {})
+    from project_context import queue
+    translation_queue = queue(root, config, limit=1)['counts']
     lockstep = config['lockstep']
     if lockstep.get('native_configuration') != 'Debug' or lockstep.get('native_platform') != 'x86':
         raise ValueError('Lockstep convergence requires Debug x86')
@@ -642,7 +652,7 @@ def validate_convergence_contract(root):
         raise ValueError('Configure exact PS1 DRAM and scratchpad sizes')
     native_scope = frontier_packet(root)
     return {'contract': 'xport-lockstep-v2', 'capture': capture,
-            'decompilation_status': decompilation, 'native_scope': native_scope}
+            'translation_queue': translation_queue, 'native_scope': native_scope}
 
 
 def convergence_contract_packet(root):
@@ -818,7 +828,7 @@ def verify_ida_image(root, run, configs, image):
             'config': relative(root, config), 'config_sha256': digest_file(config), 'files': files}
 
 
-def accept_ida(root, label, selected=None):
+def accept_ida(root, label, selected=None, *, snapshot=False):
     if not LABEL_PATTERN.fullmatch(label):
         raise ValueError('Invalid IDA run label')
     root = Path(root).resolve()
@@ -833,9 +843,13 @@ def accept_ida(root, label, selected=None):
     unknown = sorted(set(images)-set(candidates))
     if unknown:
         raise ValueError('Images are absent from the IDA run: '+', '.join(unknown))
-    destination = project_path(root, config, 'ida_exports', 'orig/images')
+    destination = (root/'status/ida/snapshots'/label if snapshot else
+                   project_path(root, config, 'ida_exports', 'orig/images'))
     if not destination.is_relative_to(root):
         raise ValueError('Accepted IDA exports must remain inside the project')
+    receipt_path = root/'status/ida/accepted'/(label+'.json')
+    if receipt_path.exists():
+        raise ValueError('Accepted immutable receipt already exists: '+relative(root, receipt_path))
     configs = project_path(root, config, 'ida_configs', 'tools/ida')
     manifests = [verify_ida_image(root, run, configs, image) for image in images]
     collisions = [relative(root, destination/image) for image in images if (destination/image).exists()]
@@ -866,7 +880,8 @@ def accept_ida(root, label, selected=None):
         raise
     receipt = {'version': 1, 'label': label, 'accepted_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                'destination': relative(root, destination), 'images': manifests}
-    receipt_path = root/'status/ida/accepted'/(label+'.json')
+    if snapshot:
+        receipt['role'] = 'supplemental_original_analysis'
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_text(json.dumps(receipt, indent=2)+'\n', encoding='utf-8')
     return {'accepted': images, 'destination': relative(root, destination), 'receipt': relative(root, receipt_path)}
@@ -887,6 +902,7 @@ def run_ghidra(root, ghidra, plugin, label, images=None, plan=False):
         if not IMAGE_PATTERN.fullmatch(image):
             raise ValueError('Invalid image')
         cfg = read_json(project_path(root, config, 'ida_configs', 'tools/ida')/(image+'.json'))
+        validate_gp_config(root, cfg)
         load = cfg['loads'][-1]
         command = [str(Path(ghidra)/'support/analyzeHeadless.bat'), str(run), image,
                    '-import', str((root/load['path']).resolve()), '-loader', 'BinaryLoader',
@@ -902,6 +918,19 @@ def run_ghidra(root, ghidra, plugin, label, images=None, plan=False):
                 raise RuntimeError('Signature export did not finish: '+image)
     (run/'commands.json').write_text(json.dumps(commands, indent=2)+'\n', encoding='utf-8')
     return {'run': str(run), 'planned': plan, 'images': images}
+
+
+def recognize_psyq(root, tools, label):
+    config = project(root)
+    detector = config.get('analysis', {}).get('sdk_detector', 'xport')
+    if detector == 'xport':
+        from psyq_project import recognize
+        return recognize(root, label)
+    if detector != 'ghidra':
+        raise ValueError('Unknown PsyQ detector: ' + str(detector))
+    recognition = run_ghidra(root, tools['ghidra'], tools['plugin'], label)
+    return recognition, classify_psyq(root, 'status/ghidra/runs/' + label,
+                                      output=config.get('paths', {}).get('sdk_classification'))
 
 
 def classify_psyq(root, reports, output=None):
@@ -1002,6 +1031,46 @@ def validate_similarity(root):
         return validator.validate(db)
 
 
+def validate_game_icon(root):
+    """Require reviewed game pixels and provenance before native compilation"""
+    from tim_to_ico import decode_tim, encode_ico
+    root = Path(root)
+    directory = root/'status/memory-card-icon'
+    extraction = read_json(directory/'extraction.json')
+    verification = read_json(directory/'verification.json')
+    conversion = read_json(directory/'conversion.json')
+    tim = directory/'memory-card.tim'
+    icon = root/'src/platform/win/icon.ico'
+    image = decode_tim(tim.read_bytes())
+    if (image['width'], image['height'], image['depth']) != (16, 16, 4):
+        raise ValueError('STARTUP_ICON_REQUIRES_16X16_4BIT_TIM')
+    if icon.read_bytes() != encode_ico(image):
+        raise ValueError('STARTUP_ICON_PIXELS_DIFFER_FROM_TIM')
+    if (conversion.get('input_sha256') != digest_file(tim) or
+            conversion.get('output_sha256') != digest_file(icon) or
+            verification.get('ico_sha256') != digest_file(icon) or
+            verification.get('passed') is not True):
+        raise ValueError('STARTUP_ICON_RECEIPTS_STALE')
+    if not extraction.get('original_code_evidence') or not extraction.get('inputs'):
+        raise ValueError('STARTUP_ICON_REQUIRES_ORIGINAL_EVIDENCE')
+    for item in extraction['inputs']:
+        path = (root/item['path']).resolve()
+        if not path.is_relative_to(root.resolve()):
+            raise ValueError('STARTUP_ICON_INPUT_OUTSIDE_PROJECT')
+        if digest_file(path) != item['sha256']:
+            raise ValueError('STARTUP_ICON_INPUT_CHANGED')
+    resource = root/'src/platform/win/icon.rc'
+    resource_bytes = resource.read_bytes()
+    resource_text = resource_bytes.decode('utf-16' if resource_bytes.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig')
+    if not re.search(r'MAINICON\s+ICON\s+"icon.ico"', resource_text):
+        raise ValueError('STARTUP_ICON_RESOURCE_NOT_BOUND')
+    config = project(root)
+    native = project_path(root, config, 'native_solution').with_suffix('.vcxproj').read_text()
+    if 'ResourceCompile Include="icon.rc"' not in native or 'Image Include="icon.ico"' not in native:
+        raise ValueError('STARTUP_ICON_PROJECT_NOT_BOUND')
+    return {'ico_sha256': digest_file(icon), 'verification': relative(root, directory/'verification.json')}
+
+
 def apply_response(root, state, response):
     attention = state.get('attention')
     if state.get('status') != 'attention' or not attention:
@@ -1031,6 +1100,9 @@ def apply_response(root, state, response):
             atomic_json(path, value)
         atomic_json(config_path, config)
         next_step = 'inventory'
+    elif kind == 'icon_review':
+        validate_game_icon(root)
+        next_step = 'build'
     elif kind == 'psyq_review':
         if decision.get('approved') is not True:
             raise ValueError('STARTUP_PSYQ_REVIEW_NOT_APPROVED')
@@ -1125,8 +1197,16 @@ def frontier_packet(root):
             roots = [(image, ida['entry'])]
         if any(identity not in functions for identity in roots):
             raise ValueError('Configured native entrypoint is not an analyzed function')
-        selected = [identity for identity in roots if functions[identity][4] == 'TODO']
-        remaining = sum(row[4] == 'TODO' for row in functions.values())
+        from project_context import database_path, function_summary, queue
+        if database_path(Path(root), config).is_file():
+            sdk = {(row[0], row[1]) for row in db.execute('SELECT image,address FROM library_classification')}
+            selected = [identity for identity in roots if identity not in sdk and
+                        not function_summary(Path(root), config, *identity)['decompiled']]
+            remaining = queue(Path(root), config, limit=1)['counts']['uncovered']
+        else:
+            # Preserve legacy startup resumability until explicit SQL body binding
+            selected = [identity for identity in roots if functions[identity][4] == 'TODO']
+            remaining = sum(row[4] == 'TODO' for row in functions.values())
         rows = [(image, address, *functions[(image, address)][:4])
                 for image, address in selected]
     os.environ['XPORT_PROJECT'] = str(Path(root).resolve())
@@ -1136,7 +1216,7 @@ def frontier_packet(root):
                   'listing': listing, 'pseudocode': pseudocode,
                   'audit_context': source_context.compact(
                       image, address, budget=2097152, full_source=True, full_original=True),
-                  'proposed_change': {'status': 'WIP', 'source': None, 'semantic_name': None,
+                  'proposed_change': {'complete_body_required': True, 'source': None, 'semantic_name': None,
                                       'evidence_required': ['reviewed MIPS/IDA context', 'source mapping', 'verification result']}}
                  for image, address, name, sha, listing, pseudocode in rows]
     for function in functions:
@@ -1156,7 +1236,7 @@ def frontier_packet(root):
                 'code_refresh_is_semantic_evidence': False,
                 'required_response_field': 'decision.function_audits',
             },
-            'ledger': 'status/translation-ledger.json'}
+            'project_database': config.get('paths', {}).get('project_database', 'status/project.sqlite')}
 
 
 def advance(root, state):
@@ -1182,11 +1262,10 @@ def advance(root, state):
                     atomic_json(root/CONFIG_NAME, config)
                 atomic_json(root/'status/startup-github.json', result)
                 record_step(state, step, result, started)
-                state = publish(root, state, step='build')
-            elif step == 'build':
+                state = publish(root, state, step='diagnose')
+            elif step == 'diagnose':
                 doctor = run_shared(root, 'doctor')
-                build = run_shared(root, 'build_native')
-                record_step(state, step, {'doctor': doctor, 'build': build}, started)
+                record_step(state, step, {'doctor': doctor}, started)
                 state = publish(root, state, step='extract_data')
             elif step == 'extract_data':
                 result = startup_disc.extract(root)
@@ -1214,6 +1293,16 @@ def advance(root, state):
                 state.setdefault('decisions', {})['tools'] = toolchain['tools']
                 result = {'toolchain': toolchain, 'project': project_preflight(root)}
                 record_step(state, step, result, started)
+                state = publish(root, state, step='icon')
+            elif step == 'icon':
+                state = set_attention(root, state, 'icon_review',
+                    'Prepare and independently verify the original Memory Card icon before building',
+                    ['status/memory-card-icon/extraction.json', 'status/memory-card-icon/verification.json'],
+                    {'destination': 'src/platform/win/icon.ico'}, {'approved': False})
+            elif step == 'build':
+                icon = validate_game_icon(root)
+                build = run_shared(root, 'build_native')
+                record_step(state, step, {'icon': icon, 'build': build}, started)
                 state = publish(root, state, step='music')
             elif step == 'music':
                 config = project(root)
@@ -1239,24 +1328,24 @@ def advance(root, state):
                 plan = prepare_ida_export(root, tools['ida'], labels.get('ida_plan', 'startup-ida-plan'), plan=True)
                 label = labels.get('ida', 'startup-ida-v1')
                 actual = prepare_ida_export(root, tools['ida'], label)
-                canonical = canonicalize_ida(root, 'status/ida/runs/'+label, 'tools/ida')
+                canonical = canonicalize_ida(root, 'status/ida/runs/'+label,
+                                             project_path(root, project(root), 'ida_configs', 'tools/ida'))
                 accepted = accept_ida(root, label)
                 record_step(state, step, {'plan': plan, 'actual': actual, 'canonical': canonical, 'accepted': accepted}, started)
                 state = publish(root, state, step='psyq')
             elif step == 'psyq':
-                state = publish_progress(root, state, 'Running Ghidra PsyQ recognition')
+                state = publish_progress(root, state, 'Running PsyQ SDK recognition')
                 tools = state['decisions']['tools']
                 label = state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1')
-                recognition = run_ghidra(root, tools['ghidra'], tools['plugin'], label)
-                classification = classify_psyq(root, 'status/ghidra/runs/'+label)
+                recognition, classification = recognize_psyq(root, tools, label)
                 record_step(state, step, {'recognition': recognition, 'classification': classification}, started)
                 state = set_attention(root, state, 'psyq_review', 'Review accepted and pending PsyQ classifications',
                                       ['decision.approved'], psyq_review_summary(root, classification))
             elif step == 'database':
                 build = run_shared(root, 'build_database')
                 similarity = validate_similarity(root)
-                progress = run_shared(root, 'render_progress')
-                record_step(state, step, {'build_database': build, 'similarity': similarity, 'progress': progress}, started)
+                context = run_shared(root, 'project_context', ('init',))
+                record_step(state, step, {'build_database': build, 'similarity': similarity, 'project_context': context}, started)
                 packet = frontier_packet(root)
                 if packet['functions']:
                     state = set_attention(root, state, 'frontier_translation',
@@ -1266,9 +1355,9 @@ def advance(root, state):
                     state = publish(root, state, step='verify_frontier')
             elif step == 'verify_frontier':
                 refresh = run_shared(root, 'source_index', ('--rebuild', '--no-format'))
-                progress = run_shared(root, 'render_progress')
+                progress = run_shared(root, 'project_context', ('queue', '--limit', '1'))
                 record_step(state, step, {'source_index': refresh,
-                                          'progress': progress,
+                                          'translation_queue': progress,
                                           'native_link_deferred_to_coverage': True}, started)
                 state = publish(root, state, step='trace_contract')
             elif step == 'trace_contract':
@@ -1305,12 +1394,12 @@ def advance(root, state):
                             'deployments': deployments, 'capture': capture,
                             'shared_distribution': str((TOOLS/'duckstation/distribution').resolve())}
                 record_step(state, step, emulator, started)
-                progress = read_json(root/'status/progress-data.json')
+                from project_context import queue
                 completion = {'project': config['name'], 'short_name': config.get('short_name'),
                               'project_root': str(root), 'inputs': state.get('inventory', {}),
                               'ida': state['steps'].get('ida_export', {}).get('result'),
                               'psyq': state['steps'].get('psyq', {}).get('result'),
-                              'decompilation_status': progress.get('decompilation_status'),
+                              'translation_queue': queue(root, config, limit=1)['counts'],
                               'native_solution': config['paths']['native_solution'],
                               'native_executable': config['paths']['native_executable'],
                               'native_debug_executable': config['paths']['native_debug_executable'],
@@ -1350,6 +1439,7 @@ def archive_failed_artifacts(root, state):
         targets.extend(root/'status/ida/runs'/name for name in (labels.get('ida_plan', 'startup-ida-plan'), labels.get('ida', 'startup-ida-v1')))
     if step in ('psyq', 'database', 'verify_frontier'):
         targets.append(root/'status/ghidra/runs'/state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1'))
+        targets.append(root/'status/psyq-analyzer/runs'/state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1'))
     recovery = root/'status/startup-recovery';blobs = recovery/'blobs';blobs.mkdir(parents=True, exist_ok=True)
     manifest = {'revision': state['revision'], 'step': step, 'files': []}
     for target in targets:
@@ -1433,6 +1523,9 @@ def reexport(root, expected_revision, label, exports, advance_now=True):
         ledger = read_json(root/'status/translation-ledger.json') if (root/'status/translation-ledger.json').exists() else {}
         if ledger.get('entries'):
             raise ValueError('STARTUP_REEXPORT_REQUIRES_EMPTY_TRANSLATION_LEDGER')
+        from project_context import ledger_document
+        if ledger_document(root).get('entries'):
+            raise ValueError('STARTUP_REEXPORT_REQUIRES_EMPTY_TRANSLATION_LEDGER')
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label):
             raise ValueError('STARTUP_INVALID_REEXPORT_LABEL')
         destination = (root/exports).resolve()
@@ -1444,6 +1537,8 @@ def reexport(root, expected_revision, label, exports, advance_now=True):
         for key, value in labels.items():
             base = 'status/ghidra/runs' if key == 'psyq' else 'status/ida/runs'
             if (root/base/value).exists() or (root/'status/ida/accepted'/(value+'.json')).exists():
+                raise ValueError('STARTUP_REEXPORT_LABEL_EXISTS')
+            if key == 'psyq' and (root/'status/psyq-analyzer/runs'/value).exists():
                 raise ValueError('STARTUP_REEXPORT_LABEL_EXISTS')
         config = project(root)
         receipt = root/'status/startup-recovery'/('reexport-revision-'+str(expected_revision)+'.json')
@@ -1518,9 +1613,15 @@ def reopen_convergence(root, advance_now=True):
                    state.get('attention', {}).get('kind') in ('convergence_review', 'frontier_translation'))
         if state.get('status') != 'complete' and not refresh:
             raise ValueError('STARTUP_NOT_COMPLETE: use status, submit or retry')
-        progress_path = root/'status/progress-data.json'
-        progress = read_json(progress_path).get('decompilation_status', {}) if progress_path.is_file() else {}
-        next_step = 'database' if progress.get('TODO', 1) else 'convergence_contract'
+        from project_context import queue
+        counts = queue(root, project(root), limit=1)
+        if counts['available']:
+            pending = counts['counts']['uncovered']
+        else:
+            progress_path = root/'status/progress-data.json'
+            old = read_json(progress_path).get('decompilation_status', {}) if progress_path.is_file() else {}
+            pending = old.get('TODO', 1)
+        next_step = 'database' if pending else 'convergence_contract'
         state = publish(root, state, status='running', step=next_step,
                         completion=None, attention=None, failure=None)
         return advance(root, state) if advance_now else state

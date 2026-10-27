@@ -15,6 +15,15 @@ public class ExportPseudocodeFunctions extends GhidraScript {
 
     public void run() throws Exception {
         var input = JsonParser.parseString(Files.readString(Path.of(getScriptArgs()[0]))).getAsJsonObject();
+        var gpRegister = currentProgram.getRegister("gp");
+        var expectedGp = new java.math.BigInteger(input.get("gp").getAsString(), 16);
+        if (gpRegister == null) throw new IllegalStateException("Missing gp register");
+        for (var item : input.getAsJsonArray("functions")) {
+            var entry = toAddr(item.getAsJsonObject().get("address").getAsString());
+            var actual = currentProgram.getProgramContext().getValue(gpRegister, entry, false);
+            if (!expectedGp.equals(actual))
+                throw new IllegalStateException("GP mismatch before export at " + entry + ": " + actual);
+        }
         Path output = Path.of(getScriptArgs()[1]);
         Files.createDirectories(output.resolve("pseudocode"));
         Files.createDirectories(output.resolve("functions"));

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from urllib.parse import quote
+from windows_desktop import run_hidden_desktop
 
 
 PROFILE = Path(__file__).resolve().parent/'templates/project/github.json'
@@ -23,7 +24,7 @@ class GitHubAPI:
         if payload is not None:
             args += ['--input', '-']
         try:
-            result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
+            result = run_hidden_desktop(args, input=json.dumps(payload) if payload is not None else None,
                                     capture_output=True, text=True, encoding='utf-8', timeout=60)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise ValueError('STARTUP_GITHUB_REQUEST_FAILED: verify GitHub CLI and connection; retry the same step') from error

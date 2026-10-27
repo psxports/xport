@@ -2,11 +2,15 @@
 
 For the reusable OG/HD migration, float math, shader and batching workflow used by `enhance` tasks, read [ENHANCE.md](ENHANCE.md).
 
+For original PS1 texture decoding and selective palette-aware bilinear filtering, use the shader-source helpers and adapter contract in [VID_PSX_SAMPLING.md](VID_PSX_SAMPLING.md).
+
 ## Build
 
 Windows VID calls `wglSwapIntervalEXT(1)` when the extension is available; its absence or a failed call does not reject initialization. `SwapBuffers` paces presentation when VSync is active; Windows render-wait helpers add no software FPS limiter. Physical PS1 field timing stays independent. Web continues using `requestAnimationFrame`.
 
-Use `xport_render_wait_until(deadline)` after rendering; `~(uint64)0` means no deadline. It returns zero if the deadline has passed. Windows only checks time after presentation. Web checks time, yields to the next animation frame, then checks time again; it has no timeout race and may resume after a finite deadline. Hidden browser tabs follow the browser's animation-frame throttling. The separate `xport_render_wait` API is removed.
+Successful screen presentation owns pacing. Windows waits in `SwapBuffers` with the configured swap interval. Web `vid_end` closes the frame before calling `xport_present_complete`, which yields to `requestAnimationFrame` and records the serviced physical field. `vid_blit` uses the same completion hook after a successful screen blit. Offscreen targets, cancelled/failed frames, zero-sized output and headless frames do not yield. Do not add another game-side wait after present. Repeated HD redraws and OG/FMVs use the same host contract; presentation does not advance game simulation. Hidden tabs follow browser throttling.
+
+`xport_render_wait_until(deadline)` remains a compatibility deadline comparison on both platforms. It does not wait or generate another animation frame. Existing callers after present do not yield twice. New game code must not use an infinite deadline to pace rendering.
 
 - Compile `src/vid_ogl.c` and define `GAPI_OGL` for Windows and Web
 - Windows links `opengl32.lib`, `gdi32.lib` and `user32.lib`; base GL functions use DLL imports, extended GL/WGL functions use the supplied `src/libs/gl` function-pointer types and dynamic lookup
@@ -24,7 +28,7 @@ Use `xport_render_wait_until(deadline)` after rendering; `~(uint64)0` means no d
 
 Games register application resource cleanup through `xport_set_cleanup(callback)`. The host clears the callback before invoking it once during `xport_shutdown`, before audio/VID/context teardown. Passing NULL removes the registration. Windows window-close unwinding returns to host shutdown without requiring the game stack to return normally. No game-specific callback is required from other projects
 
-Windows Alt+Enter stores the current window style and placement, enters a monitor-sized `WS_POPUP` window through `SetWindowPos` with `SWP_FRAMECHANGED`, and restores the exact stored style and placement on exit. Removing `WS_OVERLAPPEDWINDOW` alone does not establish this fullscreen contract. Verify the actual presentation mode with ETW/PresentMon; a monitor-sized rectangle does not prove hardware flip or exclusive presentation. Preserve the requested swap interval and game clock during this transition
+Windows Alt+Enter stores the current window style and placement, enters a monitor-sized `WS_POPUP` window through `SetWindowPos` with `SWP_FRAMECHANGED`, and restores the exact stored style and placement on exit. Removing `WS_OVERLAPPEDWINDOW` alone does not establish this fullscreen contract. Preserve the requested swap interval and game clock during this transition. Alt+Enter testing is not a mandatory integration or completion check; retain human confirmation when supplied. ETW/PresentMon tracing is diagnostic only; window geometry alone does not establish hardware flip or exclusive presentation
 
 `vid.h` is the common public interface. Resource layouts, context ownership and GL objects are private to `vid_ogl.c`. Rendering uses vertex buffers and shaders; no fixed-function pipeline is permitted.
 
@@ -86,7 +90,9 @@ The game stores semantic resource selections and VID references. It never alloca
 
 An explicit pass snapshots viewport, fog, material and current draw uniforms. Each subsequent `vid_submit` snapshots its current draw uniforms; zero vectors leave the pass/object uniforms unchanged. Change viewport/fog by starting another pass. A legacy `vid_draw` ends the explicit-pass recording scope; call `vid_pass` again before another submit. Keep referenced mesh/index/material data immutable while commands are queued. `vid_sample` uses its own viewport and preserves command order; begin a new pass after a probe before resuming geometry
 
-The renderer sets viewport/scissor, depth/blend/cull, program and textures once per explicit pass. Submissions bind their mesh VAO, upload changed resources and object uniforms, and issue the draw. Mesh attribute layout is configured once in its owned VAO. There is no GL state cache or draw-statistics subsystem
+The renderer sets viewport/scissor, depth/blend/cull, program and textures once per explicit pass. Submissions bind their mesh VAO, upload changed resources and object uniforms, and issue the draw. Mesh attribute layout is configured once in its owned VAO. Retain one explicit pass across adjacent submissions with the same material state; changing object uniforms alone does not require another pass
+
+Texture filter/wrap settings are retained with each VID-owned texture. The backend sets them on first sampling or an actual setting change; integer textures force nearest/clamp before comparison. Pixel uploads, target resize and target copy preserve settings on the same GL object. If a future path replaces a texture's GL object while retaining its owner, invalidate the saved settings before sampling. There is no global GL state cache or draw-statistics subsystem
 
 Vertex-buffer uploads use `GL_STATIC_DRAW`; the committed version still determines uploads, and later commits remain valid. Do not change this hint to `GL_DYNAMIC_DRAW` without an actual WebGL indexed-identity regression test. On ANGLE/D3D11, dynamic vertex storage can add the minimum element index twice to `gl_VertexID`, while fetching the correct vertex attributes. A shader that indexes material/morph textures through `gl_VertexID` then reads another face. Verify nonzero minimum indices, including values above 65535, against shader-reported integer identities and rendered material pixels. Do not subtract an observed offset in game shaders. Reproducer and actual browser evidence: Pandemonium2-xport `status/enhance/checks/web-vertex-id-isolation` and `status/enhance/web-indexed-vertex-identity.json`.
 

@@ -90,6 +90,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--no-build',action='store_true');parser.add_argument('--no-tests',action='store_true');parser.add_argument('--no-format',action='store_true');parser.add_argument('--architecture',choices=('x86','x64'));args=parser.parse_args()
     root,project=load_project();settings=project.get('code_refresh',{});started=time.perf_counter();steps={};logs=[];failure=None
     report_path=artifact_path(settings.get('report','status/code-refresh-latest.json'));log_path=artifact_path(settings.get('log','status/code-refresh-latest.log'))
+    build=settings.get('build')
     try:
         if settings.get('source_index',True):
             from source_index import rebuild
@@ -114,16 +115,24 @@ def main():
                 outcome=run_command(argv,root,logs);outcome['name']=test['name'];tests.append(outcome)
             steps['tests']=tests
         steps['artifacts']=refresh_artifacts(root,settings.get('artifacts',[]))
-        if settings.get('progress',True):
-            progress=[sys.executable,str(Path(__file__).resolve().parent/'render_progress.py')]
-            steps['progress']=run_command(progress,root,logs,{'XPORT_PROJECT':str(root)})
-        else:steps['progress']={'skipped':True,'reason':'Disabled by project configuration'}
+        from project_context import queue
+        steps['translation_queue']=queue(root,project,limit=1)['counts']
         database=(root/project['paths']['analysis_database']).resolve();steps['database']=database_check(database)
         if steps['database']['integrity']!='ok' or steps['database']['foreign_key_errors']:raise RuntimeError('SQLite validation failed')
     except Exception as error:
         failure=type(error).__name__+': '+str(error)
     report=dict(version=1,project=project['name'],result='FAIL' if failure else 'PASS',seconds=round(time.perf_counter()-started,3),steps=steps,error=failure)
     write_json(report_path,report);log_path.parent.mkdir(parents=True,exist_ok=True);log_path.write_text('\n'.join(logs),encoding='utf-8')
+    from project_context import put
+    references=[report_path.relative_to(root).as_posix(),'xport-project.json']
+    if steps.get('build',{}).get('executable'):
+        references.append(steps['build']['executable'])
+    put(root,project,key='code-refresh',kind='check',subsystem='integration',
+        summary='Code refresh '+report['result']+'; native build '+('executed' if 'build' in steps else 'not run')+
+                '; configured tests '+('executed' if steps.get('tests') else 'not run'),
+        scope='Only the indexing, build, tests and artifacts listed in the report; no implicit gameplay/pixel/PCM proof',
+        configuration=json.dumps(build or {},sort_keys=True),evidence=references,
+        next_step=failure or '')
     print(json.dumps(dict(result=report['result'],seconds=report['seconds'],report=str(report_path),log=str(log_path),error=failure)))
     if failure:raise SystemExit(1)
 

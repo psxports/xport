@@ -13,6 +13,9 @@ import trace_workflow
 
 
 class StartupSupervisorTests(unittest.TestCase):
+    def test_display_name_allows_colon(self):
+        startup.validate_names('Mortal Kombat Mythologies: Sub-Zero', 'MKM')
+
     def test_generated_readme_uses_supplied_names_and_template(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'Unrelated-directory'
@@ -196,7 +199,8 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(state['status'], 'attention')
             self.assertEqual(state['attention']['kind'], 'image_review')
             self.assertEqual(state['steps']['initialize']['status'], 'passed')
-            self.assertEqual(state['steps']['build']['status'], 'passed')
+            self.assertNotIn('build', state['steps'])
+            self.assertEqual(state['steps']['diagnose']['status'], 'passed')
             self.assertNotIn('emulator', state['steps'])
             self.assertFalse((root/'DuckStation.bat').exists())
             self.assertTrue((root/'status/startup.json').is_file())
@@ -369,7 +373,14 @@ class StartupSupervisorTests(unittest.TestCase):
         self.assertEqual(user['Debug']['GDBServerPort'], '45002')
         self.assertEqual(user['Pad1']['Type'], 'AnalogController')
         self.assertEqual([user['Pad1'][key] for key in ('Up', 'Right', 'Down', 'Left')],
+                         ['Keyboard/UpArrow', 'Keyboard/RightArrow', 'Keyboard/DownArrow', 'Keyboard/LeftArrow'])
+        self.assertEqual([user['Pad1'][key] for key in ('LUp', 'LRight', 'LDown', 'LLeft')],
                          ['Keyboard/W', 'Keyboard/D', 'Keyboard/S', 'Keyboard/A'])
+        self.assertEqual(user['Audio']['OutputMuted'], 'false')
+        self.assertEqual(Path(user['Folders']['BIOS']),
+                         Path(r'C:\Projects\xports'))
+        self.assertTrue(all(user['BIOS'][key] == 'scph5502.bin'
+                            for key in ('PathNTSCJ', 'PathNTSCU', 'PathPAL')))
         self.assertEqual(user['Hotkeys'], {'FastForward': 'Keyboard/Tab',
                                            'TogglePause': 'Keyboard/Space'})
         audit = duckstation_deploy.settings_for_role('audit', 'user', 45000)
@@ -377,6 +388,24 @@ class StartupSupervisorTests(unittest.TestCase):
         self.assertNotIn('FastForwardSpeed', audit['Main'])
         self.assertNotIn('Pad1', audit)
         self.assertNotIn('Hotkeys', audit)
+        self.assertEqual(audit['Audio']['OutputMuted'], 'true')
+        self.assertEqual(audit['Folders']['BIOS'], user['Folders']['BIOS'])
+
+    def test_emulator_bios_paths_resolve_against_the_selected_template(self):
+        source = Path(duckstation_deploy.__file__).parent / 'duckstation/settings.ini'
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            template = folder / 'settings.ini'
+            original = source.read_text(encoding='utf-8').replace(r'BIOS = C:\Projects\xports', 'BIOS = bios')
+            template.write_text(original, encoding='utf-8')
+            user = duckstation_deploy.settings_for_role('user', 'user', 45002, template)
+            self.assertEqual(Path(user['Folders']['BIOS']), folder / 'bios')
+            absolute = folder / 'custom-bios'
+            template.write_text(original.replace('BIOS = bios', 'BIOS = ' + str(absolute)), encoding='utf-8')
+            audit = duckstation_deploy.settings_for_role('audit', 'user', 45000, template)
+            self.assertEqual(Path(audit['Folders']['BIOS']), absolute)
+            self.assertEqual(audit['Debug']['GDBServerPort'], '45000')
+            self.assertEqual(audit['Audio']['OutputMuted'], 'true')
 
     def test_emulator_preparation_is_the_final_startup_step(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -478,8 +507,8 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(waiting['attention']['kind'], 'trace_capture_review')
             result = waiting['steps']['verify_frontier']['result']
             self.assertEqual(result['source_index'], 'ok')
-            self.assertEqual(result['progress'], 'ok')
-            self.assertEqual([call.args[1] for call in commands.call_args_list], ['source_index', 'render_progress'])
+            self.assertEqual(result['translation_queue'], 'ok')
+            self.assertEqual([call.args[1] for call in commands.call_args_list], ['source_index', 'project_context'])
             self.assertTrue(result['native_link_deferred_to_coverage'])
 
     def test_refresh_completion_requires_exact_completed_revision(self):
@@ -682,7 +711,19 @@ class StartupSupervisorTests(unittest.TestCase):
                 result = startup.advance(root, state)
             validate.assert_called_once_with()
             self.assertEqual(result['steps']['preflight']['result']['toolchain'], prepared)
-            self.assertEqual(result['failure']['step'], 'ida_export')
+            self.assertEqual(result['attention']['kind'], 'icon_review')
+            self.assertNotIn('build', result['steps'])
+
+    def test_build_requires_game_icon_before_compiler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'IconGate-xport'
+            startup.initialize_project(root, 'Icon Gate', 'IG', 45240)
+            state = {'schema': 1, 'revision': 1, 'status': 'running', 'step': 'build',
+                     'steps': {}, 'history': [], 'decisions': {}}
+            with mock.patch.object(startup, 'run_shared') as run:
+                result = startup.advance(root, state)
+            run.assert_not_called()
+            self.assertEqual(result['failure']['step'], 'build')
 
     def test_status_resumes_interrupted_running_state(self):
         with tempfile.TemporaryDirectory() as directory:

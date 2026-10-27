@@ -324,6 +324,19 @@ class LockstepSupervisor:
             self.state["transitions"].append({"revision": self.state["revision"],
                                                "at": time.time(), **visible})
         self._save()
+        if status in ('ATTENTION_REQUIRED', 'COMPLETE', 'FAILED') and (self.root / 'xport-project.json').is_file():
+            from project_context import put
+            from xport_project import load_project
+            root, config = load_project(self.root)
+            packet = self.state.get('packet')
+            references = [self.path.relative_to(root).as_posix(), 'xport-project.json']
+            if packet and Path(packet).is_file():
+                references.append(Path(packet).relative_to(root).as_posix())
+            put(root, config, key='converge:' + self.directory.name, kind='check', stage='converge',
+                summary='Converge ' + status,
+                scope='Recorded interval from its initial save state only; startup and unrecorded paths remain unproved',
+                configuration='Lockstep Debug x86; see bound run and record', evidence=references,
+                next_step=str(self.state.get('reason') or '')[:1200] if status != 'COMPLETE' else '')
 
     @staticmethod
     def _close(value) -> None:
