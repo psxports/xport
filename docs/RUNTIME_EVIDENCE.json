@@ -1,0 +1,484 @@
+{
+  "schema": 1,
+  "purpose": "Retained historical source/provenance notes, not executable task policy",
+  "sections": {
+    "Native ClearImage2": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Explicit authorization and unverified migration: `Apocalypse-xport/status/refactoring/readability-execution/stage-7-clearimage2-sdk-move.json`. Final Debug x86 startup, rectangle/alignment, packet/state and repeated-reset checks remain required"
+      ]
+    },
+    "Native DCPL command": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Explicit human authorization and source migration: `Apocalypse-xport/status/refactoring/readability-execution/stage-6-sdk-proposal.json`. Structural migration is unverified until that stage's full Debug x86 register/flag/numeric and gameplay checks complete; do not claim broader GTE equivalence",
+        "Real WaveOut stop/resume evidence: `Pandemonium2-xport/status/enhance/audio-stall-recovery.json`.",
+        "Original paired40-second voice evidence predates this physical-output policy: `Pandemonium2-xport/status/audio/review-audio-clock-20261017.json`.",
+        "Paired Goon City evidence: `Pandemonium2-xport/status/audio/goon-city-channels/comparison.json`.",
+        "Evidence: `Pandemonium2-xport/status/audio/review-silent-audio-20261016.json`.",
+        "Evidence: `Pandemonium2-xport/status/function-coverage/first/review-native-first-playable-20261016.json`.",
+        "Evidence: `Pandemonium2-xport/status/function-coverage/first/review-native-menu-integration-20261016.json`.",
+        "Local BIOS evidence: `Pandemonium2-xport/status/function-coverage/first/review-bios-cd-remove-20261016.json`.",
+        "Evidence: `Pandemonium2-xport/status/function-coverage/first/review-bios-user-heap-20261016.json`."
+      ]
+    },
+    "Native inline image-load packets": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- AC3 authorization and validation: `AceCombat3-xport/status/native-sdk-migration/native-draw-load-implementation-review.json`; `python -B tools/test_native_draw_load.py` from that project checks1800 original constructor cases and actual deferred OT order/wrap."
+      ]
+    },
+    "Native decoded SPU PCM": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Run `python -B tools/gpu_observer_test.py --fixture spu_decoded --configuration Debug` from a consuming project. The fixture exercises actual SPU/IMA implementations, flag bounds, nonzero CD/voice taps, silent inputs, half/ring wrap, completion, reset and binary/portable restore. Its 8 MiB stack accommodates the existing portable LIBSND snapshot local; this does not change a game's stack configuration. `spu_control` and `spu_pending_key` remain regression fixtures; their unused BIOS/IRQ/event boundaries abort explicitly",
+        "- AC3 authorization and output-preservation evidence: `AceCombat3-xport/status/native-sdk-migration/native-decoded-pcm-implementation-review.json`."
+      ]
+    },
+    "Native VAB bank ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original open/close/reset now copy/release native VH and use existing-1 failures for invalid ranges/selection.",
+        "- Source spans,original field mapping,explicit bug repairs and lifecycle: `Pandemonium2-xport/status/native-refactoring/native-vab-resource-ownership.json`. Broader malformed-input semantics and final Debug x86 audio/lifecycle verification remain pending"
+      ]
+    },
+    "Native SPU DMA registration and event ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original SDK identities,default words,reset binding scope and pending final Debug x86 checks: `Pandemonium2-xport/status/native-refactoring/native-spu-dma-event-driver.json`."
+      ]
+    },
+    "Native BIOS display callback and event domains": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original lifecycle/order evidence and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-bios-clock-display-events.json`. Callback state-file rebinding,exhaustion and mixed SDK reset semantics are not declared equivalent"
+      ]
+    },
+    "Native root-counter stop": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original MIPS,boot constant/string review and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-startup-constants-counter.json`"
+      ]
+    },
+    "Native SPU silent sample and FIFO source": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original identity,known pre-existing CPU busy-loop omissions and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-spu-silent-fifo.json`"
+      ]
+    },
+    "Native sample-note metadata and queued noise": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original alias correction,default evidence and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-spu-sample-notes-noise.json`."
+      ]
+    },
+    "Native SPU key control": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 original key function and shared unbound SpuSetKey use it;existing explicit guest bindings remain unchanged",
+        "Original markers and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-spu-key-control.json`"
+      ]
+    },
+    "Native SPU transfer callback domain": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 original DMA completion calls the native callback when present,otherwise DeliverEvent;the branches are exclusive.",
+        "- Complete original DMA branch,ABI and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-spu-transfer-callback.json`"
+      ]
+    },
+    "Native callback driver lifecycle": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 cold initialization zeros the owner;queue IRQ2 removal uses actual InterruptCallback registration.",
+        "Pointer-free driver scalars participate in psx_state_io;old streams without that block reject. Callback rebinding and mixed BIOS/native stop/reset semantics remain unverified;existing StopCallback API is unchanged",
+        "- Original wrappers/markers,device aliases,complete MIPS and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-callback-driver-owner.json`"
+      ]
+    },
+    "Native VBlank callback slots": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Provenance,reset/lifetime and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-vblank-callback-slots.json`."
+      ]
+    },
+    "GPU reset and status boundaries": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Original markers,retired-region dependency evidence and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-graph-reset-boundaries.json`."
+      ]
+    },
+    "Native GPU control cache": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 cold/reset entries initialize it from reviewed original zeros and preserve reset queue-enable/type publication order",
+        "- Pointer-free control state participates in the existing size-prefixed GPU portable scalar block;older different-size blocks reject. Existing guest observation bindings remain separate contracts;full shared LIBGPU ownership and snapshot compatibility policy are not declared complete",
+        "- P2 removes its numeric GPU control adapter and restores ClearOTag debug prelude ABI while preserving markers.",
+        "Source/MIPS provenance and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-graph-control-cache.json`"
+      ]
+    },
+    "Native GPU debug ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 cold/reset defaults are zero.",
+        "Historical exported markers remain intact with complete-entry aliases in `Pandemonium2-xport/status/native-refactoring/native-graph-debug-owner.json`"
+      ]
+    },
+    "Native video mode and draw completion": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 removes an unread guest VBlank-counter mirror;native VSync counter/wait/order behavior is unchanged.",
+        "- Original MIPS,return-consumer audit,reset behavior and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-video-draw-completion.json`. No runtime equivalence claim"
+      ]
+    },
+    "Native SEQ clock callback ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 reuses `SpuSequenceClock` for scalar mode/phase and actual tick/previous IRQ pointers;`SpuSequenceScheduler` now retains only sequence state/counts/tracks.",
+        "- P2 original IRQ0 chaining captures/restores `InterruptCallback(0,...)`;shared timer start captures a VSync user callback in that mode.",
+        "P2 retains original start/stop/division/toggle order while removing numeric callback switches and native/code-address matching adapters",
+        "- Exact original defaults,ABI/source dependency scope and pending final Debug x86 cases: `Pandemonium2-xport/status/native-refactoring/native-seq-clock-callbacks.json`."
+      ]
+    },
+    "Native voice modulation callbacks": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original fields are zero;no actual modulation provider is inferred from that fact.",
+        "- Reviewed callsite ABI,original defaults,tick declaration repair and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-voice-modulation-callbacks.json`."
+      ]
+    },
+    "Native pending sequence teardown": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original reset/unload now perform this cleanup;VAB close additionally accepts a header-open flag2 bank and releases its busy reservation and native VH owner.",
+        "- Exact original evidence,ownership order,explicit repair scope and pending final Debug x86 interruption/reentry cases: `Pandemonium2-xport/status/native-refactoring/native-sequence-load-cancellation.json`."
+      ]
+    },
+    "Native scene sequence parent resources": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Original mappings,return-carrier scope,resource input-domain and final Debug x86 scenarios;in-flight cleanup is implemented in the linked cancellation follow-up: `Pandemonium2-xport/status/native-refactoring/native-scene-sequence-bundles.json`."
+      ]
+    },
+    "Native SDK SPU address conversion": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original6FCA0,classifications,VoiceAddress removal,all consumers and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-spu-register-address-converter.json`."
+      ]
+    },
+    "Native sequence startup and pitch defaults": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 now uses that typed table and preserves callback/NRPN/delta ordering",
+        "Actual original ranges,table identities,adapter removal and pending final Debug x86 scenarios: `Pandemonium2-xport/status/native-refactoring/native-seq-startup-defaults.json`."
+      ]
+    },
+    "Native VM controls and reverb inputs": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original addresses,defaults and native consumers: `Pandemonium2-xport/status/native-refactoring/native-vm-controls-reverb-attributes.json`;the former startup stack boundary is resolved with an explicit missing-mask repair in `Pandemonium2-xport/status/native-refactoring/native-seq-startup-defaults.json`."
+      ]
+    },
+    "Native VAB sample sources": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original VB upload validates its exact available source extent against the original capped transfer length and retains existing bank/-1 results.",
+        "- Source ownership,archive rounding,explicit failure repairs and pending final Debug x86 scenarios: `Pandemonium2-xport/status/native-refactoring/native-vb-sample-ownership.json`. No runtime equivalence claim"
+      ]
+    },
+    "Native sequence range failures": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Current guard/failure scope and deferred scenarios: `Pandemonium2-xport/status/native-refactoring/native-seq-stream-guards.json`."
+      ]
+    },
+    "Native sequence stream ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Exact source/lifetime/allocation and result-carrier scope: `Pandemonium2-xport/status/native-refactoring/native-seq-stream-ownership.json`."
+      ]
+    },
+    "Sequence control fields": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Current provenance: `Pandemonium2-xport/status/native-refactoring/native-seq-event-fields.json`; final Debug x86 verification pending"
+      ]
+    },
+    "Native sequence track storage": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Evidence: `Pandemonium2-xport/status/native-refactoring/native-seq-typed-track-abi.json`.",
+        "- Current storage,lifetime,partial-reset contract and closed volume-pointer boundary: `Pandemonium2-xport/status/native-refactoring/native-seq-track-storage.json`."
+      ]
+    },
+    "Sequence volume output ABI": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original79244 uses native uint16 output pointers; ramp work buffers are native local halfwords.",
+        "Evidence: `Pandemonium2-xport/status/native-refactoring/native-seq-volume-output.json`, with current ownership in `native-seq-track-storage.json`; final Debug x86 pause/volume-ramp verification pending"
+      ]
+    },
+    "Native sequence scheduling state": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 nonzero defaults60/1/127,consumer identities and timing invariants: `Pandemonium2-xport/status/native-refactoring/native-seq-scheduler-state.json`."
+      ]
+    },
+    "Native VAB attribute workspaces": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original program/tone get/set functions now accept native binary workspaces and retain partial writes/byte order with explicit little-endian halfword codecs.",
+        "- Function identities,buffer extents,unchanged holes and unresolved ignored-error paths: `Pandemonium2-xport/status/native-refactoring/native-vab-command-buffers.json`."
+      ]
+    },
+    "Native tone command signatures": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original ADSR codec/tone function restoration,explicit baseline bug repairs and removed aggregate adapters: `Pandemonium2-xport/status/native-refactoring/original-seq-tone-handlers.json`."
+      ]
+    },
+    "Native sequence handlers": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 primary-table provenance, removed numeric guard and remaining heterogeneous tone adapter: `Pandemonium2-xport/status/native-refactoring/native-seq-handler-table.json`."
+      ]
+    },
+    "Reverb and allocation ownership": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 reset/field mapping,stale-shadow correction and remaining SDK consolidation scope: `Pandemonium2-xport/status/native-refactoring/native-reverb-allocation-owner.json`."
+      ]
+    },
+    "Native voice lifecycle records": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Field provenance and unresolved callback behavior: `Pandemonium2-xport/status/native-refactoring/native-spu-voice-records.json`."
+      ]
+    },
+    "Native note working context": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 field provenance, cold-zero defaults, partial reset and remaining binary resource dependencies: `Pandemonium2-xport/status/native-refactoring/native-spu-note-context.json`."
+      ]
+    },
+    "Native voice event state": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original15-entry history intersection, reset contract and consumer evidence: `Pandemonium2-xport/status/native-refactoring/native-spu-voice-events.json`."
+      ]
+    },
+    "Native voice register cache": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 now rejects invalid bank16 using the existing failure result.",
+        "- Cold and repeated initialization, consumer identities and remaining SDK dependencies: `Pandemonium2-xport/status/native-refactoring/native-vab-voice-register-cache.json`."
+      ]
+    },
+    "Native VAB transfer metadata": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 original bank16 aliases and native cold/reset semantics: `Pandemonium2-xport/status/native-refactoring/native-vab-transfer-metadata.json`."
+      ]
+    },
+    "Native SDK allocation records": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Evidence: `Pandemonium2-xport/status/native-refactoring/native-spu-allocation-records.json`."
+      ]
+    },
+    "SPU device constants and default reverb regions": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- P2 immutable EXE dependency migration: `Pandemonium2-xport/status/native-refactoring/native-spu-device-defaults.json`."
+      ]
+    },
+    "Native SPU transfer state": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 migration evidence: `Pandemonium2-xport/status/native-refactoring/native-spu-transfer-owner.json`."
+      ]
+    },
+    "Native game saves": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Current Gran Turismo pause PCM evidence and consumer scope: `GranTurismo-xport/status/function-coverage/first2/pause-quit-progress.json`; other consuming games are not runtime-validated by that scenario.",
+        "Project evidence: `Apocalypse-xport/status/refactoring/stage-2/native-angle-steps-migration.json`; run `python -B tools/verify_native_trig_math.py` in that project for the complete saved/native arithmetic check and bounded raw MIPS samples.",
+        "RRJ uses this mode to keep the missing-boundary body outside the optimized GPU caller translation unit without disabling C4702 or reducing GPU optimization."
+      ]
+    },
+    "Graphics presentation": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Rapid Racer current-source graphics checks: `RapidRacer-xport/tools/check.py`; latest result: `RapidRacer-xport/status/checks.json`"
+      ]
+    },
+    "Modules": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "RapidRacer uses this boundary to prevent automatic VSync output from exposing an unfinished display page or the first half of a split-screen frame",
+        "After `PadInitDirect`, call `PadStartCom` to enable native packet publication. Active polling publishes connected `0x41` packets for both keyboard ports and any bound SDK owner packets; it preserves active-low button byte order. `PadStopCom` suspends polling. Replay-bound pads retain recorded packets and bypass native publication. Native serial state is independent per port. Verify with `python -B -m unittest tests.test_pad_ports -v` from `tools`; actual Win/Web C closures, sparse gamepad enumeration, SDK packets, stopped polling and replay isolation are exercised. Game-specific split-screen evidence belongs to the consuming project.",
+        "SF original PsyQ `LIBSND.LIB/SSCMUTE.OBJ` evidence: `SyphonFilter-xport/status/native-startup/sequence-mute-native-review.json`.",
+        "SF evidence: `SyphonFilter-xport/status/native-startup/ss-vo-keyoff-signatures.json`.",
+        "SF original PsyQ `LIBGS.LIB/GS_114.OBJ` evidence and integration: `SyphonFilter-xport/status/native-startup/sort-ot-native-review.json`.",
+        "Original evidence: `SyphonFilter-xport/status/native-startup/gs-flat-light-native-review.json`.",
+        "Verify `X gpu_observer_test --configuration Debug`; source-bound FF integration and consumer compile limitations: `FightingForce-xport/status/implementation-completion/display-initialize-review.json`.",
+        "Original provenance and current integration: `SyphonFilter-xport/status/native-startup/seq-data-native-review.json`.",
+        "Source receipt: `RoadRashJailbreak-xport/status/repairs/start-cross/native-spu-irq-device.json`.",
+        "Original SDK object execution versus actual shared C on x86/WASM Debug: `NFSHS-xport/status/pad-sdk-state-layouts.json`, 1536 cases per SDK with complete query instruction coverage.",
+        "NFSHS image-specific query and port-selector comparison: `NFSHS-xport/status/pad-state-mips-comparison.json`.",
+        "NFSHS complete original-MIPS and isolated x86 Release body checks: `NFSHS-xport/status/pad-actuator-mips-comparison.json`, 198 cases covering the wrapper, port selector and `_padSetAct`, plus live buffer mutation/replacement checks.",
+        "FF uses 4112 from its original pre-table halfword; the shared routine never reads game RAM.",
+        "Original evidence, cross-consumer review status and deferred final checks: `FightingForce-xport/status/refactoring/current.json`, `normalization_sdk_contract`.",
+        "Current original evidence: `SyphonFilter-xport/status/native-startup/seq-vm-keyon-native-review.json`.",
+        "Original body evidence: `SyphonFilter-xport/status/native-startup/seq-vm-alloc-native-review.json`.",
+        "Original body evidence: `SyphonFilter-xport/status/native-startup/seq-vm-doallocate-native-review.json`.",
+        "Original game/SDK comparison: `Apocalypse-xport/status/audits/gameplay-combat/revisions/sound-update-queue-bound/results.json`; this evidence does not prove PCM, physical timing or consumer initialization.",
+        "Original evidence: `SyphonFilter-xport/status/native-startup/seq-note-pitch-native-review.json`.",
+        "P2 original `SLUS_005.78:800880BC` has the same 384 bytes; its imported attribute adapter uses this table only for indices 0..191 and retains original out-of-range SDK memory semantics pending that domain migration.",
+        "Source/data analysis: `Pandemonium2-xport/status/native-refactoring/spu-attribute-private-converters.json`; final Debug x86 verification remains pending",
+        "Original evidence: `SyphonFilter-xport/status/native-startup/seq-vm-keyon-now-native-review.json`.",
+        "Original evidence: `SyphonFilter-xport/status/native-startup/seq-vm-keyoff-native-review.json`.",
+        "Original complete MIPS and confirmed PsyQ identity: `SyphonFilter-xport/status/native-startup/voice-check-native-review.json`; no original equivalence is claimed"
+      ]
+    },
+    "SPU reverb work-area transfers": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Original raw/C, failure restoration, native/guest portable roundtrip and consumer checks for the historical explicit-source adapter: `FightingForce-xport/status/implementation-completion/reverb-clear-acceptance.json`."
+      ]
+    },
+    "Analog gamepad input": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "RRJ binds this storage from `rrj_memory_bind` on initial load and restore.",
+        "Original image evidence: `Apocalypse-xport/status/audits/audio-level-fixes-20261015/repair.json`; regression: `gpu_observer_test --fixture spu_pending_key --configuration Debug`."
+      ]
+    },
+    "Native VAB attributes": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "- Implementation/provenance and deferred project gates: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_vab_attributes`.",
+        "- Source/provenance: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_vab_bank_views`.",
+        "- Earlier prerequisite sections describe historical sequencing. Native VAB loading, selected metadata and game bank handles now share the SDK owner; scalar VM context, voice/cache/SEQ and callback contracts remain unfinished.",
+        "- Source and deferred requirements: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_vab_game_ownership`. Structural changes remain uncompiled and unverified",
+        "- Structural edits remain uncompiled/unverified. Source/evidence: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_sequence_streams`",
+        "- Structural edits remain uncompiled/unverified. Final verification must cover both native and default SDK representations, initialization/reset/reconfiguration/lifetime, bit31/slot exhaustion, scalar width/wrap/ramp division, per-channel state, sound identity33, all supported event/control/NRPN/loop/chaining paths and affected existing projects.",
+        "- Project source mapping/field provenance and required final scope: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_sequence_tracks`, and `native-sequence-track-fields.json`.",
+        "- Structural migration remains uncompiled/unverified. Native timers/interrupt registration follow the lifecycle below; VM voice/context/cache and complete SDK body consolidation are unfinished",
+        "- Source/ownership mapping: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_sequence_callbacks`",
+        "- Structural edits remain uncompiled/unverified. All callback-bearing native APIs require serialized lifetime against dispatch/reset",
+        "- Source/provenance and exact pending scope: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_sequence_timer`, and `native-sequence-timer-inputs.json`",
+        "- Structural edits remain uncompiled/unverified. Shared renderer code is untouched",
+        "- Source/original-device mapping: `Apocalypse-xport/status/refactoring/stage-2/connected-model-owner-implementation.json`, section `native_callback_bootstrap`, and `native-callback-bootstrap-inputs.json`"
+      ]
+    },
+    "Native CD read completion callback": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Ownership, original SDK mapping and pending final Debug x86 scope: `Pandemonium2-xport/status/native-refactoring/native-cd-read-callback.json`"
+      ]
+    },
+    "Voice attribute SDK boundary": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Project evidence: Pandemonium2-xport/status/native-refactoring/native-spu-voice-attributes.json; original SDK functions7101C/71044/716A0/6FCA0."
+      ]
+    },
+    "SDK key operation and observed MIPS result": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "The expanded SpuKeyControl changes nested SPU_STATE layout. spu_state_io writes version2 and rejects version1 before the state payload; retain existing per-block size checks and early XA-readiness clearing on load. No complete failed-load rollback is promised."
+      ]
+    },
+    "Bounded native sticky VAB owner": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 cold bootstrap calls existing SsInit before defaults/RunGame and migrates all former VAB globals/header allocations to this owner.",
+        "Apocalypse uses its existing native manager/legacy VAB API path.",
+        "Source coordination and pending final Debug checks: Pandemonium2-xport/status/native-refactoring/native-vab-single-owner.json."
+      ]
+    },
+    "Native by-value NRPN VAB attributes": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Source provenance and pending final Debug checks: Pandemonium2-xport/status/native-refactoring/nrpn-vab-handler-call-order.json. No intermediate execution verification is claimed."
+      ]
+    },
+    "Distinct scheduler Data Entry profile": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Source review is recorded in Pandemonium2-xport/status/native-refactoring/sequence-data-entry-contract.json; final Debug verification remains pending."
+      ]
+    },
+    "Common SEQ reference and coordinated migration": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 historical evidence is Pandemonium2-xport/status/audio/review-audio-clock-20261017.json; it does not verify subsequent structural refactoring.",
+        "Record interface decisions, edit ownership, migration state and unresolved differences in Pandemonium2-xport/status/native-refactoring/shared-sequence-coordination.json."
+      ]
+    },
+    "Common scheduler operations from the P2 reference": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Exact pre-move bodies, signatures and provenance are recorded in Pandemonium2-xport/status/native-refactoring/shared-sequence-scheduler-core.json and its linked baseline."
+      ]
+    },
+    "Common reference SEQ events and transport": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "P2 original functions now retain their image/address markers and delegate to these algorithms.",
+        "Exact original functions, pre-move bodies, interfaces, lifetime constraints and pending final Debug x86 validation: Pandemonium2-xport/status/native-refactoring/shared-sequence-events.json and shared-sequence-transport.json."
+      ]
+    },
+    "Common reference SEQ open, clock and mutable owners": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Current receipts: Pandemonium2-xport/status/native-refactoring/shared-sequence-open-clock.json and shared-sequence-core-owner.json.39 original P2 SEQ operations are structurally shared.",
+        "P2 original marker bridges remain."
+      ]
+    },
+    "Common reference voice backend and lifecycle": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Receipts and pre-move bodies: Pandemonium2-xport/status/native-refactoring/shared-sequence-voice-backend.json and shared-sequence-voice-lifecycle.json.25 voice/backend operations join the39 SEQ operations already extracted."
+      ]
+    },
+    "Common P2 SPU device and callback-driver lifecycle": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Receipt and original pre-move bodies: Pandemonium2-xport/status/native-refactoring/shared-spu-device-lifecycle.json.",
+        "P2 now keeps all94 p2_sdk entries in src/psyq_bindings.cpp, with original marker bindings; five empty historical SDK modules were removed and the Windows build input was updated in the earlier binding relocation.70 original SEQ/SPU/platform algorithms have been extracted."
+      ]
+    },
+    "FMV.md": {
+      "kind": "Historical provenance, not current API policy",
+      "notes": [
+        "- P2 evidence: `Pandemonium2-xport/status/enhance/webcodecs-coordination.json`. Its browser transport fixture is `tools/serve_video_check.py`; the current report distinguishes low-level RGB/PCM testing from game/SPU and listening acceptance"
+      ]
+    },
+    "Former guest VLC boundary": {
+      "kind": "Historical provenance, not current API policy",
+      "notes": [
+        "## Guest VLC state boundary\n\n- Compile `src/psx_vlc_guest.c` when using `DecDCTvlcSize2PSX`, `DecDCTvlcBuildPSX` or `DecDCTvlc2PSX`; the existing pure native decoder remains in `src/psx_vlc.c`\n- Call `psx_vlc_bind_guest(state_address, table_source, size_add_pc, decode_entry)` before these entries. Bind original image addresses and the reviewed matching SDK instruction layout; each entry aborts when its required binding is absent\n- The state block contains limit at0, nine continuation words at4..36 and final output end at40. Inputs, tables and outputs remain numeric guest addresses accessed through standard scalar memory services\n- Preserve the original compressed table expansion, forward overlapping copies, halfword XOR phase, continuation publication, signed ADD/ADDI/SUB traps and sentinel fill. Native callback/configuration pointers never enter the guest state block\n- AC3 evidence and executable checks: `AceCombat3-xport/status/function-coverage/first/integration-vlc-review.json`; run `python -B tools/test_native_vlc_table.py` then `python -B tools/test_native_vlc_decode.py` from that project\n- These checks cover the table bytes, selected VLC streams, continuation state and trap PCs. They do not prove MDEC DMA/device behavior, movie presentation or malformed-stream coverage\n\n"
+      ]
+    },
+    "PSYQ_VIDEO.md": {
+      "kind": "Historical provenance, not current API policy",
+      "notes": [
+        "SDK evidence: `NFSHS-xport/tools/audit_mdec_callback_sdk.py` and `status/mdec-callback-sdk-evidence.json`.",
+        "Original owner and x86/WASM regression: `NFSHS-xport/tools/test_mdec_dma_callback_abi.py` and `status/mdec-dma-callback-current.json`."
+      ]
+    },
+    "LIBRARY_SYSTEM.md": {
+      "kind": "Historical provenance, not current API policy",
+      "notes": [
+        "NFSHS independently interprets the PsyQ 3.6 and 4.5 `INLINE_C.H` transfer programs and compares 17 actual helpers in an x86 Release harness: `NFSHS-xport/tools/test_gte_transfer_abi.py` and `status/gte-transfer-abi-comparison.json`.",
+        "Current-source runtime and graphics checks: `RapidRacer-xport/tools/check.py`."
+      ]
+    },
+    "LIBRARY_VIDEO.md": {
+      "kind": "Historical provenance, not current API policy",
+      "notes": [
+        "For Rapid Racer use tools/check.py and status/checks.json; build and test Release only when explicitly requested and authorized by that project's user policy."
+      ]
+    }
+  }
+}

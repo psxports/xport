@@ -20,7 +20,7 @@ Catalog SHA-256: `91d19b491790bbfedd092bf28e9304ac48c52344ce9300c41baea1cc7b857b
 
 ## Comparison
 
-Both detectors were checked against the same original bytes. Ghidra counts include alternative labels from preserved raw detector reports, with versions deduplicated and technical `loc_`/`text_` names removed. “All xport” includes weak and ambiguous candidates. “Confirmed” requires a unique strongest eligible name and no unresolved relocations. These are symbol addresses, not function counts. The last column separately counts entire original IDA bodies inside strong fully checked SDK spans; some internal bodies have no recovered SDK name.
+Both detectors were checked against the same original bytes. Ghidra counts include alternative labels from preserved raw detector reports, with versions deduplicated and technical `loc_`/`text_` names removed. РІР‚СљAll xportРІР‚Сњ includes weak and ambiguous candidates. РІР‚СљConfirmedРІР‚Сњ requires a unique strongest eligible name and no unresolved relocations. These are symbol addresses, not function counts. The last column separately counts entire original IDA bodies inside strong fully checked SDK spans; some internal bodies have no recovered SDK name.
 
 | Project / image | Ghidra addresses | All xport | Confirmed names | Additional confirmed names | Ghidra only | Confirmed SDK bodies / verified original bodies |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

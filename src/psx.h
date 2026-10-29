@@ -20,18 +20,18 @@ extern "C"
 #endif
 
     /* Access shared guest memory through stable debugger symbols */
-    GDB_CALL uint8 r_u8(uint32 address);
-    GDB_CALL uint16 r_u16(uint32 address);
-    GDB_CALL uint32 r_u32(uint32 address);
+    uint8 r_u8(uint32 address);
+    uint16 r_u16(uint32 address);
+    uint32 r_u32(uint32 address);
     /* Return the aligned word and observe the active LWL/LWR byte lanes */
-    GDB_CALL uint32 r_masked_u32(uint32 address, uint32 byte_mask);
-    GDB_CALL sint8 r_s8(uint32 address);
-    GDB_CALL sint16 r_s16(uint32 address);
-    GDB_CALL sint32 r_s32(uint32 address);
-    GDB_CALL sint32(w_u8)(uint32 address, uint32 value);
-    GDB_CALL sint32(w_u16)(uint32 address, uint32 value);
-    GDB_CALL sint32(w_u32)(uint32 address, uint32 value);
-    GDB_CALL sint32(w_masked_u32)(uint32 address, uint32 value, uint32 byte_mask);
+    uint32 r_masked_u32(uint32 address, uint32 byte_mask);
+    sint8 r_s8(uint32 address);
+    sint16 r_s16(uint32 address);
+    sint32 r_s32(uint32 address);
+    sint32(w_u8)(uint32 address, uint32 value);
+    sint32(w_u16)(uint32 address, uint32 value);
+    sint32(w_u32)(uint32 address, uint32 value);
+    sint32(w_masked_u32)(uint32 address, uint32 value, uint32 byte_mask);
 
 /* Use the PsyQ name instead of the Windows API macro */
 #ifdef OpenEvent
@@ -386,7 +386,7 @@ extern "C"
     struct PsxGteContext
     {
         PsxGteSnapshot registers;
-        uint32 lzcs, lzcr;
+        uint32 lzcs, lzcr, res1;
         uint16 ofx_frac, ofy_frac;
     };
 
@@ -396,20 +396,8 @@ extern "C"
     extern "C"
     {
 #endif
-#if defined(LOCKSTEP_DEBUG)
-        extern uint8 (*xport_lockstep_dram)[PSX_DRAM_SIZE];
-        extern uint32 (*xport_lockstep_scratchpad)[256];
-    #if defined(_MSC_VER)
-        extern __declspec(dllexport) const volatile PsxGteSnapshot *xport_lockstep_gte_state;
-    #else
-        extern const volatile PsxGteSnapshot *xport_lockstep_gte_state;
-    #endif
-    #define DRAM (*xport_lockstep_dram)
-    #define SCRATCHPAD (*xport_lockstep_scratchpad)
-#else
 extern uint32 SCRATCHPAD[256];
 extern uint8 DRAM[PSX_DRAM_SIZE];
-#endif
 
 /* PsyQ LIBETC offsets are 32-bit words in the single shared scratchpad */
 #define getScratchAddr(offset) (&SCRATCHPAD[(uint32)(offset)])
@@ -449,9 +437,6 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 psx_clock_cancel(PsxClock *clock, uint32 id);
         sint32 psx_clock_run(PsxClock *clock, uint64 until, uint32 event_budget);
         void psx_vblank_bind(PsxVBlankWait wait, void *context, uint32 initial_count);
-#if defined(LOCKSTEP_DEBUG)
-        sint32 psx_wait_events_resume(void);
-#endif
         void psx_vblank_signal(void);
         sint32 psx_wait_events(void);
         sint32 psx_callbacks_allowed(void);
@@ -1277,6 +1262,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         sint32 DrawSync(sint32 mode);
         void DrawPrim(void *primitive);
         void DrawOTag(uint32 *ot);
+        uint32 BreakDraw(void);
         uint32 *ClearOTagRNativePSX(uint32 *ot, sint32 count, uint32 header_address, uint32 header_target);
         uint32 *ClearOTagRPSX(uint32 *ot, sint32 count, uint32 header_address, uint32 header_target, uint32 guest_ot);
         uint32 DrawOTagPSX(uint32 guest_ot);
@@ -1720,20 +1706,6 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #endif
 
         void pad_publish(sint32 controller, sint32 connected, uint16 buttons);
-
-        typedef struct PsxPadReplayBinding
-        {
-            uint32 buffers[2];
-            uint32 active;
-            sint32 main_modes[2];
-        } PsxPadReplayBinding;
-
-        sint32 pad_bind_replay(const PsxPadReplayBinding *binding);
-        sint32 pad_publish_replay(sint32 controller, const uint8 *report, uint32 length);
-        sint32 pad_replay_failed(void);
-        sint32 pad_replay_is_bound(void);
-        sint32 pad_lockstep_apply(sint32 controller, uint32 type, uint32 buttons, uint32 analog);
-        int pad_state_io(FILE *file, int load);
 
 #if defined(__cplusplus)
     }

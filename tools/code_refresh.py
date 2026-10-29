@@ -52,15 +52,12 @@ def write_json(path,value):
 
 def refresh_artifacts(root,items):
     from source_context import compact
-    from trace_audit_packet import audit
     result=[]
     for item in items:
         started=time.perf_counter();kind=item['kind'];output=artifact_path(item['output'])
         if kind=='source_context':
             value=compact(item['image'],int(str(item['address']),0),item.get('budget',12000),item.get('full_source',False),
                 int(str(item['mips_address']),0) if item.get('mips_address') is not None else None,item.get('source_line'),item.get('pseudo_line'))
-        elif kind=='trace_audit_packet':
-            value=audit(int(str(item['site']),0),item.get('image'),item.get('state'),item.get('radius',32),item.get('pseudo_line'))
         else:raise ValueError('Unknown code_refresh artifact kind: '+kind)
         write_json(output,value)
         result.append(dict(kind=kind,path=output.relative_to(root).as_posix(),sha256=digest(output),seconds=round(time.perf_counter()-started,3)))
@@ -92,6 +89,8 @@ def main():
     report_path=artifact_path(settings.get('report','status/code-refresh-latest.json'));log_path=artifact_path(settings.get('log','status/code-refresh-latest.log'))
     build=settings.get('build')
     try:
+        if build and not args.no_build and build.get('configuration', 'Debug') != 'Debug':
+            raise ValueError('code_refresh uses Debug; final Release uses build_native --configuration Release')
         if settings.get('source_index',True):
             from source_index import rebuild
             at=time.perf_counter();steps['source_index']=rebuild(format_changed=not args.no_format);steps['source_index']['seconds']=round(time.perf_counter()-at,3)
@@ -119,6 +118,8 @@ def main():
         steps['translation_queue']=queue(root,project,limit=1)['counts']
         database=(root/project['paths']['analysis_database']).resolve();steps['database']=database_check(database)
         if steps['database']['integrity']!='ok' or steps['database']['foreign_key_errors']:raise RuntimeError('SQLite validation failed')
+        from xport_project import stage_sources
+        steps['git_index'] = stage_sources(root)
     except Exception as error:
         failure=type(error).__name__+': '+str(error)
     report=dict(version=1,project=project['name'],result='FAIL' if failure else 'PASS',seconds=round(time.perf_counter()-started,3),steps=steps,error=failure)

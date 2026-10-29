@@ -61,27 +61,6 @@ typedef struct XportMemoryRef
     uint32 guest_address;
 } XportMemoryRef;
 
-typedef enum MEMORY_REGION
-{
-    MEMORY_REGION_DRAM = 0,
-    MEMORY_REGION_SCRATCHPAD = 1
-} MEMORY_REGION;
-
-typedef enum MEMORY_EXCEPTION_KIND
-{
-    MEMORY_EXCEPTION_GUEST_STACK = 0,
-    MEMORY_EXCEPTION_FIRMWARE_RUNTIME = 1,
-    MEMORY_EXCEPTION_TRUSTED_DEVICE_STATE = 2
-} MEMORY_EXCEPTION_KIND;
-
-typedef struct MEMORY_EXCEPTION
-{
-    uint32 region;
-    uint32 offset;
-    uint32 size;
-    uint32 kind;
-} MEMORY_EXCEPTION;
-
 #if defined(__cplusplus)
 extern "C"
 {
@@ -104,6 +83,8 @@ extern "C"
     uint8 xport_load_u8(const void *pointer);
     uint16 xport_load_le16(const void *pointer);
     uint32 xport_load_le32(const void *pointer);
+    sint16 xport_load_le_s16(const void *pointer);
+    sint32 xport_load_le_s32(const void *pointer);
     sint32 xport_store_u8(void *pointer, uint32 value);
     sint32 xport_store_le16(void *pointer, uint32 value);
     sint32 xport_store_le32(void *pointer, uint32 value);
@@ -112,10 +93,6 @@ extern "C"
     XportMemoryRef xport_guest_ref(uint32 address);
     sint32 xport_guest_copy(XportMemoryRef destination, XportMemoryRef source, size_t length);
     sint32 xport_guest_fill(uint32 destination, uint8 value, size_t length);
-    extern const MEMORY_EXCEPTION xport_memory_exceptions[];
-    extern const uint32 xport_memory_exception_count;
-    extern const MEMORY_EXCEPTION game_memory_exceptions[];
-    extern const uint32 game_memory_exception_count;
 
 #if defined(__cplusplus)
 }
@@ -256,14 +233,6 @@ typedef struct XportAuditRecord
 
 typedef void (*XportAuditSink)(void *user, const XportAuditRecord *record);
 
-#if defined(LOCKSTEP_DEBUG)
-    #if defined(_MSC_VER)
-        #include <intrin.h>
-        #define XPORT_AUDIT_RETURN_ADDRESS() ((uintptr_t)_ReturnAddress())
-    #else
-        #define XPORT_AUDIT_RETURN_ADDRESS() ((uintptr_t)__builtin_return_address(0))
-    #endif
-#endif
 
 #if defined(__cplusplus)
 extern "C"
@@ -271,10 +240,6 @@ extern "C"
 #endif
     void xport_audit_bind(XportAuditSink sink, void *user);
     void xport_audit_emit(XportAuditKind kind, const char *image, uint32_t address, const char *name, const char *function, const char *file, int line);
-#if defined(LOCKSTEP_DEBUG)
-    void xport_lockstep_function_marker(const char *image, uint32_t address, const char *function, const char *file, uint32_t line, uintptr_t host_return_address);
-    void xport_lockstep_function_marker_args(const char *image, uint32_t address, const char *function, const char *file, uint32_t line, uint32_t return_kind, uintptr_t host_return_address, uint32_t argument_count, ...);
-#endif
 #if defined(__cplusplus)
 }
 #endif
@@ -290,11 +255,7 @@ extern "C"
     #define XPORT_WIP(image, address, name) ((void)0)
     #define XPORT_FAILURE(image, address, name) ((void)0)
 #endif
-#if defined(LOCKSTEP_DEBUG)
-    #define FUNCTION_MARKER_ARGS(address, image, return_kind, argument_count, ...) xport_lockstep_function_marker_args((image), (uint32)(address), __func__, __FILE__, __LINE__, (return_kind), XPORT_AUDIT_RETURN_ADDRESS(), (argument_count), __VA_ARGS__)
-#else
     #define FUNCTION_MARKER_ARGS(address, image, return_kind, argument_count, ...) FUNCTION_MARKER((address), (image))
-#endif
 #define FUNCTION_MARKER_ALIAS(address, image) FUNCTION_MARKER((address), (image))
 
 typedef enum XportCallEdge
@@ -472,272 +433,6 @@ extern "C"
 }
 #endif
 
-#if defined(LOCKSTEP_DEBUG)
-    #if !defined(LOCKSTEP_DEBUG)
-        #error xport_trace.h requires LOCKSTEP_DEBUG
-    #endif
-
-    #if !defined(_WIN32) || !defined(_M_IX86)
-        #error LOCKSTEP_DEBUG requires Windows x86
-    #endif
-
-    #include <stddef.h>
-    #include "psx.h"
-
-    #define XPORT_LOCKSTEP_RUN_ID_LENGTH 32u
-    #define XPORT_LOCKSTEP_MAPPING_NAME_CAPACITY 96u
-    #define XPORT_LOCKSTEP_DEFERRED_MAGIC 0x44504C58u
-    #define XPORT_LOCKSTEP_DEFERRED_VERSION 12u
-    #define XPORT_LOCKSTEP_DEFERRED_MAX_RANGES 511u
-    #define XPORT_LOCKSTEP_DEFERRED_MAX_CANONICAL_RANGES 32u
-    #define XPORT_LOCKSTEP_SPU_EVENT_CAPACITY 4096u
-
-typedef enum XportLockstepSpuEventKind
-{
-    XPORT_LOCKSTEP_SPU_KEY_ON_LOW = 1,
-    XPORT_LOCKSTEP_SPU_KEY_ON_HIGH = 2,
-    XPORT_LOCKSTEP_SPU_KEY_OFF_LOW = 3,
-    XPORT_LOCKSTEP_SPU_KEY_OFF_HIGH = 4,
-    XPORT_LOCKSTEP_SPU_VOICE_READ = 5
-} XportLockstepSpuEventKind;
-
-typedef struct XportLockstepSpuEvent
-{
-    uint32 kind;
-    uint32 address;
-    uint32 value;
-    uint32 ticks_low;
-    uint32 ticks_high;
-} XportLockstepSpuEvent;
-
-typedef struct XportLockstepDeferredRange
-{
-    uint32 region;
-    uint32 offset;
-    uint32 size;
-} XportLockstepDeferredRange;
-
-typedef struct XportLockstepDeferredState
-{
-    uint32 magic;
-    uint32 version;
-    volatile uint32 sequence;
-    volatile uint32 generation;
-    volatile uint32 range_count;
-    volatile uint32 boundary_count;
-    volatile uint32 catchup_count;
-    volatile uint32 open;
-    volatile uint32 resolved;
-    volatile uint32 canonical_count;
-    XportLockstepDeferredRange ready;
-    XportLockstepDeferredRange canonical[XPORT_LOCKSTEP_DEFERRED_MAX_CANONICAL_RANGES];
-    XportLockstepDeferredRange ranges[XPORT_LOCKSTEP_DEFERRED_MAX_RANGES];
-    volatile uint32 device_sequence;
-    volatile uint32 device_ticks_low;
-    volatile uint32 device_ticks_high;
-    volatile uint32 spu_timeline_active;
-    volatile uint32 spu_timeline_write;
-    volatile uint32 spu_timeline_read;
-    volatile uint32 spu_timeline_error;
-    XportLockstepSpuEvent spu_events[XPORT_LOCKSTEP_SPU_EVENT_CAPACITY];
-    volatile uint32 device_clock_low;
-    volatile uint32 device_clock_high;
-    volatile uint32 original_frame_boundary;
-} XportLockstepDeferredState;
-
-typedef enum XportLockstepMemoryError
-{
-    XPORT_LOCKSTEP_MEMORY_OK = 0,
-    XPORT_LOCKSTEP_MEMORY_MISSING_ENVIRONMENT,
-    XPORT_LOCKSTEP_MEMORY_INVALID_RUN_ID,
-    XPORT_LOCKSTEP_MEMORY_INVALID_MAPPING_NAME,
-    XPORT_LOCKSTEP_MEMORY_MAPPING_COLLISION,
-    XPORT_LOCKSTEP_MEMORY_CREATE_FAILED,
-    XPORT_LOCKSTEP_MEMORY_MAP_FAILED,
-    XPORT_LOCKSTEP_MEMORY_ALREADY_INITIALIZED
-} XportLockstepMemoryError;
-
-typedef struct XportLockstepMemoryIdentity
-{
-    char run_id[XPORT_LOCKSTEP_RUN_ID_LENGTH + 1u];
-    char dram_mapping[XPORT_LOCKSTEP_MAPPING_NAME_CAPACITY];
-    char scratchpad_mapping[XPORT_LOCKSTEP_MAPPING_NAME_CAPACITY];
-    char deferred_mapping[XPORT_LOCKSTEP_MAPPING_NAME_CAPACITY];
-    uint32 dram_size;
-    uint32 scratchpad_size;
-    uint32 deferred_size;
-} XportLockstepMemoryIdentity;
-
-    #if defined(__cplusplus)
-extern "C"
-{
-    #endif
-    #if defined(_MSC_VER)
-    __declspec(dllexport) __declspec(noinline) void xport_lockstep_memory_ready(void);
-    #else
-__attribute__((visibility("default"), noinline)) void xport_lockstep_memory_ready(void);
-    #endif
-    sint32 xport_lockstep_memory_init(void);
-    void xport_lockstep_memory_shutdown(void);
-    XportLockstepMemoryError xport_lockstep_memory_error(void);
-    const char *xport_lockstep_memory_error_name(XportLockstepMemoryError error);
-    const XportLockstepMemoryIdentity *xport_lockstep_memory_identity(void);
-    size_t xport_lockstep_device_checkpoint_size(void);
-    sint32 xport_lockstep_device_checkpoint_capture(void *data, size_t size);
-    sint32 xport_lockstep_device_checkpoint_restore(const void *data, size_t size);
-    sint32 xport_lockstep_device_clock(uint64 *ticks);
-    sint32 xport_lockstep_device_frame_boundary(void);
-    sint32 xport_lockstep_spu_timeline_active(void);
-    sint32 xport_lockstep_spu_event_consume(XportLockstepSpuEventKind kind, uint32 address, uint32 *value, sint32 validate_value, uint64 *ticks);
-    sint32 xport_lockstep_deferred_begin(void);
-    sint32 xport_lockstep_deferred_active(void);
-    sint32 xport_lockstep_deferred_add(XportMemoryRegion region, uint32 offset, uint32 size);
-    sint32 xport_lockstep_deferred_ready(XportMemoryRegion region, uint32 offset, uint32 size);
-    sint32 xport_lockstep_deferred_canonical(XportMemoryRegion region, uint32 offset, uint32 size);
-    void xport_lockstep_deferred_boundary(void);
-    uint32 xport_lockstep_deferred_boundary_count(void);
-    uint32 xport_lockstep_deferred_range_count(void);
-    uint32 xport_lockstep_deferred_take_catchup(void);
-    sint32 xport_lockstep_deferred_resolved(void);
-    sint32 xport_lockstep_deferred_commit(void);
-    #if defined(__cplusplus)
-}
-    #endif
-    #if !defined(LOCKSTEP_DEBUG)
-        #error xport_trace.h requires LOCKSTEP_DEBUG
-    #endif
-
-    #include <stdint.h>
-
-    #if defined(_MSC_VER)
-        #include <intrin.h>
-    #endif
-
-    #define XPORT_LOCKSTEP_BOUNDARY_CONTRACT "xport-lockstep-native-boundary-v1"
-    #define XPORT_LOCKSTEP_BOUNDARY_MAX_VALUES 16u
-
-typedef enum LOCKSTEP_BOUNDARY_KIND
-{
-    XPORT_LOCKSTEP_PRE_CALL = 1,
-    XPORT_LOCKSTEP_VBLANK = 4,
-    XPORT_LOCKSTEP_MODE_TRANSITION = 5
-} LOCKSTEP_BOUNDARY_KIND;
-
-typedef enum LOCKSTEP_MODE
-{
-    LOCKSTEP_MODE_DETAILED = 0,
-    LOCKSTEP_MODE_PREFIX_GUARD = 1
-} LOCKSTEP_MODE;
-
-typedef struct LOCKSTEP_BOUNDARY_HIT
-{
-    uint32 schema;
-    LOCKSTEP_BOUNDARY_KIND kind;
-    uint64 sequence;
-    const char *contract;
-    const char *image;
-    uint32 address;
-    const char *function;
-    const char *file;
-    uint32 line;
-    const XportCallValue *arguments;
-    uint32 argument_count;
-    XportCallValueKind return_kind;
-    uintptr_t host_return_address;
-    uint32 frame;
-    uint32 controller_type[2];
-    uint32 controller_buttons[2];
-    uint32 controller_analog[2];
-    PsxGteSnapshot gte;
-} LOCKSTEP_BOUNDARY_HIT;
-
-    #if defined(_MSC_VER)
-        #define XPORT_LOCKSTEP_NOINLINE __declspec(noinline)
-        #define XPORT_LOCKSTEP_EXPORT __declspec(dllexport)
-    #else
-        #define XPORT_LOCKSTEP_NOINLINE __attribute__((noinline))
-        #define XPORT_LOCKSTEP_EXPORT __attribute__((visibility("default")))
-    #endif
-
-    #if defined(__cplusplus)
-extern "C"
-{
-    #endif
-    extern XPORT_LOCKSTEP_EXPORT const char xport_lockstep_boundary_contract[];
-    extern XPORT_LOCKSTEP_EXPORT const volatile LOCKSTEP_BOUNDARY_HIT *xport_lockstep_last_hit;
-    extern XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_mode;
-    extern XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_epoch;
-    extern XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_target_frame;
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_boundary_break(const LOCKSTEP_BOUNDARY_HIT *hit);
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_vblank_break(const LOCKSTEP_BOUNDARY_HIT *hit);
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_transition_break(const LOCKSTEP_BOUNDARY_HIT *hit);
-    void xport_lockstep_function_marker(const char *image, uint32 address, const char *function, const char *file, uint32 line, uintptr_t host_return_address);
-    void xport_lockstep_boundary_emit(const char *image, uint32 address, const char *function, const char *file, uint32 line, const XportCallValue *arguments, uint32 argument_count, XportCallValueKind return_kind, uintptr_t host_return_address);
-    void xport_lockstep_boundary_frame(const char *image, uint32 frame, const uint32 type[2], const uint32 buttons[2], const uint32 analog[2]);
-    void xport_lockstep_boundary_set_frame(uint32 frame);
-    void xport_lockstep_boundary_configure(uint32 target_frame);
-    void xport_lockstep_boundary_resume_from_checkpoint(uint32 next_frame);
-    #if defined(__cplusplus)
-}
-    #endif
-
-    #if defined(_MSC_VER)
-        #define XPORT_LOCKSTEP_RETURN_ADDRESS() ((uintptr_t)_ReturnAddress())
-    #else
-        #define XPORT_LOCKSTEP_RETURN_ADDRESS() ((uintptr_t)__builtin_return_address(0))
-    #endif
-
-    #define XPORT_LOCKSTEP_BOUNDARY(address, image, values, value_count, return_kind) xport_lockstep_boundary_emit((image), (uint32)(address), __func__, __FILE__, __LINE__, (values), (value_count), (return_kind), XPORT_LOCKSTEP_RETURN_ADDRESS())
-    #if !defined(LOCKSTEP_DEBUG)
-        #error xport_trace.h requires LOCKSTEP_DEBUG
-    #endif
-
-    #include "xport.h"
-
-    #define XPORT_LOCKSTEP_INPUT_MAGIC "XPLSREC1"
-    #define XPORT_LOCKSTEP_INPUT_VERSION 1u
-    #define XPORT_LOCKSTEP_INPUT_HEADER_SIZE 64u
-    #define XPORT_LOCKSTEP_INPUT_ENTRY_SIZE 28u
-
-    #if defined(__cplusplus)
-extern "C"
-{
-    #endif
-    sint32 xport_lockstep_frame_init(const char *image);
-    void xport_lockstep_frame_shutdown(void);
-    sint32 xport_lockstep_frame_done(void);
-    sint32 xport_lockstep_frame_begin_at(uint32 next_frame);
-    uint32 xport_lockstep_frame_next(void);
-    sint32 xport_lockstep_frame_resume(uint32 next_frame);
-    sint32 xport_lockstep_frame_apply_watch_request(void);
-    const char *xport_lockstep_frame_error(void);
-    #if defined(__cplusplus)
-}
-    #endif
-    #if !defined(LOCKSTEP_DEBUG)
-        #error xport_trace.h requires LOCKSTEP_DEBUG
-    #endif
-    #include <setjmp.h>
-
-    #if defined(__cplusplus)
-extern "C"
-{
-    #endif
-    extern XPORT_LOCKSTEP_EXPORT jmp_buf xport_lockstep_checkpoint_context;
-    extern XPORT_LOCKSTEP_EXPORT volatile uint32 xport_lockstep_checkpoint_valid;
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE sint32 xport_lockstep_checkpoint_capture(void);
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_checkpoint_jump(void);
-    void xport_lockstep_checkpoint_bind(sint32 (*prepare)(void));
-    XPORT_LOCKSTEP_EXPORT XPORT_LOCKSTEP_NOINLINE void xport_lockstep_checkpoint_committed_break(void);
-    void xport_lockstep_checkpoint_invalidate(void);
-    void xport_lockstep_checkpoint_resumed(void);
-    sint32 xport_lockstep_checkpoint_save_portable(const char *path);
-    sint32 xport_lockstep_checkpoint_load_portable(const char *path, uint32 *next_frame);
-    #if defined(__cplusplus)
-}
-    #endif
-
-#endif
 
 /* Diagnostic streams */
 #include <stdio.h>
@@ -787,7 +482,6 @@ extern "C"
     int xport_trace_open_suffix(FILE **stream, const char *base, const char *suffix, const char *mode);
     int xport_trace_open_streams(XportTraceStreams *streams, const char *phase_path, const char *calls_path, const char *output_base, const char *phase_mode, const char *calls_mode);
     int xport_trace_close_streams(XportTraceStreams *streams);
-    int xport_trace_read_context(const char *checkpoint, uint32_t magic, uint32_t pc, uint32_t phase, uint32_t values[12]);
     int xport_trace_write_progress(const char *path, uint32_t sequence, const uint32_t *values, size_t count);
 #if defined(__cplusplus)
 }

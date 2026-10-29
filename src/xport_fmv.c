@@ -6,6 +6,109 @@
 #include "psx_spu.h"
 #include "psx_stream.h"
 
+#if defined(AP_WEB)
+extern sint32 xport_web_fmv_open(const char *path);
+extern sint32 xport_web_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame);
+extern void xport_web_fmv_pause(sint32 paused);
+extern void xport_web_fmv_close(void);
+#endif
+
+static XportFmvBackend source_backend;
+static void *source_context;
+static sint32 source_active;
+static sint32 source_audio_active;
+static sint32 player_active;
+
+static sint32 fmv_uses_source(void)
+{
+#if defined(AP_WEB)
+    return 1;
+#else
+    return source_backend.open != NULL;
+#endif
+}
+
+sint32 xport_fmv_set_backend(const XportFmvBackend *backend, void *context)
+{
+    if (source_active || player_active || (backend && (!backend->open || !backend->next || !backend->pause || !backend->close)))
+        return 0;
+    if (backend)
+        source_backend = *backend;
+    else
+        memset(&source_backend, 0, sizeof(source_backend));
+    source_context = context;
+    return 1;
+}
+
+sint32 xport_fmv_open(const char *path)
+{
+    sint32 result;
+    if (!path || source_active)
+        return -1;
+    if (source_backend.open)
+    {
+        result = source_backend.open(source_context, path);
+        if (result > 0 && source_backend.audio && (!source_backend.has_audio || source_backend.has_audio(source_context)))
+        {
+            spu_set_cd_pcm_source(source_backend.audio, source_context);
+            source_audio_active = 1;
+        }
+    }
+    else
+    {
+#if defined(AP_WEB)
+        result = xport_web_fmv_open(path);
+#else
+        result = -1;
+#endif
+    }
+    source_active = result > 0;
+    return result;
+}
+
+sint32 xport_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
+{
+    if (!source_active || !rgb || !frame)
+        return -1;
+    if (source_backend.next)
+        return source_backend.next(source_context, rgb, capacity, frame);
+#if defined(AP_WEB)
+    return xport_web_fmv_next(rgb, capacity, frame);
+#else
+    return -1;
+#endif
+}
+
+void xport_fmv_pause(sint32 paused)
+{
+    if (!source_active)
+        return;
+    if (source_backend.pause)
+        source_backend.pause(source_context, paused);
+#if defined(AP_WEB)
+    else
+        xport_web_fmv_pause(paused);
+#endif
+}
+
+void xport_fmv_close(void)
+{
+    if (!source_active)
+        return;
+    if (source_backend.close)
+    {
+        if (source_audio_active)
+            spu_set_cd_pcm_source(NULL, NULL);
+        source_backend.close(source_context);
+    }
+#if defined(AP_WEB)
+    else
+        xport_web_fmv_close();
+#endif
+    source_active = 0;
+    source_audio_active = 0;
+}
+
 enum
 {
     FMV_RING_SECTORS = 64,
@@ -16,9 +119,8 @@ enum
 
 typedef struct FmvBuffers
 {
-#if defined(AP_WEB)
     uint8 rgb[FMV_MAX_WIDTH * FMV_MAX_HEIGHT * 3];
-#else
+#if !defined(AP_WEB)
     uint32 ring[FMV_RING_SECTORS * 2048 / 4];
     uint32 vlc[FMV_VLC_WORDS];
 #endif
@@ -62,14 +164,17 @@ static void fmv_close(void)
 {
     if (!fmv.active)
         return;
-#if defined(AP_WEB)
-    xport_fmv_close();
-#else
-    CdControlB(CdlStop, NULL, NULL);
-    StUnSetRing();
-    StSetRing(NULL, 0);
-    cd_unmount_image();
-    DecDCTReset(1);
+    if (fmv_uses_source())
+        xport_fmv_close();
+#if !defined(AP_WEB)
+    else
+    {
+        CdControlB(CdlStop, NULL, NULL);
+        StUnSetRing();
+        StSetRing(NULL, 0);
+        cd_unmount_image();
+        DecDCTReset(1);
+    }
 #endif
     DecDCTinCallback(fmv.input);
     DecDCToutCallback(fmv.output);
@@ -85,6 +190,7 @@ static void fmv_close(void)
     free(fmv.buffers);
     fmv.buffers = NULL;
     fmv.active = 0;
+    player_active = 0;
 }
 
 static void fmv_shutdown(void)
@@ -147,7 +253,8 @@ static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const St
     }
     return 1;
 }
-#else
+#endif
+
 static sint32 fmv_upload_rgb(const XportFmvFrame *frame, sint32 page, const XportFmvPresentation *presentation)
 {
     uint32 x, y;
@@ -166,7 +273,6 @@ static sint32 fmv_upload_rgb(const XportFmvFrame *frame, sint32 page, const Xpor
     }
     return 1;
 }
-#endif
 
 sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 repeat, const XportFmvPresentation *presentation)
 {
@@ -185,7 +291,7 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     sint32 finishing = 0;
     uint32 finish_step = 1;
     uint64 last_frame;
-    if (path == NULL || fmv.active || (controllers & ~3) || !xport_window_init())
+    if (path == NULL || fmv.active || source_active || (controllers & ~3) || !xport_window_init())
         return -1;
     xport_fmv_discard_audio();
     if (presentation)
@@ -196,11 +302,13 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     buffers = (FmvBuffers *)malloc(sizeof(*buffers));
     if (buffers == NULL)
         return -1;
-#if defined(AP_WEB)
-    if (xport_fmv_open(path) <= 0)
+    if (fmv_uses_source() ? xport_fmv_open(path) <= 0 :
+#if !defined(AP_WEB)
+                          !cd_mount_stream_file(path)
 #else
-    if (!cd_mount_stream_file(path))
+                          1
 #endif
+    )
     {
         free(buffers);
         return -1;
@@ -226,13 +334,17 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     SpuSetCommonAttr(&sound);
     fmv.cleanup = xport_get_cleanup();
     fmv.active = 1;
+    player_active = 1;
     xport_set_cleanup(fmv_shutdown);
 #if !defined(AP_WEB)
-    DecDCTReset(0);
-    DecDCTvlcSize(0);
-    StSetRing(buffers->ring, FMV_RING_SECTORS);
-    StSetStream(1, 1, 0xFFFFFFF, NULL, NULL);
-    stream_set_read_mode(0xC0);
+    if (!fmv_uses_source())
+    {
+        DecDCTReset(0);
+        DecDCTvlcSize(0);
+        StSetRing(buffers->ring, FMV_RING_SECTORS);
+        StSetStream(1, 1, 0xFFFFFFF, NULL, NULL);
+        stream_set_read_mode(0xC0);
+    }
 #endif
     gpu_set_raster(1);
     SetDispMask(0);
@@ -242,20 +354,18 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     last_frame = xport_timer_get();
 #if !defined(AP_WEB)
     CdIntToPos(0, &location);
-    if (!CdControlB(CdlSeekL, (uint8 *)&location, NULL) || !CdRead2(0xC0))
+    if (!fmv_uses_source() && (!CdControlB(CdlSeekL, (uint8 *)&location, NULL) || !CdRead2(0xC0)))
         failed = 1;
 #endif
     while (!failed && !skipped && !ended)
     {
         uint32 buttons;
         sint32 presented = 0;
-#if defined(AP_WEB)
         XportFmvFrame decoded_frame;
         StHEADER video_header = {0};
         const StHEADER *header = &video_header;
-#else
+#if !defined(AP_WEB)
         uint32 *src = NULL, *record = NULL;
-        const StHEADER *header = NULL;
 #endif
         sint32 progress = 0;
         gpu_frame_begin();
@@ -285,31 +395,38 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
         else
         {
             if (!failed && !skipped)
-#if defined(AP_WEB)
             {
-                progress = xport_fmv_next(buffers->rgb, sizeof(buffers->rgb), &decoded_frame);
-                if (progress == 1)
+                if (fmv_uses_source())
                 {
-                    video_header.width = decoded_frame.width;
-                    video_header.height = decoded_frame.height;
-                    video_header.frameCount = decoded_frame.number;
+                    progress = xport_fmv_next(buffers->rgb, sizeof(buffers->rgb), &decoded_frame);
+                    if (progress == 1)
+                    {
+                        video_header.width = decoded_frame.width;
+                        video_header.height = decoded_frame.height;
+                        video_header.frameCount = decoded_frame.number;
+                    }
+                    failed = progress < 0;
                 }
-                if (progress < 0)
-                    failed = 1;
+#if !defined(AP_WEB)
+                else
+                {
+                    do
+                    {
+                        progress = stream_pump();
+                    } while (progress > 0);
+                    if (StGetNext(&src, &record) == 0)
+                    {
+                        header = (const StHEADER *)record;
+                        progress = 1;
+                    }
+                    else if (progress < 0)
+                        progress = 2;
+                }
+#endif
             }
             if (!skipped && !failed && progress == 1)
-#else
-                do
-                {
-                    progress = stream_pump();
-                } while (progress > 0);
-            if (!failed && !skipped && StGetNext(&src, &record) == 0)
-#endif
             {
                 PSX_RECT rectangle;
-#if !defined(AP_WEB)
-                header = (const StHEADER *)record;
-#endif
                 if (!fmv_rectangle(header->width, header->height, page, presentation, &rectangle))
                     failed = 1;
                 if (!failed && !width)
@@ -324,11 +441,14 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                 if (!failed && presentation && presentation->frame && presentation->frame(presentation->context, header->frameCount) <= 0)
                     failed = 1;
                 if (!failed)
-#if defined(AP_WEB)
-                    failed = !fmv_upload_rgb(&decoded_frame, page, presentation);
-#else
-                    failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation);
+                {
+                    if (fmv_uses_source())
+                        failed = !fmv_upload_rgb(&decoded_frame, page, presentation);
+#if !defined(AP_WEB)
+                    else
+                        failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation);
 #endif
+                }
                 if (!failed)
                 {
                     if (!width)
@@ -357,14 +477,11 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                         ended = 1;
                 }
 #if !defined(AP_WEB)
-                StFreeRing(src);
+                if (!fmv_uses_source())
+                    StFreeRing(src);
 #endif
             }
-#if defined(AP_WEB)
             else if (!skipped && progress == 2)
-#else
-            else if (!skipped && progress < 0)
-#endif
                 ended = 1;
         }
         if (xport_timer_get() - last_frame > 5000000)
@@ -373,25 +490,30 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
         if (!failed && !skipped && (!ended || presented))
             gpu_present();
 #if !defined(AP_WEB)
-        if (!failed && !skipped && ended && !repeat && !finishing)
+        if (!fmv_uses_source() && !failed && !skipped && ended && !repeat && !finishing)
             fmv_audio_ready = spu_save_xa_pcm();
 #endif
         if (!failed && !skipped && ended && repeat)
         {
-#if defined(AP_WEB)
-            xport_fmv_close();
-            if (xport_fmv_open(path) <= 0)
-                failed = 1;
-#else
-            if (!CdControlB(CdlStop, NULL, NULL))
-                failed = 1;
-            StClearRing();
-            DecDCTReset(0);
-            StSetStream(1, 1, 0xFFFFFFF, NULL, NULL);
-            stream_set_read_mode(0xC0);
-            CdIntToPos(0, &location);
-            if (!failed && (!CdControlB(CdlSeekL, (uint8 *)&location, NULL) || !CdRead2(0xC0)))
-                failed = 1;
+            if (fmv_uses_source())
+            {
+                xport_fmv_close();
+                if (xport_fmv_open(path) <= 0)
+                    failed = 1;
+            }
+#if !defined(AP_WEB)
+            else
+            {
+                if (!CdControlB(CdlStop, NULL, NULL))
+                    failed = 1;
+                StClearRing();
+                DecDCTReset(0);
+                StSetStream(1, 1, 0xFFFFFFF, NULL, NULL);
+                stream_set_read_mode(0xC0);
+                CdIntToPos(0, &location);
+                if (!failed && (!CdControlB(CdlSeekL, (uint8 *)&location, NULL) || !CdRead2(0xC0)))
+                    failed = 1;
+            }
 #endif
             ended = 0;
             last_frame = xport_timer_get();
@@ -403,10 +525,10 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                 failed = 1;
             else if (progress > 0)
             {
-#if defined(AP_WEB)
-                xport_fmv_pause(1);
-#else
-                if (!CdControlB(CdlStop, NULL, NULL))
+                if (fmv_uses_source())
+                    xport_fmv_pause(1);
+#if !defined(AP_WEB)
+                else if (!CdControlB(CdlStop, NULL, NULL))
                     failed = 1;
 #endif
                 finishing = 1;

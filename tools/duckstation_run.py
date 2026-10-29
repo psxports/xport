@@ -7,22 +7,10 @@ import shutil
 import time
 from xport_project import load_project, project_path
 from duckstation_runtime import (executable, data_directory, environment, launch_process,
-                                 validate_settings, record_owner, verify_owner, lockstep_timing_arguments)
+                                 validate_settings, record_owner, verify_owner)
 from gdb_endpoint import listener_process
-from lockstep_gdb import DuckStationLockstep
 
 
-def initialize_manual_runtime(config, port, visible):
-    adapter = DuckStationLockstep(config.get('host', '127.0.0.1'), port)
-    remote = adapter.remote
-    try:
-        if not remote.packet('?').startswith(('S', 'T')):
-            raise RuntimeError('DuckStation did not start paused')
-        adapter.configure_wait_points(config['wait_points'], config.get('sio_delay'))
-        if visible:
-            remote.resume_acknowledged()
-    finally:
-        remote.close()
 
 
 def show_existing_window(pid):
@@ -62,7 +50,6 @@ def main():
     parser.add_argument('--slot',type=int)
     parser.add_argument('--visible',action='store_true')
     parser.add_argument('--plan',action='store_true')
-    parser.add_argument('--lockstep-timing',action='store_true')
     args=parser.parse_args()
     if args.disc and args.game_exe:
         parser.error('--disc cannot be combined with --game-exe')
@@ -73,10 +60,6 @@ def main():
     validate_settings(data,port)
     exe=executable()
     command=[str(exe),'-fastboot']
-    if args.lockstep_timing:
-        if not config['duckstation'].get('wait_points'):
-            parser.error('--lockstep-timing requires project duckstation.wait_points')
-        command[1:1] = lockstep_timing_arguments(exe)
     boot = data/'boot.exe'
     if not args.visible:command.append('-batch')
     if args.state:
@@ -87,8 +70,6 @@ def main():
     if args.game_exe:
         command.append(str(boot))
     else:
-        if args.lockstep_timing and not args.state and args.slot is None:
-            command.extend(['-exe', str(boot)])
         command.append(str(args.disc.resolve(strict=True) if args.disc else project_path('disc_image')))
     if args.plan:
         print(json.dumps({'command':command,'data_directory':str(data),'port':port,'visible':args.visible}))
@@ -100,7 +81,7 @@ def main():
             verify_owner(data, port, owner)
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             parser.exit(1, f'Port {port} belongs to an unverified process (PID {owner["Id"]}); no changes made. {error}\n')
-        if not args.visible or args.state or args.slot is not None or args.game_exe or args.lockstep_timing or args.disc:
+        if not args.visible or args.state or args.slot is not None or args.game_exe or args.disc:
             parser.exit(1, f'DuckStation is already running for this role (PID {owner["Id"]}, port {port}). Close it before starting another scenario; its current state was preserved.\n')
         focused = show_existing_window(owner['Id'])
         print('DuckStation is already running.' if focused else
@@ -108,11 +89,11 @@ def main():
         return
     ini=configparser.ConfigParser(interpolation=None);ini.optionxform=str
     ini.read(data/'settings.ini',encoding='utf-8-sig')
-    ini['Main']['StartPaused']='true' if args.lockstep_timing else 'false'
+    ini['Main']['StartPaused']='false'
     ini['Main']['EmulationSpeed']='1' if args.visible else '0'
     ini['BIOS']['PatchFastBoot']='true'
     with (data/'settings.ini').open('w',encoding='utf-8') as stream:ini.write(stream)
-    if args.game_exe or (args.lockstep_timing and not args.state and args.slot is None):
+    if args.game_exe:
         shutil.copyfile(project_path('original_executable'), boot)
     process=launch_process(command,data,environment(data),args.visible)
     receipt=record_owner(data,port,process.pid)
@@ -127,8 +108,6 @@ def main():
             if process.poll() is not None or time.monotonic()>deadline:
                 raise RuntimeError('Launched process has not exposed its endpoint; inspect the same PID, do not restart')
             time.sleep(.1)
-    if args.lockstep_timing:
-        initialize_manual_runtime(config['duckstation'], port, args.visible)
     if args.visible:
         print('DuckStation started.')
     else:

@@ -254,9 +254,7 @@ def package_runtime(workspace, source, manifest, manifest_identity, build_comman
         'configuration': 'Release x64 v143',
         'compatibility_executable_name': target_exe,
         'exe_sha256': executable_hash,
-        'lockstep_protocol_version': manifest['runtime']['lockstep_protocol_version'],
         'data_root_environment': manifest['runtime']['data_root_environment'],
-        'timing': manifest['runtime']['timing'],
         'runtime_files': hashes,
         'validation': {
             'build': 'passed',
@@ -299,7 +297,9 @@ def running_executable(path):
     path = Path(path).resolve()
     result = subprocess.run(
         ['powershell.exe', '-NoProfile', '-Command',
-         'Get-CimInstance Win32_Process | Select-Object Name,ExecutablePath | ConvertTo-Json -Compress'],
+         "Get-Process -ErrorAction Stop | Select-Object "
+         "@{Name='Name';Expression={$_.ProcessName+'.exe'}},"
+         "@{Name='ExecutablePath';Expression={$_.Path}} | ConvertTo-Json -Compress"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode:
         raise RuntimeError('Cannot inspect DuckStation executable paths before publishing')

@@ -4,6 +4,9 @@ import json
 
 
 def apply_review(root, project, function, view):
+    if project.get('analysis', {}).get('evidence_backend') == 'ghidra' and view.get('path'):
+        view = {**view, 'content_complete': view.get('complete', False), 'complete': False,
+                'semantic_status': 'unreviewed'}
     relative = project.get('analysis', {}).get('pseudocode_reviews')
     if not relative:
         return view
@@ -30,7 +33,7 @@ def apply_review(root, project, function, view):
         if (not view.get('path') or row['function_sha256'] != function['sha256'] or
                 row['pseudocode_sha256'] != view['sha256']):
             raise ValueError('Pseudocode review has stale original evidence')
-        view = {**view, 'content_complete': view['complete'], 'complete': False,
+        view = {**view, 'content_complete': view.get('content_complete', view['complete']), 'complete': False,
                 'review': {'path': path.relative_to(root).as_posix(),
                            'sha256': hashlib.sha256(raw).hexdigest(), 'reason': row['reason']}}
     return view

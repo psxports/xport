@@ -11,6 +11,7 @@ from urllib.parse import quote
 from web_output_permissions import inherit_output_permissions
 from video_mp4 import index_mp4
 from convert_video import inspect_str
+from xport_project import player_count
 
 
 PACKAGE_LIMIT = 25 * 1024 * 1024
@@ -123,8 +124,6 @@ def prepared_videos(project):
     if video.get('web_enabled') is not True:
         return {}, []
     sector_rate = video.get('sector_rate')
-    if type(sector_rate) is not int or sector_rate not in (75, 150):
-        raise ValueError('Registered movies require reviewed video.sector_rate (75 or 150)')
     receipt = project/'bin/VIDEO/manifest.json'
     if not receipt.is_file():
         raise ValueError('video.web_enabled requires a prepared VIDEO manifest')
@@ -163,10 +162,21 @@ def prepared_videos(project):
         if (len(track['samples']) != len(frame_list) or not frame_list or
                 (track['width'], track['height']) != (original_info.get('width'), original_info.get('height'))):
             raise ValueError('Prepared movie frames/geometry differ from source: '+source)
-        observed = inspect_str(original, include_completions=True)
-        if ([(row['frame'], row['sector']) for row in observed['frames']] !=
-                [(row['frame'], row['sector']) for row in frame_list]):
-            raise ValueError('Original movie frame locations differ from receipt: '+source)
+        timeline = clip.get('media_timeline')
+        if timeline is not None:
+            if (not isinstance(timeline, dict) or any(type(timeline.get(key)) is not int or timeline[key] < 0
+                    for key in ('video_offset_us', 'audio_offset_us'))):
+                raise ValueError('Invalid prepared media timeline: '+source)
+            runtime_frames = [dict(number=frame['frame']) for frame in frame_list]
+        else:
+            if type(sector_rate) is not int or sector_rate not in (75, 150):
+                raise ValueError('STR movies require reviewed video.sector_rate (75 or 150)')
+            observed = inspect_str(original, include_completions=True)
+            if ([(row['frame'], row['sector']) for row in observed['frames']] !=
+                    [(row['frame'], row['sector']) for row in frame_list]):
+                raise ValueError('Original movie frame locations differ from receipt: '+source)
+            runtime_frames = [dict(number=frame['frame'], sector=frame['sector'], endSector=frame['end_sector'])
+                              for frame in observed['frames']]
         virtual = '/'+source[4:]
         if any(key.casefold() == virtual.casefold() for key in result):
             raise ValueError('Duplicate registered movie source')
@@ -180,10 +190,11 @@ def prepared_videos(project):
         result[virtual] = dict(url='VIDEO/'+filename, hash=clip['sha256'], size=clip['bytes'],
                               chunks=chunks,
                               width=track['width'], height=track['height'], frameRate=clip['frame_rate'],
-                              frames=[dict(number=frame['frame'], sector=frame['sector'], endSector=frame['end_sector'])
-                                      for frame in observed['frames']], sectorRate=sector_rate,
+                              frames=runtime_frames, sectorRate=sector_rate,
                               sourceSectorBytes=original_info.get('sector_bytes', 2352),
                               sourceAudio=original_info.get('audio', []), tracks=tracks)
+        if timeline is not None:
+            result[virtual]['mediaTimeline'] = timeline
         outputs.append((movie, filename))
     return result, outputs
 
@@ -269,6 +280,9 @@ def main():
 
 def build_lazy(args, output):
     project = args.project.resolve()
+    config_path = project / 'xport-project.json'
+    config = json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.is_file() else {}
+    players = player_count(config)
     excluded = exclusion_patterns(getattr(args, 'exclude', []))
     videos, video_outputs = prepared_videos(project)
     excluded += [key.lower() for key in videos]
@@ -368,6 +382,10 @@ def build_lazy(args, output):
         icon_name = 'xport-icon-' + hashlib.sha256(icon_data).hexdigest()[:16] + '.ico'
         (output / icon_name).write_bytes(icon_data)
         favicon = '<link rel="icon" type="image/x-icon" href="' + icon_name + '">'
+    cover_url = github_cover_url(project)
+    boot_cover = ('<img id="boot-cover" class="cover" src="' + html.escape(cover_url, quote=True) +
+                  '" alt="' + html.escape(args.full_name + ' cover', quote=True) + '">') if cover_url else ''
+    index = index.replace('@@BOOT_COVER@@', boot_cover).replace('@@BOOT_PLAYERS@@', str(players))
     index = index.replace('@@FAVICON@@', favicon).replace('@@SOCIAL_PREVIEW@@', social_preview(args))
     index = index.replace('@@PACKAGES@@', manifest_name).replace('@@ASSETS@@', runtime_name)
     (output / 'index.html').write_text(index, encoding='utf-8')

@@ -13,22 +13,6 @@ import startup
 
 
 class ProjectBootstrapTests(unittest.TestCase):
-    def test_initializer_keeps_native_and_recording_ntsc_timing_in_sync(self):
-        from lockstep_record_cli import recording_timing
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Timing-xport'
-            startup.initialize_project(root, 'Timing Fixture', 'TF', 43120)
-            config = json.loads((root/'xport-project.json').read_text(encoding='utf-8'))
-            self.assertEqual(config['lockstep']['timing'], {'video_standard': 'NTSC', 'field_rate': 60})
-            self.assertEqual(recording_timing(config), ('NTSC', 60))
-            project = ET.parse(root/'src/platform/win/TF.vcxproj')
-            namespace = {'msbuild': 'http://schemas.microsoft.com/developer/msbuild/2003'}
-            groups = project.findall('msbuild:ItemDefinitionGroup', namespace)
-            for configuration in ['Debug', 'Release']:
-                group = next(group for group in groups if group.get('Condition') == "'$(Configuration)'=='"+configuration+"'")
-                definitions = group.find('msbuild:ClCompile/msbuild:PreprocessorDefinitions', namespace).text.split(';')
-                self.assertEqual([value for value in definitions if value.startswith('FIELD_RATE=')], ['FIELD_RATE=60'])
 
     def test_initializer_uses_user_short_name_for_native_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -49,7 +33,7 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertIn('Debug|Win32', project)
             self.assertIn('Release|Win32', project)
             self.assertEqual(project.count('<SubSystem>Windows</SubSystem>'), 2)
-            self.assertNotIn('<EntryPointSymbol>', project)
+            self.assertIn('<EntryPointSymbol>WinMainCRTStartup</EntryPointSymbol>', project)
             self.assertNotIn('<SubSystem>Console</SubSystem>', project)
             self.assertIn('<CompileAs>CompileAsC</CompileAs>', project)
             self.assertIn('<TargetName>FF_debug</TargetName>', project)
@@ -64,11 +48,11 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertEqual(project.count('FULL_NAME=&quot;Fighting Force&quot;'), 2)
             self.assertIn('WND_TITLE=&quot;Fighting Force (xport)&quot;', project)
             self.assertIn('WND_WIDTH=960', project)
-            self.assertIn('WND_HEIGHT=768', project)
+            self.assertIn('WND_HEIGHT=720', project)
             self.assertIn('FIELD_RATE=60', project)
             self.assertEqual(project.count('_CRT_SECURE_NO_WARNINGS'), 2)
             self.assertEqual(project.count('<TreatWarningAsError>true</TreatWarningAsError>'), 2)
-            self.assertEqual(project.count('<DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings>'), 2)
+            self.assertEqual(project.count('<DisableSpecificWarnings>4100;4244;4554;%(DisableSpecificWarnings)</DisableSpecificWarnings>'), 2)
             self.assertIn('winmm.lib', project)
             main = (root/'src/game_main.c').read_text(encoding='utf-8')
             self.assertIn('void xport_main(void)', main)
@@ -76,7 +60,7 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertNotIn('spu_render', main)
             self.assertNotIn('xport_address', main)
             self.assertNotIn('xport_audio_output_environment', main)
-            self.assertEqual({path.name for path in (root/'src/platform/win').iterdir()}, {'FF.sln', 'FF.vcxproj'})
+            self.assertEqual({path.name for path in (root/'src/platform/win').iterdir()}, {'FF.sln', 'FF.vcxproj', 'icon.ico', 'icon.rc'})
             self.assertIn('#include "xport.h"', main)
             self.assertEqual(main.count('#include "xport.h"'), 1)
             self.assertFalse((root/'src/xport.h').exists())
@@ -86,14 +70,8 @@ class ProjectBootstrapTests(unittest.TestCase):
             self.assertIn('Runtime data: `bin/DATA`', agents)
             self.assertIn('Red Book output when applicable: `bin/MUSIC`', agents)
             self.assertEqual(json.loads((root/'status/translation-ledger.json').read_text())['entries'], [])
-            lockstep = config['lockstep']
-            self.assertEqual(lockstep['schema'], 1)
-            self.assertFalse(lockstep['enabled'])
-            self.assertEqual(lockstep['native_platform'], 'x86')
-            self.assertEqual(lockstep['runtime']['duckstation_role'], 'lockstep')
-            self.assertEqual(lockstep['runtime']['record_role'], 'user')
-            self.assertEqual(set(config['duckstation']['reserved_gdb_ports']), {'user', 'lockstep', 'audit', 'trace'})
-            self.assertEqual(len(set(config['duckstation']['reserved_gdb_ports'].values())), 4)
+            self.assertEqual(set(config['duckstation']['reserved_gdb_ports']), {'user', 'audit'})
+            self.assertEqual(len(set(config['duckstation']['reserved_gdb_ports'].values())), 2)
 
     def test_initializer_defines_unresolved_gpu_graph_type_binding(self):
         with tempfile.TemporaryDirectory() as directory:

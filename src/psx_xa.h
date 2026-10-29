@@ -13,7 +13,10 @@ typedef struct XaState
     uint32 half_phase;
 } XaState;
 
-enum { XPORT_FMV_AUDIO_FRAMES = 32768 };
+enum
+{
+    XPORT_FMV_AUDIO_FRAMES = 32768
+};
 
 struct XportFmvAudioRemainder
 {

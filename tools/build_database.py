@@ -15,8 +15,8 @@ def main(no_format=False):
  index_inputs=[dict(image=read(out/'export-report.json')['image'],path=out.relative_to(R).as_posix(),
                     functions_sha256=hashlib.sha256((out/'functions.json').read_bytes()).hexdigest())
                for out in index_exports]
- from source_index import format_sources
- source_paths=[p.relative_to(R).as_posix() for p in (R/'src').rglob('*') if p.is_file() and p.suffix.lower() in ('.c','.h')]
+ from source_index import format_sources, SOURCE_EXTENSIONS
+ source_paths=[p.relative_to(R).as_posix() for p in (R/'src').rglob('*') if p.is_file() and p.suffix.lower() in SOURCE_EXTENSIONS]
  source_format=(dict(files=[],trimmed_files=[],formatter=None,style_sha256=hashlib.sha256((Path(__file__).resolve().parents[1]/"src/.clang-format").read_bytes()).hexdigest())
                 if no_format else format_sources(R,source_paths))
  classification_path=project_path('sdk_classification','status/ghidra/classification.json')

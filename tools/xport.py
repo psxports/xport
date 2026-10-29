@@ -18,9 +18,6 @@ def main():
     args = parser.parse_args()
     tool = args.tool.removesuffix('.py')
     tool_arguments = list(args.arguments)
-    if tool == 'stop':
-        tool = 'record'
-        tool_arguments.insert(0, 'stop')
     if tool == 'startup':
         parser.error('Run startup.py directly because a new project has no xport-project.json')
     removed = {'project_init', 'ida_accept', 'ghidra_recognize'}
@@ -33,6 +30,21 @@ def main():
                           'short_name': config.get('short_name'),
                           'toolset': str(Path(__file__).resolve().parent),
                           'paths': config.get('paths', {})}, indent=2))
+        return
+    if tool == 'stage_sources':
+        if tool_arguments:
+            parser.error('stage_sources takes no arguments')
+        from xport_project import stage_sources
+        print(json.dumps(stage_sources(root)))
+        return
+    if tool in ('refactor', 'enhance'):
+        if tool_arguments:
+            parser.error('This agent task takes its scope from the user request and current project context')
+        document = 'docs/REFACTOR.md' if tool == 'refactor' else 'docs/ENHANCE.md'
+        print(json.dumps({'command': tool, 'project': str(root), 'document': document,
+                          'goal_required': True,
+                          'action': 'Agent must read the complete contract, analyze the project, create/reuse its covering goal and execute all required stages',
+                          'terminal': 'Complete implementation and required final verification; a plan or helper response is not completion'}))
         return
     if Path(args.tool).name != args.tool:
         parser.error('Use a tool name, not a path')

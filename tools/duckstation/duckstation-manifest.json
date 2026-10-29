@@ -6,8 +6,8 @@
     "version": "0.1-11752"
   },
   "patch": {
-    "path": "internal-trace-api.patch",
-    "sha256": "65cdf2fe7d4b9a9f630eaf069147a08567117fb221e41d0f83d5a48a5405ea95"
+    "path": "project-data-root.patch",
+    "sha256": "a8f9351ba6b9028cdecee386d45ec317b0399036d3e629e55b6fde63f8a9ea27"
   },
   "dependencies": {
     "windows-x64": {
@@ -28,7 +28,6 @@
     "distribution_executable": "duckstation-qt-x64-ReleaseLTCG.exe"
   },
   "runtime": {
-    "device_serializer_version": 85,
     "data_root_environment": "XPORT_DUCKSTATION_DATA_ROOT",
     "required_files": [
       "duckstation-qt-x64-ReleaseLTCG.exe",
@@ -40,33 +39,7 @@
       "LICENSE.txt"
     ],
     "required_executable_markers": [
-      "qXportLockstepAttach",
-      "qXportLockstepPreludeStart",
-      "qXportLockstepStartAt",
-      "qXportLockstepHandoffState",
-      "qXportLockstepMode",
-      "qXportLockstepRecordRead",
-      "qXportFunctionCoverageStart",
-      "qXportFunctionCoverageRead",
-      "qXportLockstepCheckpointCapture",
-      "qXportLockstepCheckpointExport",
-      "qXportLockstepCheckpointImport",
-      "qXportLockstepCheckpointRestore",
-      "qXportLockstepLastInstruction",
-      "XPORT_DUCKSTATION_DATA_ROOT",
-      "qXportLockstepTimerState",
-      "qXportLockstepBeamState",
-      "qXportWaitPoints",
-      "qXportSpuRAMRead",
-      "qXportFastForward",
-      "qXportCRTCState",
-      "-lockstep-timing"
-    ],
-    "lockstep_protocol_version": 23,
-    "timing": {
-      "default": "standard",
-      "lockstep_argument": "-lockstep-timing",
-      "standard_argument": "-standard-timing"
-    }
+      "XPORT_DUCKSTATION_DATA_ROOT"
+    ]
   }
 }

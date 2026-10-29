@@ -27,6 +27,7 @@ extern "C"
 
     void cd_dispatch_ready_event(void);
     sint32 xport_xa_play_file(const char *path, sint32 repeat);
+    sint32 xport_xa_play_file_at(const char *path, sint32 repeat, sint32 sector);
     sint32 xport_xa_file_position(CdlLOC *position, uint32 *frames);
     sint32 CdInit(void);
     sint32 CdLastCom(void);
@@ -569,6 +570,7 @@ extern "C"
     uint32 spu_sequence_vm_reverb_feedback(uint8 value);
     uint32 spu_sequence_vm_reverb_delay(uint8 value);
 
+    sint32 _spu_init(uint32 mode);
     void spu_sequence_vm_reset_device(uint32 mode);
     void spu_sequence_vm_dma(void);
     PsxInterruptCallback spu_sequence_vm_register_dma(PsxInterruptCallback callback);
@@ -824,16 +826,7 @@ extern "C"
     sint32 spu_save_xa_pcm(void);
     void spu_discard_xa_pcm(void);
     void spu_render_vblank(sint16 *interleaved_stereo, uint32 frame_count);
-    int spu_state_io(FILE *file, int load);
-    int spu_lockstep_portable_io(FILE *file, int load);
-#if defined(LOCKSTEP_DEBUG)
-    size_t spu_lockstep_checkpoint_size(void);
-    int spu_lockstep_checkpoint_capture(void *data, size_t size);
-    int spu_lockstep_checkpoint_restore(const void *data, size_t size);
-    int spu_lockstep_checkpoint_synchronize(void);
-    int spu_lockstep_checkpoint_rebase_clock(void);
-    int spu_lockstep_portable_selftest(void);
-#endif
+
     /* END GENERATED MODULE API */
 
     sint32 cd_stream_pop_sector_native(uint8 output[2352]);

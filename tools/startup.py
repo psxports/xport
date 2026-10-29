@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 from toolchain_preflight import validate_receipt as validate_toolchain_receipt, validate_runtime_access
 from xport_process import normalized_environment
-from xport_project import CONFIG_NAME, allocation_lock, reservations
+from xport_project import CONFIG_NAME, allocation_lock, reservations, player_count, stage_sources
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -224,29 +224,8 @@ def ensure_duckstation_launcher(root):
     return {'path': 'DuckStation.bat', 'sha256': digest_file(path), 'reused': reused}
 
 
-def record_launcher_text(root):
-    command = os.path.relpath(TOOLS/'xport.py', Path(root).resolve()).replace('/', '\\')
-    return f'''@echo off
-setlocal
-cd /d "%~dp0"
-python -B "%~dp0{command}" --project "%~dp0." record %*
-exit /b %errorlevel%
-'''
 
 
-def ensure_record_launcher(root):
-    root = Path(root).resolve()
-    path = root/'record.bat'
-    expected = record_launcher_text(root)
-    if path.exists():
-        if not path.is_file() or path.read_text(encoding='utf-8-sig') != expected:
-            raise ValueError('Existing record.bat differs from the startup launcher')
-        reused = True
-    else:
-        with path.open('x', encoding='utf-8', newline='\r\n') as stream:
-            stream.write(expected)
-        reused = False
-    return {'path': 'record.bat', 'sha256': digest_file(path), 'reused': reused}
 
 
 def initialize_project(root, name, short_name, first_port=2400):
@@ -255,7 +234,7 @@ def initialize_project(root, name, short_name, first_port=2400):
         raise ValueError('STARTUP_ALREADY_INITIALIZED: '+str(root/CONFIG_NAME))
     validate_names(name, short_name)
     platform = root/'src/platform/win'
-    targets = [root/CONFIG_NAME, root/'README.md', root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'record.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
+    targets = [root/CONFIG_NAME, root/'README.md', root/'.gitignore', root/'AGENTS.md', root/'DuckStation.bat', root/'src/game_main.c', platform/(short_name+'.sln'),
                platform/(short_name+'.vcxproj'), platform/'icon.ico', platform/'icon.rc', root/'status/translation-ledger.json']
     existing = [str(path) for path in targets if path.exists()]
     if existing:
@@ -276,7 +255,7 @@ def initialize_project(root, name, short_name, first_port=2400):
         sockets, ports = [], {}
         try:
             candidate = first_port
-            for role in ('user', 'lockstep', 'audit', 'trace'):
+            for role in ('user', 'audit'):
                 while candidate <= 65535:
                     port = candidate
                     candidate += 1
@@ -297,7 +276,7 @@ def initialize_project(root, name, short_name, first_port=2400):
             for relative_path in ('src/platform/win', 'bin', '_build', 'iso', 'orig/images', 'orig/ghidra',
                                   'status/ida/runs', 'status/ida/accepted', 'status/ghidra/runs', 'tools/ida/databases'):
                 (root/relative_path).mkdir(parents=True, exist_ok=True)
-            config = {'schema': 1, 'name': name, 'short_name': short_name, 'toolset': str(TOOLS),
+            config = {'schema': 1, 'name': name, 'short_name': short_name, 'players': 1, 'toolset': str(TOOLS),
                       'github': {'repository': 'psxports/'+''.join(name.split())+'-xport'},
                       'paths': {'status': 'status', 'project_tools': 'tools', 'analysis_database': 'status/analysis.sqlite',
                                 'native_executable': 'bin/'+short_name+'.exe',
@@ -309,15 +288,6 @@ def initialize_project(root, name, short_name, first_port=2400):
                       'duckstation': {'host': '127.0.0.1', 'gdb_port': ports['user'], 'reserved_gdb_ports': ports,
                                       'default_role': 'user', 'data_directory': 'tools/duckstation/data/user',
                                       'data_directories': {role: 'tools/duckstation/data/'+role for role in ports}},
-                       'lockstep': {'schema': 1, 'enabled': False, 'original_image': '',
-                           'timing': {'video_standard': 'NTSC', 'field_rate': 60},
-                           'native_configuration': 'Debug', 'native_platform': 'x86',
-                           'msbuild_property': 'LockstepDebug=true', 'source_roots': ['src'],
-                           'max_events': 1000000,
-                           'memory': {'dram_size': 2097152, 'scratchpad_size': 1024},
-                           'devices': {'vram': 'trusted_wrapper', 'spu_ram': 'trusted_wrapper'},
-                           'runtime': {'duckstation_role': 'lockstep', 'record_role': 'user',
-                                       'native_arguments': ['--lockstep-replay']}},
                       'code_refresh': {'build': {'solution': 'src/platform/win/'+short_name+'.sln',
                                                  'configuration': 'Debug', 'platform': 'x86',
                                                  'process_name': short_name+'_debug.exe'}, 'tests': [], 'artifacts': []}}
@@ -571,8 +541,7 @@ def image_review_proposal(root, found):
             'loads': [{'path': item['path'], 'base': start, 'offset': facts['file_offset']}],
             'seeds': [facts['entry']], 'code_ranges': [[start, end]]}
     patch = {'paths': paths, 'analysis': {'images': [Path(item['path']).name for item in ordered],
-             'default_image': Path(default['path']).name},
-             'lockstep': {'original_image': Path(default['path']).name}}
+             'default_image': Path(default['path']).name}}
     if capabilities:
         patch['capabilities'] = capabilities
     return {'config_patch': patch, 'ida_configs': profiles}
@@ -589,84 +558,12 @@ def project_preflight(root):
     return {'platform': platform}
 
 
-def validate_capture_contract(root):
-    root = Path(root).resolve()
-    config = project(root)
-    lockstep = config.get('lockstep') or {}
-    if lockstep.get('schema') != 1 or lockstep.get('enabled') is not True:
-        raise ValueError('Enable the lockstep record and converge contract')
-    image = lockstep.get('original_image')
-    if not isinstance(image, str) or not IMAGE_PATTERN.fullmatch(image):
-        raise ValueError('Configure lockstep.original_image')
-    runtime = lockstep.get('runtime', {})
-    role = runtime.get('duckstation_role')
-    record_role = runtime.get('record_role', 'user')
-    directories = config.get('duckstation', {}).get('data_directories', {})
-    ports = config.get('duckstation', {}).get('reserved_gdb_ports', {})
-    if any(value not in directories or value not in ports for value in (role, record_role)):
-        raise ValueError('Reserve the user and lockstep DuckStation runtimes')
-    disc = root/config.get('paths', {}).get('disc_image', '')
-    profile_path = project_path(root, config, 'ida_configs', 'tools/ida')/(image+'.json')
-    if profile_path.is_file():
-        profile = read_json(profile_path)
-        if profile.get('image') != image or len(profile.get('loads', [])) != 1:
-            raise ValueError('Recording image requires its exact single-load IDA profile')
-        original = Path(profile['loads'][0]['path'])
-        original = original if original.is_absolute() else root/original
-    else:
-        original = root/'orig'/image
-    if not disc.is_file() or not original.is_file():
-        raise ValueError('Lockstep recording requires the disc image and original executable')
-    return {'schema': 1, 'original_image': image, 'duckstation_role': role,
-            'record_role': record_role,
-            'disc_image': relative(root, disc), 'original_executable': relative(root, original)}
 
 
-def capture_contract_packet(root):
-    try:
-        current = validate_capture_contract(root)
-        problem = None
-    except (KeyError, OSError, ValueError, sqlite3.Error) as error:
-        current = None
-        problem = str(error)
-    return {'current': current, 'problem': problem,
-            'required_config': ['lockstep.schema=1', 'lockstep.enabled=true',
-                                'lockstep.original_image', 'lockstep.runtime.duckstation_role'],
-            'scope': 'Configure input-only recording from one exact save state'}
 
 
-def validate_convergence_contract(root):
-    """Require a reviewed project-native continuation before startup can complete"""
-    root = Path(root).resolve()
-    config = project(root)
-    capture = validate_capture_contract(root)
-    from project_context import queue
-    translation_queue = queue(root, config, limit=1)['counts']
-    lockstep = config['lockstep']
-    if lockstep.get('native_configuration') != 'Debug' or lockstep.get('native_platform') != 'x86':
-        raise ValueError('Lockstep convergence requires Debug x86')
-    if lockstep.get('msbuild_property') != 'LockstepDebug=true':
-        raise ValueError('Configure the LOCKSTEP_DEBUG build property')
-    memory = lockstep.get('memory', {})
-    if memory.get('dram_size') != 2097152 or memory.get('scratchpad_size') != 1024:
-        raise ValueError('Configure exact PS1 DRAM and scratchpad sizes')
-    native_scope = frontier_packet(root)
-    return {'contract': 'xport-lockstep-v2', 'capture': capture,
-            'translation_queue': translation_queue, 'native_scope': native_scope}
 
 
-def convergence_contract_packet(root):
-    try:
-        current = validate_convergence_contract(root)
-        problem = None
-    except (KeyError, OSError, ValueError, sqlite3.Error) as error:
-        current = None
-        problem = str(error)
-    return {'current': current, 'problem': problem,
-            'required_config': ['lockstep.native_configuration=Debug', 'lockstep.native_platform=x86',
-                                'lockstep.msbuild_property=LockstepDebug=true', 'lockstep.memory'],
-            'required_files': ['src/game_except.c', 'LOCKSTEP_DEBUG native build'],
-            'scope': 'Configure shared-memory lockstep comparison and semantic call boundaries'}
 
 
 def prepare_ida_export(root, ida, label, images=None, export_existing=False, plan=False):
@@ -1085,9 +982,12 @@ def apply_response(root, state, response):
         config_path = Path(root)/CONFIG_NAME
         config = read_json(config_path)
         patch = decision.get('config_patch', {})
-        if any(key not in ('paths', 'analysis', 'capabilities', 'lockstep', 'video') for key in patch):
+        if any(key not in ('paths', 'analysis', 'capabilities', 'video', 'players') for key in patch):
             raise ValueError('STARTUP_RESPONSE_CONFIG_SCOPE')
         for key, value in patch.items():
+            if key == 'players':
+                config['players'] = player_count({'players': value})
+                continue
             if not isinstance(value, dict):
                 raise ValueError('STARTUP_RESPONSE_CONFIG_OBJECT_REQUIRED')
             config.setdefault(key, {}).update(value)
@@ -1107,6 +1007,16 @@ def apply_response(root, state, response):
         if decision.get('approved') is not True:
             raise ValueError('STARTUP_PSYQ_REVIEW_NOT_APPROVED')
         next_step = 'database'
+    elif kind == 'ghidra_psyq_review':
+        if decision.get('approved') is not True:
+            raise ValueError('STARTUP_GHIDRA_PSYQ_REVIEW_NOT_APPROVED')
+        import ghidra_startup
+        verified = ghidra_startup.validate(root, project(root))
+        if verified != attention.get('context', {}).get('verification'):
+            raise ValueError('STARTUP_GHIDRA_EVIDENCE_CHANGED')
+        record_step(state, 'psyq', {'backend': 'ghidra', 'verification': verified,
+                                   'accepted': 0, 'pending': verified['pending']})
+        next_step = 'ghidra_frontier'
     elif kind == 'frontier_translation':
         if decision.get('approved') is not True or not decision.get('changed_files'):
             raise ValueError('STARTUP_FRONTIER_REQUIRES_REVIEWED_CHANGES')
@@ -1134,16 +1044,6 @@ def apply_response(root, state, response):
                     audit.get('unresolved_semantics') != []):
                 raise ValueError('STARTUP_FRONTIER_FUNCTION_AUDIT_INCOMPLETE')
         next_step = 'verify_frontier'
-    elif kind == 'trace_capture_review':
-        if decision.get('approved') is not True or not decision.get('changed_files'):
-            raise ValueError('STARTUP_TRACE_CAPTURE_REQUIRES_REVIEWED_CHANGES')
-        validate_capture_contract(root)
-        next_step = 'convergence_contract'
-    elif kind == 'convergence_review':
-        if decision.get('approved') is not True or not decision.get('changed_files'):
-            raise ValueError('STARTUP_CONVERGENCE_REQUIRES_REVIEWED_CHANGES')
-        validate_convergence_contract(root)
-        next_step = 'emulator'
     else:
         raise ValueError('STARTUP_UNSUPPORTED_ATTENTION_KIND: '+kind)
     history = state.setdefault('history', [])
@@ -1223,7 +1123,7 @@ def frontier_packet(root):
         context = function['audit_context']
         if (context.get('mips') or {}).get('complete') is not True:
             raise ValueError('STARTUP_FRONTIER_REQUIRES_COMPLETE_MIPS_CONTEXT')
-    scope = 'Configured executable entrypoints only; callees are deferred to function coverage'
+    scope = 'Configured executable entrypoints only; callees are deferred to decomp'
     return {'functions': functions, 'dependency_closed': False, 'cyclic': False, 'remaining_todo': remaining,
             'native_entrypoints': [{'image': image, 'address': address} for image, address in roots],
             'reachable_functions': None,
@@ -1346,52 +1246,35 @@ def advance(root, state):
                 similarity = validate_similarity(root)
                 context = run_shared(root, 'project_context', ('init',))
                 record_step(state, step, {'build_database': build, 'similarity': similarity, 'project_context': context}, started)
-                packet = frontier_packet(root)
-                if packet['functions']:
-                    state = set_attention(root, state, 'frontier_translation',
-                                          'Translate only the reviewed executable entrypoint',
-                                          ['decision.approved', 'decision.changed_files'], packet)
-                else:
-                    state = publish(root, state, step='verify_frontier')
+                state = publish(root, state, step='verify_frontier')
+            elif step == 'ghidra_frontier':
+                state = publish(root, state, step='verify_frontier')
             elif step == 'verify_frontier':
-                refresh = run_shared(root, 'source_index', ('--rebuild', '--no-format'))
+                if project(root).get('analysis', {}).get('evidence_backend') == 'ghidra':
+                    import ghidra_startup
+                    verified = ghidra_startup.validate(root, project(root))
+                    refresh = {'status': 'deferred_to_decomp', 'reason': 'Preserve the hash-bound Ghidra analysis index until translation', 'analysis_sha256': verified['analysis_sha256']}
+                else:
+                    refresh = run_shared(root, 'source_index', ('--rebuild', '--no-format'))
                 progress = run_shared(root, 'project_context', ('queue', '--limit', '1'))
                 record_step(state, step, {'source_index': refresh,
                                           'translation_queue': progress,
-                                          'native_link_deferred_to_coverage': True}, started)
-                state = publish(root, state, step='trace_contract')
-            elif step == 'trace_contract':
-                packet = capture_contract_packet(root)
-                if packet['problem']:
-                    state = set_attention(root, state, 'trace_capture_review',
-                                          'Audit and configure the original recording contract',
-                                          ['decision.approved', 'decision.changed_files'], packet)
-                else:
-                    record_step(state, step, packet['current'], started)
-                    state = publish(root, state, step='convergence_contract')
-            elif step == 'convergence_contract':
-                packet = convergence_contract_packet(root)
-                if packet['problem']:
-                    state = set_attention(root, state, 'convergence_review',
-                                          'Implement and review the native convergence contract',
-                                          ['decision.approved', 'decision.changed_files'], packet)
-                else:
-                    record_step(state, step, packet['current'], started)
-                    state = publish(root, state, step='emulator')
+                                          'function_translation_deferred_to_decomp': True,
+                                          'native_link_deferred_to_decomp': True}, started)
+                state = publish(root, state, step='emulator')
             elif step == 'emulator':
                 if 'verify_frontier' not in state.get('steps', {}):
                     refresh = run_shared(root, 'source_index', '--rebuild', '--no-format')
                     record_step(state, 'verify_frontier', {'source_index': refresh,
-                                'native_link_deferred_to_coverage': True})
+                                'native_link_deferred_to_decomp': True})
                 config = project(root)
-                capture = validate_capture_contract(root)
                 launcher = ensure_duckstation_launcher(root)
-                record_launcher = ensure_record_launcher(root)
                 deployments = {}
                 for role in config['duckstation']['reserved_gdb_ports']:
                     deployments[role] = run_shared(root, 'duckstation_deploy', ('--role', role, '--ensure'))
-                emulator = {'launcher': launcher, 'record_launcher': record_launcher,
-                            'deployments': deployments, 'capture': capture,
+                git_index = stage_sources(root)
+                emulator = {'launcher': launcher, 'git_index': git_index,
+                            'deployments': deployments,
                             'shared_distribution': str((TOOLS/'duckstation/distribution').resolve())}
                 record_step(state, step, emulator, started)
                 from project_context import queue
@@ -1404,12 +1287,15 @@ def advance(root, state):
                               'native_executable': config['paths']['native_executable'],
                               'native_debug_executable': config['paths']['native_debug_executable'],
                               'duckstation': emulator,
-                              'convergence': validate_convergence_contract(root),
                               'source_index': state['steps']['verify_frontier']['result']['source_index'],
-                              'next': 'Run function_coverage NAME, stop, then coverage NAME'}
+                              'next': 'Run decomp'}
                 created = datetime.datetime.fromisoformat(state['created_utc'])
                 canonical_result = state['steps'].get('ida_export', {}).get('result', {}).get('canonical', [])
-                classification = state['steps'].get('psyq', {}).get('result', {}).get('classification', {})
+                psyq_result = state['steps'].get('psyq', {}).get('result', {})
+                classification = psyq_result.get('classification', {})
+                if psyq_result.get('backend') == 'ghidra':
+                    classification = psyq_result
+                    completion['ghidra'] = psyq_result.get('verification')
                 completion['metrics'] = {
                     'total_seconds': round((datetime.datetime.now(datetime.timezone.utc)-created).total_seconds(), 3),
                     'step_seconds': {name: value.get('seconds') for name, value in state['steps'].items()},
@@ -1556,19 +1442,97 @@ def reexport(root, expected_revision, label, exports, advance_now=True):
         return advance(root,state) if advance_now else state
 
 
-def refresh_frontier(root, expected_revision):
-    """Regenerate paused translation evidence after a hash-bound pseudocode review"""
+def adopt_ghidra(root, expected_revision):
+    """Replace an obsolete IDA review with a separately validated Ghidra review"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        state = load_state(root)
+        if state['revision'] != expected_revision:
+            raise ValueError('STARTUP_STALE_GHIDRA_MIGRATION')
+        if state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'psyq_review':
+            raise ValueError('STARTUP_GHIDRA_MIGRATION_REQUIRES_OLD_PSYQ_REVIEW')
+        import ghidra_startup
+        config = project(root)
+        verified = ghidra_startup.validate(root, config)
+        archive = root/'status/startup-recovery'/('ghidra-migration-revision-'+str(expected_revision)+'.json')
+        if archive.exists():
+            raise ValueError('STARTUP_GHIDRA_MIGRATION_ARCHIVE_EXISTS')
+        snapshot = root/'status/ghidra'/('input-index-'+verified['analysis_sha256']+'.sqlite')
+        if snapshot.exists():
+            if digest_file(snapshot) != verified['analysis_sha256']:
+                raise ValueError('STARTUP_GHIDRA_INDEX_SNAPSHOT_CHANGED')
+        else:
+            shutil.copyfile(root/verified['analysis_database'], snapshot)
+            if digest_file(snapshot) != verified['analysis_sha256']:
+                raise ValueError('STARTUP_GHIDRA_INDEX_SNAPSHOT_MISMATCH')
+        atomic_json(archive, {'state': state, 'config_sha256': digest_file(root/CONFIG_NAME),
+                              'index_snapshot': relative(root, snapshot), 'verification': verified})
+        state.setdefault('recoveries', []).append({'revision': expected_revision, 'step': 'ghidra_migration',
+                                                   'receipt': relative(root, archive)})
+        for name in ('ida_export', 'psyq', 'database'):
+            state.get('steps', {}).pop(name, None)
+        return set_attention(root, state, 'ghidra_psyq_review',
+                             'Review Ghidra-only PsyQ candidates; no SDK identity is accepted',
+                             ['decision.approved'], {'verification': verified,
+                              'candidate_catalog': verified['sdk_candidates'],
+                              'policy': 'All matches remain pending until original boundary and caller ABI review'},
+                             {'approved': False})
+
+
+def defer_frontier(root, expected_revision):
+    """Continue an older paused startup without translating functions"""
     root = Path(root).resolve()
     with StartupLock(root):
         state = load_state(root)
         if state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'frontier_translation':
-            raise ValueError('STARTUP_REFRESH_REQUIRES_FRONTIER_ATTENTION')
+            raise ValueError('STARTUP_DEFER_REQUIRES_FRONTIER_ATTENTION')
         if state['revision'] != expected_revision:
-            raise ValueError('STARTUP_STALE_REFRESH')
+            raise ValueError('STARTUP_STALE_DEFER')
+        config = project(root)
+        if config.get('analysis', {}).get('evidence_backend') == 'ghidra':
+            import ghidra_startup
+            ghidra_startup.validate(root, config)
         packet = frontier_packet(root)
-        return set_attention(root, state, 'frontier_translation',
-                             'Translate only the reviewed executable entrypoint',
-                             ['decision.approved', 'decision.changed_files'], packet)
+        state.setdefault('history', []).append({'kind': 'frontier_deferred_to_decomp', 'revision': expected_revision,
+                                                 'entrypoints': packet.get('native_entrypoints', []),
+                                                 'remaining_todo': packet.get('remaining_todo')})
+        return publish(root, state, status='running', step='verify_frontier', attention=None, failure=None)
+
+
+def refresh_frontier(root, expected_revision):
+    """Regenerate paused translation evidence after a hash-bound pseudocode review"""
+    root = Path(root).resolve()
+    with StartupLock(root):
+        return refresh_frontier_locked(root, expected_revision)
+
+
+def refresh_frontier_locked(root, expected_revision):
+    state = load_state(root)
+    if state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'frontier_translation':
+        raise ValueError('STARTUP_REFRESH_REQUIRES_FRONTIER_ATTENTION')
+    if state['revision'] != expected_revision:
+        raise ValueError('STARTUP_STALE_REFRESH')
+    config = project(root)
+    if config.get('analysis', {}).get('evidence_backend') == 'ghidra':
+        import ghidra_startup
+        verified = ghidra_startup.validate(root, config)
+        previous = state.get('steps', {}).get('psyq', {}).get('result', {}).get('verification', {})
+        previous_catalog = (root / previous.get('sdk_candidates', '')).resolve()
+        if not previous_catalog.is_relative_to(root / 'status') or not previous_catalog.is_file() or digest_file(previous_catalog) != previous.get('sdk_candidates_sha256'):
+            raise ValueError('STARTUP_PREVIOUS_GHIDRA_SDK_EVIDENCE_CHANGED')
+        with contextlib.closing(sqlite3.connect(previous_catalog.as_uri()+'?mode=ro', uri=True)) as old, contextlib.closing(sqlite3.connect((root / verified['sdk_candidates']).as_uri()+'?mode=ro', uri=True)) as new:
+            old_rows = old.execute('SELECT * FROM candidates ORDER BY image,address').fetchall()
+            new_rows = new.execute('SELECT * FROM candidates ORDER BY image,address').fetchall()
+            if old_rows != new_rows or previous.get('accepted') != verified['accepted'] or previous.get('pending') != verified['pending']:
+                raise ValueError('STARTUP_GHIDRA_SDK_REVIEW_CHANGED')
+        record_step(state, 'psyq', {'backend': 'ghidra', 'verification': verified,
+                                    'accepted': verified['accepted'], 'pending': verified['pending']})
+    packet = frontier_packet(root)
+    if config.get('analysis', {}).get('evidence_backend') == 'ghidra':
+        packet['ghidra_evidence'] = verified
+    return set_attention(root, state, 'frontier_translation',
+                         'Translate only the reviewed executable entrypoint',
+                         ['decision.approved', 'decision.changed_files'], packet)
 
 
 def start(root, name, short_name, first_port=2400, advance_now=True):
@@ -1598,33 +1562,11 @@ def refresh_completion(root, expected_revision, advance_now=True):
             raise ValueError('STARTUP_REVISION_MISMATCH')
         if state.get('status') != 'complete':
             raise ValueError('STARTUP_NOT_COMPLETE')
-        validate_capture_contract(root)
         state = publish(root, state, status='running', step='verify_frontier',
                         completion=None, attention=None, failure=None)
         return advance(root, state) if advance_now else state
 
 
-def reopen_convergence(root, advance_now=True):
-    """Resume a completed legacy startup at the convergence readiness gate"""
-    root = Path(root).resolve()
-    with StartupLock(root):
-        state = load_state(root)
-        refresh = (state.get('status') == 'attention' and
-                   state.get('attention', {}).get('kind') in ('convergence_review', 'frontier_translation'))
-        if state.get('status') != 'complete' and not refresh:
-            raise ValueError('STARTUP_NOT_COMPLETE: use status, submit or retry')
-        from project_context import queue
-        counts = queue(root, project(root), limit=1)
-        if counts['available']:
-            pending = counts['counts']['uncovered']
-        else:
-            progress_path = root/'status/progress-data.json'
-            old = read_json(progress_path).get('decompilation_status', {}) if progress_path.is_file() else {}
-            pending = old.get('TODO', 1)
-        next_step = 'database' if pending else 'convergence_contract'
-        state = publish(root, state, status='running', step=next_step,
-                        completion=None, attention=None, failure=None)
-        return advance(root, state) if advance_now else state
 
 
 def submit(root, response, advance_now=True):
@@ -1730,6 +1672,9 @@ def main():
     start_parser.add_argument('--name', required=True)
     start_parser.add_argument('--short-name', required=True)
     start_parser.add_argument('--first-port', type=int, default=2400)
+    ghidra_parser = subparsers.add_parser('adopt-ghidra')
+    ghidra_parser.add_argument('--project', type=Path, default=Path.cwd())
+    ghidra_parser.add_argument('--expected-revision', required=True, type=int)
     status_parser = subparsers.add_parser('status')
     status_parser.add_argument('--project', type=Path, default=Path.cwd())
     status_parser.add_argument('--after-revision', type=int)
@@ -1744,11 +1689,12 @@ def main():
     refresh_parser = subparsers.add_parser('refresh-frontier')
     refresh_parser.add_argument('--project', type=Path, default=Path.cwd())
     refresh_parser.add_argument('--expected-revision', required=True, type=int)
+    defer_parser = subparsers.add_parser('defer-frontier')
+    defer_parser.add_argument('--project', type=Path, default=Path.cwd())
+    defer_parser.add_argument('--expected-revision', required=True, type=int)
     completion_parser = subparsers.add_parser('refresh-completion')
     completion_parser.add_argument('--project', type=Path, default=Path.cwd())
     completion_parser.add_argument('--expected-revision', required=True, type=int)
-    reopen_parser = subparsers.add_parser('reopen-convergence')
-    reopen_parser.add_argument('--project', type=Path, default=Path.cwd())
     reexport_parser = subparsers.add_parser('reexport')
     reexport_parser.add_argument('--project', type=Path, default=Path.cwd())
     reexport_parser.add_argument('--expected-revision', required=True, type=int)
@@ -1762,6 +1708,8 @@ def main():
             validate_toolchain_receipt()
             result = compact(start(args.project, args.name, args.short_name, args.first_port, advance_now=False))
             dispatch_worker(args.project)
+        elif args.action == 'adopt-ghidra':
+            result = compact(adopt_ghidra(args.project, args.expected_revision))
         elif args.action == 'submit':
             pending = load_state(args.project)
             if pending.get('attention', {}).get('kind') == 'image_review':
@@ -1783,11 +1731,11 @@ def main():
             result = compact(work(args.project))
         elif args.action == 'refresh-frontier':
             result = compact(refresh_frontier(args.project, args.expected_revision))
+        elif args.action == 'defer-frontier':
+            result = compact(defer_frontier(args.project, args.expected_revision))
+            dispatch_worker(args.project)
         elif args.action == 'refresh-completion':
             result = compact(refresh_completion(args.project, args.expected_revision, advance_now=False))
-            dispatch_worker(args.project)
-        elif args.action == 'reopen-convergence':
-            result = compact(reopen_convergence(args.project, advance_now=False))
             dispatch_worker(args.project)
         else:
             state = load_state(args.project)

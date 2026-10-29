@@ -23,29 +23,29 @@ These counts attest source availability, not complete PsyQ semantics or compatib
 
 | SDK name | Shared definition |
 | --- | --- |
-| `ClearImage` | [`ClearImage`](../src/psx_gpu.c#L872) |
-| `ClearOTagR` | [`ClearOTagR`](../src/psx_gpu.c#L998) |
-| `DrawOTag` | [`DrawOTag`](../src/psx_gpu.c#L3115) |
-| `DrawPrim` | [`DrawPrim`](../src/psx_gpu.c#L2924) |
-| `DrawSync` | [`DrawSync`](../src/psx_gpu.c#L2707) |
-| `DrawSyncCallback` | [`DrawSyncCallback`](../src/psx_gpu.c#L3105) |
-| `InitGeom` | [`InitGeom`](../src/psx.c#L3031) |
-| `MemCardSync` | [`MemCardSync`](../src/psx.c#L13796) |
-| `PadGetState` | [`PadGetState`](../src/psx.c#L5402) |
-| `PadInfoAct` | [`PadInfoAct`](../src/psx.c#L5509) |
-| `PadInfoMode` | [`PadInfoMode`](../src/psx.c#L5441) |
-| `SetDrawEnv` | [`SetDrawEnv`](../src/psx_gpu.c#L3538) |
-| `SetGraphDebug` | [`SetGraphDebug`](../src/psx_gpu.c#L2643) |
-| `SetRCnt` | [`SetRCnt`](../src/psx.c#L1677) |
-| `SpuGetAllKeysStatus` | [`SpuGetAllKeysStatus`](../src/psx_spu.c#L5095) |
-| `_ctl` | [`_ctl`](../src/psx_gpu.c#L2679) |
-| `_getctl` | [`_getctl`](../src/psx_gpu.c#L2685) |
-| `_spu_FsetRXXa` | [`_spu_FsetRXXa`](../src/psx_spu.c#L195) |
-| `_status` | [`_status`](../src/psx_gpu.c#L2674) |
-| `memset` | [`memset`](../src/platform/win/xcrt.c#L159) |
-| `setIntrDMA` | [`setIntrDMA`](../src/psx.c#L12444) |
-| `setIntrVSync` | [`setIntrVSync`](../src/psx.c#L1760) |
-| `trapIntrVSync` | [`trapIntrVSync`](../src/psx.c#L1771) |
+| `ClearImage` | [`ClearImage`](../src/psx_gpu.c) |
+| `ClearOTagR` | [`ClearOTagR`](../src/psx_gpu.c) |
+| `DrawOTag` | [`DrawOTag`](../src/psx_gpu.c) |
+| `DrawPrim` | [`DrawPrim`](../src/psx_gpu.c) |
+| `DrawSync` | [`DrawSync`](../src/psx_gpu.c) |
+| `DrawSyncCallback` | [`DrawSyncCallback`](../src/psx_gpu.c) |
+| `InitGeom` | [`InitGeom`](../src/psx.c) |
+| `MemCardSync` | [`MemCardSync`](../src/psx.c) |
+| `PadGetState` | [`PadGetState`](../src/psx.c) |
+| `PadInfoAct` | [`PadInfoAct`](../src/psx.c) |
+| `PadInfoMode` | [`PadInfoMode`](../src/psx.c) |
+| `SetDrawEnv` | [`SetDrawEnv`](../src/psx_gpu.c) |
+| `SetGraphDebug` | [`SetGraphDebug`](../src/psx_gpu.c) |
+| `SetRCnt` | [`SetRCnt`](../src/psx.c) |
+| `SpuGetAllKeysStatus` | [`SpuGetAllKeysStatus`](../src/psx_spu.c) |
+| `_ctl` | [`_ctl`](../src/psx_gpu.c) |
+| `_getctl` | [`_getctl`](../src/psx_gpu.c) |
+| `_spu_FsetRXXa` | [`_spu_FsetRXXa`](../src/psx_spu.c) |
+| `_status` | [`_status`](../src/psx_gpu.c) |
+| `memset` | [`memset`](../src/platform/win/xcrt.c) |
+| `setIntrDMA` | [`setIntrDMA`](../src/psx.c) |
+| `setIntrVSync` | [`setIntrVSync`](../src/psx.c) |
+| `trapIntrVSync` | [`trapIntrVSync`](../src/psx.c) |
 
 ## Names without mapped implementations
 
@@ -67,6 +67,6 @@ Most are SDK driver internals. Existing native GPU, CD/filesystem, pad, interrup
 
 ## Verification and limits
 
-Definitions were parsed from shared top-level C/C++ sources and headers, including static/inline bodies; unmatched names were checked throughout nonvendored shared runtime/platform sources and headers. `memset` is implemented in Windows `xcrt.c` and provided by the host C runtime on other platforms. The only leading-underscore alias used is explicitly restricted `_firstfile` → `firstfile`. No fuzzy name matching was treated as an implementation. Comment/variable occurrences such as `callback` are not function definitions.
+Definitions were parsed from shared top-level C/C++ sources and headers, including static/inline bodies; unmatched names were checked throughout nonvendored shared runtime/platform sources and headers. `memset` is implemented in Windows `xcrt.c` and provided by the host C runtime on other platforms. The only leading-underscore alias used is explicitly restricted `_firstfile` Р Р†РІР‚В РІР‚в„ў `firstfile`. No fuzzy name matching was treated as an implementation. Comment/variable occurrences such as `callback` are not function definitions.
 
 The source snapshot records every inspected runtime file hash. Other agents may subsequently change the shared sources; recheck those hashes before reusing the numbers. This was a source availability audit, with manual inspection of matched bodies and identified restricted bridges; no runtime implementation was changed and no behavior-equivalence tests were claimed.

@@ -97,7 +97,9 @@ class MipsFunctionFixture:
                     self.lo = product & 0xffffffff
                     self.hi = product >> 32
                 elif fn == 13:
-                    raise ValueError(f'Guest MIPS BREAK {(word >> 16) & 0xffff}')
+                    high, low = (word >> 16) & 0x3ff, (word >> 6) & 0x3ff
+                    code = f'{high}, {low}' if low else str(high)
+                    raise ValueError(f'Guest MIPS BREAK {code}')
                 elif fn in (26, 27):
                     dividend = self.signed(r[rs]) if fn == 26 else r[rs]
                     divisor = self.signed(r[rt]) if fn == 26 else r[rt]

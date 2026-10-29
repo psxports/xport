@@ -66,7 +66,7 @@ Ordering is deterministic, including tied candidate generation. Existing accepte
 - `inputs.json`, per-image configs/commands/logs and `.idb`: input hashes, GP/BSS evidence, exact launch commands and isolated IDA databases
 - `pal/<image>/` and `ntsc-u/<image>/`: complete exported function listings, pseudocode where available, call/data references, symbols, strings and `comparison-features.json`
 - `comparison.json`: full one-to-one map, changed instruction words/address operands, ranked candidates, data correspondence, unmatched items and independent `functions_by_size` inventories on both sides
-- `functions.csv`: every PAL function ordered by size, with its map or best unaccepted candidate and `similarity_pct` in 0–100 units
+- `functions.csv`: every PAL function ordered by size, with its map or best unaccepted candidate and `similarity_pct` in 0РІР‚вЂњ100 units
 - `potential-differences.json`: functions requiring evaluation, changed mapped data and unmatched NTSC functions/data
 - `index.html`: local searchable function list sorted by size with similarity percentages, strict verification reasons and a changed-data shortlist; only strictly verified equivalents are hidden by default
 

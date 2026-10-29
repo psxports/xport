@@ -1,8 +1,18 @@
 # Changelog
 
+## 2026-10-29
+
+- Split agent stage contracts from scoped technical references, centralized build/context/host-tool policies and added documentation validation. Added reviewed assertion migration, safe editorial binding transfers and automatic project source/cover/README staging; shared FFmpeg and GitHub CLI paths preserve existing Pageant authentication
+
+- Consolidated full static game translation into docs/DECOMP.md and the decomp command with a durable goal and decomp: n% title. Added refactor/enhance goal routes, renamed REFACTOR.md and added plan-based enhance progress. Removed execution-discovery, paired replay supervisors, shared comparison mappings and machine-state codecs. DuckStation now uses pinned upstream CPU/device behavior with only project data-root isolation
+
+## 2026-10-27
+
+- Removed whole-frame skipping and its GPU control/query API. VSync retains elapsed-field accounting without raster suppression or an early-return scheduler. All submitted primitive/OT passes, fills and presentation execute normally; explicit HD raster disablement and complete-frame presentation scopes remain. Removed obsolete consumer calls and AceCombat3 recovery controls; native/Web timing and Debug x86 GPU observer checks pass
+
 ## 2026-10-26
 
-- Added native pending pitch/reverb masks to `SpuKeyControl`. With no guest-key binding and `event_mode & 1`, `SpuSetReverbVoice` updates or queries the pending reverb mask under the audio lock; only modes0/1 set event flag8. Existing mode8, guest binding, immediate register helper and noise contracts remain unchanged. Rebuild header consumers and invalidate old raw checkpoints; portable SPU state version2 rejects version1. FF advances its native checkpoint ABI to282. Exact SDK-only R2 static review received from AgentArmstrong, Pandemonium2, RapidRacer, AceCombat3 and TestDrive5; compiled/runtime compatibility checks remain deferred
+- Added native pending pitch/reverb masks to `SpuKeyControl`. With no guest-key binding and `event_mode & 1`, `SpuSetReverbVoice` updates or queries the pending reverb mask under the audio lock; only modes0/1 set event flag8. Existing mode8, guest binding, immediate register helper and noise contracts remain unchanged. Rebuild header consumers. Exact SDK-only R2 static review received from AgentArmstrong, Pandemonium2, RapidRacer, AceCombat3 and TestDrive5; compiled/runtime compatibility checks remain deferred
 - Added `spu_clear_reverb_work_area(mode, binding, direction)` for synchronous clearing with caller-owned transfer/event fields and the existing private zero source. It delegates to the existing clear core without global rebinding; existing PsyQ APIs, import/restore, reservation and serialized layouts are unchanged. No required consumer migration. Preserve native source provenance and binding/context lifetime as documented in `docs/LIBRARY.md`. Static consumer review recorded; compilation and runtime validation remain deferred
 
 ## 2026-10-24
@@ -15,7 +25,7 @@
 
 ## 2026-10-16 18:19:31 UTC
 
-- Added `r_masked_u32` for aligned word reads with explicit LWL/LWR observation byte lanes. Existing scalar and MMIO contracts are unchanged; partial MMIO is rejected because the device read callback has no mask. No new consumer binding, serialized state or required migration. Native x86/x64 and x86 LOCKSTEP_DEBUG contract tests pass; FF texture-loader raw/C comparison passes37 cases including two unaligned sources with exact ordered masks. Contract: docs/MASKED_MEMORY.md. Evidence: FightingForce-xport/status/implementation-completion/masked-memory-compatibility-review.json and texture-loader-full-review.json. Other consumers' gameplay and physical bus timing are not certified
+- Added `r_masked_u32` for aligned word reads with explicit LWL/LWR observation byte lanes. Existing scalar and MMIO contracts are unchanged; partial MMIO is rejected because the device read callback has no mask. No new consumer binding, serialized state or required migration. Native x86/x64 memory contract tests pass; FF texture-loader raw/C comparison passes37 cases including two unaligned sources with exact ordered masks. Contract: docs/MASKED_MEMORY.md. Evidence: FightingForce-xport/status/implementation-completion/masked-memory-compatibility-review.json and texture-loader-full-review.json. Other consumers' gameplay and physical bus timing are not certified
 
 ## 2026-10-15 01:59:41 UTC
 

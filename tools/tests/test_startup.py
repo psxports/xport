@@ -9,7 +9,6 @@ import sys
 
 import startup
 import duckstation_deploy
-import trace_workflow
 
 
 class StartupSupervisorTests(unittest.TestCase):
@@ -22,6 +21,7 @@ class StartupSupervisorTests(unittest.TestCase):
             startup.initialize_project(root, 'RapidRacer', 'RR', 45400)
             text = (root/'README.md').read_text(encoding='utf-8')
             self.assertEqual(text, startup.render_project_readme('RapidRacer', 'RR'))
+            self.assertEqual(json.loads((root/'xport-project.json').read_text())['players'], 1)
             self.assertIn('>RapidRacer-xport</h1>', text)
             self.assertIn('https://psxports.to/RR/', text)
             for label in ('decomp', 'refactor', 'enhance', 'remaster'):
@@ -377,7 +377,7 @@ class StartupSupervisorTests(unittest.TestCase):
         self.assertEqual([user['Pad1'][key] for key in ('LUp', 'LRight', 'LDown', 'LLeft')],
                          ['Keyboard/W', 'Keyboard/D', 'Keyboard/S', 'Keyboard/A'])
         self.assertEqual(user['Audio']['OutputMuted'], 'false')
-        self.assertEqual(Path(user['Folders']['BIOS']),
+        self.assertEqual(Path(user['BIOS']['SearchDirectory']),
                          Path(r'C:\Projects\xports'))
         self.assertTrue(all(user['BIOS'][key] == 'scph5502.bin'
                             for key in ('PathNTSCJ', 'PathNTSCU', 'PathPAL')))
@@ -389,21 +389,21 @@ class StartupSupervisorTests(unittest.TestCase):
         self.assertNotIn('Pad1', audit)
         self.assertNotIn('Hotkeys', audit)
         self.assertEqual(audit['Audio']['OutputMuted'], 'true')
-        self.assertEqual(audit['Folders']['BIOS'], user['Folders']['BIOS'])
+        self.assertEqual(audit['BIOS']['SearchDirectory'], user['BIOS']['SearchDirectory'])
 
     def test_emulator_bios_paths_resolve_against_the_selected_template(self):
         source = Path(duckstation_deploy.__file__).parent / 'duckstation/settings.ini'
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             template = folder / 'settings.ini'
-            original = source.read_text(encoding='utf-8').replace(r'BIOS = C:\Projects\xports', 'BIOS = bios')
+            original = source.read_text(encoding='utf-8').replace(r'SearchDirectory = C:\Projects\xports', 'SearchDirectory = bios')
             template.write_text(original, encoding='utf-8')
             user = duckstation_deploy.settings_for_role('user', 'user', 45002, template)
-            self.assertEqual(Path(user['Folders']['BIOS']), folder / 'bios')
+            self.assertEqual(Path(user['BIOS']['SearchDirectory']), folder / 'bios')
             absolute = folder / 'custom-bios'
-            template.write_text(original.replace('BIOS = bios', 'BIOS = ' + str(absolute)), encoding='utf-8')
+            template.write_text(original.replace('SearchDirectory = bios', 'SearchDirectory = ' + str(absolute)), encoding='utf-8')
             audit = duckstation_deploy.settings_for_role('audit', 'user', 45000, template)
-            self.assertEqual(Path(audit['Folders']['BIOS']), absolute)
+            self.assertEqual(Path(audit['BIOS']['SearchDirectory']), absolute)
             self.assertEqual(audit['Debug']['GDBServerPort'], '45000')
             self.assertEqual(audit['Audio']['OutputMuted'], 'true')
 
@@ -420,15 +420,14 @@ class StartupSupervisorTests(unittest.TestCase):
                          'psyq': {'result': {'classification': {}}}},
                      'inventory': {}, 'recoveries': [], 'attention': None, 'failure': None}
             capture = {'schema': 1, 'original_image': 'MAIN.EXE'}
-            with mock.patch.object(startup, 'validate_capture_contract', return_value=capture), \
-                 mock.patch.object(startup, 'validate_convergence_contract', return_value={'native_abi': 'Example ABI 1'}), \
-                 mock.patch.object(startup, 'run_shared', return_value='deployed') as run_shared:
+            with mock.patch.object(startup, 'run_shared', return_value='deployed') as run_shared, \
+                 mock.patch.object(startup, 'stage_sources', return_value={'staged_files': 1}) as stage:
                 completed = startup.advance(root, state)
+            stage.assert_called_once_with(root)
             self.assertEqual(completed['status'], 'complete')
             self.assertTrue((root/'DuckStation.bat').is_file())
-            self.assertTrue((root/'record.bat').is_file())
-            self.assertEqual([call.args[2][1] for call in run_shared.call_args_list], ['user', 'lockstep', 'audit', 'trace'])
-            self.assertEqual(set(completed['completion']['duckstation']['deployments']), {'user', 'lockstep', 'audit', 'trace'})
+            self.assertEqual([call.args[2][1] for call in run_shared.call_args_list], ['user', 'audit'])
+            self.assertEqual(set(completed['completion']['duckstation']['deployments']), {'user', 'audit'})
 
     def test_emulator_resume_refreshes_missing_frontier_index(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -439,77 +438,18 @@ class StartupSupervisorTests(unittest.TestCase):
                      'project_root': str(root.resolve()), 'name': 'Library Entry', 'short_name': 'LE',
                      'created_utc': '2026-09-25T00:00:00+00:00', 'steps': {},
                      'inventory': {}, 'recoveries': [], 'attention': None, 'failure': None}
-            with mock.patch.object(startup, 'validate_capture_contract', return_value={'schema': 1}), \
-                 mock.patch.object(startup, 'validate_convergence_contract', return_value={}), \
-                 mock.patch.object(startup, 'run_shared', return_value='ok') as run_shared:
+            with mock.patch.object(startup, 'run_shared', return_value='ok') as run_shared, \
+                 mock.patch.object(startup, 'stage_sources', return_value={'staged_files': 1}) as stage:
                 completed = startup.advance(root, state)
+            stage.assert_called_once_with(root)
             self.assertEqual(completed['status'], 'complete')
             self.assertEqual(completed['completion']['source_index'], 'ok')
             self.assertEqual(run_shared.call_args_list[0].args[1:],
                              ('source_index', '--rebuild', '--no-format'))
 
-    def test_startup_pauses_before_emulator_until_capture_contract_is_reviewed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45310)
-            state = {'schema': 1, 'revision': 9, 'status': 'running', 'step': 'trace_contract',
-                     'project_root': str(root.resolve()), 'name': 'Example Game', 'short_name': 'EX',
-                     'created_utc': '2026-09-25T00:00:00+00:00', 'steps': {}, 'inventory': {},
-                     'recoveries': [], 'attention': None, 'failure': None}
-            waiting = startup.advance(root, state)
-            self.assertEqual(waiting['status'], 'attention')
-            self.assertEqual(waiting['attention']['kind'], 'trace_capture_review')
-            self.assertFalse((root/'DuckStation.bat').exists())
 
-    def test_startup_pauses_for_convergence_contract_after_capture_review(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45315)
-            state = {'schema': 1, 'revision': 9, 'status': 'running', 'step': 'convergence_contract',
-                     'project_root': str(root.resolve()), 'name': 'Example Game', 'short_name': 'EX',
-                     'created_utc': '2026-09-25T00:00:00+00:00', 'steps': {}, 'inventory': {},
-                     'recoveries': [], 'attention': None, 'failure': None}
-            startup.atomic_json(root/'status/progress-data.json', {'decompilation_status': {'TODO': 0}})
-            with mock.patch.object(startup, 'validate_capture_contract', return_value={'schema': 1}):
-                waiting = startup.advance(root, state)
-            self.assertEqual(waiting['status'], 'attention')
-            self.assertEqual(waiting['attention']['kind'], 'convergence_review')
-            self.assertTrue(waiting['attention']['context']['problem'])
-            self.assertFalse((root/'DuckStation.bat').exists())
 
-    def test_reopen_convergence_resumes_completed_legacy_startup(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45316)
-            state = {'schema': 1, 'revision': 9, 'status': 'complete', 'step': 'complete',
-                     'project_root': str(root.resolve()), 'name': 'Example Game', 'short_name': 'EX',
-                     'created_utc': '2026-09-25T00:00:00+00:00', 'steps': {}, 'inventory': {},
-                     'recoveries': [], 'attention': None, 'failure': None, 'completion': {'legacy': True}}
-            startup.atomic_json(startup.state_path(root), state)
-            startup.atomic_json(root/'status/progress-data.json', {'decompilation_status': {'TODO': 0}})
-            waiting = startup.reopen_convergence(root)
-            self.assertEqual(waiting['status'], 'attention')
-            self.assertEqual(waiting['attention']['kind'], 'convergence_review')
-            self.assertIsNone(waiting['completion'])
 
-    def test_verify_frontier_advances_to_trace_contract(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45317)
-            state = {'schema': 1, 'revision': 9, 'status': 'running', 'step': 'verify_frontier',
-                     'project_root': str(root.resolve()), 'name': 'Example Game', 'short_name': 'EX',
-                     'created_utc': '2026-09-25T00:00:00+00:00', 'steps': {}, 'inventory': {},
-                     'recoveries': [], 'attention': None, 'failure': None}
-            with mock.patch.object(startup, 'run_shared', return_value='ok') as commands, \
-                 mock.patch.object(startup, 'capture_contract_packet', return_value={'problem': 'review required'}):
-                waiting = startup.advance(root, state)
-            self.assertEqual(waiting['status'], 'attention')
-            self.assertEqual(waiting['attention']['kind'], 'trace_capture_review')
-            result = waiting['steps']['verify_frontier']['result']
-            self.assertEqual(result['source_index'], 'ok')
-            self.assertEqual(result['translation_queue'], 'ok')
-            self.assertEqual([call.args[1] for call in commands.call_args_list], ['source_index', 'project_context'])
-            self.assertTrue(result['native_link_deferred_to_coverage'])
 
     def test_refresh_completion_requires_exact_completed_revision(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -518,7 +458,7 @@ class StartupSupervisorTests(unittest.TestCase):
             state = {'schema': 1, 'revision': 9, 'status': 'complete', 'step': 'complete',
                      'project_root': str(root), 'completion': {'stale': True}, 'steps': {}}
             startup.atomic_json(startup.state_path(root), state)
-            with mock.patch.object(startup, 'validate_capture_contract', return_value={'schema': 1}):
+            with contextlib.nullcontext():
                 with self.assertRaisesRegex(ValueError, 'REVISION_MISMATCH'):
                     startup.refresh_completion(root, 8, advance_now=False)
                 refreshed = startup.refresh_completion(root, 9, advance_now=False)
@@ -576,41 +516,8 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(packet['remaining_todo'], 2)
             self.assertEqual(packet['functions'], [])
 
-    def test_capture_contract_accepts_migrated_lockstep_project(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45320)
-            config_path = root/'xport-project.json'
-            config = json.loads(config_path.read_text())
-            config['paths']['disc_image'] = 'iso/game.cue'
-            config['lockstep']['enabled'] = True
-            config['lockstep']['original_image'] = 'MAIN.EXE'
-            startup.atomic_json(config_path, config)
-            (root/'iso').mkdir(exist_ok=True)
-            (root/'iso/game.cue').write_text('FILE game.bin BINARY\n')
-            (root/'orig/MAIN.EXE').write_bytes(b'PS-X EXE')
-            result = startup.validate_capture_contract(root)
-            self.assertEqual(result['schema'], 1)
-            self.assertEqual(result['original_image'], 'MAIN.EXE')
 
-    def test_capture_contract_uses_image_profile_extracted_original(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)/'Example-xport'
-            startup.initialize_project(root, 'Example Game', 'EX', 45320)
-            config = json.loads((root/'xport-project.json').read_text())
-            config['paths']['disc_image'] = 'iso/game.cue'
-            config['lockstep'].update(enabled=True, original_image='DISC1_MAIN.EXE')
-            startup.atomic_json(root/'xport-project.json', config)
-            (root/'iso/game.cue').write_text('FILE game.bin BINARY\n')
-            original = root/'bin/DATA/1/MAIN.EXE'
-            original.parent.mkdir(parents=True, exist_ok=True)
-            original.write_bytes(b'PS-X EXE')
-            profile = root/'tools/ida/DISC1_MAIN.EXE.json'
-            startup.atomic_json(profile, {'image': 'DISC1_MAIN.EXE',
-                                         'loads': [{'path': 'bin/DATA/1/MAIN.EXE', 'base': 2147549184, 'offset': 2048}]})
-            result = startup.validate_capture_contract(root)
-            self.assertEqual(result['original_executable'], 'bin/DATA/1/MAIN.EXE')
-            self.assertFalse((root/'orig/DISC1_MAIN.EXE').exists())
+
 
     def test_image_review_proposes_psx_profiles_and_boot_image(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -630,7 +537,6 @@ class StartupSupervisorTests(unittest.TestCase):
             proposal = startup.image_review_proposal(root, {'psx_executables': files, 'cue_files': []})
             self.assertEqual(proposal['config_patch']['paths']['original_executable'], 'orig/SCUS_123.45')
             self.assertEqual(proposal['config_patch']['analysis']['default_image'], 'GAME.EXE')
-            self.assertEqual(proposal['config_patch']['lockstep']['original_image'], 'GAME.EXE')
             self.assertEqual(set(proposal['ida_configs']), {'SCUS_123.45', 'GAME.EXE'})
             self.assertEqual(proposal['ida_configs']['GAME.EXE']['gp'], 0x1234)
             self.assertEqual(proposal['ida_configs']['GAME.EXE']['gp_evidence']['source'], 'psx_exe_header')
@@ -678,19 +584,7 @@ class StartupSupervisorTests(unittest.TestCase):
         self.assertLess(assignment, seeds)
         self.assertLess(verification, export)
 
-    def test_trace_workflow_requires_the_lockstep_project_contract(self):
-        config = {'lockstep': {'schema': 1, 'enabled': True}}
-        self.assertIs(trace_workflow.require_lockstep(config), config['lockstep'])
-        with self.assertRaisesRegex(ValueError, 'LOCKSTEP_PROJECT_NOT_MIGRATED'):
-            trace_workflow.require_lockstep({'lockstep': {'schema': 1, 'enabled': False}})
-        with self.assertRaisesRegex(ValueError, 'LOCKSTEP_PROJECT_NOT_MIGRATED'):
-            trace_workflow.require_lockstep({'duckstation': {}})
 
-    def test_trace_workflow_rejects_incomplete_lockstep_contract(self):
-        with self.assertRaisesRegex(ValueError, 'LOCKSTEP_PROJECT_NOT_MIGRATED'):
-            trace_workflow.require_lockstep({'lockstep': {'enabled': True}})
-        with self.assertRaisesRegex(ValueError, 'LOCKSTEP_PROJECT_NOT_MIGRATED'):
-            trace_workflow.require_lockstep({'lockstep': {'schema': 1}})
 
     def test_project_preflight_checks_native_platform_without_host_tools(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -756,10 +650,10 @@ class StartupSupervisorTests(unittest.TestCase):
             self.skipTest('Windows desktop startup information')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'Example-xport';(root/'status').mkdir(parents=True)
-            with mock.patch.dict(startup.os.environ, {'XPORT_WINDOWS_DESKTOP': 'WinSta0\\XportConverge'}):
+            with mock.patch.dict(startup.os.environ, {'XPORT_WINDOWS_DESKTOP': 'WinSta0\\XportWorker'}):
                 with mock.patch('windows_desktop.launch_default_desktop_process', return_value=mock.Mock(pid=456)) as launch:
                     startup.dispatch_worker(root)
-            self.assertEqual(launch.call_args.kwargs['environment']['XPORT_WINDOWS_DESKTOP'], 'WinSta0\\XportConverge')
+            self.assertEqual(launch.call_args.kwargs['environment']['XPORT_WINDOWS_DESKTOP'], 'WinSta0\\XportWorker')
             self.assertFalse(launch.call_args.kwargs['visible'])
             self.assertEqual(launch.call_args.args[1], root.resolve())
 

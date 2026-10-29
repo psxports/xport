@@ -44,6 +44,9 @@ EM_JS(void, video_close, (void), {
 EM_JS(uint32, video_pcm, (sint16 *output, uint32 count), {
     return Module.xportVideoReadPcm ? Module.xportVideoReadPcm(HEAP16.subarray(output >> 1, (output >> 1) + count * 2), count) : 0;
 });
+EM_JS(sint32, video_has_audio, (), {
+    return Module.xportVideoHasAudio && Module.xportVideoHasAudio() ? 1 : 0;
+});
 // clang-format on
 
 static uint32 video_cd_pcm(void *context, sint16 *output, uint32 frames)
@@ -51,28 +54,35 @@ static uint32 video_cd_pcm(void *context, sint16 *output, uint32 frames)
     return video_pcm(output, frames);
 }
 
-sint32 xport_fmv_open(const char *path)
+static sint32 video_audio_attached;
+
+sint32 xport_web_fmv_open(const char *path)
 {
     sint32 result;
     spu_set_cd_pcm_source(NULL, NULL);
     result = video_open(path);
-    if (result > 0)
-        spu_set_cd_pcm_source(video_cd_pcm, NULL);
+    video_audio_attached = 0;
     return result;
 }
 
-sint32 xport_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
+sint32 xport_web_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
 {
+    if (!video_audio_attached && video_has_audio())
+    {
+        spu_set_cd_pcm_source(video_cd_pcm, NULL);
+        video_audio_attached = 1;
+    }
     return video_next(rgb, capacity, frame);
 }
 
-void xport_fmv_pause(sint32 paused)
+void xport_web_fmv_pause(sint32 paused)
 {
     video_pause(paused);
 }
 
-void xport_fmv_close(void)
+void xport_web_fmv_close(void)
 {
     spu_set_cd_pcm_source(NULL, NULL);
+    video_audio_attached = 0;
     video_close();
 }

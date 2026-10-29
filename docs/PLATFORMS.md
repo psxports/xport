@@ -10,7 +10,7 @@
 
 OS and CPU identity are independent. Use AP macros for xport-owned platform branches; keep compiler feature macros such as `_MSC_VER` for compiler-specific syntax and leave third-party headers unchanged. Invalid OS/CPU combinations fail compilation.
 
-`LOCKSTEP_DEBUG` requires `AP_WIN` and `AP_X86` and fails at compilation on x64/Web. Converge/debugger replay remains x86. Native x64 support must not add x64 argument/stack probes, relax MATCH, change guest widths or add memory exceptions. Existing mapped DRAM remains 2 MiB and scratchpad remains 1 KiB; their backing storage, little-endian accesses and comparison protocols are unchanged.
+Native x64 support must not add x64 argument/stack probes, relax MATCH, change guest widths or add memory exceptions. Existing mapped DRAM remains 2 MiB and scratchpad remains 1 KiB; their backing storage, little-endian accesses and comparison protocols are unchanged.
 
 ## Build selection and files
 
@@ -25,13 +25,13 @@ python -B [XPORT_ROOT]/tools/xport.py --project PROJECT_ROOT build_native --arch
 
 Intermediates use `_build/x86/CONFIG` and `_build/x64/CONFIG`. Executables retain `bin/SHORT.exe` and `bin/SHORT_debug.exe`, with working directory `bin`. The latest architecture build replaces that configuration's executable. Do not build both architectures concurrently against those shared output files. Project targets record the last successfully linked architecture per configuration and force relinking on a switch, including when the other architecture has a newer executable timestamp. They do not recompile unchanged intermediates merely to switch architecture.
 
-Release on x86 and x64 selects xcrt when `UseXcrt` is enabled. `/p:UseXcrt=false` selects standard static CRT `/MT`; Debug uses `/MDd`. Shared `xcrt.c` contains portable services. Each architecture assembles its own `platform/win/xcrt_x86.asm` or `platform/win/xcrt_x64.asm` through the MASM build customization, providing its own register ABI helpers, math entry points and stack probing. Both Release architectures disable ASLR/relocations and use `/Gs2147483647` to suppress ordinary stack probes. x64 retains full-width addresses and does not require loading below 4 GiB; its XCRT `__chkstk` helper remains available for code compiled with other probe thresholds. Build Release only when authorized by the project/user policy.
+Release on x86 and x64 selects xcrt when `UseXcrt` is enabled. `/p:UseXcrt=false` selects standard static CRT `/MT`; Debug uses `/MDd`. Shared `xcrt.c` contains portable services. Each architecture assembles its own `platform/win/xcrt_x86.asm` or `platform/win/xcrt_x64.asm` through the MASM build customization, providing its own register ABI helpers, math entry points and stack probing. Both Release architectures disable ASLR/relocations and use `/Gs2147483647` to suppress ordinary stack probes. x64 retains full-width addresses and does not require loading below 4 GiB; its XCRT `__chkstk` helper remains available for code compiled with other probe thresholds. Use [BUILD_POLICY.md](BUILD_POLICY.md) for build timing and selected configurations.
 
 ## Pointer and format boundaries
 
 Host pointers, callbacks and pointer arithmetic retain pointer width (`uintptr_t`, `intptr_t`, `size_t`, `ptrdiff_t` where appropriate). Original PS1 addresses, offsets, registers, DMA tags and asset/save fields retain their original fixed widths. Do not mechanically widen guest words or serialize native structures containing pointers.
 
-Register complete native OT/packet pools through `gpu_register_packet_range`. The registry maps full host addresses to independent 24-bit links. On x64, unregistered native OT/packet pointers passed to chain helpers are rejected instead of being truncated. Numeric guest links and terminators remain valid for `setaddr`; registered pointers use the same registry. x86 retains its legacy fallback and lockstep behavior. A registered pool must stay alive while its links can be used; this API does not unregister temporary allocations.
+Register complete native OT/packet pools through `gpu_register_packet_range`. The registry maps full host addresses to independent 24-bit links. On x64, unregistered native OT/packet pointers passed to chain helpers are rejected instead of being truncated. Numeric guest links and terminators remain valid for `setaddr`; registered pointers use the same registry. A registered pool must stay alive while its links can be used; this API does not unregister temporary allocations.
 
 The native `VSyncCallback` return uses `intptr` so a previous host callback address survives on x64; guest SDK wrappers and original guest callback fields retain their PS1 contracts. Pointer-bearing native structures can grow. Asset/packet formats must not grow: use explicit decode/encode and size/offset assertions at their boundaries.
 
@@ -39,7 +39,6 @@ VID owns GPU handles and pointer-sized buffer offsets. Its compact world/UI vert
 
 ## Targeted checks
 
-Shared fixtures accept an architecture independently of converge:
 
 ```text
 python -B [XPORT_ROOT]/tools/xport.py --project PROJECT_ROOT gpu_observer_test --architecture x64 --configuration Debug
@@ -56,12 +55,12 @@ python -B -m unittest tests.test_architecture tests.test_native_timing tests.tes
 
 The helper selects `vcvars64.bat`/`vcvars32.bat` before compiling native snippets. Web builds use the pinned Emscripten toolchain and stay wasm32. Validate AP_WEB from an actual Emscripten compile and rebuild Web after common-header changes.
 
-Verify OG chains above 4 GiB, callback roundtrips, raster/VRAM/VSync, actual native GL shader/pixel tests, float math, saves and project layouts. Verify actual x86 mapped memory and x64 lockstep rejection separately. Contract tests and unchanged mapped bytes do not establish a fresh full-game converge MATCH; do not report them as one. Keep full replay acceptance with its existing x86 project/record owner.
+Verify OG chains above 4 GiB, callback roundtrips, raster/VRAM/VSync, actual native GL shader/pixel tests, float math, saves and project layouts. Keep full replay acceptance with its existing x86 project/record owner.
 
 Pilot evidence and validation limits: consuming project's `status/audits/x64/report.json`. No game Release build or runtime acceptance is implied by a Debug fixture or project-property evaluation.
 
 
-Native VM platform startup binds the existing `spu_mmio_read`/`spu_mmio_write` callbacks to `0x1F801C00..0x1F801DFF` after `xport_memory_init`. The native SEQ/VM flush uses these SPU register accesses; XA mixing follows a separate path and can remain audible when this binding is missing. Keep this device-register boundary separate from game DRAM ownership. Historical `LOCKSTEP_DEBUG` retains its own binding contract. Do not enable unrelated DMA/GPU bus paths to restore native SPU output.
+Native VM platform startup binds the existing `spu_mmio_read`/`spu_mmio_write` callbacks to `0x1F801C00..0x1F801DFF` after `xport_memory_init`. The native SEQ/VM flush uses these SPU register accesses; XA mixing follows a separate path and can remain audible when this binding is missing. Keep this device-register boundary separate from game DRAM ownership. Do not enable unrelated DMA/GPU bus paths to restore native SPU output.
 
 ## XCRT architecture checks
 
@@ -76,7 +75,7 @@ The fixture links `/NODEFAULTLIB`, checks startup, actual global C++ constructio
 
 ## Minimal XCRT and C++ lifetime
 
-Ordinary Release startup passes an empty command line to `WinMain`; only `_DEBUG` or `LOCKSTEP_DEBUG` startup reads `GetCommandLineA`. Keep `atexit` callbacks and static destruction available to shared consumers.
+Keep `atexit` callbacks and static destruction available to shared consumers.
 
 `WinMainCRTStartup` initializes the heap, walks linker-sorted `.CRT$XCA` through `.CRT$XCZ` C++ initializers and calls `exit` after `WinMain`. `atexit` retains callbacks in a heap-backed LIFO list; callbacks run outside its lock and may register additional callbacks. `abort` does not run exit callbacks. This is ordinary C++ static lifetime support, independent of STL.
 

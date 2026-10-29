@@ -127,6 +127,10 @@ static RUN_MODE platform_run_mode;
 static sint32 platform_exit_code;
 static sint16 audio_input[XPORT_AUDIO_INPUT_FRAMES * 2];
 static float audio_output[XPORT_AUDIO_OUTPUT_FRAMES * 2];
+static uint32 audio_clock_before;
+static uint32 audio_clock_rate;
+static uint32 audio_clock_valid;
+static double audio_clock_deadline;
 
 volatile uint32 g_xport_audio_submitted_buffers;
 volatile uint32 g_xport_audio_nonzero_buffers;
@@ -278,9 +282,9 @@ void xport_input_rumble(sint32 controller, uint16 low, uint16 high)
 
 EM_JS(uint32, xport_audio_rate, (), { return Module.xportAudioRate || 44100; });
 
-EM_JS(void, xport_audio_push, (const float *samples, uint32 frames), {
+EM_JS(void, xport_audio_push, (const float *samples, uint32 frames, double age), {
     if (Module.xportAudioPush)
-        Module.xportAudioPush(HEAPF32.slice(samples >> 2, (samples >> 2) + frames * 2));
+        Module.xportAudioPush(HEAPF32.slice(samples >> 2, (samples >> 2) + frames * 2), age);
 });
 
 EM_JS(void, xport_error, (const char *title, const char *message), {
@@ -449,7 +453,27 @@ uint64 xport_timer_get(void)
     return now - start;
 }
 
-EM_ASYNC_JS(void, platform_wait_frame, (void), { await new Promise(function(wake) { requestAnimationFrame(wake); }); });
+EM_ASYNC_JS(void, platform_wait_frame, (void), {
+    var state = Module['xportFrameTask'];
+    if (!state)
+    {
+        var channel = new MessageChannel();
+        state = { channel: channel, pending: [] };
+        channel.port1.onmessage = function() {
+            var wake = state.pending.shift();
+            if (wake)
+                wake();
+        };
+        Module['xportFrameTask'] = state;
+    }
+    await new Promise(function(wake) {
+        requestAnimationFrame(function() {
+            // Resume outside the animation callback so the submitted frame can paint
+            state.pending.push(wake);
+            state.channel.port2.postMessage(0);
+        });
+    });
+});
 
 void xport_present_complete(void)
 {
@@ -602,6 +626,8 @@ sint32 xport_isquit(void)
 
 sint32 xport_audio_init(void)
 {
+    if (!audio_active)
+        audio_clock_valid = 0;
     audio_active = 1;
     g_xport_audio_backend_active = 1;
     return 1;
@@ -618,6 +644,7 @@ void xport_audio_unlock(void)
 void xport_audio_shutdown(void)
 {
     audio_active = 0;
+    audio_clock_valid = 0;
     g_xport_audio_backend_active = 0;
 }
 
@@ -636,6 +663,14 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     spu_dispatch_pending_irq();
     if (!audio_active || !rate)
         return;
+    /* Keep sample deadlines on the field timeline during catch-up */
+    if (!audio_clock_valid || audio_clock_rate != rate || (sint32)(before - audio_clock_before) <= 0)
+        audio_clock_deadline = (double)xport_timer_get();
+    else
+        audio_clock_deadline += (double)(uint32)(before - audio_clock_before) * (rate == FIELD_RATE ? 1000000.0 * FIELD_RATE_DENOMINATOR / FIELD_RATE_NUMERATOR : 1000000.0 / rate);
+    audio_clock_before = before;
+    audio_clock_rate = rate;
+    audio_clock_valid = 1;
     input_frames = (rate == FIELD_RATE ? xport_field_sample_count(before, SPU_SAMPLE_RATE) : (uint32)(((uint64)(before + 1u) * SPU_SAMPLE_RATE) / rate - ((uint64)before * SPU_SAMPLE_RATE) / rate));
     if (!input_frames || input_frames > XPORT_AUDIO_INPUT_FRAMES)
         return;
@@ -668,7 +703,7 @@ void xport_audio_vblank(uint32 before, uint32 rate)
     if (peak > g_xport_audio_peak)
         g_xport_audio_peak = peak;
     ++g_xport_audio_submitted_buffers;
-    xport_audio_push(audio_output, output_frames);
+    xport_audio_push(audio_output, output_frames, ((double)xport_timer_get() - audio_clock_deadline) / 1000000.0);
 }
 
 EM_ASYNC_JS(void, xport_file_prepare, (const char *path), { await Module.xportEnsureFile(UTF8ToString(path)); });
@@ -761,7 +796,7 @@ int main(int argc, char **argv)
     platform_run_mode = RUN_MODE_GAME;
     platform_exit_code = 0;
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
-#if !defined(LOCKSTEP_DEBUG) && defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
     xport_memory_bind_mmio(0x1F801C00, 0x200, spu_mmio_read, spu_mmio_write, NULL);
 #endif
     xport_input_init();

@@ -19,9 +19,7 @@ enum
     GPU_DISPLAY_MAX_HEIGHT = 512
 };
 
-#if !defined(LOCKSTEP_DEBUG)
 uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
-#endif
 
 enum
 {
@@ -111,28 +109,30 @@ static sint32 psyq_bound;
 static GpuPsyqQueueBinding psyq_queue_binding;
 static sint32 psyq_queue_bound;
 static GpuLinkedSubmit linked_submit;
+static GpuLinkedPause linked_pause;
 static void *linked_submit_context;
 static sint32 linked_submit_failed;
-static void gpu_draw_linked_dma(uint32 *ot);
+
+typedef struct GpuNativeLinkedCursor
+{
+    struct GpuNativeLinkedCursor *previous;
+    uint32 address;
+    uint32 *packet;
+    sint32 ready, drawing, paused;
+} GpuNativeLinkedCursor;
+
+static GpuNativeLinkedCursor *native_linked_cursor;
+static uint32 native_paused_address;
+static uint32 *native_paused_packet;
+static sint32 gpu_draw_linked_dma(uint32 *ot);
+static void gpu_draw_linked_dma_body(uint32 *ot, GpuNativeLinkedCursor *cursor);
 static XportDeviceOperation *linked_trace_operation;
 static GpuSyncSample sync_sample;
-
-static struct
-{
-    uint64 deadline, last_time;
-    uint32 fraction, started, skipped, skipped_count;
-    sint32 enabled;
-} frame_skip = {0, 0, 0, 0, 0, 0,
-#if defined(LOCKSTEP_DEBUG)
-                0
-#else
-                1
-#endif
-};
 
 static sint32 frame_raster = 1;
 static uint32 frame_present_depth;
 static uint32 vram_version = 1;
+static void gpu_render_list_invalidate(void);
 
 static void gpu_vram_invalidate(void)
 {
@@ -147,16 +147,10 @@ uint32 gpu_vram_version(void)
 
 void gpu_set_raster(sint32 enabled)
 {
-#if defined(LOCKSTEP_DEBUG)
-    (void)enabled;
-#else
     enabled = enabled != 0;
     if (!enabled && frame_raster)
         gpu_vram_invalidate();
-    if (enabled && !frame_raster)
-        frame_skip.started = frame_skip.skipped = 0;
     frame_raster = enabled;
-#endif
 }
 
 sint32 gpu_get_raster(void)
@@ -164,64 +158,70 @@ sint32 gpu_get_raster(void)
     return frame_raster;
 }
 
-void gpu_set_frame_skip(sint32 enabled)
-{
-    memset(&frame_skip, 0, sizeof(frame_skip));
-#if !defined(LOCKSTEP_DEBUG)
-    frame_skip.enabled = enabled != 0;
-#else
-    (void)enabled;
-#endif
-}
-
-sint32 gpu_frame_skipped(void)
-{
-    return frame_skip.skipped && !transfer_observer && !linked_submit && !sync_sample && !xport_device_trace_enabled();
-}
-
-uint32 gpu_skipped_frames(void)
-{
-    return frame_skip.skipped_count;
-}
-
-sint32 gpu_frame_sync(uint32 fields)
-{
-    uint64 now, span, scaled;
-    if (!frame_skip.enabled || transfer_observer || linked_submit || sync_sample || xport_device_trace_enabled())
-    {
-        frame_skip.started = frame_skip.skipped = 0;
-        return 0;
-    }
-    now = xport_timer_get();
-    scaled = (uint64)fields * 1000000u * FIELD_RATE_DENOMINATOR;
-    span = scaled / FIELD_RATE_NUMERATOR;
-    // Rebase after a pause instead of replaying an unbounded backlog
-    if (!frame_skip.started || now < frame_skip.last_time || now - frame_skip.last_time > 1000000)
-    {
-        // The first requested field ends after the initial VSync wait
-        frame_skip.deadline = now + span;
-        frame_skip.fraction = 0;
-        frame_skip.started = 1;
-    }
-    else
-    {
-        scaled += frame_skip.fraction;
-        frame_skip.deadline += scaled / FIELD_RATE_NUMERATOR;
-        frame_skip.fraction = scaled % FIELD_RATE_NUMERATOR;
-    }
-    frame_skip.last_time = now;
-    // Blocking VSync latches one decision for every pass of the following frame
-    frame_skip.skipped = now >= frame_skip.deadline + span;
-    if (frame_skip.skipped)
-        ++frame_skip.skipped_count;
-    return frame_skip.skipped;
-}
-
 void gpu_bind_linked_submit(GpuLinkedSubmit submit, void *context)
 {
     linked_submit = submit;
+    linked_pause = NULL;
+    native_paused_packet = NULL;
     linked_submit_context = context;
     linked_submit_failed = 0;
+}
+
+void gpu_bind_linked_pause(GpuLinkedPause pause)
+{
+    linked_pause = pause;
+}
+
+static void gpu_cancel_native_linked(void)
+{
+    GpuNativeLinkedCursor *cursor;
+    for (cursor = native_linked_cursor; cursor; cursor = cursor->previous)
+        cursor->paused = 1;
+    native_paused_packet = NULL;
+}
+
+uint32 BreakDraw(void)
+{
+    if (linked_submit)
+    {
+        uint32 continuation = 0;
+        sint32 result;
+        if (!linked_pause)
+        {
+            linked_submit_failed = 1;
+            return 0xFFFFFFFFu;
+        }
+        result = linked_pause(linked_submit_context, &continuation);
+        if (result == 0)
+            return 0;
+        if (result != 1)
+        {
+            if (result != -1)
+                linked_submit_failed = 1;
+            return 0xFFFFFFFFu;
+        }
+        if (native_linked_cursor)
+            native_linked_cursor->paused = 1;
+        if ((continuation & 0xFFFFFFu) == 0xFFFFFFu)
+            return 0;
+        if ((continuation & 3u) || continuation > 0xFFFFFFu)
+        {
+            linked_submit_failed = 1;
+            return 0xFFFFFFFFu;
+        }
+        return continuation;
+    }
+    if (!native_linked_cursor || native_linked_cursor->paused)
+        return 0;
+    /* Rasterization cannot be interrupted inside a primitive */
+    if (native_linked_cursor->drawing)
+        return 0xFFFFFFFFu;
+    if (!native_linked_cursor->ready)
+        return 0;
+    native_linked_cursor->paused = 1;
+    native_paused_address = native_linked_cursor->address;
+    native_paused_packet = native_linked_cursor->packet;
+    return native_paused_address;
 }
 
 sint32 gpu_linked_submit_failed(void)
@@ -461,6 +461,8 @@ static void gpu_unobserved_transfer(void)
 static void gpu_observe_ot(uint32 address, const uint32 *packet, sint32 native)
 {
     uint32 words = packet[0] >> 24;
+    GpuNativeLinkedCursor *cursor = native_linked_cursor;
+    sint32 current = cursor && cursor->ready && cursor->packet == packet;
     if (!transfer_observer)
         return;
     if (native || address >= PSX_DRAM_SIZE || words > (PSX_DRAM_SIZE - address - 4u) / 4u)
@@ -469,8 +471,17 @@ static void gpu_observe_ot(uint32 address, const uint32 *packet, sint32 native)
         return;
     }
     transfer_observer(transfer_observer_context, 3u, address, packet, 1u);
+    if (current && cursor->paused)
+        return;
     if (words)
+    {
+        /* Payload delivery is atomic with respect to native packet pause */
+        if (current)
+            cursor->drawing = 1;
         transfer_observer(transfer_observer_context, 2u, address + 4u, packet + 1, words);
+        if (current)
+            cursor->drawing = 0;
+    }
 }
 
 static void gpu_observe_dma_direction(void)
@@ -561,6 +572,7 @@ static void gpu_trace_vram_row(XportDeviceOperation *operation, XportDeviceRegio
 
 sint32 gpu_load_rect(uint32 source, sint32 x, sint32 y, sint32 width, sint32 height)
 {
+    gpu_render_list_invalidate();
     XportDeviceOperation operation = {0};
     XportDeviceRegion source_region = XPORT_DEVICE_REGION_NONE;
     uint32 source_offset = 0u;
@@ -734,6 +746,7 @@ sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image)
 
 sint32 LoadImagePSX(PSX_RECT *rectangle, uint32 *pixels)
 {
+    gpu_render_list_invalidate();
     XportDeviceOperation operation = {0};
     XportDeviceRegion source_region = XPORT_DEVICE_REGION_NONE;
     uint32 source_offset = 0u;
@@ -814,6 +827,7 @@ static void gpu_vram_copy(PSX_RECT *rectangle, sint32 x, sint32 y, XportDeviceOp
 
 sint32 MoveImage(PSX_RECT *rectangle, sint32 x, sint32 y)
 {
+    gpu_render_list_invalidate();
     XportDeviceOperation operation = {0};
     if (!rectangle || rectangle->w < 0 || rectangle->w > GPU_VRAM_WIDTH || rectangle->h < 0)
         return -1;
@@ -873,6 +887,7 @@ sint32 gpu_bind_clear_image(uint32 packet, uint32 dimensions)
 
 sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
 {
+    gpu_render_list_invalidate();
     XportDeviceOperation operation = {0};
     sint32 row;
     sint32 column;
@@ -933,8 +948,6 @@ sint32 ClearImage(PSX_RECT *rectangle, uint8 red, uint8 green, uint8 blue)
         gpu_unobserved_transfer();
     if (!rectangle || rectangle->w < 0 || rectangle->h < 0)
         return -1;
-    if (gpu_frame_skipped())
-        return 0;
     if (xport_device_trace_enabled())
     {
         xport_device_trace_begin(&operation, 0u, XPORT_DEVICE_GPU, XPORT_DEVICE_VRAM_FILL, XPORT_DEVICE_DIRECTION_INTERNAL, 2u, 0x02u);
@@ -1118,6 +1131,18 @@ typedef struct
 } ScanVertex;
 
 static uint32 present_pixels[GPU_DISPLAY_MAX_WIDTH * GPU_DISPLAY_MAX_HEIGHT];
+
+typedef struct GpuPortState
+{
+    uint32 packet[256], count, needed, polyline;
+    uint32 direction, disabled, irq, mask, latch;
+    uint32 x, y, width, height, cursor, transfer;
+    uint32 horizontal_range;
+    XportDeviceOperation upload;
+} GpuPortState;
+
+static GpuPortState gpu_port = {{0}, 0, 0, 0, 0, 1};
+
 static uint16 active_tpage;
 
 void gpu_set_polygon_tpage(uint16 page)
@@ -1529,10 +1554,7 @@ static sint32 raster_enabled(void)
 {
     if (!frame_raster)
         return 0;
-#if defined(LOCKSTEP_DEBUG)
-    // Lockstep must preserve GPU readback semantics
-    return 1;
-#elif defined(_DEBUG)
+#if defined(_DEBUG)
     static sint32 force = -1;
     if (!xport_is_headless())
         return 1;
@@ -1555,12 +1577,13 @@ static sint32 raster_surface_x, raster_surface_y;
 
 sint32 gpu_import_raster(const GpuRasterState *state, const void *vram, size_t bytes)
 {
-    if (!state || !vram || bytes != sizeof(VRAM) || (state->draw_mode & ~0x1ffu) || (state->draw_flags & ~0x600u) || state->texture_window > 0xfffffu || state->area[0] >= VRAM_W || state->area[2] >= VRAM_W || state->area[1] >= VRAM_H || state->area[3] >= VRAM_H || state->offset[0] < -1024 || state->offset[0] > 1023 || state->offset[1] < -1024 || state->offset[1] > 1023)
+    if (!state || !vram || bytes != sizeof(VRAM) || (state->draw_mode & ~0x1ffu) || (state->draw_flags & ~0x1e00u) || state->texture_window > 0xfffffu || state->area[0] >= VRAM_W || state->area[2] >= VRAM_W || state->area[1] >= VRAM_H || state->area[3] >= VRAM_H || state->offset[0] < -1024 || state->offset[0] > 1023 || state->offset[1] < -1024 || state->offset[1] > 1023)
         return 0;
     gpu_vram_invalidate();
     memmove(VRAM, vram, sizeof(VRAM));
     active_tpage = (uint16)state->draw_mode;
-    active_draw_flags = (uint16)state->draw_flags;
+    active_draw_flags = (uint16)(state->draw_flags & 0x600u);
+    gpu_port.mask = (state->draw_flags >> 11) & 3u;
     texture_window = state->texture_window;
     raster_surface_x = raster_surface_y = 0;
     raster_clip_x0 = (sint32)state->area[0];
@@ -1577,7 +1600,7 @@ void gpu_export_raster(GpuRasterState *state)
     if (!state)
         return;
     state->draw_mode = active_tpage & 0x1ffu;
-    state->draw_flags = active_draw_flags;
+    state->draw_flags = active_draw_flags | (gpu_port.mask << 11);
     state->texture_window = texture_window;
     state->area[0] = (uint32)(raster_clip_x0 + raster_surface_x);
     state->area[1] = (uint32)(raster_clip_y0 + raster_surface_y);
@@ -1596,8 +1619,8 @@ static void pxc(sint32 x, sint32 y, uint32 color)
 {
     sint32 vram_x = x + raster_surface_x;
     sint32 vram_y = y + raster_surface_y;
-    if (x >= raster_clip_x0 && x < raster_clip_x1 && y >= raster_clip_y0 && y < raster_clip_y1 && (uint32)vram_x < VRAM_W && (uint32)vram_y < VRAM_H)
-        VRAM[vram_y * VRAM_W + vram_x] = (uint16)(((color >> 19) & 31u) | ((color >> 6) & 0x3e0u) | ((color << 7) & 0x7c00u) | ((color >> 16) & 0x8000u));
+    if (x >= raster_clip_x0 && x < raster_clip_x1 && y >= raster_clip_y0 && y < raster_clip_y1 && (uint32)vram_x < VRAM_W && (uint32)vram_y < VRAM_H && (!(gpu_port.mask & 2u) || !(VRAM[vram_y * VRAM_W + vram_x] & 0x8000u)))
+        VRAM[vram_y * VRAM_W + vram_x] = (uint16)(((color >> 19) & 31u) | ((color >> 6) & 0x3e0u) | ((color << 7) & 0x7c00u) | ((color >> 16) & 0x8000u) | ((gpu_port.mask & 1u) << 15));
 }
 
 static uint32 rgb555(uint16 c)
@@ -1844,7 +1867,7 @@ static void scan_triangle(RV va, RV vb, RV vc, uint16 tp, uint16 cl, uint32 ca, 
                 texture = texel_indexed((uint8)(value[0] >> 24), (uint8)(value[1] >> 24), tp, cl, &transparent);
                 mask = texture & 0x8000u;
             }
-            if (!transparent)
+            if (!transparent && (!(gpu_port.mask & 2u) || !(background & 0x8000u)))
             {
                 for (i = 0; i < 3; ++i)
                 {
@@ -1876,7 +1899,7 @@ static void scan_triangle(RV va, RV vb, RV vc, uint16 tp, uint16 cl, uint32 ca, 
                         channel[i] = color < 0 ? 0 : color > 31 ? 31 : color;
                     }
                 }
-                foreground = mask | (uint16)(channel[0] | channel[1] << 5 | channel[2] << 10);
+                foreground = mask | (uint16)((gpu_port.mask & 1u) << 15) | (uint16)(channel[0] | channel[1] << 5 | channel[2] << 10);
                 VRAM[physical_y * VRAM_W + physical_x] = foreground;
             }
             for (i = 0; i < 5; ++i)
@@ -1969,6 +1992,7 @@ static sint32 gpu_draw_state_word(uint32 word)
             raster_offset_y = gpu_sign_extend_11(word >> 11) - raster_surface_y;
             return 1;
         case 0xe6:
+            gpu_port.mask = word & 3u;
             return 1;
         default:
             return 0;
@@ -1976,6 +2000,101 @@ static sint32 gpu_draw_state_word(uint32 word)
 }
 
 static void gpu_draw_command(void *raw);
+
+struct GpuRenderList
+{
+    DRAWENV environment;
+    GpuRasterState initial;
+    uint32 *words;
+    size_t count, capacity;
+    uint32 generation;
+    sint32 failed, valid;
+};
+
+static GpuRenderList *render_list_capture;
+static uint32 render_list_generation = 1;
+
+static void gpu_render_list_invalidate(void)
+{
+    if (render_list_capture)
+        render_list_capture->failed = 1;
+}
+
+GpuRenderList *gpu_render_list_create(void)
+{
+    return calloc(1, sizeof(GpuRenderList));
+}
+
+void gpu_render_list_free(GpuRenderList *list)
+{
+    if (!list)
+        return;
+    if (render_list_capture == list)
+        render_list_capture = NULL;
+    free(list->words);
+    free(list);
+}
+
+sint32 gpu_render_list_begin(GpuRenderList *list, const DRAWENV *environment)
+{
+    if (!list || !environment || render_list_capture || linked_submit || raster_surface_x || raster_surface_y)
+        return 0;
+    list->environment = *environment;
+    gpu_export_raster(&list->initial);
+    list->count = 0;
+    list->generation = render_list_generation;
+    list->failed = list->valid = 0;
+    render_list_capture = list;
+    return 1;
+}
+
+sint32 gpu_render_list_end(GpuRenderList *list)
+{
+    if (!list || render_list_capture != list)
+        return 0;
+    render_list_capture = NULL;
+    list->valid = !list->failed;
+    return list->valid;
+}
+
+static void gpu_render_list_record(const uint32 *packet)
+{
+    GpuRenderList *list = render_list_capture;
+    size_t words, required, capacity;
+    uint32 command;
+    uint32 *grown;
+    if (!list || list->failed)
+        return;
+    command = packet[1] >> 24;
+    /* Pixel transfers and framebuffer feedback require their original owner */
+    if (!(command <= 1 || (command >= 0x20 && command < 0x80) || (command >= 0xe1 && command <= 0xe6)))
+    {
+        list->failed = 1;
+        return;
+    }
+    words = (packet[0] >> 24) + 1;
+    if (list->count > SIZE_MAX / sizeof(*grown) - words)
+    {
+        list->failed = 1;
+        return;
+    }
+    required = list->count + words;
+    if (required > list->capacity)
+    {
+        capacity = list->capacity ? list->capacity : 1024;
+        while (capacity < required && capacity <= SIZE_MAX / sizeof(*grown) / 2)
+            capacity *= 2;
+        if (capacity < required || !(grown = realloc(list->words, capacity * sizeof(*grown))))
+        {
+            list->failed = 1;
+            return;
+        }
+        list->words = grown;
+        list->capacity = capacity;
+    }
+    memcpy(list->words + list->count, packet, words * sizeof(*packet));
+    list->count = required;
+}
 
 static void draw_prim(void *raw)
 {
@@ -2045,6 +2164,7 @@ static void gpu_draw_command(void *raw)
     sint32 code = p[7] & 0xfc;
     uint32 *w = (uint32 *)p;
     uint32 ca, cb, cc, cd;
+    gpu_render_list_record(w);
     /* Direct VRAM sampling has no texture cache to invalidate */
     if (p[7] == 0x01u)
     {
@@ -2070,7 +2190,7 @@ static void gpu_draw_command(void *raw)
         uint32 height = (w[3] >> 16) & 511;
         uint16 color = (uint16)(((w[1] >> 3) & 31) | ((w[1] >> 6) & 0x3e0) | ((w[1] >> 9) & 0x7c00));
         uint32 row, column, interlaced, active_field;
-        if (!width || !height || gpu_frame_skipped())
+        if (!width || !height)
             return;
         gpu_scanout_poll();
         interlaced = (native_scanout.mode & 0x24) == 0x24 && !(active_draw_flags & 0x400);
@@ -2152,7 +2272,7 @@ static void gpu_draw_command(void *raw)
         /* Polygon texture attributes also select the page for following sprites */
         gpu_set_polygon_tpage(mode);
     }
-    if (gpu_frame_skipped() || !raster_enabled())
+    if (!raster_enabled())
         return;
     ca = packet_rgb(p, 4);
     // Flat lines and polylines share clipping, draw offset and blending
@@ -2353,17 +2473,6 @@ static void gpu_draw_command(void *raw)
 #endif
 }
 
-typedef struct GpuPortState
-{
-    uint32 packet[256], count, needed, polyline;
-    uint32 direction, disabled, irq, mask, latch;
-    uint32 x, y, width, height, cursor, transfer;
-    uint32 horizontal_range;
-    XportDeviceOperation upload;
-} GpuPortState;
-
-static GpuPortState gpu_port = {{0}, 0, 0, 0, 0, 1};
-
 static void gpu_port_clear_fifo(void)
 {
     if (gpu_port.upload.active)
@@ -2471,8 +2580,8 @@ static sint32 gpu_port_gp0(uint32 value)
     }
     else
     {
-        /* The raster core does not yet implement masked primitive/copy writes */
-        if (gpu_port.mask && command < 0xA0 && command != 2)
+        /* Masked VRAM copies remain outside the supported port contract */
+        if (gpu_port.mask && (command & 0xe0u) == 0x80u)
             return 0;
         gpu_port.packet[0] = gpu_port.count << 24;
         gpu_draw_command(gpu_port.packet);
@@ -2583,6 +2692,7 @@ sint32 gpu_port_read(uint32 offset, uint32 *value)
 
 sint32 gpu_port_write(uint32 offset, uint32 value)
 {
+    gpu_render_list_invalidate();
     if (offset == 0)
         return gpu_port_gp0(value);
     if (offset == 4)
@@ -2618,6 +2728,7 @@ sint32 ResetGraph(sint32 mode)
     if (mode == 1 && transfer_observer && soft_reset_head && soft_reset_tail && !linked_submit)
     {
         uint32 command = 0x02000000u;
+        gpu_cancel_native_linked();
         // Synchronous observation has no active DMA transfer to cancel
         *(uint32 *)psx_addr(soft_reset_tail, 4u) = 0u;
         *(uint32 *)psx_addr(soft_reset_head, 4u) = 0u;
@@ -2628,6 +2739,7 @@ sint32 ResetGraph(sint32 mode)
     }
     if (mode == 1 && !transfer_observer && !linked_submit && !sync_sample && soft_reset_head && soft_reset_tail)
     {
+        gpu_cancel_native_linked();
         /* Native packets complete synchronously, with no active DMA or partial FIFO */
         *(uint32 *)psx_addr(soft_reset_tail, 4u) = 0u;
         *(uint32 *)psx_addr(soft_reset_head, 4u) = 0u;
@@ -2640,6 +2752,7 @@ sint32 ResetGraph(sint32 mode)
     gpu_unobserved_transfer();
     if (mode != 0)
         return -1;
+    gpu_cancel_native_linked();
     gpu_reset_graph_state();
     if (xport_is_headless())
         return 0;
@@ -2794,10 +2907,12 @@ static uint32 gpu_raster_pixel(sint32 x, sint32 y)
  * The caller supplies the VRAM origin of the draw surface (not the displayed
  * surface). This preserves relative clip/offset changes in the 320x240 window.
  * Dithering, draw-to-display inhibition and GPU mask bits remain WIP. */
-static void gpu_draw_env_native(DRAWENV *environment, sint32 surface_x, sint32 surface_y)
+static void gpu_draw_env_native(const DRAWENV *environment, sint32 surface_x, sint32 surface_y)
 {
     const uint8 *e = (const uint8 *)environment;
     sint32 x, y;
+    if (render_list_capture)
+        render_list_capture->failed = 1;
     raster_surface_x = surface_x;
     raster_surface_y = surface_y;
     raster_clip_x0 = read_s16_le_at(e, 0) - surface_x;
@@ -2810,13 +2925,44 @@ static void gpu_draw_env_native(DRAWENV *environment, sint32 surface_x, sint32 s
     active_draw_flags = (e[22] ? 0x200u : 0u) | (e[23] ? 0x400u : 0u);
     /* Pack the PsyQ texture-window fields into a GP0 command */
     texture_window = (((uint32)(-read_s16_le_at(e, 16)) & 255u) >> 3) | ((((uint32)(-read_s16_le_at(e, 18)) & 255u) >> 3) << 5) | ((uint32)(e[12] >> 3) << 10) | ((uint32)(e[14] >> 3) << 15);
-    if (e[24] && !gpu_frame_skipped() && raster_enabled())
+    if (e[24] && raster_enabled())
     {
         uint32 color = (uint32)e[25] << 16 | (uint32)e[26] << 8 | e[27];
         for (y = raster_clip_y0; y < raster_clip_y1; y++)
             for (x = raster_clip_x0; x < raster_clip_x1; x++)
                 pxc(x, y, color);
     }
+}
+
+sint32 gpu_render_list_replay(const GpuRenderList *list)
+{
+    uint16 page = active_tpage, flags = active_draw_flags;
+    uint32 window = texture_window, mask = gpu_port.mask;
+    sint32 raster = frame_raster;
+    sint32 saved[8] = {raster_clip_x0, raster_clip_y0, raster_clip_x1, raster_clip_y1, raster_offset_x, raster_offset_y, raster_surface_x, raster_surface_y};
+    size_t cursor;
+    if (!list || !list->valid || list->generation != render_list_generation || render_list_capture)
+        return 0;
+    frame_raster = 1;
+    gpu_vram_invalidate();
+    gpu_port.mask = (list->initial.draw_flags >> 11) & 3;
+    gpu_draw_env_native(&list->environment, 0, 0);
+    for (cursor = 0; cursor < list->count; cursor += (list->words[cursor] >> 24) + 1)
+        gpu_draw_command(list->words + cursor);
+    active_tpage = page;
+    active_draw_flags = flags;
+    texture_window = window;
+    gpu_port.mask = mask;
+    raster_clip_x0 = saved[0];
+    raster_clip_y0 = saved[1];
+    raster_clip_x1 = saved[2];
+    raster_clip_y1 = saved[3];
+    raster_offset_x = saved[4];
+    raster_offset_y = saved[5];
+    raster_surface_x = saved[6];
+    raster_surface_y = saved[7];
+    frame_raster = raster;
+    return 1;
 }
 
 void gpu_draw_env(uint32 env, sint32 surface_x, sint32 surface_y)
@@ -2963,7 +3109,17 @@ void DrawPrim(void *primitive)
 }
 
 /* Host DMA adapter: consume PSX address tags, never native pointer tags. */
-static void gpu_draw_linked_dma(uint32 *ot)
+static sint32 gpu_draw_linked_dma(uint32 *ot)
+{
+    GpuNativeLinkedCursor cursor = {0};
+    cursor.previous = native_linked_cursor;
+    native_linked_cursor = &cursor;
+    gpu_draw_linked_dma_body(ot, &cursor);
+    native_linked_cursor = cursor.previous;
+    return !cursor.paused;
+}
+
+static void gpu_draw_linked_dma_body(uint32 *ot, GpuNativeLinkedCursor *cursor)
 {
     uint32 head;
     uint32 count = 0;
@@ -2985,7 +3141,7 @@ static void gpu_draw_linked_dma(uint32 *ot)
             native_segment = head & 0xff000000u;
         }
     }
-    while ((head & 0xffffffu) != 0xffffffu)
+    while (!cursor->paused && (head & 0xffffffu) != 0xffffffu)
     {
         uint32 link = head & 0xffffffu;
         uint32 address = native ? native_segment | link : link;
@@ -3068,7 +3224,13 @@ static void gpu_draw_linked_dma(uint32 *ot)
 #endif
         if (linked_trace_operation && linked_trace_operation->active)
             xport_device_trace_stage(linked_trace_operation, XPORT_DEVICE_FETCH, XPORT_DEVICE_EVIDENCE_EXACT, packet_native ? XPORT_DEVICE_REGION_NONE : address < PSX_DRAM_SIZE ? XPORT_DEVICE_REGION_RAM : XPORT_DEVICE_REGION_SCRATCHPAD, packet_native ? 0u : address < PSX_DRAM_SIZE ? address : address - 0x1f800000u, XPORT_DEVICE_REGION_NONE, 0u, 4u + 4u * (tag >> 24), 0xffffffffu);
+        cursor->address = native ? address : link;
+        cursor->packet = packet;
+        cursor->ready = 1;
         gpu_observe_ot(address, packet, packet_native);
+        cursor->ready = 0;
+        if (cursor->paused)
+            return;
         if (transfer_observer && transfer_observation_failed)
             return;
         /* Preserve the original terminal packet in RAM. The host still omits this
@@ -3094,7 +3256,9 @@ static void gpu_draw_linked_dma(uint32 *ot)
             gpu_debug_packet_address = address;
             gpu_debug_packet_tag = tag;
 #endif
+            cursor->drawing = 1;
             draw_prim(packet_native ? packet : psx_addr(address, 4u + 4u * (tag >> 24)));
+            cursor->drawing = 0;
         }
         head = tag;
     }
@@ -3126,6 +3290,8 @@ PsxInterruptCallback DrawSyncCallback(PsxInterruptCallback callback)
 void DrawOTag(uint32 *ot)
 {
     XportDeviceOperation operation = {0};
+    XportDeviceOperation *previous_operation = linked_trace_operation;
+    sint32 completed;
     uint32 source_offset = 0u;
     XportDeviceRegion source_region = gpu_trace_pointer(ot, 4u, &source_offset);
     if (xport_device_trace_enabled())
@@ -3146,9 +3312,9 @@ void DrawOTag(uint32 *ot)
         return;
     }
     linked_trace_operation = operation.active ? &operation : NULL;
-    gpu_draw_linked_dma(ot);
-    linked_trace_operation = NULL;
-    if (!transfer_observation_failed && !linked_submit_failed && native_draw_sync_callback)
+    completed = gpu_draw_linked_dma(ot);
+    linked_trace_operation = previous_operation;
+    if (completed && !transfer_observation_failed && !linked_submit_failed && native_draw_sync_callback)
     {
         ++native_draw_sync_pending;
         psx_wait_signal_service(2);
@@ -3157,7 +3323,10 @@ void DrawOTag(uint32 *ot)
     }
     if (operation.active)
     {
-        xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
+        if (completed)
+            xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, source_region, source_offset, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
+        else
+            xport_device_trace_gap(&operation, 2u);
         xport_device_trace_complete(&operation, transfer_observation_failed ? 0 : 1);
     }
     psx_sync_callbacks();
@@ -3166,6 +3335,8 @@ void DrawOTag(uint32 *ot)
 sint32 gpu_execute_linked_dma(uint32 physical_address)
 {
     XportDeviceOperation operation = {0};
+    XportDeviceOperation *previous_operation = linked_trace_operation;
+    sint32 completed;
     if (!transfer_observer || transfer_observation_failed || physical_address > PSX_DRAM_SIZE - 4u || (physical_address & 3u))
     {
         linked_submit_failed = 1;
@@ -3177,13 +3348,16 @@ sint32 gpu_execute_linked_dma(uint32 physical_address)
         xport_device_trace_stage(&operation, XPORT_DEVICE_SUBMIT, XPORT_DEVICE_EVIDENCE_EXACT, XPORT_DEVICE_REGION_RAM, physical_address, XPORT_DEVICE_REGION_NONE, 0u, 0u, 0u);
     }
     linked_trace_operation = operation.active ? &operation : NULL;
-    gpu_draw_linked_dma((uint32 *)psx_addr(physical_address, 4u));
-    linked_trace_operation = NULL;
+    completed = gpu_draw_linked_dma((uint32 *)psx_addr(physical_address, 4u));
+    linked_trace_operation = previous_operation;
     if (transfer_observation_failed)
         linked_submit_failed = 1;
     if (operation.active)
     {
-        xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, XPORT_DEVICE_REGION_RAM, physical_address, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
+        if (completed)
+            xport_device_trace_stage(&operation, XPORT_DEVICE_RASTER_COMPLETE, XPORT_DEVICE_EVIDENCE_CANDIDATE, XPORT_DEVICE_REGION_RAM, physical_address, XPORT_DEVICE_REGION_VRAM, 0u, 0u, 0u);
+        else
+            xport_device_trace_gap(&operation, 2u);
         xport_device_trace_complete(&operation, linked_submit_failed ? 0 : 1);
     }
     return !linked_submit_failed;
@@ -3279,7 +3453,7 @@ void gpu_frame_end(void)
 
 sint32 gpu_present(void)
 {
-    if (frame_present_depth || gpu_frame_skipped() || (display_state & 2u))
+    if (frame_present_depth || (display_state & 2u))
         return 1;
     if (!raster_enabled())
         return 1;
@@ -3324,7 +3498,6 @@ void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height)
 void gpu_init_empty(void)
 {
     frame_present_depth = 0;
-    frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
@@ -3335,6 +3508,7 @@ void gpu_init_empty(void)
     active_tpage = 0;
     active_draw_flags = 0;
     texture_window = 0;
+    gpu_port.mask = 0;
     raster_clip_x0 = raster_clip_y0 = raster_offset_x = raster_offset_y = 0;
     raster_clip_x1 = VRAM_W;
     raster_clip_y1 = VRAM_H;
@@ -3368,8 +3542,15 @@ sint32 gpu_save_frame(const char *path)
 /* Reset only host GPU state; PsyQ environment calls provide game dimensions */
 void gpu_reset_graph_state(void)
 {
+    if (!++render_list_generation)
+        render_list_generation = 1;
+    if (render_list_capture)
+    {
+        render_list_capture->failed = 1;
+        render_list_capture = NULL;
+    }
+    gpu_cancel_native_linked();
     frame_present_depth = 0;
-    frame_skip.started = frame_skip.skipped = 0;
     gpu_scanout_reset(&native_scanout);
     scanout_last_us = xport_timer_get();
     scanout_clock_started = 1u;
@@ -3378,6 +3559,7 @@ void gpu_reset_graph_state(void)
     active_tpage = 0;
     active_draw_flags = 0;
     texture_window = 0;
+    gpu_port.mask = 0;
     raster_clip_x0 = 0;
     raster_clip_y0 = 0;
     raster_clip_x1 = VRAM_W;
@@ -3675,10 +3857,12 @@ static void gpu_psyq_disp_env(DISPENV *environment)
 
 DISPENV *PutDispEnv(DISPENV *environment)
 {
+    static const sint32 widths[4] = {256, 320, 512, 640};
     if (!environment)
         return 0;
     gpu_psyq_disp_env(environment);
-    gpu_set_display(environment->disp.x, environment->disp.y, environment->disp.w, environment->disp.h);
+    /* Keep the scanout width selected by the existing GP1 mode handler */
+    gpu_set_display(environment->disp.x, environment->disp.y, native_scanout.mode & 64u ? 368 : widths[native_scanout.mode & 3u], environment->disp.h);
     display_state = (display_state & ~4u) | (environment->isrgb24 ? 4u : 0u);
     return environment;
 }
@@ -3694,188 +3878,10 @@ sint32 gpu_get_display_env(DISPENV *environment)
 void gpu_clear_menu_surfaces(void)
 {
     uint32 y;
-    if (gpu_frame_skipped())
-        return;
     gpu_vram_invalidate();
     for (y = 0; y < 256; y++)
         memset(VRAM + y * VRAM_W, 0, 640 * sizeof(uint16));
 }
-
-static int gpu_state_block(FILE *file, void *data, size_t size, int load)
-{
-    uint32 stored = (uint32)size;
-    if (load)
-        return fread(&stored, 4, 1, file) == 1 && stored == size && fread(data, 1, size, file) == size;
-    return fwrite(&stored, 4, 1, file) == 1 && fwrite(data, 1, size, file) == size;
-}
-
-typedef struct GPU_PORTABLE_SCALARS
-{
-    uint32 draw_sync_pending;
-    GpuScanoutState scanout;
-    uint32 scanout_fraction;
-    DISPENV native_disp_cache;
-    uint32 native_disp_cached;
-    uint32 move_image_packet;
-    uint32 clear_image_packet;
-    uint32 clear_image_dimensions;
-    uint16 active_draw_flags;
-    sint32 graph_debug_level;
-    GpuGraphControl graph_control;
-    uint32 sync_head;
-    uint32 sync_tail;
-    uint32 sync_budget;
-    sint32 sync_failed;
-    sint32 sync_running;
-    uint32 soft_reset_head;
-    uint32 soft_reset_tail;
-    sint32 transfer_observation_failed;
-    sint32 linked_submit_failed;
-    sint32 psyq_bound;
-    sint32 psyq_queue_bound;
-    GpuPsyqStateBinding psyq_binding;
-    GpuPsyqQueueBinding psyq_queue_binding;
-} GPU_PORTABLE_SCALARS;
-
-int gpu_state_io(FILE *f, int load)
-{
-    if (load)
-        gpu_vram_invalidate();
-    GPU_PORTABLE_SCALARS scalars = {0};
-    if (!load)
-        gpu_scanout_poll();
-    if (!(gpu_state_block(f, &VRAM, sizeof(VRAM), load) && gpu_state_block(f, &active_tpage, sizeof(active_tpage), load) && gpu_state_block(f, &texture_window, sizeof(texture_window), load) && gpu_state_block(f, &display_state, sizeof(display_state), load) && gpu_state_block(f, &display_x, sizeof(display_x), load) && gpu_state_block(f, &display_y, sizeof(display_y), load) && gpu_state_block(f, &display_width, sizeof(display_width), load) && gpu_state_block(f, &display_height, sizeof(display_height), load) && gpu_state_block(f, &display_offset_x, sizeof(display_offset_x), load) && gpu_state_block(f, &display_offset_y, sizeof(display_offset_y), load) && gpu_state_block(f, &raster_clip_x0, sizeof(raster_clip_x0), load) && gpu_state_block(f, &raster_clip_y0, sizeof(raster_clip_y0), load) && gpu_state_block(f, &raster_clip_x1, sizeof(raster_clip_x1), load) && gpu_state_block(f, &raster_clip_y1, sizeof(raster_clip_y1), load) &&
-          gpu_state_block(f, &raster_offset_x, sizeof(raster_offset_x), load) && gpu_state_block(f, &raster_offset_y, sizeof(raster_offset_y), load) && gpu_state_block(f, &raster_surface_x, sizeof(raster_surface_x), load) && gpu_state_block(f, &raster_surface_y, sizeof(raster_surface_y), load)))
-        return 0;
-    if (load)
-    {
-        if (!gpu_state_block(f, &scalars, sizeof(scalars), 1) || !gpu_scanout_validate(&scalars.scanout) || scalars.scanout_fraction >= 1000000u || scalars.native_disp_cached > 1u || scalars.sync_running || scalars.psyq_bound != psyq_bound || scalars.psyq_queue_bound != psyq_queue_bound || (psyq_bound && memcmp(&scalars.psyq_binding, &psyq_binding, sizeof(psyq_binding))) || (psyq_queue_bound && memcmp(&scalars.psyq_queue_binding, &psyq_queue_binding, sizeof(psyq_queue_binding))))
-            return 0;
-        native_scanout = scalars.scanout;
-        native_draw_sync_pending = scalars.draw_sync_pending;
-        if (native_draw_sync_pending)
-            psx_wait_signal_service(2);
-        scanout_fraction = scalars.scanout_fraction;
-        native_disp_cache = scalars.native_disp_cache;
-        native_disp_cached = scalars.native_disp_cached;
-        scanout_clock_started = 0u;
-        move_image_packet = scalars.move_image_packet;
-        clear_image_packet = scalars.clear_image_packet;
-        clear_image_dimensions = scalars.clear_image_dimensions;
-        active_draw_flags = scalars.active_draw_flags;
-        graph_debug_level = scalars.graph_debug_level;
-        gpu_graph_control = scalars.graph_control;
-        sync_head = scalars.sync_head;
-        sync_tail = scalars.sync_tail;
-        sync_budget = scalars.sync_budget;
-        sync_failed = scalars.sync_failed;
-        soft_reset_head = scalars.soft_reset_head;
-        soft_reset_tail = scalars.soft_reset_tail;
-        transfer_observation_failed = scalars.transfer_observation_failed;
-        linked_submit_failed = scalars.linked_submit_failed;
-        frame_present_depth = 0;
-        frame_skip.started = frame_skip.skipped = 0;
-        return 1;
-    }
-    /* The full guest DRAM binding is recreated by platform initialization */
-    if ((native_dma_range_count && (native_dma_range_count != 1 || native_dma_ranges[0].begin != (uintptr_t)DRAM || native_dma_ranges[0].end != (uintptr_t)DRAM + PSX_DRAM_SIZE)) || transfer_observer || linked_submit || linked_trace_operation || sync_sample || sync_pump || sync_wait || sync_running || sync_timeout_bound)
-        return 0;
-    scalars.scanout = native_scanout;
-    scalars.draw_sync_pending = native_draw_sync_pending;
-    scalars.scanout_fraction = scanout_fraction;
-    scalars.native_disp_cache = native_disp_cache;
-    scalars.native_disp_cached = native_disp_cached;
-    scalars.move_image_packet = move_image_packet;
-    scalars.clear_image_packet = clear_image_packet;
-    scalars.clear_image_dimensions = clear_image_dimensions;
-    scalars.active_draw_flags = active_draw_flags;
-    scalars.graph_debug_level = graph_debug_level;
-    scalars.graph_control = gpu_graph_control;
-    scalars.sync_head = sync_head;
-    scalars.sync_tail = sync_tail;
-    scalars.sync_budget = sync_budget;
-    scalars.sync_failed = sync_failed;
-    scalars.sync_running = sync_running;
-    scalars.soft_reset_head = soft_reset_head;
-    scalars.soft_reset_tail = soft_reset_tail;
-    scalars.transfer_observation_failed = transfer_observation_failed;
-    scalars.linked_submit_failed = linked_submit_failed;
-    scalars.psyq_bound = psyq_bound;
-    scalars.psyq_queue_bound = psyq_queue_bound;
-    if (psyq_bound)
-        scalars.psyq_binding = psyq_binding;
-    if (psyq_queue_bound)
-        scalars.psyq_queue_binding = psyq_queue_binding;
-    return gpu_state_block(f, &scalars, sizeof(scalars), 0);
-}
-
-#if defined(LOCKSTEP_DEBUG)
-int gpu_lockstep_portable_selftest(void)
-{
-    const GpuPsyqStateBinding state_binding = {0x80005000u, 0x80005100u, 0x80005200u, 0x80005300u, 0x80005400u, 0x80005500u};
-    GpuPsyqQueueBinding queue_binding = {0};
-    const char *export_path = getenv("XPORT_LOCKSTEP_GPU_EXPORT_PATH");
-    const char *import_path = getenv("XPORT_LOCKSTEP_GPU_IMPORT_PATH");
-    FILE *file;
-    int ok;
-    gpu_register_dma_range(DRAM, PSX_DRAM_SIZE);
-    queue_binding.last_callback = 0x80006000u;
-    queue_binding.last_argument = 0x80006004u;
-    queue_binding.last_aux = 0x80006008u;
-    queue_binding.pointer_segment = 0x80000000u;
-    if (!gpu_bind_psyq_state(&state_binding) || !gpu_bind_psyq_queue(&queue_binding))
-        return 0;
-    if (import_path && *import_path)
-    {
-        file = fopen(import_path, "rb");
-        if (!file)
-            return 0;
-        ok = gpu_state_io(file, 1) && fgetc(file) == EOF && VRAM[9] == 0x1357u && move_image_packet == 0x80001000u && clear_image_packet == 0x80002000u && clear_image_dimensions == 0x01400100u && active_draw_flags == 0x1234u && graph_debug_level == 7 && sync_head == 0x80003000u && sync_tail == 0x80003004u && sync_budget == 33u && sync_failed == 1 && soft_reset_head == 0x80004000u && soft_reset_tail == 0x80004004u && transfer_observation_failed == 1 && linked_submit_failed == 1;
-        fclose(file);
-        if (!ok)
-            return 0;
-        queue_binding.last_callback = 0x80006100u;
-        if (!gpu_bind_psyq_queue(&queue_binding))
-            return 0;
-        file = fopen(import_path, "rb");
-        if (!file)
-            return 0;
-        ok = !gpu_state_io(file, 1);
-        fclose(file);
-        if (!ok)
-            return 0;
-        file = tmpfile();
-        if (!file)
-            return 0;
-        gpu_register_dma_range(&queue_binding, sizeof(queue_binding));
-        ok = !gpu_state_io(file, 0);
-        native_dma_range_count = 1;
-        fclose(file);
-        return ok;
-    }
-    file = export_path && *export_path ? fopen(export_path, "wb") : tmpfile();
-    if (!file)
-        return 0;
-    VRAM[9] = 0x1357u;
-    move_image_packet = 0x80001000u;
-    clear_image_packet = 0x80002000u;
-    clear_image_dimensions = 0x01400100u;
-    active_draw_flags = 0x1234u;
-    graph_debug_level = 7;
-    sync_head = 0x80003000u;
-    sync_tail = 0x80003004u;
-    sync_budget = 33u;
-    sync_failed = 1;
-    soft_reset_head = 0x80004000u;
-    soft_reset_tail = 0x80004004u;
-    transfer_observation_failed = 1;
-    linked_submit_failed = 1;
-    ok = gpu_state_io(file, 0);
-    if (fclose(file))
-        ok = 0;
-    return ok;
-}
-#endif
 
 sint32 MargePrim(uint32 first, uint32 second)
 {
@@ -3911,6 +3917,23 @@ uint32 DrawOTagPSX(uint32 guest_ot)
 {
     DrawOTag((uint32 *)psx_addr(guest_ot, 4u));
     return xport_gpu_draw_otag_guest_result(guest_ot);
+}
+
+void gpu_resume_linked_draw(uint32 continuation)
+{
+    uint32 *packet = NULL;
+    if (continuation == 0xFFFFFFFFu || (continuation & 3u))
+        abort();
+    if (native_paused_packet && continuation == native_paused_address)
+    {
+        packet = native_paused_packet;
+        native_paused_packet = NULL;
+    }
+    else if (!gpu_packet_range_pointer(continuation, &packet))
+        packet = (uint32 *)psx_addr(continuation, 4u);
+    if (!packet)
+        abort();
+    DrawOTag(packet);
 }
 
 void SetDrawMove(DR_MOVE *packet, PSX_RECT *rectangle, sint32 x, sint32 y)

@@ -4,10 +4,10 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 from urllib.parse import quote
 from windows_desktop import run_hidden_desktop
+from xport_process import host_executable
 
 
 PROFILE = Path(__file__).resolve().parent/'templates/project/github.json'
@@ -15,9 +15,7 @@ PROFILE = Path(__file__).resolve().parent/'templates/project/github.json'
 
 class GitHubAPI:
     def __init__(self):
-        self.executable = os.environ.get('XPORT_GH') or shutil.which('gh')
-        if not self.executable:
-            raise ValueError('STARTUP_GITHUB_AUTH: install GitHub CLI or set XPORT_GH, then run gh auth login --hostname github.com --web')
+        self.executable = host_executable('gh', 'github-cli/bin/gh.exe', os.environ.get('XPORT_GH'))
 
     def __call__(self, endpoint, method='GET', payload=None):
         args = [self.executable, 'api', '--hostname', 'github.com', endpoint, '--method', method]
@@ -31,7 +29,7 @@ class GitHubAPI:
         if result.returncode:
             # Keep credentials and response bodies out of startup diagnostics
             raise ValueError('STARTUP_GITHUB_REQUEST_FAILED: '+method+' '+endpoint+
-                             '; verify gh auth status, repository existence and Issues write access, then retry')
+                             '; verify auth status using '+self.executable+', repository existence and Issues write access, then retry')
         return json.loads(result.stdout) if result.stdout.strip() else None
 
 

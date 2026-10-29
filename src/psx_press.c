@@ -4,10 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Default quantization and scale matrices from PsyQ 4.6 LIBPRESS */
-static const DECDCTENV default_env = {{2, 16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29, 29, 29, 27, 27, 29, 29, 32, 32, 34, 34, 37, 38, 37, 35, 35, 34, 35, 38, 38, 40, 40, 40, 48, 48, 46, 46, 56, 56, 58, 69, 69, 83}, {2, 16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29, 29, 29, 27, 27, 29, 29, 32, 32, 34, 34, 37, 38, 37, 35, 35, 34, 35, 38, 38, 40, 40, 40, 48, 48, 46, 46, 56, 56, 58, 69, 69, 83}, {23170, 23170,  23170,  23170, 23170, 23170,  23170,  23170, 32138, 27245,  18204, 6392,  -6393,  -18205, -27246, -32139, 30273, 12539,  -12540, -30274, -30274, -12540, 12539,  30273, 27245, -6393,  -32139, -18205, 18204, 32138,  6392,  -27246,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         23170, -23171, -23171, 23170, 23170, -23171, -23171, 23170, 18204, -32139, 6392,  27245, -27246, -6393,  32138,  -18205, 12539, -30274, 30273,  -12540, -12540, 30273,  -30274, 12539, 6392,  -18205, 27245,  -32139, 32138, -27246, 18204, -6393}};
-
 static MdecState decoder;
 static const uint32 *input;
 static uint32 input_snapshot[65535];
@@ -20,72 +16,6 @@ static uint32 input_masked, output_masked;
 static void mdec_wait_service(void)
 {
     mdec_psyq_pump(0);
-}
-
-typedef struct MDEC_CHECKPOINT
-{
-    MdecState decoder;
-    uint32 input_snapshot[65535];
-    uint32 input_pos, input_left, output_address, output_left;
-    uint32 initialized, input_busy, output_busy, input_pending, output_pending;
-} MDEC_CHECKPOINT;
-
-sint32 mdec_psyq_checkpoint_io(FILE *file, sint32 load)
-{
-    MDEC_CHECKPOINT *saved;
-    uint32 *restored_output = NULL;
-    sint32 ok;
-    if (!file)
-        return 0;
-    saved = (MDEC_CHECKPOINT *)calloc(1, sizeof(*saved));
-    if (!saved)
-        return 0;
-    if (load)
-    {
-        ok = fread(saved, sizeof(*saved), 1, file) == 1;
-        if (ok && saved->output_busy)
-        {
-            restored_output = (uint32 *)xport_guest_ptr(saved->output_address, (size_t)saved->output_left * 4);
-            ok = restored_output != NULL;
-        }
-        if (ok)
-        {
-            decoder = saved->decoder;
-            memcpy(input_snapshot, saved->input_snapshot, sizeof(input_snapshot));
-            input = saved->initialized ? input_snapshot : NULL;
-            input_pos = saved->input_pos;
-            input_left = saved->input_left;
-            output = restored_output;
-            output_left = saved->output_left;
-            initialized = saved->initialized;
-            input_busy = saved->input_busy;
-            output_busy = saved->output_busy;
-            input_pending = saved->input_pending;
-            output_pending = saved->output_pending;
-            input_masked = output_masked = 0;
-            psx_wait_bind_service(0, initialized ? mdec_wait_service : NULL);
-            if (input_pending || output_pending)
-                psx_wait_signal_service(0);
-        }
-    }
-    else
-    {
-        saved->decoder = decoder;
-        memcpy(saved->input_snapshot, input_snapshot, sizeof(input_snapshot));
-        saved->input_pos = input_pos;
-        saved->input_left = input_left;
-        saved->output_left = output_left;
-        saved->initialized = initialized;
-        saved->input_busy = input_busy;
-        saved->output_busy = output_busy;
-        saved->input_pending = input_pending;
-        saved->output_pending = output_pending;
-        if (output_busy)
-            saved->output_address = xport_guest_buffer_address(output, (size_t)output_left * 4);
-        ok = (!output_busy || saved->output_address) && fwrite(saved, sizeof(*saved), 1, file) == 1;
-    }
-    free(saved);
-    return ok;
 }
 
 static void ensure_initialized(void)
@@ -107,8 +37,8 @@ void DecDCTReset(sint32 mode)
     output = NULL;
     if (!mode)
     {
-        memcpy(decoder.quantization_y, default_env.iq_y, 64);
-        memcpy(decoder.quantization_uv, default_env.iq_c, 64);
+        memcpy(decoder.quantization_y, mdec_default_environment.iq_y, 64);
+        memcpy(decoder.quantization_uv, mdec_default_environment.iq_c, 64);
         memcpy(decoder.scale, mdec_standard_scale, sizeof(decoder.scale));
     }
 }

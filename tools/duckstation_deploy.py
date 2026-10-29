@@ -4,7 +4,7 @@ import configparser
 import json
 from pathlib import Path
 import socket
-from trace_cache import digest
+from project_context import digest
 from xport_project import allocation_lock, load_project, reservations
 from duckstation_runtime import data_directory, validate_settings
 

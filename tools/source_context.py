@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from lockstep_audit import words_from_listing
+from mips_audit import words_from_listing
 from xport_project import load_project, artifact_path
 
 
@@ -119,6 +119,15 @@ def reviewed_library_identity(image, address):
             'original_sha256': function['sha256']}
 
 
+def verify_ghidra_content(db,image,address,mips,pseudocode):
+    try:
+        row=db.execute('SELECT mips_sha256,pseudocode_sha256 FROM ghidra_content_hashes WHERE image=? AND address=?',(image,address)).fetchone()
+    except sqlite3.OperationalError as error:
+        raise ValueError('Ghidra content identity table is missing') from error
+    if not row or mips.get('sha256')!=row[0] or pseudocode.get('sha256')!=row[1]:
+        raise ValueError('Ghidra original content changed or is missing')
+
+
 def compact(image,address,budget=12000,full_source=False,mips_address=None,source_line=None,pseudo_line=None,
             full_original=False):
     if not 4096<=budget<=2097152:raise ValueError('Budget must be 4096..2097152 bytes')
@@ -155,8 +164,12 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
             mips=original_excerpt(root,function['listing'],mips_address or address,56,full=full_original),
             pseudocode=original_excerpt(root,function['pseudocode'],None,40,pseudo_line,full=full_original),
             evidence=evidence,semantic_aliases=semantic,gaps=[])
+        if project.get('analysis',{}).get('evidence_backend')=='ghidra':
+            verify_ghidra_content(db,image,address,result['mips'],result['pseudocode'])
     from pseudocode_review import apply_review
     result['pseudocode']=apply_review(root,project,dict(function),result['pseudocode'])
+    if project.get('analysis',{}).get('evidence_backend')=='ghidra':
+        result['gaps'].append('Ghidra boundaries and pseudocode are unreviewed; data references, cross-image call resolution and similarity are incomplete')
     if result['pseudocode'].get('review'):result['gaps'].append('Reviewed incomplete pseudocode: '+result['pseudocode']['review']['reason'])
     if impl['mapping_status']!='mapped':result['gaps'].append('No unique explicit address-to-C-function mapping: '+impl['mapping_basis'])
     if function['boundary_status']!='audited':result['gaps'].append('Original boundary status: '+function['boundary_status'])
@@ -167,23 +180,60 @@ def compact(image,address,budget=12000,full_source=False,mips_address=None,sourc
     result['function'].pop('status',None)
     if not result['translation']['decompiled']:result['gaps'].append('No current complete translation binding; partial bodies do not count')
     if body_view and not body_view['complete']:result['gaps'].append('C body exceeds bounded view; use --full-source or --source-line')
-    if full_original and len(json.dumps(result,ensure_ascii=True).encode())>budget:
+    return bound_context(result, budget, full_source and body_view is not None, full_original, source_line)
+
+
+def serialized_size(result):
+    """Measure the complete response, including its self-reported size"""
+    result.setdefault('serialized_bytes', 0)
+    while True:
+        size = len(json.dumps(result, ensure_ascii=True).encode())
+        if result['serialized_bytes'] == size:
+            return size
+        result['serialized_bytes'] = size
+
+
+def bound_context(result, budget, full_source=False, full_original=False, source_line=None):
+    """Retain primary source context and fail closed if metadata cannot fit"""
+    result['budget_bytes'] = budget
+    if full_original and serialized_size(result)>budget:
         raise ValueError('Complete MIPS, pseudocode and C context does not fit requested budget')
+    if serialized_size(result)>budget and 'project_context' in result:
+        context = result['project_context']
+        result['project_context'] = {'omitted': True, 'reason': 'Budget; use X project_context show',
+                                     'record_count': len(context.get('records', []))}
     # Preserve exact C/declaration context before secondary original-code excerpts
     for key,minimum in (('pseudocode',8),('mips',16)):
-        while len(result[key]['lines'])>minimum and len(json.dumps(result,ensure_ascii=True).encode())>budget:
+        while len(result[key]['lines'])>minimum and serialized_size(result)>budget:
             result[key]['lines'].pop();result[key]['complete']=False
     for row in reversed(result['declarations']):
-        if len(json.dumps(result,ensure_ascii=True).encode())<=budget:break
+        if serialized_size(result)<=budget:break
         row.pop('text',None);row['text_omitted']=True
     for key in ('pseudocode','mips'):
-        while result[key]['lines'] and len(json.dumps(result,ensure_ascii=True).encode())>budget:
+        while result[key]['lines'] and serialized_size(result)>budget:
             result[key]['lines'].pop();result[key]['complete']=False
-    while result['declarations'] and len(json.dumps(result,ensure_ascii=True).encode())>budget:
+    while result['declarations'] and serialized_size(result)>budget:
         result['declarations'].pop();result['declarations_truncated']=True
-    if len(json.dumps(result,ensure_ascii=True).encode())>budget and body_view and full_source:
+    if serialized_size(result)>budget and not full_source:
+        view = result.get('implementation', {})
+        if 'text' in view:
+            lines = view.pop('text').splitlines()
+            view.update(lines=lines, first_line=view.get('start_line', 1), total_lines=len(lines), complete=False)
+            result.setdefault('gaps', []).append('C body exceeds bounded view; use --full-source or --source-line')
+        if 'lines' in view:
+            while len(view['lines'])>1 and serialized_size(result)>budget:
+                anchor_line = source_line if source_line is not None else view['first_line']
+                if anchor_line-view['first_line'] >= len(view['lines'])//2:
+                    view['lines'].pop(0)
+                    view['first_line'] += 1
+                else:
+                    view['lines'].pop()
+                view['complete'] = False
+                view['window_reduced_for_budget'] = True
+    if serialized_size(result)>budget and full_source:
         raise ValueError('Exact C body does not fit requested budget; raise --budget or omit --full-source')
-    result['serialized_bytes']=len(json.dumps(result,ensure_ascii=True).encode());result['budget_bytes']=budget
+    if serialized_size(result)>budget:
+        raise ValueError('Audit context metadata does not fit requested budget; raise --budget')
     return result
 
 

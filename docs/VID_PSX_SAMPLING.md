@@ -40,7 +40,7 @@ When original nearest window addressing can fall outside the resource, preserve 
 
 Get image identity/dimensions from the resource loader, never polygon UV extrema. Normalize inclusive/exclusive conventions once. Preserve animated frame identity, palette changes and scrolling. Do not mutate queued materials to select filtering.
 
-Follow [ENHANCE.md section 9.1](ENHANCE.md#91-add-selective-bilinear-filtering): objects/environment and audited backdrops can filter; effects need a transparency/blend audit; HUD/fonts/icons remain nearest by default. A backdrop behind a menu is separate from its controls.
+Follow [ENHANCE.md section 9.1](ENHANCE_REFERENCE.md#91-add-selective-bilinear-filtering): objects/environment and audited backdrops can filter; effects need a transparency/blend audit; HUD/fonts/icons remain nearest by default. A backdrop behind a menu is separate from its controls.
 
 RapidRacer and Pandemonium2 reviewed this contract. RR maps square regions to `(x,y,size,size)`; P2 retains rectangular sizes and its word transport. Adding the header does not certify project migration or game appearance. Preserve project adapter and migration receipts separately.
 

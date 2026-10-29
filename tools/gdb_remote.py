@@ -21,15 +21,6 @@ class Remote:
         self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._rx = bytearray()
         self.stopped = False
-        self.shared_ram = None
-        self.shared_ram_error = None
-        self.shared_bytes = 0
-        if os.environ.get('XPORT_GDB_RAM_BACKEND', os.environ.get('FF_GDB_RAM_BACKEND', 'auto')) != 'rsp':
-            try:
-                from shared_ram import SharedRAM
-                self.shared_ram = SharedRAM(host, port)
-            except (OSError, ValueError, AttributeError) as exc:
-                self.shared_ram_error = str(exc)
         # DuckStation's stub accepts the conventional initial positive ACK.
         self.s.sendall(b"+")
 
@@ -64,13 +55,6 @@ class Remote:
             self._rx.extend(part)
 
     def packet(self, command: str, timeout: float | None = None) -> str:
-        if command.startswith('m') and self.stopped and self.shared_ram:
-            address, size = (int(x,16) for x in command[1:].split(','))
-            from shared_ram import ram_offset
-            if ram_offset(address,size) is not None:
-                data = self.shared_ram.read(address,size)
-                self.shared_bytes += len(data)
-                return data.hex()
         if command[:1] in ('c','s','C','S','v','D','k'):
             self.stopped = False
         previous_timeout = self.s.gettimeout()
@@ -104,27 +88,7 @@ class Remote:
         finally:
             self.s.settimeout(previous_timeout)
 
-    def checkpoint(self, name: str, *, load: bool = False) -> None:
-        """Project DuckStation extension; full state, paused target, no UI.
-
-        Saving never overwrites. Loading clears this client's breakpoints;
-        reinstall them before continuing. Requires the patched runtime.
-        """
-        if not name or len(name) > 64 or any(c not in
-                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in name):
-            raise ValueError('Checkpoint name must be 1..64 ASCII letters, digits, hyphens or underscores')
-        features = self.packet('qSupported')
-        command = 'qFFLoadState' if load else 'qFFSaveState'
-        if command + '+' not in features:
-            raise RuntimeError('DuckStation does not advertise the full-state API extension')
-        reply = self.packet(command + ':' + name.encode('ascii').hex(), timeout=60)
-        if reply != 'OK':
-            raise RuntimeError(f'{command} failed: {reply}')
-        self.stopped = True
-
     def close(self) -> None:
-        if self.shared_ram:
-            self.shared_ram.close()
         self.s.close()
 
     def resume_acknowledged(self) -> None:
@@ -138,13 +102,8 @@ class Remote:
             raise RuntimeError('GDB continue was not acknowledged: '+repr(part))
 
     def read_memory(self, address: int, size: int) -> bytes:
-        from shared_ram import ram_offset
         if size < 0:
             raise ValueError('Negative memory size')
-        if self.stopped and self.shared_ram and ram_offset(address,size) is not None:
-            data = self.shared_ram.read(address,size)
-            self.shared_bytes += len(data)
-            return data
         return b''.join(bytes.fromhex(self.packet(f'm{address+o:x},{min(1024,size-o):x}'))
                         for o in range(0,size,1024))
 

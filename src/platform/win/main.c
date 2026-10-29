@@ -67,8 +67,6 @@ sint32 xport_load(void *data, sint32 capacity)
 
 #include "xport_trace.h"
 void psx_root_counter_poll(void);
-#if defined(LOCKSTEP_DEBUG)
-#endif
 
 enum
 {
@@ -524,8 +522,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             return DefWindowProc(window, message, wparam, lparam);
         case WM_KEYDOWN:
         case WM_KEYUP:
-            if (message == WM_KEYDOWN && !(lparam & (1L << 30)) && wparam >= VK_F1 && wparam <= VK_F12 &&
-                function_key_handler != NULL && function_key_handler((uint32)(wparam - VK_F1 + 1)))
+            if (message == WM_KEYDOWN && !(lparam & (1L << 30)) && wparam >= VK_F1 && wparam <= VK_F12 && function_key_handler != NULL && function_key_handler((uint32)(wparam - VK_F1 + 1)))
                 return 0;
             if (wparam == VK_TAB)
             {
@@ -950,9 +947,7 @@ sint32 xport_audio_init(void)
     sint32 use_null;
 #ifdef _DEBUG
     const char *audible = getenv("XPORT_AUDIO_OUTPUT");
-    #if !defined(LOCKSTEP_DEBUG)
     const char *backend = getenv("XPORT_AUDIO_BACKEND");
-    #endif
 #endif
     if (InterlockedCompareExchange(&output.running, 1, 1) != 0)
         return 1;
@@ -972,7 +967,7 @@ sint32 xport_audio_init(void)
     g_xport_audio_peak = 0;
     g_xport_audio_callback_overruns = 0;
     use_null = xport_is_headless();
-#if defined(_DEBUG) && !defined(LOCKSTEP_DEBUG)
+#if defined(_DEBUG)
     if (backend != NULL && strcmp(backend, "null") == 0)
         use_null = 1;
     else if (backend != NULL && strcmp(backend, "waveout") == 0)
@@ -1297,18 +1292,8 @@ void xport_shutdown(void)
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR command_line, int show_command)
 {
     int result;
-#if defined(LOCKSTEP_DEBUG)
-    if (!xport_lockstep_memory_init())
-    {
-    #ifndef NDEBUG
-        fprintf(stderr, "lockstep_memory_error=%s\n", xport_lockstep_memory_error_name(xport_lockstep_memory_error()));
-    #endif
-        return 2;
-    }
-    xport_lockstep_memory_ready();
-#endif
     xport_memory_init(DRAM, sizeof(DRAM), (uint8 *)SCRATCHPAD, sizeof(SCRATCHPAD), NULL, 0u);
-#if !defined(LOCKSTEP_DEBUG) && defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
+#if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
     xport_memory_bind_mmio(0x1F801C00, 0x200, spu_mmio_read, spu_mmio_write, NULL);
 #endif
 #if defined(_DEBUG)
@@ -1319,14 +1304,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR comman
     }
 #endif
     platform_run_mode = RUN_MODE_GAME;
-#if defined(LOCKSTEP_DEBUG)
-    if (strstr(command_line, "--lockstep-replay"))
-        platform_run_mode = RUN_MODE_LOCKSTEP_REPLAY;
-    else if (strstr(command_line, "--lockstep-boundary-selftest"))
-        platform_run_mode = RUN_MODE_LOCKSTEP_SELFTEST;
-#endif
-    if (platform_run_mode != RUN_MODE_GAME)
-        platform_headless = 1;
     InitializeCriticalSection(&audio_lock);
     audio_lock_initialized = 1;
     xport_timer_init();
@@ -1338,9 +1315,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous_instance, LPSTR comman
     platform_game_exit_active = 0;
     result = platform_exit_code;
     xport_shutdown();
-#if defined(LOCKSTEP_DEBUG)
-    xport_lockstep_memory_shutdown();
-#endif
 #if defined(_DEBUG)
     collect_end();
 #endif

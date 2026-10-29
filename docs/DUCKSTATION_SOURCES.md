@@ -2,7 +2,7 @@
 
 Upstream: `https://github.com/stenzek/duckstation.git`.
 
-`duckstation-manifest.json` pins the upstream commit, dependency release and SHA-256, build configuration, runtime contract and complete local patch. `internal-trace-api.patch` is the only patch applied. Do not restore a standalone state API patch; those changes are already included in the complete patch.
+`duckstation-manifest.json` pins the upstream commit, dependency release and SHA-256, build configuration, runtime contract and complete local patch. `project-data-root.patch` is the only patch applied. The patch only selects the project data root; CPU, device and debugger behavior remain upstream.
 
 Regenerate the patch only from the explicitly selected prepared source tree. Pass that tree through `duckstation_refresh_patch.py --source PATH`; the command has no implicit source-tree fallback. Use the same tree whose changes were reviewed and built.
 

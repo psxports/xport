@@ -45,7 +45,7 @@ SW_HIDE = 0
 SW_SHOWNORMAL = 1
 
 
-def open_worker_desktop(name="XportConverge"):
+def open_worker_desktop(name="XportWorker"):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
         raise ValueError("Invalid worker desktop name")
     user = ctypes.WinDLL("user32", use_last_error=True)
@@ -92,12 +92,12 @@ def launch_worker_desktop(command, directory: Path, *, environment):
         user.CloseDesktop(handle)
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        worker_environment = dict(environment, XPORT_WINDOWS_DESKTOP="WinSta0\\XportConverge",
+        worker_environment = dict(environment, XPORT_WINDOWS_DESKTOP="WinSta0\\XportWorker",
                                   XPORT_WORKER_READY_EVENT=name)
         process = launch_default_desktop_process(command, directory, visible=False,
                                                 environment=worker_environment)
         if kernel.WaitForSingleObject(event, 10000) != 0:
-            raise RuntimeError("Hidden converge worker did not initialize")
+            raise RuntimeError("Hidden worker did not initialize")
         return process.pid
     finally:
         kernel.CloseHandle(event)

@@ -13,8 +13,82 @@
     #game { position: relative; width: 100vw; height: 100dvh; background: #000; }
     canvas { width: 100%; height: 100%; display: block; outline: none; image-rendering: pixelated; }
     html:fullscreen { cursor: none; }
-    #boot { position: absolute; inset: 0; display: grid; place-content: center; gap: 12px; padding: 24px; background: #111; text-align: center; }
-    progress { width: min(70vw, 420px); height: 18px; }
+    html:fullscreen #fullscreen { display: none; }
+    #boot { position: absolute; inset: 0; display: flex; flex-direction: column; overflow: auto; padding: 32px 18px; background: #101113; color: #e8e9eb; font: 14px/1.5 system-ui, sans-serif; }
+    #boot { color-scheme:dark;--bg:#101113;--surface:#181a1e;--line:#303238;--text:#e8e9eb;--muted:#8e929b;--green:#b5e3a7;--blue:#529dff;--boot-gap:26px }
+    #boot .boot-layout { width:min(100%,400px);margin:auto }
+    #boot .boot-main { width:min(100%,320px);margin:0 auto var(--boot-gap);text-align:center }
+    #boot .cover { display:block;width:auto;height:auto;max-width:calc(100vw - 36px);margin:0 0 var(--boot-gap);position:relative;left:50%;transform:translateX(-50%) }
+    #boot .start { margin-top:0;width:100%;height:42px;background:var(--blue);border:0;border-radius:7px;color:#081a30;font:600 14px system-ui;cursor:pointer;transition:filter .15s }
+    #boot .start:hover { filter:brightness(1.1) }
+    #boot .start span { margin-left:8px;opacity:.6 }
+    #boot .panel { background:var(--surface);border:1px solid #2a2d32;border-radius:12px;overflow:hidden }
+    #boot .panel-head { display:flex;justify-content:center;padding:14px 18px;border-bottom:1px solid #292c32 }
+    #boot .tabs { display:flex;background:#101215;padding:3px;border-radius:6px;gap:3px }
+    #boot .tabs button { font:12px system-ui;color:var(--muted);background:transparent;border:0;border-radius:4px;padding:6px 15px;cursor:pointer }
+    #boot .tabs button[aria-selected="true"] { background:#30343a;color:#eee }
+    #boot .shoulders { display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:18px 16px 0 }
+    #boot .shoulder-side { display:flex;align-items:center;justify-content:center;gap:7px }
+    #boot .binding { display:flex;align-items:center;justify-content:center;gap:7px;min-height:32px }
+    #boot .button-label { color:#b5bac3;font:12px ui-monospace,Consolas,monospace }
+    #boot kbd { display:inline-grid;place-items:center;border:1px solid #454952;border-bottom:3px solid #454952;border-radius:5px;background:linear-gradient(#292c32,#22252a);color:#d9dce2;font:12px ui-monospace,Consolas,monospace;min-width:32px;height:32px;text-align:center;padding:0 8px;transition:background .1s,border-color .1s,color .1s;white-space:nowrap }
+    #boot kbd.pressed { background:var(--green);border-color:#8bb67d;color:#1b2c18;transform:translateY(1px) }
+    #boot .bindings { display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:20px 16px 18px }
+    #boot .control-group { display:flex;flex-direction:column;align-items:center }
+    #boot .group-title { font-size:10px;font-weight:400;letter-spacing:.14em;color:#777e89;text-transform:uppercase;margin:0 0 13px }
+    #boot .direction { display:grid;grid-template-columns:repeat(3,32px);grid-template-rows:repeat(2,32px);gap:5px }
+    #boot .direction kbd { padding:0 }
+    #boot .up { grid-column:2;grid-row:1 }
+    #boot .left { grid-column:1;grid-row:2 }
+    #boot .right { grid-column:3;grid-row:2 }
+    #boot .down { grid-column:2;grid-row:2 }
+    #boot .center { grid-column:2;grid-row:2;display:grid;place-items:center;font-size:12px;color:#414650 }
+    #boot .face-grid { display:grid;grid-template-columns:max-content max-content;grid-template-rows:repeat(2,32px);gap:5px 18px }
+    #boot .symbol { display:inline-grid;place-items:center;width:22px;height:25px;font-size:25px;font-weight:400;line-height:1 }
+    #boot .triangle { color:#6edbc4 }
+    #boot .square { color:#e49dd2 }
+    #boot .cross { color:#8cbdff }
+    #boot .circle { color:#ec8f93 }
+    #boot .system { display:flex;justify-content:center;gap:27px;padding:0 18px 20px }
+    #boot .system .button-label { font-size:10px }
+    #boot .system kbd { height:27px;min-width:32px;font-size:11px }
+    #boot .panel-foot { padding:12px 18px;border-top:1px solid #292c32;display:flex;justify-content:space-between;align-items:center;color:#777e89;font-size:11px;gap:12px }
+    #boot .shortcuts { display:flex;align-items:center;gap:16px }
+    #boot .panel-foot kbd { display:inline-block;height:23px;min-width:24px;line-height:19px;font-size:10px;padding:0 6px;border-bottom-width:2px;vertical-align:middle }
+    #boot .note { color:#686e78;text-align:center;font-size:11px;margin:13px 0 0 }
+    #boot .icon { opacity:.75;margin-right:5px }
+    @media(max-width:440px) {
+#boot .shoulders { padding:16px 14px 0;gap:10px }
+    #boot .shoulder-side { gap:8px }
+    #boot .binding { gap:5px }
+    #boot .bindings { padding:20px 14px 18px;gap:10px }
+    #boot .face-grid { column-gap:12px }
+    #boot .system { gap:17px }
+    #boot .panel-foot { padding:11px 14px;font-size:10px }
+    #boot .cover { max-width:calc(100vw - 24px);margin-bottom:var(--boot-gap) }
+    #boot .boot-main { margin-bottom:var(--boot-gap) }
+    #boot .tabs button { padding:6px 14px }
+    }
+    #boot #status { display: none; color: #f29198; font-size: 12px; margin: 0 0 12px; overflow-wrap: anywhere; }
+    #boot #status:empty { display: none; }
+    #boot .cover[hidden] { display: none; }
+    #boot [data-player][hidden] { display: none; }
+    #boot progress { display: block; width: 100%; height: 5px; appearance: none; border: 0; border-radius: 4px; overflow: hidden; background: #292d32; accent-color: var(--blue); }
+    #boot progress::-webkit-progress-bar { background: #292d32; border-radius: 4px; }
+    #boot progress::-webkit-progress-value { background: var(--blue); border-radius: 4px; }
+    #boot progress::-moz-progress-bar { background: var(--blue); border-radius: 4px; }
+    #boot progress[hidden] { display: none; }
+    #boot .start { position: relative; overflow: hidden; isolation: isolate; background: #252b34; color: #081a30; }
+    #boot .start::before { content: ''; position: absolute; inset: 0; z-index: -1; background: var(--blue); transform: scaleX(var(--load-progress, 0)); transform-origin: left; transition: transform .18s ease; }
+    #boot .start .start-label { margin: 0; opacity: 1; }
+    #boot .start:not(:disabled)::before { transition: none; }
+    #boot .start:not(:disabled) { color: #fff; font-size: 16px; font-weight: 700; }
+    #boot .start:disabled { opacity: 1; color: #e8e9eb; cursor: wait; }
+    #boot[data-boot-error] .start { height: auto; min-height: 42px; padding: 10px 14px; background: transparent; border: 1px solid #e66b76; color: #f29198; cursor: default; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+    #boot[data-boot-error] .start::before { display: none; }
+    @media (prefers-reduced-motion: reduce) { #boot .start::before { transition: none; } }
+    #boot button:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+    @media (max-width: 440px) { #boot { padding: 22px 12px; --boot-gap: 22px; } }
     button { padding: 10px 16px; border: 1px solid #777; border-radius: 5px; background: #222; color: #fff; font: inherit; }
     button:disabled { opacity: .45; }
     #fullscreen { position: absolute; top: 10px; right: 10px; z-index: 3; width: 40px; height: 40px; padding: 0; border-color: #aaa; background: #111a; font-size: 22px; line-height: 1; }
@@ -42,11 +116,17 @@
   <div id="game">
     <canvas id="canvas" tabindex="0"></canvas>
     <button id="loading" hidden>Loading…</button>
-    <button id="fullscreen" type="button" title="Fullscreen (Shift+F)" aria-label="Fullscreen">⛶</button>
-    <div id="boot">
-      <div id="status">Loading…</div>
-      <progress id="progress" value="0" max="100"></progress>
-      <button id="start" type="button" disabled>Start</button>
+    <button id="fullscreen" type="button" title="Fullscreen (F)" aria-label="Fullscreen">⛶</button>
+    <div id="boot" data-players="@@BOOT_PLAYERS@@">
+      <div class="boot-layout">
+<section class="boot-main">@@BOOT_COVER@@<div id="status" role="status" aria-live="polite">Loading…</div>
+      <progress id="progress" value="0" max="100" aria-label="Loading progress" hidden></progress><button class="start" id="start" type="button" aria-busy="true" disabled><span class="start-label"></span></button></section>
+<section class="panel" aria-label="PS1 keyboard bindings"><header class="panel-head"><div class="tabs" role="tablist" aria-label="Player"><button role="tab" aria-selected="true" data-player="0">Player 1</button><button role="tab" aria-selected="false" data-player="1">Player 2</button></div></header>
+<div class="shoulders"><div class="shoulder-side"><span class="button-label">L</span><kbd data-bind="l1" title="L1"></kbd><kbd data-bind="l2" title="L2"></kbd></div><div class="shoulder-side"><span class="button-label">R</span><kbd data-bind="r1" title="R1"></kbd><kbd data-bind="r2" title="R2"></kbd></div></div>
+<div class="bindings"><section class="control-group"><div class="direction"><kbd class="up" data-bind="up"></kbd><kbd class="left" data-bind="left"></kbd><kbd class="right" data-bind="right"></kbd><kbd class="down" data-bind="down"></kbd></div></section><section class="control-group"><div class="face-grid"><div class="binding"><span class="symbol triangle" aria-label="Triangle">△</span><kbd data-bind="triangle"></kbd></div><div class="binding"><span class="symbol circle" aria-label="Circle">○</span><kbd data-bind="circle"></kbd></div><div class="binding"><span class="symbol square" aria-label="Square"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4" y="4" width="16" height="16"/></svg></span><kbd data-bind="square"></kbd></div><div class="binding"><span class="symbol cross" aria-label="Cross"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 4L20 20M20 4L4 20"/></svg></span><kbd data-bind="cross"></kbd></div></div></section></div>
+<div class="system"><div class="binding"><span class="button-label">SELECT</span><kbd data-bind="select"></kbd></div><div class="binding"><span class="button-label">START</span><kbd data-bind="start"></kbd></div></div>
+<footer class="panel-foot"><span class="shortcuts"><span><kbd>F</kbd> &nbsp; Fullscreen</span><span><kbd>Tab</kbd> &nbsp; OG / HD</span></span><span><span class="icon">⊕</span> <span id="boot-gamepad">Gamepads supported</span></span></footer></section><p class="note">Press a key to highlight</p>
+      </div>
     </div>
   </div>
   <div id="touch">
@@ -80,12 +160,246 @@
     let ready = false;
     let gamepadName = '';
 
+    const bootKeyLayouts = [
+  {
+    "up": [
+      "W",
+      "KeyW"
+    ],
+    "left": [
+      "A",
+      "KeyA"
+    ],
+    "down": [
+      "S",
+      "KeyS"
+    ],
+    "right": [
+      "D",
+      "KeyD"
+    ],
+    "triangle": [
+      "I",
+      "KeyI"
+    ],
+    "circle": [
+      "L",
+      "KeyL"
+    ],
+    "square": [
+      "J",
+      "KeyJ"
+    ],
+    "cross": [
+      "K",
+      "KeyK"
+    ],
+    "l1": [
+      "Q",
+      "KeyQ"
+    ],
+    "l2": [
+      "1",
+      "Digit1"
+    ],
+    "r1": [
+      "E",
+      "KeyE"
+    ],
+    "r2": [
+      "3",
+      "Digit3"
+    ],
+    "select": [
+      "Backspace",
+      "Backspace"
+    ],
+    "start": [
+      "Enter",
+      "Enter"
+    ]
+  },
+  {
+    "up": [
+      "\u2191",
+      "ArrowUp"
+    ],
+    "left": [
+      "\u2190",
+      "ArrowLeft"
+    ],
+    "down": [
+      "\u2193",
+      "ArrowDown"
+    ],
+    "right": [
+      "\u2192",
+      "ArrowRight"
+    ],
+    "triangle": [
+      "Num 5",
+      "Numpad5"
+    ],
+    "circle": [
+      "Num 3",
+      "Numpad3"
+    ],
+    "square": [
+      "Num 1",
+      "Numpad1"
+    ],
+    "cross": [
+      "Num 2",
+      "Numpad2"
+    ],
+    "l1": [
+      "Num 4",
+      "Numpad4"
+    ],
+    "l2": [
+      "Num 7",
+      "Numpad7"
+    ],
+    "r1": [
+      "Num 6",
+      "Numpad6"
+    ],
+    "r2": [
+      "Num 9",
+      "Numpad9"
+    ],
+    "select": [
+      "Num +",
+      "NumpadAdd"
+    ],
+    "start": [
+      "Num Enter",
+      "NumpadEnter"
+    ]
+  }
+];
+    const bootKeys = [...boot.querySelectorAll('kbd[data-bind]')];
+    const bootPlayerCount = Math.min(2, Number(boot.dataset.players));
+    const playerTabs = [...boot.querySelectorAll('[data-player]')];
+    playerTabs.forEach(tab => { tab.hidden = Number(tab.dataset.player) >= bootPlayerCount; });
+
+    function bootVisible() {
+      return boot.style.display !== 'none';
+    }
+
+    function alignBootShoulders() {
+      if (!bootVisible())
+        return;
+      const rect = name => boot.querySelector('[data-bind="' + name + '"]').getBoundingClientRect();
+      const up = rect('up'), triangle = rect('triangle'), circle = rect('circle');
+      const targets = [up.x + up.width / 2, (triangle.x + triangle.width / 2 + circle.x + circle.width / 2) / 2];
+      const groups = [['.shoulder-side:first-child', 'l1', 'l2'], ['.shoulder-side:last-child', 'r1', 'r2']];
+      groups.forEach(([selector, first, second], index) => {
+        const group = boot.querySelector(selector);
+        group.style.transform = '';
+        const a = rect(first), b = rect(second);
+        group.style.transform = 'translateX(' + (targets[index] - (a.right + b.left) / 2) + 'px)';
+      });
+    }
+
+    function selectBootPlayer(player) {
+      player = Math.max(0, Math.min(bootPlayerCount - 1, player));
+      playerTabs.forEach(tab => {
+        const selected = Number(tab.dataset.player) === player;
+        tab.setAttribute('aria-selected', String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+      });
+      bootKeys.forEach(key => {
+        const pair = bootKeyLayouts[player][key.dataset.bind];
+        key.textContent = pair[0];
+        key.dataset.code = pair[1];
+        key.classList.remove('pressed');
+      });
+      alignBootShoulders();
+    }
+
+    playerTabs.forEach(tab => {
+      tab.addEventListener('click', () => selectBootPlayer(Number(tab.dataset.player)));
+      tab.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.code))
+          return;
+        event.preventDefault();
+        const player = bootPlayerCount === 1 ? 0 : event.code === 'Home' ? 0 : event.code === 'End' ? 1 : 1 - Number(tab.dataset.player);
+        selectBootPlayer(player);
+        playerTabs[player].focus();
+      });
+    });
+
+    function clearBootKeys() {
+      bootKeys.forEach(key => key.classList.remove('pressed'));
+    }
+
+    addEventListener('keydown', event => {
+      if (!bootVisible() || event.ctrlKey || event.altKey || event.metaKey)
+        return;
+      if (event.target.closest('button') && ['Enter', 'Space'].includes(event.code))
+        return;
+      const keys = bootKeys.filter(key => key.dataset.code === event.code);
+      if (keys.length)
+        event.preventDefault();
+      keys.forEach(key => key.classList.add('pressed'));
+    });
+    addEventListener('keyup', event => bootKeys.forEach(key => {
+      if (key.dataset.code === event.code)
+        key.classList.remove('pressed');
+    }));
+    addEventListener('blur', clearBootKeys);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden)
+        clearBootKeys();
+    });
+    addEventListener('resize', alignBootShoulders);
+    if (document.fonts)
+      document.fonts.ready.then(alignBootShoulders);
+    const bootCover = document.getElementById('boot-cover');
+    if (bootCover) {
+      bootCover.addEventListener('error', () => { bootCover.hidden = true; });
+      if (bootCover.complete && !bootCover.naturalWidth)
+        bootCover.hidden = true;
+    }
+    selectBootPlayer(0);
+
+
+    function updateBootProgress() {
+      const fraction = Math.max(0, Math.min(1, progress.max > 0 ? progress.value / progress.max : 0));
+      const error = boot.hasAttribute('data-boot-error');
+      const complete = ready && fraction === 1 && !error;
+      start.querySelector('.start-label').textContent = error ? 'Loading failed' : complete ? 'Start' : '';
+      start.disabled = !complete;
+      start.style.setProperty('--load-progress', error ? '0' : String(fraction));
+      start.setAttribute('aria-label', error ? 'Loading failed' : complete ? 'Start' : 'Loading game: ' + Math.round(fraction * 100) + '%');
+      start.setAttribute('aria-busy', String(!complete && !error));
+    }
+
+    function showBootError(reason) {
+      if (!bootVisible())
+        return;
+      console.error('Game startup failed:', reason);
+      boot.setAttribute('data-boot-error', '');
+      status.textContent = 'Loading failed';
+      updateBootProgress();
+    }
+
+    addEventListener('error', event => {
+      if (event.target instanceof HTMLScriptElement)
+        showBootError('Unable to load game resources');
+      else if (event.message)
+        showBootError(event.message);
+    }, true);
+    addEventListener('unhandledrejection', event => showBootError(event.reason));
+
     function updateGamepadStatus() {
       const pads = navigator.getGamepads ? navigator.getGamepads() : [];
       const pad = [...pads].find(item => item && item.connected);
       gamepadName = pad ? pad.id : '';
-      if (ready)
-        status.textContent = gamepadName ? `Ready — ${gamepadName}` : 'Ready';
+      const label = document.getElementById('boot-gamepad');
+      label.textContent = gamepadName ? 'Gamepad connected' : 'Gamepads supported';
+      label.title = gamepadName;
     }
 
     addEventListener('gamepadconnected', updateGamepadStatus);
@@ -99,7 +413,8 @@
         return path === 'xport-runtime.wasm' ? path + location.search : path;
       },
       setStatus(text) {
-        status.textContent = text;
+        if (!boot.hasAttribute('data-boot-error'))
+          status.textContent = text;
         if (text && !document.getElementById('loading').hidden)
           document.getElementById('loading').textContent = text;
         const match = text.match(/\((\d+(?:\.\d+)?)\/(\d+)\)/);
@@ -107,19 +422,29 @@
           progress.max = Number(match[2]);
           progress.value = Number(match[1]);
         }
+        updateBootProgress();
       },
       monitorRunDependencies(left) {
-        if (left) {
-          progress.max = Math.max(progress.max, this.totalDependencies || left);
-          this.totalDependencies = progress.max;
-          progress.value = progress.max - left;
+        if (left)
+          this.totalDependencies = Math.max(this.totalDependencies || 0, left);
+        if (this.totalDependencies) {
+          progress.max = this.totalDependencies;
+          progress.value = this.totalDependencies - left;
         }
+        updateBootProgress();
+      },
+      onAbort(reason) {
+        showBootError(reason);
       },
       onRuntimeInitialized() {
         ready = true;
         progress.value = progress.max;
+        updateBootProgress();
+        if (!boot.hasAttribute('data-boot-error')) {
+          status.textContent = '';
+          start.disabled = false;
+        }
         updateGamepadStatus();
-        start.disabled = false;
       }
     };
 
@@ -130,6 +455,14 @@
       const context = new AudioContextClass({ latencyHint: 'interactive' });
       await context.resume();
       Module.xportAudioContext = context;
+      const maxAudioLatency = 0.15;
+      const audioPacket = (samples, age = 0) => age > maxAudioLatency ? null : {
+        samples,
+        endTime: context.currentTime - age
+      };
+      const outputGain = context.createGain();
+      outputGain.gain.value = new URLSearchParams(location.search).get('mute') === '1' ? 0 : 1;
+      outputGain.connect(context.destination);
       if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
         const queue = [];
         let offset = 0;
@@ -137,14 +470,18 @@
         node.onaudioprocess = event => {
           const left = event.outputBuffer.getChannelData(0);
           const right = event.outputBuffer.getChannelData(1);
+          while (queue.length && queue[0].endTime < context.currentTime - maxAudioLatency) {
+            queue.shift();
+            offset = 0;
+          }
           for (let frame = 0; frame < left.length; ++frame) {
-            while (queue.length && offset >= queue[0].length / 2) {
+            while (queue.length && offset >= queue[0].samples.length / 2) {
               queue.shift();
               offset = 0;
             }
             if (queue.length) {
-              left[frame] = queue[0][offset * 2];
-              right[frame] = queue[0][offset * 2 + 1];
+              left[frame] = queue[0].samples[offset * 2];
+              right[frame] = queue[0].samples[offset * 2 + 1];
               ++offset;
             } else {
               left[frame] = 0;
@@ -152,14 +489,17 @@
             }
           }
         };
-        node.connect(context.destination);
+        node.connect(outputGain);
         Module.xportAudioRate = context.sampleRate;
-        Module.xportAudioPush = block => {
+        Module.xportAudioPush = (block, age) => {
+          const packet = audioPacket(block, age);
+          if (!packet)
+            return;
           if (queue.length >= 8) {
             queue.length = 0;
             offset = 0;
           }
-          queue.push(block);
+          queue.push(packet);
         };
         Module.xportAudioNode = node;
         document.body.dataset.xportAudio = 'script-processor';
@@ -182,13 +522,17 @@
           process(inputs, outputs) {
             const left = outputs[0][0];
             const right = outputs[0][1];
+            while (this.queue.length && this.queue[0].endTime < currentTime - ${maxAudioLatency}) {
+              this.queue.shift();
+              this.offset = 0;
+            }
             for (let frame = 0; frame < left.length; ++frame) {
-              while (this.queue.length && this.offset >= this.queue[0].length / 2) {
+              while (this.queue.length && this.offset >= this.queue[0].samples.length / 2) {
                 this.queue.shift();
                 this.offset = 0;
               }
               if (this.queue.length) {
-                const block = this.queue[0];
+                const block = this.queue[0].samples;
                 left[frame] = block[this.offset * 2];
                 right[frame] = block[this.offset * 2 + 1];
                 ++this.offset;
@@ -206,9 +550,13 @@
       await context.audioWorklet.addModule(url);
       URL.revokeObjectURL(url);
       const node = new AudioWorkletNode(context, 'xport-audio', { outputChannelCount: [2] });
-      node.connect(context.destination);
+      node.connect(outputGain);
       Module.xportAudioRate = context.sampleRate;
-      Module.xportAudioPush = block => node.port.postMessage(block, [block.buffer]);
+      Module.xportAudioPush = (block, age) => {
+        const packet = audioPacket(block, age);
+        if (packet)
+          node.port.postMessage(packet, [block.buffer]);
+      };
       Module.xportAudioNode = node;
       document.body.dataset.xportAudio = 'worklet';
     }
@@ -222,7 +570,7 @@
 
     document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
     addEventListener('keydown', event => {
-      if (event.shiftKey && event.code === 'KeyF') {
+      if (event.code === 'KeyF' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.repeat) {
         event.preventDefault();
         toggleFullscreen();
       }
@@ -308,7 +656,7 @@
     });
 
     start.addEventListener('click', async () => {
-      if (!ready)
+      if (!ready || boot.hasAttribute('data-boot-error'))
         return;
       start.disabled = true;
       status.textContent = 'Starting…';
@@ -318,6 +666,7 @@
         document.body.dataset.xportAudioError = Module.xportAudioError;
         console.error('Web audio initialization failed:', error);
       });
+      clearBootKeys();
       boot.style.display = 'none';
       touch.classList.add('running');
       Module.canvas.focus();

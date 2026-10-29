@@ -10,6 +10,6 @@
 - Existing scalar reads/writes, callbacks, consumer bindings and snapshots are unchanged
 - The API does not implement LWL/LWR register merging or physical bus timing
 
-From `tools`, run `python -B -m unittest discover -s tests -p test_masked_memory.py -v`. Select x64 with `XPORT_TEST_ARCH=x64`. The tests compile actual runtime bodies and public headers, including `LOCKSTEP_DEBUG`, all masks/regions/aliases and legacy scalar/MMIO behavior. Passing these tests does not establish other games' gameplay compatibility.
+From `tools`, run `python -B -m unittest discover -s tests -p test_masked_memory.py -v`. Select x64 with `XPORT_TEST_ARCH=x64`. Passing these tests does not establish other games' gameplay compatibility.
 
 FF integration evidence: `FightingForce-xport/status/implementation-completion/texture-loader-full-review.json`. Its two unaligned palette-copy cases compare ordered addresses, values and byte masks against original LWL/LWR execution without mask exclusions.

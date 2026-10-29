@@ -24,8 +24,5 @@
 #if defined(AP_WEB) && (defined(AP_X86) || defined(AP_X64))
     #error Web targets must not select a native x86 architecture
 #endif
-#if defined(LOCKSTEP_DEBUG) && (!defined(AP_WIN) || !defined(AP_X86))
-    #error LOCKSTEP_DEBUG requires Windows x86
-#endif
 
 #endif

@@ -473,13 +473,16 @@ def format_sources(root,relative_paths):
     style=Path(__file__).resolve().parents[1]/'src/.clang-format'
     if not style.is_file():raise ValueError('Shared clang-format style is missing: '+str(style))
     if not paths:return dict(files=[],trimmed_files=[],formatter=None,style_sha256=sha(style.read_bytes()))
+    from project_context import formatting_snapshot, rebind_formatted
+    bindings = formatting_snapshot(root, paths)
     trimmed=[]
     for relative in paths:
         path=root/relative;raw=path.read_bytes();clean=re.sub(rb'[ \t]+(?=\r?$)',b'',raw,flags=re.M)
         if clean!=raw:path.write_bytes(clean);trimmed.append(relative)
     formatter=find_formatter();version=subprocess.check_output([str(formatter),'--version'],text=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)).strip()
     subprocess.run([str(formatter),'-i','--style=file:'+str(style),'--',*[str((root/path).resolve()) for path in paths]],check=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    return dict(files=paths,trimmed_files=trimmed,formatter=version,style_sha256=sha(style.read_bytes()))
+    rebound = rebind_formatted(root, bindings)
+    return dict(files=paths,trimmed_files=trimmed,formatter=version,style_sha256=sha(style.read_bytes()),bindings=rebound)
 
 
 def rebuild(format_changed=True):
@@ -534,6 +537,7 @@ def rebuild(format_changed=True):
         if format_changed:db.execute("INSERT OR REPLACE INTO metadata VALUES('source_format_style_sha256',?)",(formatting['style_sha256'],))
         if formatting['formatter']:db.execute("INSERT OR REPLACE INTO metadata VALUES('source_formatter_version',?)",(formatting['formatter'],))
         summary.update(formatted_files=formatting['files'],trimmed_files=formatting['trimmed_files'],formatter=formatting['formatter'],format_style_sha256=formatting['style_sha256'])
+        summary['format_binding_transfer'] = formatting.get('bindings', {'rebound': 0, 'requires_review': []})
         db.commit()
         if db.execute('PRAGMA integrity_check').fetchone()[0]!='ok' or db.execute('PRAGMA foreign_key_check').fetchall():raise ValueError('Indexed database validation failed')
     finally:original.close();db.close()

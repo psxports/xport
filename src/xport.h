@@ -6,6 +6,21 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#if defined(_DEBUG)
+    #define XASSERT(x) \
+        do \
+        { \
+            if (!(x)) \
+            { \
+                fprintf(stderr, "%s:%d: Assertion failed: %s\n", __FILE__, __LINE__, #x); \
+                abort(); \
+            } \
+        } while (0)
+#else
+    #define XASSERT(x) ((void)0)
+#endif
 
 typedef uint8_t uint8;
 typedef int8_t sint8;
@@ -116,10 +131,8 @@ static __inline uint32 xport_field_sample_count(uint32 before, uint32 sample_rat
 }
 
 #if defined(_DEBUG) && defined(_MSC_VER)
-    #define GDB_CALL __declspec(dllexport) __declspec(noinline)
     #define GDB_DATA __declspec(dllexport)
 #else
-    #define GDB_CALL
     #define GDB_DATA
 #endif
 
@@ -127,9 +140,7 @@ typedef struct PSX_RECT PSX_RECT;
 
 typedef enum RUN_MODE
 {
-    RUN_MODE_GAME = 0,
-    RUN_MODE_LOCKSTEP_REPLAY = 1,
-    RUN_MODE_LOCKSTEP_SELFTEST = 2
+    RUN_MODE_GAME = 0
 } RUN_MODE;
 
 #if defined(__cplusplus)
@@ -175,19 +186,30 @@ extern "C"
     // Take native XA audio once after successful synchronous playback
     sint32 xport_fmv_take_audio(XportFmvAudioRemainder *audio);
     void xport_fmv_discard_audio(void);
-#if defined(AP_WEB)
+
     typedef struct XportFmvFrame
     {
         uint32 width, height, number;
     } XportFmvFrame;
 
-    // Registered MP4 session without an owned game loop
+    typedef struct XportFmvBackend
+    {
+        sint32 (*open)(void *context, const char *path);
+        sint32 (*next)(void *context, uint8 *rgb, uint32 capacity, XportFmvFrame *frame);
+        void (*pause)(void *context, sint32 paused);
+        void (*close)(void *context);
+        uint32 (*audio)(void *context, sint16 *output, uint32 frames);
+        sint32 (*has_audio)(void *context);
+    } XportFmvBackend;
+
+    // Copy the backend callbacks while no source session is open; NULL restores the platform source
+    sint32 xport_fmv_set_backend(const XportFmvBackend *backend, void *context);
+    // Open a source session without an owned game loop
     sint32 xport_fmv_open(const char *path);
     // Return 0 while waiting, 1 for RGB24, 2 at EOF and -1 on error
     sint32 xport_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame);
     void xport_fmv_pause(sint32 paused);
     void xport_fmv_close(void);
-#endif
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
 
@@ -298,15 +320,12 @@ extern const uint32 xport_cd_setloc_table_address;
 #else
     #define XPORT_FUNCTION_AUDIT_CHANNEL 0u
 #endif
-#if defined(LOCKSTEP_DEBUG)
-    #define XPORT_FUNCTION_LOCKSTEP_CHANNEL 2u
-#else
-    #define XPORT_FUNCTION_LOCKSTEP_CHANNEL 0u
-#endif
 #if defined(XPORT_DISABLE_FUNCTION_MARKERS)
     #define FUNCTION_MARKER(address, image) ((void)0)
 #else
-    #define FUNCTION_MARKER(address, image) xport_function_marker((image), (uint32)(address), __func__, __FILE__, __LINE__, XPORT_FUNCTION_RETURN_ADDRESS(), XPORT_FUNCTION_AUDIT_CHANNEL | XPORT_FUNCTION_LOCKSTEP_CHANNEL)
+    #define FUNCTION_MARKER(address, image) xport_function_marker((image), (uint32)(address), __func__, __FILE__, __LINE__, XPORT_FUNCTION_RETURN_ADDRESS(), XPORT_FUNCTION_AUDIT_CHANNEL)
 #endif
+
+#define XPORT_TODO abort()
 
 #endif

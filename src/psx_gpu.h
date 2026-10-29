@@ -9,12 +9,7 @@ extern "C"
 {
 #endif
     extern const uint32 gpu_dma_nop_terminator[5];
-#if defined(LOCKSTEP_DEBUG)
-    extern uint16 (*xport_lockstep_vram)[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
-    #define VRAM (*xport_lockstep_vram)
-#else
-extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
-#endif
+    extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     uint32 gpu_vram_version(void);
     sint32 gpu_port_read(uint32 offset, uint32 *value);
     sint32 gpu_port_write(uint32 offset, uint32 value);
@@ -51,10 +46,22 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     sint32 gpu_transfer_observation_failed(void);
     typedef sint32 (*GpuLinkedSubmit)(void *context, uint32 physical_address, uint32 copy_bytes);
     void gpu_bind_linked_submit(GpuLinkedSubmit submit, void *context);
+    /* Return 0 idle, 1 paused, -1 wrong mode or -2 unsupported/error */
+    typedef sint32 (*GpuLinkedPause)(void *context, uint32 *continuation);
+    /* Bind after the submit provider, using that provider's existing context */
+    void gpu_bind_linked_pause(GpuLinkedPause pause);
+    /* Resume a BreakDraw continuation without a legacy guest V0 adapter */
+    void gpu_resume_linked_draw(uint32 continuation);
     sint32 gpu_linked_submit_failed(void);
     sint32 gpu_execute_linked_dma(uint32 physical_address);
     void gpu_set_raster(sint32 enabled);
     sint32 gpu_get_raster(void);
+    typedef struct GpuRenderList GpuRenderList;
+    GpuRenderList *gpu_render_list_create(void);
+    void gpu_render_list_free(GpuRenderList *list);
+    sint32 gpu_render_list_begin(GpuRenderList *list, const DRAWENV *environment);
+    sint32 gpu_render_list_end(GpuRenderList *list);
+    sint32 gpu_render_list_replay(const GpuRenderList *list);
     sint32 gpu_get_display_env(DISPENV *environment);
     // Preserve an embedded polygon texture page without emitting geometry
     void gpu_set_polygon_tpage(uint16 page);
@@ -154,6 +161,7 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     typedef struct GpuRasterState
     {
         uint32 draw_mode;
+        /* GPU flags: dither bit9, draw-display bit10, mask force/check bits11/12 */
         uint32 draw_flags;
         uint32 texture_window;
         uint32 area[4];
@@ -209,19 +217,11 @@ extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     // Suppress presentation until all passes of a host frame are complete
     void gpu_frame_begin(void);
     void gpu_frame_end(void);
-    // Host frame policy is excluded from portable GPU state
-    void gpu_set_frame_skip(sint32 enabled);
-    sint32 gpu_frame_sync(uint32 fields);
-    sint32 gpu_frame_skipped(void);
-    uint32 gpu_skipped_frames(void);
     void gpu_display_offset(sint32 x, sint32 y);
     void gpu_set_display(sint32 x, sint32 y, sint32 width, sint32 height);
     sint32 gpu_load_vram(const char *path);
     void gpu_init_empty(void);
     sint32 gpu_save_frame(const char *path);
-#if defined(LOCKSTEP_DEBUG)
-    int gpu_lockstep_portable_selftest(void);
-#endif
 #if defined(__cplusplus)
 }
 #endif

@@ -1,5 +1,20 @@
 """Create deterministic child-process environments"""
 import os
+from pathlib import Path
+import shutil
+
+
+def host_executable(name, relative, override=None):
+    """Prefer an explicit choice, then the shared portable tool before PATH"""
+    if override:
+        return shutil.which(str(override)) or str(Path(override).expanduser())
+    bundled = Path(__file__).resolve().parent / relative
+    if bundled.is_file():
+        return str(bundled)
+    installed = shutil.which(name)
+    if installed:
+        return installed
+    raise ValueError('Host tool missing: ' + str(bundled) + '; restore the shared tool, do not download a per-project copy')
 
 
 def _windows_environment(values):

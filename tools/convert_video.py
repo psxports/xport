@@ -18,6 +18,16 @@ ENCODING = dict(video='libx264', pixel_format='yuv420p', crf=18, preset='slow', 
                 faststart=True, audio='aac', audio_bitrate='128k')
 
 
+def wrap_video_sector(payload):
+    """Expose an extracted video-only sector to the psxstr demuxer"""
+    block = bytearray(2352)
+    block[:12] = SYNC
+    block[15] = 2
+    block[16:24] = bytes([0, 0, 0x48, 0])*2
+    block[24:2072] = payload
+    return block
+
+
 def digest(path):
     result = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -27,7 +37,7 @@ def digest(path):
 
 
 def inspect_str(path, include_completions=False):
-    """Accept one complete standard STR video channel in raw or RIFF/CDXA sectors"""
+    """Accept standard STR in raw2048, raw2352 or RIFF/CDXA sectors"""
     frames = []
     audio = {}
     pending = None
@@ -36,14 +46,17 @@ def inspect_str(path, include_completions=False):
     with Path(path).open('rb') as stream:
         header = stream.read(44)
         offset = 44 if header[:4] == b'RIFF' and header[8:12] == b'CDXA' else 0
-        if (Path(path).stat().st_size-offset) % 2352:
-            raise ValueError('Expected complete 2352-byte sectors or RIFF/CDXA')
+        sector_bytes = 2048 if not offset and header[:4] == b'\x60\x01\x01\x80' else 2352
+        if (Path(path).stat().st_size-offset) % sector_bytes:
+            raise ValueError('Expected complete STR sectors or RIFF/CDXA')
         stream.seek(offset)
         sector = 0
         while True:
-            block = stream.read(2352)
+            block = stream.read(sector_bytes)
             if not block:
                 break
+            if sector_bytes == 2048:
+                block = wrap_video_sector(block)
             if block[:12] != SYNC or block[15] != 2 or block[16:20] != block[20:24]:
                 raise ValueError('Invalid Mode 2 sector/subheader at sector '+str(sector))
             channel, submode = block[17], block[18]
@@ -89,8 +102,8 @@ def inspect_str(path, include_completions=False):
         raise ValueError('No complete standard STR movie')
     if len(audio) > 1:
         raise ValueError('Multiple XA audio channels require a reviewed selection')
-    return dict(layout='riff_cdxa' if offset else 'raw2352', header_bytes=offset,
-                sector_bytes=2352, sectors=sector, channel=video_channel,
+    return dict(layout='riff_cdxa' if offset else 'raw'+str(sector_bytes), header_bytes=offset,
+                sector_bytes=sector_bytes, sectors=sector, channel=video_channel,
                 width=dimensions[0], height=dimensions[1], frames=frames,
                 audio=list(audio.values()))
 
@@ -119,7 +132,7 @@ def run(command, log):
 
 def decoded_frames(ffmpeg, path, log):
     progress = run([ffmpeg, '-nostdin', '-v', 'error', '-xerror', '-i', str(path),
-                    '-map', '0:v:0', '-an', '-vsync', '0', '-progress', 'pipe:1', '-f', 'null', '-'], log)
+                    '-map', '0:v:0', '-an', '-fps_mode', 'passthrough', '-progress', 'pipe:1', '-f', 'null', '-'], log)
     counts = [int(line.split('=', 1)[1]) for line in progress.splitlines() if line.startswith('frame=')]
     if not counts:
         raise ValueError('Decoder did not report any frames')
@@ -177,10 +190,9 @@ def convert(root, config, ffmpeg=None):
         if audio_rate is not None:
             encoding['audio_sample_rate'] = audio_rate
         if executable is None:
-            executable = ffmpeg or config.get('video', {}).get('ffmpeg') or os.environ.get('XPORT_FFMPEG') or shutil.which('ffmpeg')
-            if not executable:
-                raise ValueError('FFmpeg with psxstr, MDEC, libx264 and AAC support is required; set XPORT_FFMPEG')
-            executable = shutil.which(str(executable)) or str(executable)
+            from xport_process import host_executable
+            executable = host_executable('ffmpeg', 'ffmpeg/ffmpeg.exe',
+                                         ffmpeg or config.get('video', {}).get('ffmpeg') or os.environ.get('XPORT_FFMPEG'))
             version = run_hidden_desktop([executable, '-version'], check=True, capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
             encoder = dict(path=executable, sha256=digest(executable) if Path(executable).is_file() else None, version=version)
         source_hash = digest(path)
@@ -197,10 +209,16 @@ def convert(root, config, ffmpeg=None):
         output.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='encode-', dir=status) as temporary:
             encoded = Path(temporary)/'movie.mp4'
+            demux_source = path
+            if info['layout'] == 'raw2048':
+                demux_source = Path(temporary)/'movie.str'
+                with path.open('rb') as src, demux_source.open('wb') as dst:
+                    for payload in iter(lambda: src.read(2048), b''):
+                        dst.write(wrap_video_sector(payload))
             command = [executable, '-nostdin', '-hide_banner', '-v', 'error', '-err_detect', 'explode',
-                       '-r', fps, '-f', 'psxstr', '-i', str(path), '-map', '0:v:0', '-map', '0:a?',
+                       '-r', fps, '-f', 'psxstr', '-i', str(demux_source), '-map', '0:v:0', '-map', '0:a?',
                        '-c:v', 'libx264', '-preset', 'slow', '-crf', str(crf), '-pix_fmt', 'yuv420p', '-bf', '0',
-                       '-vsync', '0', '-c:a', 'aac', '-b:a', '128k']
+                       '-fps_mode', 'passthrough', '-c:a', 'aac', '-b:a', '128k']
             if audio_rate is not None:
                 command += ['-ar', str(audio_rate)]
             command += ['-movflags', '+faststart', str(encoded)]

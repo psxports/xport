@@ -87,37 +87,19 @@ def runtime_identity(path):
         'manifest_identity': receipt.get('manifest_identity'),
         'upstream_commit': receipt.get('upstream_commit'),
         'patch_sha256': receipt.get('patch_sha256'),
-        'lockstep_protocol_version': receipt.get('lockstep_protocol_version'),
     }
     lengths = {'manifest_identity': 64, 'upstream_commit': 40, 'patch_sha256': 64}
     if (any(not isinstance(identity[key], str) or len(identity[key]) != length or
             any(character not in '0123456789abcdef' for character in identity[key])
-            for key, length in lengths.items()) or
-            type(identity['lockstep_protocol_version']) is not int):
+            for key, length in lengths.items())):
         raise ValueError('DuckStation runtime identity is incomplete')
     manifest = json.loads((Path(__file__).parent / 'duckstation' /
                            'duckstation-manifest.json').read_text(encoding='utf-8'))
-    if any(identity[key] != manifest['runtime'][key]
-           for key in ('lockstep_protocol_version',)):
-        raise ValueError('DuckStation runtime protocol differs from the current toolset')
+    if identity['patch_sha256'] != manifest['patch']['sha256']:
+        raise ValueError('DuckStation runtime needs rebuilding for the current toolset')
     return identity
 
 
-def lockstep_timing_arguments(path=None):
-    """Select cooperative timing while preserving verified legacy runtime launches"""
-    path = Path(path or executable()).resolve()
-    identity = runtime_identity(path)
-    receipt = json.loads((path.parent / 'xport-runtime.json').read_text(encoding='utf-8'))
-    timing = receipt.get('timing')
-    if timing is None:
-        # Protocol 23 runtimes predating launch-time selection default to cooperative time
-        if identity['lockstep_protocol_version'] != 23:
-            raise ValueError('Legacy DuckStation timing contract is unsupported')
-        return []
-    if timing != {'default': 'standard', 'lockstep_argument': '-lockstep-timing',
-                  'standard_argument': '-standard-timing'}:
-        raise ValueError('DuckStation launch-time timing contract is unsupported')
-    return [timing['lockstep_argument']]
 
 
 def data_directory(override=None, role=None):
@@ -155,94 +137,14 @@ def validate_settings(directory, port):
     return directory
 
 
-def recording_settings(hidden=False):
-    """Return recording speed overrides without changing the CPU clock"""
-    speed = '0' if hidden else '1'
-    return {
-        'mode': 'hidden' if hidden else 'interactive',
-        'startup': {
-            'Main': {
-                'StartPaused': 'false',
-                'EmulationSpeed': speed,
-                'FastForwardSpeed': speed,
-                'TurboSpeed': speed,
-                'SyncToHostRefreshRate': 'false',
-                'RewindEnable': 'false',
-                'RunaheadFrameCount': '0',
-                'SaveStateOnExit': 'false'
-            },
-            'BIOS': {'PatchFastBoot': 'true'},
-            'Display': {'VSync': 'false'}
-        },
-        # StartPaused is a launch instruction and is not part of the captured effective settings
-        'effective': {
-            'Main': {
-                'EmulationSpeed': speed,
-                'FastForwardSpeed': speed,
-                'TurboSpeed': speed,
-                'SyncToHostRefreshRate': 'false',
-                'RewindEnable': 'false',
-                'RunaheadFrameCount': '0'
-            },
-            'Display': {'VSync': 'false'}
-        }
-    }
 
 
-def configure_recording_settings(directory, port, hidden=False):
-    """Normalize recording speed before launch while preserving user controls and audio"""
-    from gdb_endpoint import listener_process
-    from trace_cache import digest
-    directory = validate_settings(directory, port)
-    try:
-        owner = listener_process(port)
-    except OSError:
-        owner = None
-    if owner:
-        raise RuntimeError('Recording requires a fresh emulator; close the existing project-owned user runtime first')
-    plan = recording_settings(hidden)
-    ini = configparser.ConfigParser(interpolation=None)
-    ini.optionxform = str
-    ini.read(directory/'settings.ini', encoding='utf-8-sig')
-    # Capture the configured CPU clock without overriding user settings
-    plan['effective']['CPU'] = {
-        key: ini.get('CPU', key, fallback=default)
-        for key, default in (('OverclockEnable', 'false'),
-                             ('OverclockNumerator', '1'),
-                             ('OverclockDenominator', '1'))
-    }
-    for section, values in plan['startup'].items():
-        if section not in ini:
-            ini.add_section(section)
-        for key, value in values.items():
-            ini[section][key] = value
-    temporary = directory/'settings.ini.recording.pending'
-    with temporary.open('w', encoding='utf-8') as stream:
-        ini.write(stream)
-    temporary.replace(directory/'settings.ini')
-    validate_settings(directory, port)
-    return dict(plan, settings_sha256=digest(directory/'settings.ini'))
 
 
-def verify_recording_settings(path, plan):
-    """Verify the settings snapshot serialized by the emulator at recording start"""
-    ini = configparser.ConfigParser(interpolation=None)
-    ini.optionxform = str
-    if not ini.read(path, encoding='utf-8-sig'):
-        return {'verified': False, 'differences': [{'path': str(path), 'reason': 'missing'}]}
-    differences = []
-    for section, values in plan['effective'].items():
-        for key, expected in values.items():
-            actual = ini.get(section, key, fallback=None)
-            if actual is None or actual.lower() != expected.lower():
-                differences.append({'section': section, 'key': key,
-                                    'expected': expected, 'actual': actual})
-    return {'verified': not differences, 'mode': plan['mode'], 'differences': differences,
-            'scope': 'Recorded effective speed, timing, runahead and CPU-overclock settings'}
 
 
 def record_owner(directory, port, pid):
-    from trace_worker import process_identity, write_receipt
+    from process_receipt import process_identity, write_receipt
     root, project = load_project()
     directory = validate_settings(directory, port)
     identity = process_identity(pid)
@@ -259,7 +161,7 @@ def record_owner(directory, port, pid):
 
 def verify_owner(directory, port, process):
     import json
-    from trace_worker import alive
+    from process_receipt import alive
     root, project = load_project()
     expected = data_directory(directory)
     path = root/'status/runtime'/('duckstation-'+str(port)+'.json')

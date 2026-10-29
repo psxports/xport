@@ -7,10 +7,29 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import uuid
-from coverage_permissions import coverage_permissions
 
 CONFIG_NAME = 'xport-project.json'
+
+
+def stage_sources(root):
+    """Stage only the user-selected source and root presentation paths"""
+    from xport_process import normalized_environment
+    root = Path(root).resolve()
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(root), *args],
+                                       env=normalized_environment(), text=True,
+                                       stderr=subprocess.PIPE,
+                                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if git('rev-parse', '--is-inside-work-tree').strip() != 'true' or git('rev-parse', '--show-prefix').strip():
+        raise ValueError('Source staging requires the project itself to be the Git root')
+    paths = [name for name in ('src', 'cover.png', 'README.md')
+             if (root / name).exists() or git('ls-files', '--', name).strip()]
+    if paths:
+        git('add', '--all', '--force', '--', *paths)
+    staged = git('diff', '--cached', '--name-only', '--', *paths).splitlines() if paths else []
+    return {'paths': paths, 'staged_files': len(staged), 'commit': False, 'push': False}
 
 
 def atomic_json(path, value):
@@ -69,6 +88,13 @@ def reservations(workspace):
     return used
 
 
+def player_count(config, default=2):
+    value = config.get('players', default)
+    if type(value) is not int or value < 1:
+        raise ValueError('players must be a positive integer')
+    return value
+
+
 def load_project(root=None):
     explicit = root or os.environ.get('XPORT_PROJECT')
     if explicit:
@@ -87,7 +113,7 @@ def load_project(root=None):
     reserved = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
     if short_name is not None and (not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,15}', short_name) or short_name.upper() in reserved):
         raise ValueError('Invalid configured short_name')
-    coverage_permissions(document)
+    player_count(document)
     return config.parent, document
 
 

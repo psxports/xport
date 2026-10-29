@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 
-from project_context import analysis_path, function_summary, show
+from project_context import analysis_path, current_library_classification, function_summary, show
 from xport_project import load_project, project_path
 
 
@@ -33,6 +33,8 @@ def explore(root, config, image, address, view='current', limit=8, cursor=None, 
         function = dict(function)
         function.pop('status', None)
         result = {'function': {key:function[key] for key in ('image','address','name','sha256')}}
+        if config.get('analysis',{}).get('evidence_backend')=='ghidra':
+            result['analysis_limitations'] = 'Boundaries are unreviewed; data references, cross-image call resolution and similarity are incomplete'
         if view in ('current', 'sdk', 'all'):
             result.update(function=function, translation=function_summary(root,config,image,address),
                           project_context=show(root,config,image=image,address=address,limit=3))
@@ -44,10 +46,11 @@ def explore(root, config, image, address, view='current', limit=8, cursor=None, 
             'reuse_peers': 'SELECT * FROM function_reuse WHERE image=? AND address=? ORDER BY peer_image,peer_address,kind',
         }
         if view in ('current', 'sdk', 'all'):
-            rows = db.execute('SELECT alias,reason,evidence FROM library_classification WHERE image=? AND address=?', (image,address)).fetchall()
+            classification = current_library_classification(root, config, db).get((image, address))
+            rows = [classification] if classification else []
             result['library_classification'] = []
             for row in rows:
-                evidence = json.loads(row['evidence'])
+                evidence = row['evidence'] if isinstance(row['evidence'], dict) else json.loads(row['evidence'])
                 result['library_classification'].append({'alias':row['alias'],'reason':row['reason'],
                     'wrapper_status':evidence.get('wrapper_status'),
                     'boundary':'Inspect the existing shared API and actual caller ABI before reuse'})

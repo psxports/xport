@@ -191,11 +191,19 @@
       }
       if (!live(state)) throw new Error('Video session closed');
       const frames = entry.frames;
-      if (!frames.length || !Number.isInteger(frames[0].endSector) || ![75, 150].includes(entry.sectorRate))
-        throw new Error('Missing original CD completion timing');
-      // Complete sectors, rather than MP4 decode speed, establish the original CD timeline
-      state.videoOffset = (frames[0].endSector + 1) * 1000000 / entry.sectorRate;
-      state.audioOffset = entry.sourceAudio && entry.sourceAudio.length ? entry.sourceAudio[0].first_sector * 1000000 / entry.sectorRate : 0;
+      if (entry.mediaTimeline) {
+        state.videoOffset = entry.mediaTimeline.video_offset_us;
+        state.audioOffset = entry.mediaTimeline.audio_offset_us;
+        if (!frames.length || !Number.isSafeInteger(state.videoOffset) || state.videoOffset < 0 ||
+            !Number.isSafeInteger(state.audioOffset) || state.audioOffset < 0)
+          throw new Error('Invalid prepared media timeline');
+      } else {
+        if (!frames.length || !Number.isInteger(frames[0].endSector) || ![75, 150].includes(entry.sectorRate))
+          throw new Error('Missing original CD completion timing');
+        // Complete sectors establish the original CD timeline
+        state.videoOffset = (frames[0].endSector + 1) * 1000000 / entry.sectorRate;
+        state.audioOffset = entry.sourceAudio && entry.sourceAudio.length ? entry.sourceAudio[0].first_sector * 1000000 / entry.sectorRate : 0;
+      }
       state.endTime = state.videoOffset + state.videoTrack.duration;
       if (state.audioTrack) state.endTime = Math.max(state.endTime, state.audioOffset + state.audioTrack.duration);
       state.canvas = new OffscreenCanvas(entry.width, entry.height);
@@ -290,4 +298,5 @@
     pump(state);
     return {status: 0};
   };
+  Module.xportVideoHasAudio = () => !!(session && session.audioTrack);
 })();

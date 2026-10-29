@@ -28,11 +28,11 @@ def main() -> int:
 
     root = args.duckstation.resolve()
     manifest_path = root / "duckstation-manifest.json"
-    patch_path = root / "internal-trace-api.patch"
     source = args.source.resolve()
     if not source.is_dir():
         raise FileNotFoundError(source)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    patch_path = root / manifest["patch"]["path"]
     patch_text = patch_path.read_text(encoding="utf-8")
     paths = [path.removeprefix("b/") for path in DIFF_HEADER.findall(patch_text)]
     paths.extend(path for path in UNIFIED_HEADER.findall(patch_text) if path not in paths)

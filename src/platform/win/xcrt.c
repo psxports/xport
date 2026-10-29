@@ -189,6 +189,15 @@ void *memchr(const void *src, int value, size_t size)
     return NULL;
 }
 
+#if defined(AP_X86)
+int tolower(int character)
+{
+    if (character >= 'A' && character <= 'Z')
+        return character + ('a' - 'A');
+    return character;
+}
+#endif
+
 size_t strlen(const char *src)
 {
     const char *end = src;
@@ -422,6 +431,33 @@ int snprintf(char *dst, size_t capacity, const char *format, ...)
     return result;
 }
 
+size_t strcspn(const char *text, const char *reject)
+{
+    const char *begin = text;
+    while (*text && !strchr(reject, *text))
+        ++text;
+    return (size_t)(text - begin);
+}
+
+char *strncat(char *destination, const char *source, size_t count)
+{
+    char *begin = destination;
+    while (*destination)
+        ++destination;
+    while (count && *source)
+    {
+        *destination++ = *source++;
+        --count;
+    }
+    *destination = 0;
+    return begin;
+}
+
+int toupper(int value)
+{
+    return value >= 'a' && value <= 'z' ? value - 'a' + 'A' : value;
+}
+
 int atoi(const char *text)
 {
     unsigned int value = 0;
@@ -524,7 +560,7 @@ __declspec(noreturn) void WinMainCRTStartup(void)
         if (*initializer)
             (*initializer)();
     LPSTR command = "";
-#if defined(_DEBUG) || defined(LOCKSTEP_DEBUG)
+#if defined(_DEBUG)
     command = GetCommandLineA();
 #endif
     exit(WinMain(GetModuleHandleA(NULL), NULL, command, SW_SHOWDEFAULT));

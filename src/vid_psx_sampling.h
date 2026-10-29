@@ -36,5 +36,4 @@
     "vec4 color=vidPsxColor(nearestWord,stpClass,zeroOpaque);\n" \
     "return color.a==0.0||!filtered?color:vidPsxFilter(uv,tpage,clut,region,repeatAxes,stpClass,zeroOpaque); }\n"
 
-
 #endif
