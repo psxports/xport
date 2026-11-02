@@ -16,6 +16,12 @@ Before each translation inspect existing exact/family C and evidence. Reuse unch
 
 ## Translation
 
+Perform static analysis while writing each function; do not postpone it until all bodies exist. Follow the [mandatory function audit](DECOMP_REFERENCE.md#mandatory-function-translation-audit). Save unresolved producer/consumer questions explicitly and revisit them as dependencies become available; a saved draft is not a complete translation.
+
+Decompiled code is supported only on little-endian target systems.
+
+Every recovered original function is named `sub_[address]` using its original virtual address (for example, `sub_8001002C`). Keep exactly one implementation of each original address regardless of any earlier semantic C name; host-only helpers retain the normal language-specific naming rules.
+
 1. Honor the recorded language/standard and [naming contract](DECOMP_REFERENCE.md#target-language-and-naming). Establish one signature registry, semantic arguments and guest-address versus host-pointer domains
 2. Read complete MIPS and complete available pseudocode. Original MIPS is authority. Use pseudocode as structural baseline only when complete; record its actual completeness instead of inventing missing output
 3. Choose semantic widths/signedness from operations and all relevant producers/consumers. Split unrelated register lifetimes; repair wrong declarations/signatures instead of casting every use. Remove redundant casts before final audit, preserving required intermediate extension/narrowing, wrapping, signed comparisons and shifts. Use established ranges, never one trace's values. See [numeric contracts](DECOMP_REFERENCE.md#semantic-types-and-integer-conversions)
@@ -23,9 +29,15 @@ Before each translation inspect existing exact/family C and evidence. Reuse unch
 5. Save complete functions immediately with image-qualified FUNCTION_MARKER and provenance; bind through project_context decompile after review. Pending callees stay declarations. A prototype, partial body or abort stub is not complete
 6. Continue the entire selected pass before integration. Keep one current scope/family record and only genuine expensive gaps in project context; no per-cast/per-edit diary
 
+For mechanical registration or rebinding of already reviewed audits, use `python -B [XPORT_ROOT]/tools/register_decomp.py --project PROJECT_ROOT AUDIT.json [AUDIT.json ...]`. Repeat `--address 0xADDRESS` to select only specific entries from multi-function audits. The script accepts both single-function documents and documents with a `functions` array, rejects incomplete audits, and invokes the normal `project_context decompile` validation for each selected function. It neither edits C source nor performs the required MIPS semantic review.
+
 ## Modules
 
-Resume existing modules without relocation. New modules use src/batch_1.c, batch_2.c, ... or .cpp for C++. Before appending the next complete function, start the next module only when the current module already exceeds 2000 physical lines. At exactly 2000 lines append there. Keep every function whole, even if it alone exceeds the threshold. No fixed function count per module or batch build gate. Record all new modules for final integration.
+Resume existing modules without relocation. New modules use src/batch_1.c, batch_2.c, ... or .cpp for C++. Stop adding functions when the batch reaches the hard limit of 16 complete original functions; keep every function whole, use no batch build gate, and record all new modules for final integration. After each batch write and header update, report the current `T/N` count and rounded percentage using the frozen inventory defined below; deferred bindings do not change the count of fully written and audited bodies.
+
+Form each new batch entirely as an exact in-context working copy. During its decompilation the translator exclusively owns the module and guarantees that no other process edits it; the new file does not exist on disk until its completed contents are emitted. Do not reread or otherwise reload this pending batch. Accumulate whole audited functions and corrections in context, then write the completed module once before switching to the next `batch_*.c`. Complete-body audits and bindings may be deferred and performed as one pass at the end of the goal against the emitted sources and their current hashes.
+
+Use one `src/batch.h` as the shared function-signature registry. Every batch C/C++ module includes `batch.h` rather than duplicating shared declarations locally. Whenever a new batch is emitted, run `python -B [XPORT_ROOT]/tools/register_decomp.py --project PROJECT_ROOT --update-header src/batch_N.c` to add all of its nonstatic function declarations and any newly needed cross-module callee declarations to `batch.h` in the same integration step. Keep `static` helpers local to their owning module, preserve exact guest-address/native-pointer domains and argument widths, and reconcile duplicates by signature rather than adding forwarding wrappers.
 
 ## Runtime boundaries
 
@@ -43,7 +55,7 @@ XASSERT is executable only under _DEBUG; other builds do not evaluate its argume
 
 ## Integration and completion
 
-Follow [BUILD_POLICY.md](BUILD_POLICY.md). After the full pass, register all modules; reconcile declarations, callbacks, SDK boundaries and actual dependencies. Run indexing, configured Debug checks and agreed scenarios; repair actual failures from original evidence, then perform the applicable final builds. The final decomp gate includes building and packaging the Web version and checking its startup, assets/input and save/movie integration; prepare required MP4 assets here. Do not defer initial Web delivery to enhance. Explicit user exclusions apply. Inspect actual requested rendering/input/audio, not just link success.
+Follow [BUILD_POLICY.md](BUILD_POLICY.md). After the full pass, perform a project-wide static consistency audit of signatures, layouts, producer/consumer assumptions, dispatch, callbacks and ownership; close outstanding questions and review affected bodies before integration. This complements the per-function audit. Register all modules; reconcile SDK boundaries and actual dependencies. Run indexing, configured Debug checks and agreed scenarios; repair actual failures from original evidence, then perform the applicable final builds. The final decomp gate includes building and packaging the Web version and checking its startup, assets/input and save/movie integration; prepare required MP4 assets here. Do not defer initial Web delivery to enhance. Explicit user exclusions apply. Inspect actual requested rendering/input/audio, not just link success.
 
 Before completion stage project sources through [CONTEXT.md](CONTEXT.md#git-source-index). Preserve runtime limitations and historical audits. Complete the goal only after every selected function has a full implementation or reviewed authorized replacement, integration is resolved and every required final check/user gate passes. Static completeness, build success and scenario execution are separate claims.
 

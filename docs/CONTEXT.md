@@ -8,7 +8,7 @@ Resolve project and X through [../AGENTS.md](../AGENTS.md). Before a stage run `
 
 `X project_context set --key KEY --kind task|finding|check|question --summary TEXT --scope TEXT --next-step TEXT` updates a key. Use --stage, --image/--address, --subsystem, --configuration and repeat --evidence for dependencies; shared evidence uses @xport/src/.... Findings/checks require scope/evidence. Text fields have a 1200-character cap. --closed hides resolved questions. `show --key KEY` narrows reading; --after continues pages (default 8, maximum 32).
 
-Unchanged reference hashes mean references are unchanged, not that semantics or user approval are proved. Changed references need review. Preserve immutable historical evidence and limitations without loading it on every turn.
+Unchanged hashes do not prove semantics or approval. Changed references need review. Preserve immutable historical evidence and limitations without reloading them each turn.
 
 ## Translation bindings
 
@@ -23,7 +23,9 @@ Queue exclusions use project-local `analysis.decompilation_exclusions`. Schema 1
 Schema 3 adds `native_replacements`: image/address/sha256, `reason: native_file_replacement`, `reviewed: true`, scope, source/symbol/source_body_sha256 and nonempty SHA-bound evidence. Authorization: kind `runtime_file_access`, path `@xport/docs/DECOMP_REFERENCE.md`, current sha256 and exact contract quote. Optional dependencies bind source/symbol/body hash. Validate every original, authority, evidence and body; replacements grant no SDK/MIPS credit and retain final checks
 
 
-Save replacements use `native_save_replacement` and authority kind `runtime_game_save`, with an exact current quote starting `Replace card-sector I/O, card managers`. Apply all schema-3 validation above; bind roles/callers, retain payload/gameplay and final checks
+Save replacements use `native_save_replacement`, kind `runtime_game_save` and the exact quote starting `Replace card-sector I/O, card managers`. Apply schema-3 checks; retain payload/gameplay
+
+Movie replacements use `native_movie_replacement`, kind `runtime_game_movie` and the exact quote starting `Fullscreen movies call xport_fmv_play;`. Apply schema-3 checks; retain scene logic and final verification
 
 
 Queue, SDK queries and decompile checks read configured `paths.sdk_classification` directly. Validate accepted entries against image/address/original SHA; reject stale, duplicate or missing input. An explicit file replaces the derived SQL view, including an empty accepted list. Without this setting use SQL. This refreshes no analysis or SDK acceptance

@@ -76,6 +76,13 @@ enum
     VID_BLEND_SUBTRACT
 };
 
+enum
+{
+    VID_FILTER_NEAREST,
+    VID_FILTER_LINEAR,
+    VID_FILTER_ANISOTROPIC
+};
+
 typedef struct VID_MATERIAL_DATA
 {
     VID_TEXTURE *texture;
@@ -114,17 +121,24 @@ extern "C"
     void vid_index_static(VID_INDEX *indices);
     void vid_index_free(VID_INDEX *indices);
     void vid_mesh_commit(VID_GEOMETRY *geometry);
+    void vid_mesh_static(VID_GEOMETRY *geometry);
     void vid_mesh_free(VID_GEOMETRY *geometry);
     VID_TEXTURE *vid_tex_create(uint32 width, uint32 height);
+    VID_TEXTURE *vid_tex_create_array(uint32 width, uint32 height, uint32 layers);
+    VID_TEXTURE *vid_tex_create_array_fmt(uint32 width, uint32 height, uint32 layers, uint32 format);
     VID_TEXTURE *vid_tex_create_fmt(uint32 width, uint32 height, uint32 format);
     uint8 *vid_tex_data(VID_TEXTURE *texture);
     void vid_tex_commit(VID_TEXTURE *texture);
+    void vid_tex_static(VID_TEXTURE *texture);
+    void vid_tex_set_mip_levels(VID_TEXTURE *texture, uint32 levels);
+    void vid_tex_commit_rows(VID_TEXTURE *texture, uint32 first, uint32 count);
     void vid_tex_free(VID_TEXTURE *texture);
     VID_MATERIAL *vid_mat_create(void);
     VID_MATERIAL_DATA *vid_mat_data(VID_MATERIAL *material);
     void vid_mat_commit(VID_MATERIAL *material);
     void vid_mat_free(VID_MATERIAL *material);
     VID_SHADER *vid_shader_create(const char *vertex, const char *fragment);
+    VID_SHADER *vid_shader_create_array(const char *vertex, const char *fragment);
     void vid_shader_free(VID_SHADER *shader);
     VID_SAMPLE *vid_sample_create(void);
     void vid_sample_free(VID_SAMPLE *sample);
@@ -139,6 +153,7 @@ extern "C"
     sint32 vid_begin(float r, float g, float b);
     // Select before recording commands; end presents and retains the completed image
     sint32 vid_target_select(VID_TARGET *target);
+    sint32 vid_target_select_offset(VID_TARGET *target, float y);
     sint32 vid_target_select_offscreen(VID_TARGET *target);
     void vid_viewport(VID_RECT viewport);
     // Draw commands copy these vectors before the caller changes them
@@ -146,6 +161,7 @@ extern "C"
     sint32 vid_draw(VID_GEOMETRY *geometry, uint32 first, uint32 count, VID_MATERIAL *material);
     void vid_pass(VID_MATERIAL *material);
     sint32 vid_submit(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 first, uint32 count);
+    sint32 vid_clear_depth(void);
     // Queue one color probe at normalized coordinates within the current viewport
     sint32 vid_sample(VID_SAMPLE *sample, float x, float y);
     // Fade subsequent custom-shader draws through a fog color into transparency

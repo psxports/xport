@@ -1218,7 +1218,6 @@ sint32 psx_wait_events(void)
     return psx_wait_events_internal(&provider_called);
 }
 
-
 sint32 psx_callbacks_allowed(void)
 {
     return bios_interrupts_enabled && (!vblank_wait || cooperative_wait_depth || cooperative_sync_depth);
@@ -2313,19 +2312,19 @@ VECTOR *OuterProduct0(VECTOR *left, VECTOR *right, VECTOR *output)
     saved[0] = xport_gte_read_control(0);
     saved[1] = xport_gte_read_control(2);
     saved[2] = xport_gte_read_control(4);
-    words[0] = xport_load_le32((const uint8 *)left);
-    words[1] = xport_load_le32((const uint8 *)left + 4);
-    words[2] = xport_load_le32((const uint8 *)left + 8);
+    words[0] = (uint32)left->vx;
+    words[1] = (uint32)left->vy;
+    words[2] = (uint32)left->vz;
     xport_gte_write_control(0, words[0]);
     xport_gte_write_control(2, words[1]);
     xport_gte_write_control(4, words[2]);
-    xport_gte_write_data(11, xport_load_le32((const uint8 *)right + 8));
-    xport_gte_write_data(9, xport_load_le32((const uint8 *)right));
-    xport_gte_write_data(10, xport_load_le32((const uint8 *)right + 4));
+    xport_gte_write_data(11, (uint32)right->vz);
+    xport_gte_write_data(9, (uint32)right->vx);
+    xport_gte_write_data(10, (uint32)right->vy);
     xport_gte_execute(0x170000C);
-    xport_store_le32((uint8 *)output, xport_gte_read_data(25));
-    xport_store_le32((uint8 *)output + 4, xport_gte_read_data(26));
-    xport_store_le32((uint8 *)output + 8, xport_gte_read_data(27));
+    output->vx = (sint32)xport_gte_read_data(25);
+    output->vy = (sint32)xport_gte_read_data(26);
+    output->vz = (sint32)xport_gte_read_data(27);
     xport_gte_write_control(0, saved[0]);
     xport_gte_write_control(2, saved[1]);
     xport_gte_write_control(4, saved[2]);
@@ -2674,6 +2673,7 @@ void gte_gpl0(const SVECTOR *input, sint32 scale, VECTOR *output)
 
 uint32 LoadAverageShort12(SVECTOR *first, SVECTOR *second, sint32 first_weight, sint32 second_weight, SVECTOR *output)
 {
+    uint32 wire_word_10;
     SVECTOR input;
     VECTOR result;
     uint32 returned;
@@ -2686,9 +2686,9 @@ uint32 LoadAverageShort12(SVECTOR *first, SVECTOR *second, sint32 first_weight, 
     input.vy = second->vy;
     input.vz = second->vz;
     gte_gpl12(&input, second_weight, &result);
-    xport_store_le16((uint8 *)output, (uint16)result.vx);
-    xport_store_le16((uint8 *)output + 2u, (uint16)result.vy);
-    xport_store_le32((uint8 *)output + 4u, (uint32)result.vz);
+    (*(uint16 *)((uint8 *)output) = (uint16)((uint16)result.vx));
+    (*(uint16 *)((uint8 *)output + 2u) = (uint16)((uint16)result.vy));
+    (wire_word_10 = (uint32)((uint32)result.vz), memcpy((uint8 *)output + 4u, &wire_word_10, sizeof(wire_word_10)));
     return returned;
 }
 
@@ -2863,18 +2863,19 @@ static uint32 mul_rot_matrix_psx(uint32 source, uint32 destination, uint32 first
 
 static MATRIX *mul_rot_matrix_native(const MATRIX *source, MATRIX *destination, uint32 first)
 {
+    uint32 wire_word_16, wire_word_17, wire_word_18, wire_word_19, wire_word_20;
     const uint8 *input = (const uint8 *)source;
     uint8 *output = (uint8 *)destination;
     uint32 second, third, column1[3], column2[3];
-    second = xport_load_le32(input + 4);
-    third = xport_load_le32(input + 12);
+    memcpy(&second, input + 4, sizeof(second));
+    memcpy(&third, input + 12, sizeof(third));
     first = (first & 0xFFFF) | (second & 0xFFFF0000);
     xport_gte_write_data(0, first);
     xport_gte_write_data(1, third);
     xport_gte_execute(0x486012);
-    first = xport_load_le16(input + 2);
-    second = xport_load_le32(input + 8);
-    third = (uint32)(sint32)(sint16)xport_load_le16(input + 14);
+    first = (*(const uint16 *)(input + 2));
+    memcpy(&second, input + 8, sizeof(second));
+    third = (uint32)(sint32)(sint16)(*(const uint16 *)(input + 14));
     first |= second << 16;
     column1[0] = xport_gte_read_data(9);
     column1[1] = xport_gte_read_data(10);
@@ -2882,9 +2883,9 @@ static MATRIX *mul_rot_matrix_native(const MATRIX *source, MATRIX *destination, 
     xport_gte_write_data(0, first);
     xport_gte_write_data(1, third);
     xport_gte_execute(0x486012);
-    first = xport_load_le16(input + 4);
-    second = xport_load_le32(input + 8);
-    third = xport_load_le32(input + 16);
+    first = (*(const uint16 *)(input + 4));
+    memcpy(&second, input + 8, sizeof(second));
+    memcpy(&third, input + 16, sizeof(third));
     first |= second & 0xFFFF0000;
     column2[0] = xport_gte_read_data(9);
     column2[1] = xport_gte_read_data(10);
@@ -2892,24 +2893,25 @@ static MATRIX *mul_rot_matrix_native(const MATRIX *source, MATRIX *destination, 
     xport_gte_write_data(0, first);
     xport_gte_write_data(1, third);
     xport_gte_execute(0x486012);
-    xport_store_le32(output, (column1[0] & 0xFFFF) | (column2[0] << 16));
-    xport_store_le32(output + 12, (column1[2] & 0xFFFF) | (column2[2] << 16));
+    (wire_word_16 = (uint32)((column1[0] & 0xFFFF) | (column2[0] << 16)), memcpy(output, &wire_word_16, sizeof(wire_word_16)));
+    (wire_word_17 = (uint32)((column1[2] & 0xFFFF) | (column2[2] << 16)), memcpy(output + 12, &wire_word_17, sizeof(wire_word_17)));
     first = xport_gte_read_data(9);
     second = xport_gte_read_data(10);
-    xport_store_le32(output + 4, (first & 0xFFFF) | (column1[1] << 16));
-    xport_store_le32(output + 8, (column2[1] & 0xFFFF) | (second << 16));
-    xport_store_le32(output + 16, xport_gte_read_data(11));
+    (wire_word_18 = (uint32)((first & 0xFFFF) | (column1[1] << 16)), memcpy(output + 4, &wire_word_18, sizeof(wire_word_18)));
+    (wire_word_19 = (uint32)((column2[1] & 0xFFFF) | (second << 16)), memcpy(output + 8, &wire_word_19, sizeof(wire_word_19)));
+    (wire_word_20 = (uint32)(xport_gte_read_data(11)), memcpy(output + 16, &wire_word_20, sizeof(wire_word_20)));
     return destination;
 }
 
 MATRIX *MulRotMatrix(MATRIX *matrix)
 {
-    return mul_rot_matrix_native(matrix, matrix, xport_load_le32((const uint8 *)matrix));
+    uint32 wire_word_21;
+    return mul_rot_matrix_native(matrix, matrix, (memcpy(&wire_word_21, (const uint8 *)matrix, sizeof(wire_word_21)), wire_word_21));
 }
 
 MATRIX *MulRotMatrix0(const MATRIX *source, MATRIX *destination)
 {
-    return mul_rot_matrix_native(source, destination, xport_load_le16((const uint8 *)source));
+    return mul_rot_matrix_native(source, destination, (*(const uint16 *)((const uint8 *)source)));
 }
 
 uint32 MulRotMatrixPSX(uint32 matrix)
@@ -2924,31 +2926,32 @@ uint32 MulRotMatrix0PSX(uint32 source, uint32 destination)
 
 MATRIX *MulMatrix0(MATRIX *left, MATRIX *right, MATRIX *destination)
 {
+    uint32 wire_word_32, wire_word_33, wire_word_34, wire_word_35, wire_word_36;
     const uint8 *left_bytes = (const uint8 *)left;
     const uint8 *right_bytes = (const uint8 *)right;
     uint8 *output = (uint8 *)destination;
     uint32 words[5], column1[3], column2[3];
     uint32 first, second, third;
-    words[0] = xport_load_le32(left_bytes + 0u);
-    words[1] = xport_load_le32(left_bytes + 4u);
-    words[2] = xport_load_le32(left_bytes + 8u);
-    words[3] = xport_load_le32(left_bytes + 12u);
-    words[4] = xport_load_le32(left_bytes + 16u);
+    memcpy(&words[0], left_bytes + 0u, sizeof(words[0]));
+    memcpy(&words[1], left_bytes + 4u, sizeof(words[1]));
+    memcpy(&words[2], left_bytes + 8u, sizeof(words[2]));
+    memcpy(&words[3], left_bytes + 12u, sizeof(words[3]));
+    memcpy(&words[4], left_bytes + 16u, sizeof(words[4]));
     xport_gte_write_control(0u, words[0]);
     xport_gte_write_control(1u, words[1]);
     xport_gte_write_control(2u, words[2]);
     xport_gte_write_control(3u, words[3]);
     xport_gte_write_control(4u, words[4]);
-    first = xport_load_le16(right_bytes);
-    second = xport_load_le32(right_bytes + 4u);
-    third = xport_load_le32(right_bytes + 12u);
+    first = (*(const uint16 *)(right_bytes));
+    memcpy(&second, right_bytes + 4u, sizeof(second));
+    memcpy(&third, right_bytes + 12u, sizeof(third));
     first |= second & 0xFFFF0000u;
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    first = xport_load_le16(right_bytes + 2u);
-    second = xport_load_le32(right_bytes + 8u);
-    third = (uint32)(sint32)(sint16)xport_load_le16(right_bytes + 14u);
+    first = (*(const uint16 *)(right_bytes + 2u));
+    memcpy(&second, right_bytes + 8u, sizeof(second));
+    third = (uint32)(sint32)(sint16)(*(const uint16 *)(right_bytes + 14u));
     first |= second << 16;
     column1[0] = xport_gte_read_data(9u);
     column1[1] = xport_gte_read_data(10u);
@@ -2956,9 +2959,9 @@ MATRIX *MulMatrix0(MATRIX *left, MATRIX *right, MATRIX *destination)
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    first = xport_load_le16(right_bytes + 4u);
-    second = xport_load_le32(right_bytes + 8u);
-    third = xport_load_le32(right_bytes + 16u);
+    first = (*(const uint16 *)(right_bytes + 4u));
+    memcpy(&second, right_bytes + 8u, sizeof(second));
+    memcpy(&third, right_bytes + 16u, sizeof(third));
     first |= second & 0xFFFF0000u;
     column2[0] = xport_gte_read_data(9u);
     column2[1] = xport_gte_read_data(10u);
@@ -2966,13 +2969,13 @@ MATRIX *MulMatrix0(MATRIX *left, MATRIX *right, MATRIX *destination)
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    xport_store_le32(output, (column1[0] & 0xFFFFu) | (column2[0] << 16));
-    xport_store_le32(output + 12u, (column1[2] & 0xFFFFu) | (column2[2] << 16));
+    (wire_word_32 = (uint32)((column1[0] & 0xFFFFu) | (column2[0] << 16)), memcpy(output, &wire_word_32, sizeof(wire_word_32)));
+    (wire_word_33 = (uint32)((column1[2] & 0xFFFFu) | (column2[2] << 16)), memcpy(output + 12u, &wire_word_33, sizeof(wire_word_33)));
     first = xport_gte_read_data(9u);
     second = xport_gte_read_data(10u);
-    xport_store_le32(output + 4u, (first & 0xFFFFu) | (column1[1] << 16));
-    xport_store_le32(output + 8u, (column2[1] & 0xFFFFu) | (second << 16));
-    xport_store_le32(output + 16u, xport_gte_read_data(11u));
+    (wire_word_34 = (uint32)((first & 0xFFFFu) | (column1[1] << 16)), memcpy(output + 4u, &wire_word_34, sizeof(wire_word_34)));
+    (wire_word_35 = (uint32)((column2[1] & 0xFFFFu) | (second << 16)), memcpy(output + 8u, &wire_word_35, sizeof(wire_word_35)));
+    (wire_word_36 = (uint32)(xport_gte_read_data(11u)), memcpy(output + 16u, &wire_word_36, sizeof(wire_word_36)));
     return destination;
 }
 
@@ -3140,11 +3143,11 @@ void SetRotMatrix(MATRIX *m)
     const uint8 *input = (const uint8 *)m;
     uint32 words[5];
 
-    words[0] = xport_load_le32(input);
-    words[1] = xport_load_le32(input + 4u);
-    words[2] = xport_load_le32(input + 8u);
-    words[3] = xport_load_le32(input + 12u);
-    words[4] = xport_load_le32(input + 16u);
+    memcpy(&words[0], input, sizeof(words[0]));
+    memcpy(&words[1], input + 4u, sizeof(words[1]));
+    memcpy(&words[2], input + 8u, sizeof(words[2]));
+    memcpy(&words[3], input + 12u, sizeof(words[3]));
+    memcpy(&words[4], input + 16u, sizeof(words[4]));
     xport_gte_write_control(0u, words[0]);
     xport_gte_write_control(1u, words[1]);
     xport_gte_write_control(2u, words[2]);
@@ -3163,11 +3166,11 @@ void SetColorMatrix(MATRIX *m)
     const uint8 *input = (const uint8 *)m;
     uint32 words[5];
 
-    words[0] = xport_load_le32(input);
-    words[1] = xport_load_le32(input + 4u);
-    words[2] = xport_load_le32(input + 8u);
-    words[3] = xport_load_le32(input + 12u);
-    words[4] = xport_load_le32(input + 16u);
+    memcpy(&words[0], input, sizeof(words[0]));
+    memcpy(&words[1], input + 4u, sizeof(words[1]));
+    memcpy(&words[2], input + 8u, sizeof(words[2]));
+    memcpy(&words[3], input + 12u, sizeof(words[3]));
+    memcpy(&words[4], input + 16u, sizeof(words[4]));
     xport_gte_write_control(16u, words[0]);
     xport_gte_write_control(17u, words[1]);
     xport_gte_write_control(18u, words[2]);
@@ -3237,10 +3240,11 @@ void gte_intpl12(const SVECTOR *input, const SVECTOR *far_color, sint32 factor, 
 
 void SetTransMatrix(MATRIX *m)
 {
+    uint32 wire_word_47, wire_word_48, wire_word_49;
     const uint8 *input = (const uint8 *)m;
-    uint32 x = xport_load_le32(input + 20u);
-    uint32 y = xport_load_le32(input + 24u);
-    uint32 z = xport_load_le32(input + 28u);
+    uint32 x = (memcpy(&wire_word_47, input + 20u, sizeof(wire_word_47)), wire_word_47);
+    uint32 y = (memcpy(&wire_word_48, input + 24u, sizeof(wire_word_48)), wire_word_48);
+    uint32 z = (memcpy(&wire_word_49, input + 28u, sizeof(wire_word_49)), wire_word_49);
 
     xport_gte_write_control(5u, x);
     xport_gte_write_control(6u, y);
@@ -3260,6 +3264,7 @@ void ReadRotMatrix(MATRIX *m)
 
 void ReadLightMatrix(MATRIX *matrix)
 {
+    uint32 wire_word_50, wire_word_51;
     uint32 rotation[5];
     uint32 background[3];
     uint32 index;
@@ -3268,62 +3273,65 @@ void ReadLightMatrix(MATRIX *matrix)
     for (index = 0; index < 5; ++index)
         rotation[index] = xport_gte_read_control(8 + index);
     for (index = 0; index < 5; ++index)
-        xport_store_le32(output + index * 4, rotation[index]);
+        (wire_word_50 = (uint32)(rotation[index]), memcpy(output + index * 4, &wire_word_50, sizeof(wire_word_50)));
     for (index = 0; index < 3; ++index)
         background[index] = xport_gte_read_control(13 + index);
     for (index = 0; index < 3; ++index)
-        xport_store_le32(output + 20 + index * 4, background[index]);
+        (wire_word_51 = (uint32)(background[index]), memcpy(output + 20 + index * 4, &wire_word_51, sizeof(wire_word_51)));
 }
 
 void ReadColorMatrix(MATRIX *matrix)
 {
+    uint32 wire_word_52, wire_word_53;
     uint32 colors[5], far_color[3], index;
     uint8 *output = (uint8 *)matrix;
     for (index = 0; index < 5; ++index)
         colors[index] = xport_gte_read_control(16 + index);
     for (index = 0; index < 5; ++index)
-        xport_store_le32(output + index * 4, colors[index]);
+        (wire_word_52 = (uint32)(colors[index]), memcpy(output + index * 4, &wire_word_52, sizeof(wire_word_52)));
     for (index = 0; index < 3; ++index)
         far_color[index] = xport_gte_read_control(21 + index);
     for (index = 0; index < 3; ++index)
-        xport_store_le32(output + 20 + index * 4, far_color[index]);
+        (wire_word_53 = (uint32)(far_color[index]), memcpy(output + 20 + index * 4, &wire_word_53, sizeof(wire_word_53)));
 }
 
 void ColorMatCol(SVECTOR *normal, CVECTOR *color, CVECTOR *output, sint32 matc)
 {
+    uint32 wire_word_54, wire_word_55, wire_word_56, wire_word_57;
     uint32 remaining = matc > 0 ? (uint32)matc : 1;
 
-    xport_gte_write_data(0, xport_load_le32((const uint8 *)normal));
-    xport_gte_write_data(1, xport_load_le32((const uint8 *)normal + 4));
+    xport_gte_write_data(0, (memcpy(&wire_word_54, (const uint8 *)normal, sizeof(wire_word_54)), wire_word_54));
+    xport_gte_write_data(1, (memcpy(&wire_word_55, (const uint8 *)normal + 4, sizeof(wire_word_55)), wire_word_55));
     xport_gte_execute(0x4A4A6412);
     do
     {
         xport_gte_execute(0x4AA80428);
     } while (--remaining);
-    xport_gte_write_data(6, xport_load_le32((const uint8 *)color));
+    xport_gte_write_data(6, (memcpy(&wire_word_56, (const uint8 *)color, sizeof(wire_word_56)), wire_word_56));
     xport_gte_execute(0x4B38041C);
-    xport_store_le32((uint8 *)output, xport_gte_read_data(22));
+    (wire_word_57 = (uint32)(xport_gte_read_data(22)), memcpy((uint8 *)output, &wire_word_57, sizeof(wire_word_57)));
 }
 
 MATRIX *TransposeMatrix(MATRIX *source, MATRIX *destination)
 {
+    uint32 wire_word_60, wire_word_61, wire_word_64, wire_word_65;
     const uint8 *input = (const uint8 *)source;
     uint8 *output = (uint8 *)destination;
     uint32 first, second, third;
-    first = xport_load_le32(input);
-    second = xport_load_le32(input + 4u);
-    xport_store_le32(output + 4u, first);
-    xport_store_le32(output, second);
-    xport_store_le16(output, (uint16)first);
-    third = xport_load_le32(input + 8u);
-    first = xport_load_le32(input + 12u);
-    xport_store_le32(output + 12u, third);
-    xport_store_le32(output + 8u, first);
-    xport_store_le16(output + 12u, (uint16)second);
-    xport_store_le16(output + 8u, (uint16)third);
-    second = xport_load_le16(input + 16u);
-    xport_store_le16(output + 4u, (uint16)first);
-    xport_store_le16(output + 16u, (uint16)second);
+    memcpy(&first, input, sizeof(first));
+    memcpy(&second, input + 4u, sizeof(second));
+    (wire_word_60 = (uint32)(first), memcpy(output + 4u, &wire_word_60, sizeof(wire_word_60)));
+    (wire_word_61 = (uint32)(second), memcpy(output, &wire_word_61, sizeof(wire_word_61)));
+    (*(uint16 *)(output) = (uint16)((uint16)first));
+    memcpy(&third, input + 8u, sizeof(third));
+    memcpy(&first, input + 12u, sizeof(first));
+    (wire_word_64 = (uint32)(third), memcpy(output + 12u, &wire_word_64, sizeof(wire_word_64)));
+    (wire_word_65 = (uint32)(first), memcpy(output + 8u, &wire_word_65, sizeof(wire_word_65)));
+    (*(uint16 *)(output + 12u) = (uint16)((uint16)second));
+    (*(uint16 *)(output + 8u) = (uint16)((uint16)third));
+    second = (*(const uint16 *)(input + 16u));
+    (*(uint16 *)(output + 4u) = (uint16)((uint16)first));
+    (*(uint16 *)(output + 16u) = (uint16)((uint16)second));
     return destination;
 }
 
@@ -3495,23 +3503,24 @@ VECTOR *ApplyMatrixLV(MATRIX *m, VECTOR *v, VECTOR *out)
 
 SVECTOR *ApplyMatrixSV(MATRIX *m, SVECTOR *v, SVECTOR *out)
 {
+    uint32 wire_word_67, wire_word_68;
     uint32 words[5], x, y, z;
     uint32 index;
     if (!m || !v || !out)
         return out;
     for (index = 0; index < 5; ++index)
-        words[index] = xport_load_le32((const uint8 *)m + index * 4);
+        memcpy(&words[index], (const uint8 *)m + index * 4, sizeof(words[index]));
     for (index = 0; index < 5; ++index)
         xport_gte_write_control(index, words[index]);
-    xport_gte_write_data(0, xport_load_le32((const uint8 *)v));
-    xport_gte_write_data(1, xport_load_le32((const uint8 *)v + 4));
+    xport_gte_write_data(0, (memcpy(&wire_word_67, (const uint8 *)v, sizeof(wire_word_67)), wire_word_67));
+    xport_gte_write_data(1, (memcpy(&wire_word_68, (const uint8 *)v + 4, sizeof(wire_word_68)), wire_word_68));
     xport_gte_execute(0x486012);
     x = xport_gte_read_data(9);
     y = xport_gte_read_data(10);
     z = xport_gte_read_data(11);
-    xport_store_le16((uint8 *)out, (uint16)x);
-    xport_store_le16((uint8 *)out + 2, (uint16)y);
-    xport_store_le16((uint8 *)out + 4, (uint16)z);
+    (*(uint16 *)((uint8 *)out) = (uint16)((uint16)x));
+    (*(uint16 *)((uint8 *)out + 2) = (uint16)((uint16)y));
+    (*(uint16 *)((uint8 *)out + 4) = (uint16)((uint16)z));
     return out;
 }
 
@@ -3816,13 +3825,14 @@ static void matrix_left_multiply(MATRIX *m, const MATRIX *left)
 
 MATRIX *RotMatrixYXZ(SVECTOR *rotation, MATRIX *matrix)
 {
+    uint32 wire_word_70, wire_word_71, wire_word_72, wire_word_73;
     uint32 xy, product, a0, a1, a2, a3, v1, t0, t1, t2, t3, t4, t5, t6, t7, at;
     SVECTOR gpf_input;
     VECTOR gpf_output;
     sint32 sine, cosine, z;
     uint8 *output = (uint8 *)matrix;
-    z = (sint16)xport_load_le16((uint8 *)rotation + 4u);
-    xy = xport_load_le32(rotation);
+    z = (sint16)(*(const uint16 *)((uint8 *)rotation + 4u));
+    memcpy(&xy, rotation, sizeof(xy));
     rsincos(z, &sine, &cosine);
     a2 = ((uint32)(uint16)cosine << 16) | (uint16)sine;
     rsincos((sint16)(xy >> 16), &sine, &cosine);
@@ -3857,7 +3867,7 @@ MATRIX *RotMatrixYXZ(SVECTOR *rotation, MATRIX *matrix)
     gpf_input.vz = (sint16)at;
     gte_gpf12(&gpf_input, (sint32)t6, &gpf_output);
     at = (product >> 12) | ((product & 0x80000000u) != 0u ? 0xFFF00000u : 0u);
-    xport_store_le16(output + 16u, (uint16)at);
+    (*(uint16 *)(output + 16u) = (uint16)((uint16)at));
     t3 = xport_gte_read_data(9u);
     t4 = xport_gte_read_data(10u);
     t5 = xport_gte_read_data(11u);
@@ -3885,19 +3895,19 @@ MATRIX *RotMatrixYXZ(SVECTOR *rotation, MATRIX *matrix)
     gpf_input.vz = (sint16)t0;
     gte_gpf12(&gpf_input, (sint32)v1, &gpf_output);
     a0 = (a0 & 0xFFFFu) | ((0u - a3) << 16);
-    xport_store_le32(output + 8u, a0);
+    (wire_word_70 = (uint32)(a0), memcpy(output + 8u, &wire_word_70, sizeof(wire_word_70)));
     at = xport_gte_read_data(9u);
     t1 = a1 - t1;
     t6 = xport_gte_read_data(10u);
     t7 = xport_gte_read_data(11u);
     t1 <<= 16;
     t2 = (t2 + t6) & 0xFFFFu;
-    xport_store_le32(output, t1 | t2);
+    (wire_word_71 = (uint32)(t1 | t2), memcpy(output, &wire_word_71, sizeof(wire_word_71)));
     t1 = ((product >> 12) | ((product & 0x80000000u) != 0u ? 0xFFF00000u : 0u)) & 0xFFFFu;
-    xport_store_le32(output + 4u, (at << 16) | t1);
+    (wire_word_72 = (uint32)((at << 16) | t1), memcpy(output + 4u, &wire_word_72, sizeof(wire_word_72)));
     t5 = (t7 - t5) & 0xFFFFu;
     t4 = (a2 + t4) << 16;
-    xport_store_le32(output + 12u, t4 | t5);
+    (wire_word_73 = (uint32)(t4 | t5), memcpy(output + 12u, &wire_word_73, sizeof(wire_word_73)));
     return matrix;
 }
 
@@ -4773,7 +4783,6 @@ sint32 VSync(sint32 mode)
     return (sint32)frames;
 }
 
-
 /* Pad services */
 #include <string.h>
 static uint8 *pad_packets[2];
@@ -4795,16 +4804,6 @@ static uint32 bios_pad_clear_mode;
 static uint32 bios_legacy_pad_buffers;
 static uint32 bios_legacy_pad_destination;
 static uint32 bios_legacy_pad_enabled;
-
-
-
-
-
-
-
-
-
-
 
 static sint32 pad_index(sint32 port)
 {
@@ -5072,7 +5071,6 @@ void psx_pad_prepare_actuators(uint32 owner, uint32 budget)
 
 static void bios_native_pad_poll(void)
 {
-
     if (pad_active)
     {
         uint32 port;
@@ -5349,7 +5347,6 @@ sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock)
     return 1;
 }
 
-
 /* PS-X executable loading */
 #include <stdlib.h>
 #include <string.h>
@@ -5442,8 +5439,8 @@ sint32 xport_psx_exe_load(const PSX_EXE *executable)
         goto finish;
     if (memcmp(image, "PS-X EXE", 8u) != 0)
         goto finish;
-    load_address = xport_load_le32(image + 0x18u);
-    payload_size = xport_load_le32(image + 0x1cu);
+    memcpy(&load_address, image + 0x18u, sizeof(load_address));
+    memcpy(&payload_size, image + 0x1cu, sizeof(payload_size));
     if (load_address != executable->load_address || payload_size > size - 2048u || (load_address & 0x1fffffffu) + payload_size > PSX_DRAM_SIZE)
         goto finish;
     if (!xport_guest_copy(xport_guest_ref(0u), xport_host_ref(image), size) || !xport_guest_copy(xport_guest_ref(load_address), xport_guest_ref(2048u), payload_size) || !xport_guest_fill(0u, 0u, load_address & 0x1fffffffu) || !xport_guest_fill(executable->bss_start, 0u, executable->bss_end - executable->bss_start) || !w_u32(executable->heap_metadata, executable->heap_start) || !w_u32(executable->heap_metadata + 4u, executable->heap_size))
@@ -6287,6 +6284,14 @@ void StartCARD(void)
         xport_bios_exit_critical();
 }
 
+PsxVsyncCallbacks psx_bios_vsync_exchange(PsxVsyncCallbacks callbacks)
+{
+    PsxVsyncCallbacks previous = {bios_vsync_native_callback, bios_vsync_callback};
+    bios_vsync_native_callback = callbacks.native_callback;
+    bios_vsync_callback = callbacks.guest_callback;
+    return previous;
+}
+
 PsxInterruptCallback psx_bios_vsync_callback(PsxInterruptCallback callback)
 {
     PsxInterruptCallback previous = bios_vsync_native_callback;
@@ -6593,15 +6598,15 @@ static uint32 *gs_tmd_fast_f3(uint32 primitive, uint32 vertices, uint32 normals,
                     xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
                 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
                 work = gs_tmd_work_buffer(work, 5);
-                xport_store_le32(work, 0x04000000);
+                (*(work) = 0x04000000);
                 AddPrim(psx_addr(slot, 4), work);
                 if (lighting == 0)
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
-                xport_store_le32(work + 2, xport_gte_read_data(12));
-                xport_store_le32(work + 3, xport_gte_read_data(13));
-                xport_store_le32(work + 4, xport_gte_read_data(14));
+                    (*(work + 1) = xport_gte_read_data(22));
+                (*(work + 2) = xport_gte_read_data(12));
+                (*(work + 3) = xport_gte_read_data(13));
+                (*(work + 4) = xport_gte_read_data(14));
                 if (lighting != 0)
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    (*(work + 1) = xport_gte_read_data(22));
                 work += 5;
             }
         }
@@ -6676,7 +6681,7 @@ static uint32 *gs_tmd_fast_g3(uint32 primitive, uint32 vertices, uint32 normals,
                     xport_gte_execute(lighting == 1 ? 0x118043F : 0xF80416);
                 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
                 work = gs_tmd_work_buffer(work, 7);
-                xport_store_le32(work, 0x06000000);
+                (*(work) = 0x06000000);
                 AddPrim(psx_addr(slot, 4), work);
                 if (lighting != 0)
                 {
@@ -6685,16 +6690,16 @@ static uint32 *gs_tmd_fast_g3(uint32 primitive, uint32 vertices, uint32 normals,
                         indices[index] = r_u32(primitive + 8 + index * 4);
                     prefetched = 1;
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                        (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                        (*(work + 1 + index * 2) = xport_gte_read_data(20 + index));
                 }
                 else
                 {
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20));
+                        (*(work + 1 + index * 2) = xport_gte_read_data(20));
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                        (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 }
                 work += 7;
             }
@@ -6770,10 +6775,10 @@ static uint32 *gs_tmd_fast_f4(uint32 primitive, uint32 vertices, uint32 normals,
             {
                 work = gs_tmd_work_buffer(work, 6);
                 if (lighting == 0)
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
-                xport_store_le32(work + 2, xport_gte_read_data(12));
-                xport_store_le32(work + 3, xport_gte_read_data(13));
-                xport_store_le32(work + 4, xport_gte_read_data(14));
+                    (*(work + 1) = xport_gte_read_data(22));
+                (*(work + 2) = xport_gte_read_data(12));
+                (*(work + 3) = xport_gte_read_data(13));
+                (*(work + 4) = xport_gte_read_data(14));
                 xport_gte_execute(0x180001);
                 if ((sint32)xport_gte_read_flag() >= 0)
                 {
@@ -6784,14 +6789,14 @@ static uint32 *gs_tmd_fast_f4(uint32 primitive, uint32 vertices, uint32 normals,
                     if (lighting != 0)
                         xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
                     if (lighting == 0)
-                        xport_store_le32(work + 5, xport_gte_read_data(14));
+                        (*(work + 5) = xport_gte_read_data(14));
                     slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                    xport_store_le32(work, 0x05000000);
+                    (*(work) = 0x05000000);
                     AddPrim(psx_addr(slot, 4), work);
                     if (lighting != 0)
                     {
-                        xport_store_le32(work + 5, xport_gte_read_data(14));
-                        xport_store_le32(work + 1, xport_gte_read_data(22));
+                        (*(work + 5) = xport_gte_read_data(14));
+                        (*(work + 1) = xport_gte_read_data(22));
                     }
                     work += 6;
                 }
@@ -6849,11 +6854,11 @@ static uint32 *gs_tmd_fast_tf3(uint32 primitive, uint32 vertices, uint32 normals
         uv1 = r_u32(primitive + 8);
         uv2 = r_u32(primitive + 12);
         work = gs_tmd_work_buffer(work, 8);
-        xport_store_le32(work + 3, uv0);
-        xport_store_le32(work + 5, uv1);
-        xport_store_le32(work + 7, uv2);
+        (*(work + 3) = uv0);
+        (*(work + 5) = uv1);
+        (*(work + 7) = uv2);
         if (lighting == 0)
-            xport_store_le32(work + 1, color);
+            (*(work + 1) = color);
         primitive += 24;
         if (lighting == 0)
         {
@@ -6877,13 +6882,13 @@ static uint32 *gs_tmd_fast_tf3(uint32 primitive, uint32 vertices, uint32 normals
                 if (lighting != 0)
                     xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
                 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                xport_store_le32(work, 0x07000000);
+                (*(work) = 0x07000000);
                 AddPrim(psx_addr(slot, 4), work);
-                xport_store_le32(work + 2, xport_gte_read_data(12));
-                xport_store_le32(work + 4, xport_gte_read_data(13));
-                xport_store_le32(work + 6, xport_gte_read_data(14));
+                (*(work + 2) = xport_gte_read_data(12));
+                (*(work + 4) = xport_gte_read_data(13));
+                (*(work + 6) = xport_gte_read_data(14));
                 if (lighting != 0)
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    (*(work + 1) = xport_gte_read_data(22));
                 work += 8;
             }
         }
@@ -6954,7 +6959,7 @@ static uint32 *gs_tmd_fast_g4(uint32 primitive, uint32 vertices, uint32 normals,
             {
                 work = gs_tmd_work_buffer(work, 9);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x180001);
                 if (lighting != 0)
                 {
@@ -6972,28 +6977,28 @@ static uint32 *gs_tmd_fast_g4(uint32 primitive, uint32 vertices, uint32 normals,
                     if (lighting != 0)
                     {
                         xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
-                        xport_store_le32(work + 7, xport_gte_read_data(22));
+                        (*(work + 7) = xport_gte_read_data(22));
                         gs_tmd_load_vector(normals + (indices[0] & 0xFFFF) * 8, 0);
                         xport_gte_execute(lighting == 1 ? 0x118043F : 0xF80416);
                         primitive += 24;
                     }
                     slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                    xport_store_le32(work, 0x08000000);
+                    (*(work) = 0x08000000);
                     AddPrim(psx_addr(slot, 4), work);
                     if (lighting != 0)
                     {
                         for (index = 0; index < 3; ++index)
                             indices[index] = r_u32(primitive + 8 + index * 4);
                         prefetched = 1;
-                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                        (*(work + 8) = xport_gte_read_data(14));
                         for (index = 0; index < 3; ++index)
-                            xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                            (*(work + 1 + index * 2) = xport_gte_read_data(20 + index));
                     }
                     else
                     {
                         for (index = 0; index < 4; ++index)
-                            xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20));
-                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                            (*(work + 1 + index * 2) = xport_gte_read_data(20));
+                        (*(work + 8) = xport_gte_read_data(14));
                     }
                     work += 9;
                 }
@@ -7069,22 +7074,22 @@ static uint32 *gs_tmd_fast_tf4(uint32 primitive, uint32 vertices, uint32 normals
             if ((sint32)xport_gte_read_data(24) > 0)
             {
                 work = gs_tmd_work_buffer(work, 10);
-                xport_store_le32(work + 2, xport_gte_read_data(12));
-                xport_store_le32(work + 4, xport_gte_read_data(13));
-                xport_store_le32(work + 6, xport_gte_read_data(14));
+                (*(work + 2) = xport_gte_read_data(12));
+                (*(work + 4) = xport_gte_read_data(13));
+                (*(work + 6) = xport_gte_read_data(14));
                 xport_gte_execute(0x180001);
                 uv0 = r_u32(current + 4);
                 uv1 = r_u32(current + 8);
-                xport_store_le32(work + 3, uv0);
-                xport_store_le32(work + 5, uv1);
+                (*(work + 3) = uv0);
+                (*(work + 5) = uv1);
                 uv0 = r_u32(current + 12);
                 uv1 = r_u32(current + 16);
-                xport_store_le32(work + 7, uv0);
-                xport_store_le32(work + 9, uv1);
+                (*(work + 7) = uv0);
+                (*(work + 9) = uv1);
                 if (lighting == 0)
                 {
                     color = 0x00808080 | (((uint32)(sint32)r_s8(current + 3) | (gs_sort_attributes.bit30 << 1)) << 24);
-                    xport_store_le32(work + 1, color);
+                    (*(work + 1) = color);
                 }
                 if ((sint32)xport_gte_read_flag() >= 0)
                 {
@@ -7095,14 +7100,14 @@ static uint32 *gs_tmd_fast_tf4(uint32 primitive, uint32 vertices, uint32 normals
                     if (lighting != 0)
                         xport_gte_execute(lighting == 1 ? 0x108041B : 0xE80413);
                     if (lighting == 0)
-                        xport_store_le32(work + 8, xport_gte_read_data(14));
+                        (*(work + 8) = xport_gte_read_data(14));
                     slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                    xport_store_le32(work, 0x09000000);
+                    (*(work) = 0x09000000);
                     AddPrim(psx_addr(slot, 4), work);
                     if (lighting != 0)
                     {
-                        xport_store_le32(work + 8, xport_gte_read_data(14));
-                        xport_store_le32(work + 1, xport_gte_read_data(22));
+                        (*(work + 8) = xport_gte_read_data(14));
+                        (*(work + 1) = xport_gte_read_data(22));
                     }
                     work += 10;
                 }
@@ -7159,16 +7164,16 @@ static uint32 *gs_tmd_fast_tg3_lit(uint32 primitive, uint32 vertices, uint32 nor
                 xport_gte_execute(fog ? 0xF80416 : 0x118043F);
                 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
                 work = gs_tmd_work_buffer(work, 10);
-                xport_store_le32(work, 0x09000000);
+                (*(work) = 0x09000000);
                 AddPrim(psx_addr(slot, 4), work);
                 for (index = 0; index < 3; ++index)
                     uv[index] = r_u32(primitive + 4 + index * 4);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 3 + index * 3, uv[index]);
+                    (*(work + 3 + index * 3) = uv[index]);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                    (*(work + 1 + index * 3) = xport_gte_read_data(20 + index));
                 primitive += 28;
                 for (index = 0; index < 3; ++index)
                     indices[index] = r_u32(primitive + 16 + index * 4);
@@ -7210,7 +7215,7 @@ uint32 *GsTMDfastTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32
             xport_gte_write_data(20 + index, r_u32(primitive + 4 + index * 4));
         color = 0x25808080 | ((((uint32)(sint32)r_s8(primitive + 3) & 2) | (gs_sort_attributes.bit30 << 1)) << 24);
         work = gs_tmd_work_buffer(work, 8);
-        xport_store_le32(work + 1, color);
+        (*(work + 1) = color);
         primitive += 28;
         for (index = 0; index < 3; ++index)
             indices[index] = r_u16(primitive + 18 + index * 4);
@@ -7222,11 +7227,11 @@ uint32 *GsTMDfastTG3NL(uint32 primitive, uint32 vertices, uint32 normals, uint32
                 xport_gte_execute(0x158002D);
                 depth = xport_gte_read_data(7);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 3 + index * 2, xport_gte_read_data(20 + index));
+                    (*(work + 3 + index * 2) = xport_gte_read_data(20 + index));
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                xport_store_le32(work, 0x07000000);
+                (*(work) = 0x07000000);
                 AddPrim(psx_addr(slot, 4), work);
                 work += 8;
             }
@@ -7264,7 +7269,7 @@ static uint32 *gs_tmd_fast_tg4_lit(uint32 primitive, uint32 vertices, uint32 nor
             {
                 work = gs_tmd_work_buffer(work, 13);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x180001);
                 gs_tmd_load_vector(normals + (indices[1] & 0xFFFF) * 8, 1);
                 gs_tmd_load_vector(normals + (indices[2] & 0xFFFF) * 8, 2);
@@ -7277,20 +7282,20 @@ static uint32 *gs_tmd_fast_tg4_lit(uint32 primitive, uint32 vertices, uint32 nor
                     for (index = 0; index < 4; ++index)
                         uv[index] = r_u32(primitive + 4 + index * 4);
                     for (index = 0; index < 4; ++index)
-                        xport_store_le32(work + 3 + index * 3, uv[index]);
-                    xport_store_le32(work + 10, xport_gte_read_data(22));
+                        (*(work + 3 + index * 3) = uv[index]);
+                    (*(work + 10) = xport_gte_read_data(22));
                     gs_tmd_load_vector(normals + (indices[0] & 0xFFFF) * 8, 0);
                     xport_gte_execute(fog ? 0xF80416 : 0x118043F);
                     slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                    xport_store_le32(work, 0x0C000000);
+                    (*(work) = 0x0C000000);
                     AddPrim(psx_addr(slot, 4), work);
                     primitive += 36;
                     for (index = 0; index < 3; ++index)
                         indices[index] = r_u32(primitive + 20 + index * 4);
                     prefetched = 1;
-                    xport_store_le32(work + 11, xport_gte_read_data(14));
+                    (*(work + 11) = xport_gte_read_data(14));
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                        (*(work + 1 + index * 3) = xport_gte_read_data(20 + index));
                     work += 13;
                 }
             }
@@ -7337,27 +7342,27 @@ uint32 *GsTMDfastTG4NL(uint32 primitive, uint32 vertices, uint32 normals, uint32
             if ((sint32)xport_gte_read_data(24) > 0)
             {
                 work = gs_tmd_work_buffer(work, 10);
-                xport_store_le32(work + 2, xport_gte_read_data(12));
-                xport_store_le32(work + 4, xport_gte_read_data(13));
-                xport_store_le32(work + 6, xport_gte_read_data(14));
+                (*(work + 2) = xport_gte_read_data(12));
+                (*(work + 4) = xport_gte_read_data(13));
+                (*(work + 6) = xport_gte_read_data(14));
                 xport_gte_execute(0x180001);
                 color = 0x2D808080 | ((((uint32)(sint32)r_s8(current + 3) & 2) | (gs_sort_attributes.bit30 << 1)) << 24);
-                xport_store_le32(work + 1, color);
+                (*(work + 1) = color);
                 uv0 = r_u32(current + 4);
                 uv1 = r_u32(current + 8);
                 if ((sint32)xport_gte_read_flag() >= 0)
                 {
                     xport_gte_execute(0x168002E);
                     uv2 = r_u32(current + 12);
-                    xport_store_le32(work + 3, uv0);
-                    xport_store_le32(work + 5, uv1);
-                    xport_store_le32(work + 7, uv2);
+                    (*(work + 3) = uv0);
+                    (*(work + 5) = uv1);
+                    (*(work + 7) = uv2);
                     uv0 = r_u32(current + 16);
                     depth = xport_gte_read_data(7);
-                    xport_store_le32(work + 9, uv0);
-                    xport_store_le32(work + 8, xport_gte_read_data(14));
+                    (*(work + 9) = uv0);
+                    (*(work + 8) = xport_gte_read_data(14));
                     slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-                    xport_store_le32(work, 0x09000000);
+                    (*(work) = 0x09000000);
                     AddPrim(psx_addr(slot, 4), work);
                     work += 10;
                 }
@@ -7376,7 +7381,7 @@ static uint32 gs_tmd_unlit_texture_color(uint32 primitive, uint32 rgb)
 static void gs_tmd_link_unlit(uint32 *work, uint32 base, uint32 bias, uint32 depth, uint32 shift, uint32 words)
 {
     uint32 slot = base + ((((depth - bias) >> (shift & 31)) & 0xFFFF) * 4);
-    xport_store_le32(work, words << 24);
+    (*(work) = words << 24);
     AddPrim(psx_addr(slot, 4), work);
 }
 
@@ -7427,7 +7432,7 @@ static uint32 *gs_tmd_fast_unlit_triangle(uint32 primitive, uint32 vertices, uin
                 uv[index] = r_u32(primitive + 4 + index * 4);
             work = gs_tmd_work_buffer(work, packet_words[kind]);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 3 + index * step, uv[index]);
+                (*(work + 3 + index * step) = uv[index]);
         }
         primitive += stride;
         next_packed = r_u32(primitive + offset);
@@ -7443,20 +7448,20 @@ static uint32 *gs_tmd_fast_unlit_triangle(uint32 primitive, uint32 vertices, uin
                 if (kind == 0 || kind == 2)
                 {
                     gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    (*(work + 1) = xport_gte_read_data(22));
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                        (*(work + 2 + index * step) = xport_gte_read_data(12 + index));
                 }
                 else
                 {
                     if (kind == 1)
                         for (index = 0; index < 3; ++index)
-                            xport_store_le32(work + 1 + index * step, xport_gte_read_data(20 + index));
+                            (*(work + 1 + index * step) = xport_gte_read_data(20 + index));
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                        (*(work + 2 + index * step) = xport_gte_read_data(12 + index));
                     if (kind == 3)
                         for (index = 0; index < 3; ++index)
-                            xport_store_le32(work + 1 + index * step, xport_gte_read_data(20 + index));
+                            (*(work + 1 + index * step) = xport_gte_read_data(20 + index));
                     gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
                 }
                 work += packet_words[kind];
@@ -7496,7 +7501,7 @@ static uint32 *gs_tmd_fast_unlit_quad(uint32 primitive, uint32 vertices, uint32 
             fourth = r_u16(primitive + offset + 6);
             color = gs_tmd_unlit_texture_color(primitive, color);
             work = gs_tmd_work_buffer(work, packet_words[kind]);
-            xport_store_le32(work + 1, color);
+            (*(work + 1) = color);
         }
         else if (kind == 3)
         {
@@ -7522,18 +7527,18 @@ static uint32 *gs_tmd_fast_unlit_quad(uint32 primitive, uint32 vertices, uint32 
             {
                 work = gs_tmd_work_buffer(work, packet_words[kind]);
                 if (kind == 0)
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    (*(work + 1) = xport_gte_read_data(22));
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * step, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * step) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x180001);
                 if (kind == 1)
                 {
                     color = r_u32(current + 4) | (gs_sort_attributes.bit30 << 25);
                     uv0 = r_u32(current + 8);
                     uv1 = r_u32(current + 12);
-                    xport_store_le32(work + 1, color);
-                    xport_store_le32(work + 3, uv0);
-                    xport_store_le32(work + 5, uv1);
+                    (*(work + 1) = color);
+                    (*(work + 3) = uv0);
+                    (*(work + 5) = uv1);
                 }
                 else if (kind >= 2)
                 {
@@ -7541,12 +7546,12 @@ static uint32 *gs_tmd_fast_unlit_quad(uint32 primitive, uint32 vertices, uint32 
                     uv1 = r_u32(current + 8);
                     if (kind == 2)
                     {
-                        xport_store_le32(work + 3, uv0);
-                        xport_store_le32(work + 5, uv1);
+                        (*(work + 3) = uv0);
+                        (*(work + 5) = uv1);
                         uv0 = r_u32(current + 12);
                         uv1 = r_u32(current + 16);
-                        xport_store_le32(work + 7, uv0);
-                        xport_store_le32(work + 9, uv1);
+                        (*(work + 7) = uv0);
+                        (*(work + 9) = uv1);
                     }
                 }
                 if ((sint32)xport_gte_read_flag() >= 0)
@@ -7556,26 +7561,26 @@ static uint32 *gs_tmd_fast_unlit_quad(uint32 primitive, uint32 vertices, uint32 
                     {
                         color = r_u32(current + 16);
                         depth = xport_gte_read_data(7);
-                        xport_store_le32(work + 7, color);
+                        (*(work + 7) = color);
                     }
                     else if (kind == 3)
                     {
                         uv2 = r_u32(current + 12);
-                        xport_store_le32(work + 3, uv0);
-                        xport_store_le32(work + 6, uv1);
-                        xport_store_le32(work + 9, uv2);
+                        (*(work + 3) = uv0);
+                        (*(work + 6) = uv1);
+                        (*(work + 9) = uv2);
                         uv0 = r_u32(current + 16);
                         depth = xport_gte_read_data(7);
-                        xport_store_le32(work + 12, uv0);
+                        (*(work + 12) = uv0);
                     }
                     else
                         depth = xport_gte_read_data(7);
-                    xport_store_le32(work + 2 + 3 * step, xport_gte_read_data(14));
+                    (*(work + 2 + 3 * step) = xport_gte_read_data(14));
                     if (kind == 3)
                     {
                         for (index = 0; index < 3; ++index)
-                            xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
-                        xport_store_le32(work + 10, xport_gte_read_data(6));
+                            (*(work + 1 + index * 3) = xport_gte_read_data(20 + index));
+                        (*(work + 10) = xport_gte_read_data(6));
                     }
                     gs_tmd_link_unlit(work, base, bias, depth, shift, packet_words[kind] - 1);
                     work += packet_words[kind];
@@ -7605,27 +7610,27 @@ static uint32 *gs_tmd_fast_gradient_nl(uint32 primitive, uint32 vertices, uint32
         if (!gouraud)
             color = (color & 0xFFFFFF) | 0x30000000;
         work = gs_tmd_work_buffer(work, 7);
-        xport_store_le32(work + 1, color);
+        (*(work + 1) = color);
         flag = xport_gte_read_flag();
         w_u32(scratch + 36, flag);
         if (r_s32(scratch + 36) >= 0)
         {
             xport_gte_execute(0x1400006);
-            xport_store_le32(work + 3, r_u32(primitive + 8));
+            (*(work + 3) = r_u32(primitive + 8));
             w_u32(scratch + 24, xport_gte_read_data(24));
             if (r_s32(scratch + 24) > 0)
             {
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x158002D);
-                xport_store_le32(work + 5, r_u32(primitive + 12));
+                (*(work + 5) = r_u32(primitive + 12));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 depth = r_u32(scratch + 24);
                 depth_shift = r_u32(scratch + 12);
                 slot = (uint32)((sint32)depth >> (depth_shift & 31));
                 slot = (slot << 2) + r_u32(scratch + 16);
                 w_u32(scratch + 52, slot);
-                xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+                (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x06000000);
                 w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
                 work += 7;
             }
@@ -7714,7 +7719,7 @@ static uint32 gs_subdivision_slot(uint32 scratch)
 static void gs_subdivision_link_f3(uint32 **cursor, uint32 scratch, uint32 slot)
 {
     uint32 *work = gs_tmd_work_buffer(*cursor, 5);
-    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x04000000);
+    (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x04000000);
     w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
     *cursor = work + 5;
 }
@@ -7727,7 +7732,7 @@ static void gs_subdivision_emit_f3(uint32 first, uint32 second, uint32 third, ui
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 5);
-    xport_store_le32(work + 1, r_u32(scratch + 60));
+    (*(work + 1) = r_u32(scratch + 60));
     ((uint8 *)work)[3] = 4;
     ((uint8 *)work)[7] = 0x20;
     w_u32(scratch + 36, xport_gte_read_flag());
@@ -7735,7 +7740,7 @@ static void gs_subdivision_emit_f3(uint32 first, uint32 second, uint32 third, ui
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+            (*(work + 2 + index) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_f3(cursor, scratch, slot);
@@ -7781,7 +7786,7 @@ static void gs_subdivision_recurse_f3(uint32 vertices, uint32 scratch, uint32 le
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 5);
         for (index = 0; index < 5; ++index)
-            xport_store_le32(work + index, r_u32(scratch + 56 + index * 4));
+            (*(work + index) = r_u32(scratch + 56 + index * 4));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_f3(cursor, scratch, slot);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -7841,10 +7846,10 @@ static uint32 *gs_a4_div_f3(uint32 primitive, uint32 vertices, uint32 normals, u
             {
                 work = gs_tmd_work_buffer(work, 5);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x158002D);
                 if (mode == 0 || mode == 3)
-                    xport_store_le32(work + 1, r_u32(primitive + 4));
+                    (*(work + 1) = r_u32(primitive + 4));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 if (mode == 1 || mode == 2)
                 {
@@ -7852,7 +7857,7 @@ static uint32 *gs_a4_div_f3(uint32 primitive, uint32 vertices, uint32 normals, u
                     gs_tmd_load_vector(normal, 0);
                     xport_gte_execute(mode == 2 ? 0xE80413 : 0x108041B);
                     slot = gs_subdivision_slot(scratch);
-                    xport_store_le32(work + 1, xport_gte_read_data(22));
+                    (*(work + 1) = xport_gte_read_data(22));
                     depth = r_u32(scratch + 24);
                     threshold = r_u32(scratch + 28);
                     subdivide = (sint32)depth < (sint32)threshold;
@@ -7980,7 +7985,7 @@ static uint32 gs_subdivision_g3_bounds(uint32 packet, uint32 scratch)
 static void gs_subdivision_link_g3(uint32 **cursor, uint32 scratch, uint32 slot)
 {
     uint32 *work = gs_tmd_work_buffer(*cursor, 7);
-    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+    (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x06000000);
     w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
     *cursor = work + 7;
 }
@@ -7993,7 +7998,7 @@ static void gs_subdivision_emit_g3(uint32 first, uint32 second, uint32 third, ui
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 7);
-    xport_store_le32(work + 1, r_u32(first + 8));
+    (*(work + 1) = r_u32(first + 8));
     ((uint8 *)work)[3] = 6;
     ((uint8 *)work)[7] = 0x30;
     w_u32(scratch + 36, xport_gte_read_flag());
@@ -8001,10 +8006,10 @@ static void gs_subdivision_emit_g3(uint32 first, uint32 second, uint32 third, ui
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u32(second + 8));
-        xport_store_le32(work + 5, r_u32(third + 8));
+        (*(work + 3) = r_u32(second + 8));
+        (*(work + 5) = r_u32(third + 8));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_g3(cursor, scratch, slot);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -8048,11 +8053,11 @@ static void gs_subdivision_recurse_g3(uint32 vertices, uint32 scratch, uint32 le
     if (emit)
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 7);
-        xport_store_le32(work, r_u32(scratch + 56));
+        (*(work) = r_u32(scratch + 56));
         for (index = 0; index < 3; ++index)
         {
-            xport_store_le32(work + 1 + index * 2, r_u32(vertices + 8 + index * 12));
-            xport_store_le32(work + 2 + index * 2, r_u32(scratch + 64 + index * 8));
+            (*(work + 1 + index * 2) = r_u32(vertices + 8 + index * 12));
+            (*(work + 2 + index * 2) = r_u32(scratch + 64 + index * 8));
         }
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_g3(cursor, scratch, slot);
@@ -8078,6 +8083,7 @@ static void gs_subdivision_recurse_g3(uint32 vertices, uint32 scratch, uint32 le
 
 static uint32 *gs_a4_div_g3_unlit(uint32 primitive, uint32 vertices, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 distinct_colors)
 {
+    uint32 wire_word_197;
     uint32 base, index, addresses[3], slot, depth, flags, threshold, subdivide, color;
     w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
     w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
@@ -8104,10 +8110,10 @@ static uint32 *gs_a4_div_g3_unlit(uint32 primitive, uint32 vertices, uint32 *wor
         color = r_u32(primitive + 4);
         if (distinct_colors)
             color |= 0x30000000;
-        xport_store_le32(work + 1, color);
+        (*(work + 1) = color);
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
-        xport_store_le32(work + 3, r_u32(primitive + (distinct_colors ? 8 : 4)));
+        (*(work + 3) = r_u32(primitive + (distinct_colors ? 8 : 4)));
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0)
         {
@@ -8115,13 +8121,13 @@ static uint32 *gs_a4_div_g3_unlit(uint32 primitive, uint32 vertices, uint32 *wor
             if ((flags & 0x40000) == 0)
             {
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x158002D);
                 if (!distinct_colors)
-                    xport_store_le32(work + 5, r_u32(primitive + 4));
+                    (*(work + 5) = r_u32(primitive + 4));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 if (distinct_colors)
-                    xport_store_le32(work + 5, r_u32(primitive + 12));
+                    (*(work + 5) = r_u32(primitive + 12));
                 depth = r_u32(scratch + 24);
                 flags = r_u32(scratch + 12);
                 base = r_u32(scratch + 16);
@@ -8136,7 +8142,7 @@ static uint32 *gs_a4_div_g3_unlit(uint32 primitive, uint32 vertices, uint32 *wor
                     gs_subdivision_copy_vector(scratch + 84, vertices + (uint32)r_u16(primitive + (distinct_colors ? 16 : 10)) * 8);
                     if (distinct_colors)
                         for (index = 0; index < 3; ++index)
-                            w_u32(scratch + 92 + index * 12, xport_load_le32(work + 1 + index * 2) | 0x30000000);
+                            w_u32(scratch + 92 + index * 12, (memcpy(&wire_word_197, work + 1 + index * 2, sizeof(wire_word_197)), wire_word_197) | 0x30000000);
                     else
                     {
                         color = r_u32(primitive + 4);
@@ -8173,6 +8179,7 @@ uint32 *GsA4divNG3(uint32 primitive, uint32 vertices, uint32 *work, uint32 count
 
 static uint32 *gs_a4_div_g3_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 fog)
 {
+    uint32 wire_word_200;
     uint32 base, index, addresses[3], slot, depth, threshold, vertex;
     w_u16(scratch + 48, (uint32)(gs_screen_width / 2));
     w_u16(scratch + 50, (uint32)(gs_screen_height / 2));
@@ -8200,7 +8207,7 @@ static uint32 *gs_a4_div_g3_lit(uint32 primitive, uint32 vertices, uint32 normal
         {
             work = gs_tmd_work_buffer(work, 7);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
             xport_gte_execute(0x158002D);
             w_u32(scratch + 24, xport_gte_read_data(7));
             for (index = 0; index < 3; ++index)
@@ -8210,7 +8217,7 @@ static uint32 *gs_a4_div_g3_lit(uint32 primitive, uint32 vertices, uint32 normal
             xport_gte_execute(fog ? 0xF80416 : 0x118043F);
             slot = gs_subdivision_slot(scratch);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                (*(work + 1 + index * 2) = xport_gte_read_data(20 + index));
             depth = r_u32(scratch + 24);
             threshold = r_u32(scratch + 28);
             if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0)
@@ -8219,7 +8226,7 @@ static uint32 *gs_a4_div_g3_lit(uint32 primitive, uint32 vertices, uint32 normal
                 {
                     vertex = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
                     gs_subdivision_copy_vector(scratch + 84 + index * 12, vertex);
-                    w_u32(scratch + 92 + index * 12, xport_load_le32(work + 1 + index * 2));
+                    w_u32(scratch + 92 + index * 12, (memcpy(&wire_word_200, work + 1 + index * 2, sizeof(wire_word_200)), wire_word_200));
                 }
                 w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
                 gs_subdivision_recurse_g3(scratch + 84, scratch, 0, &work);
@@ -8299,7 +8306,7 @@ static uint32 gs_subdivision_f4_slot(uint32 scratch)
 static void gs_subdivision_f4_link(uint32 **cursor, uint32 scratch, uint32 slot, uint32 words)
 {
     uint32 *work = gs_tmd_work_buffer(*cursor, words);
-    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | ((words - 1) << 24));
+    (*(work) = (r_u32(slot) & 0xFFFFFF) | ((words - 1) << 24));
     w_u32(r_u32(scratch + 56), gpu_packet_link((uintptr_t)work));
     *cursor = work + words;
 }
@@ -8312,7 +8319,7 @@ static void gs_subdivision_f4_emit_triangle(uint32 first, uint32 second, uint32 
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 5);
-    xport_store_le32(work + 1, r_u32(scratch + 64));
+    (*(work + 1) = r_u32(scratch + 64));
     ((uint8 *)work)[3] = 4;
     ((uint8 *)work)[7] = 0x20;
     w_u32(scratch + 40, xport_gte_read_flag());
@@ -8320,7 +8327,7 @@ static void gs_subdivision_f4_emit_triangle(uint32 first, uint32 second, uint32 
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+            (*(work + 2 + index) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 5);
@@ -8373,7 +8380,7 @@ static void gs_subdivision_recurse_f4(uint32 vertices, uint32 scratch, uint32 le
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 6);
         for (index = 0; index < 6; ++index)
-            xport_store_le32(work + index, r_u32(scratch + 60 + index * 4));
+            (*(work + index) = r_u32(scratch + 60 + index * 4));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 6);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -8463,7 +8470,7 @@ static uint32 *gs_a4_div_f4(uint32 primitive, uint32 vertices, uint32 normals, u
             }
             work = gs_tmd_work_buffer(work, 6);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index, xport_gte_read_data(12 + index));
+                (*(work + 2 + index) = xport_gte_read_data(12 + index));
             vertex = vertices + (uint32)r_u16(primitive + index_offset + 6) * 8;
             gs_tmd_load_vector(vertex, 0);
             xport_gte_execute(0x180001);
@@ -8471,10 +8478,10 @@ static uint32 *gs_a4_div_f4(uint32 primitive, uint32 vertices, uint32 normals, u
             flags = r_u32(scratch + 40) & 0x40000;
             if (flags == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
             {
-                xport_store_le32(work + 5, xport_gte_read_data(14));
+                (*(work + 5) = xport_gte_read_data(14));
                 xport_gte_execute(0x168002E);
                 if (mode == 0 || mode == 3)
-                    xport_store_le32(work + 1, r_u32(primitive + 4));
+                    (*(work + 1) = r_u32(primitive + 4));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 depth = r_u32(scratch + 24);
                 flags = r_u32(scratch + 12);
@@ -8504,7 +8511,7 @@ static uint32 *gs_a4_div_f4(uint32 primitive, uint32 vertices, uint32 normals, u
                     packet = work;
                     gs_subdivision_f4_link(&work, scratch, slot, 6);
                     if (mode == 1 || mode == 2)
-                        xport_store_le32(packet + 1, xport_gte_read_data(22));
+                        (*(packet + 1) = xport_gte_read_data(22));
                 }
             }
         }
@@ -8586,7 +8593,7 @@ static void gs_subdivision_g4_emit_triangle(uint32 first, uint32 second, uint32 
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 7);
-    xport_store_le32(work + 1, r_u32(first + 8));
+    (*(work + 1) = r_u32(first + 8));
     ((uint8 *)work)[3] = 6;
     ((uint8 *)work)[7] = 0x30;
     w_u32(scratch + 40, xport_gte_read_flag());
@@ -8594,10 +8601,10 @@ static void gs_subdivision_g4_emit_triangle(uint32 first, uint32 second, uint32 
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u32(second + 8));
-        xport_store_le32(work + 5, r_u32(third + 8));
+        (*(work + 3) = r_u32(second + 8));
+        (*(work + 5) = r_u32(third + 8));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 7);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -8648,11 +8655,11 @@ static void gs_subdivision_recurse_g4(uint32 vertices, uint32 scratch, uint32 le
     if (emit)
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 9);
-        xport_store_le32(work, r_u32(scratch + 60));
+        (*(work) = r_u32(scratch + 60));
         for (index = 0; index < 4; ++index)
         {
-            xport_store_le32(work + 1 + index * 2, r_u32(vertices + 8 + index * 12));
-            xport_store_le32(work + 2 + index * 2, r_u32(scratch + 68 + index * 8));
+            (*(work + 1 + index * 2) = r_u32(vertices + 8 + index * 12));
+            (*(work + 2 + index * 2) = r_u32(scratch + 68 + index * 8));
         }
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 9);
@@ -8709,37 +8716,37 @@ static uint32 *gs_a4_div_g4_unlit(uint32 primitive, uint32 vertices, uint32 *wor
         if (!multicolor)
         {
             work = gs_tmd_work_buffer(work, 9);
-            xport_store_le32(work + 1, r_u32(primitive + 4));
-            xport_store_le32(work + 3, r_u32(primitive + 4));
+            (*(work + 1) = r_u32(primitive + 4));
+            (*(work + 3) = r_u32(primitive + 4));
         }
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
         if (!multicolor)
-            xport_store_le32(work + 5, r_u32(primitive + 4));
+            (*(work + 5) = r_u32(primitive + 4));
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0)
         {
             work = gs_tmd_work_buffer(work, 9);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
             vertex = vertices + (uint32)r_u16(primitive + index_offset + 3 * index_stride) * 8;
             gs_tmd_load_vector(vertex, 0);
             xport_gte_execute(0x180001);
             if (multicolor)
-                xport_store_le32(work + 1, r_u32(primitive + 4) | 0x38000000);
+                (*(work + 1) = r_u32(primitive + 4) | 0x38000000);
             w_u32(scratch + 40, xport_gte_read_flag());
             flags = r_u32(scratch + 40) & 0x40000;
             if (flags == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
             {
-                xport_store_le32(work + 8, xport_gte_read_data(14));
+                (*(work + 8) = xport_gte_read_data(14));
                 xport_gte_execute(0x168002E);
                 if (multicolor)
                 {
                     for (index = 1; index < 4; ++index)
-                        xport_store_le32(work + 1 + index * 2, r_u32(primitive + 4 + index * 4));
+                        (*(work + 1 + index * 2) = r_u32(primitive + 4 + index * 4));
                 }
                 else
-                    xport_store_le32(work + 7, r_u32(primitive + 4));
+                    (*(work + 7) = r_u32(primitive + 4));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 depth = r_u32(scratch + 24);
                 flags = r_u32(scratch + 12);
@@ -8796,6 +8803,7 @@ uint32 *GsA4divNG4(uint32 primitive, uint32 vertices, uint32 *work, uint32 count
 
 static uint32 *gs_a4_div_g4_lit(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 fog)
 {
+    uint32 wire_word_228;
     uint32 base, index, addresses[3], vertex, slot, depth, threshold;
     w_u16(scratch + 52, (uint32)(gs_screen_width / 2));
     w_u16(scratch + 54, (uint32)(gs_screen_height / 2));
@@ -8837,14 +8845,14 @@ static uint32 *gs_a4_div_g4_lit(uint32 primitive, uint32 vertices, uint32 normal
         {
             work = gs_tmd_work_buffer(work, 9);
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
             vertex = vertices + (uint32)r_u16(primitive + 22) * 8;
             gs_tmd_load_vector(vertex, 0);
             xport_gte_execute(0x180001);
             w_u32(scratch + 40, xport_gte_read_flag());
             if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
             {
-                xport_store_le32(work + 8, xport_gte_read_data(14));
+                (*(work + 8) = xport_gte_read_data(14));
                 xport_gte_execute(0x168002E);
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 for (index = 0; index < 3; ++index)
@@ -8854,11 +8862,11 @@ static uint32 *gs_a4_div_g4_lit(uint32 primitive, uint32 vertices, uint32 normal
                 xport_gte_execute(fog ? 0xF80416 : 0x118043F);
                 slot = gs_subdivision_f4_slot(scratch);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 1 + index * 2, xport_gte_read_data(20 + index));
+                    (*(work + 1 + index * 2) = xport_gte_read_data(20 + index));
                 vertex = normals + (uint32)r_u16(primitive + 20) * 8;
                 gs_tmd_load_vector(vertex, 0);
                 xport_gte_execute(fog ? 0xE80413 : 0x108041B);
-                xport_store_le32(work + 7, xport_gte_read_data(22));
+                (*(work + 7) = xport_gte_read_data(22));
                 depth = r_u32(scratch + 24);
                 threshold = r_u32(scratch + 28);
                 if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
@@ -8867,7 +8875,7 @@ static uint32 *gs_a4_div_g4_lit(uint32 primitive, uint32 vertices, uint32 normal
                     {
                         vertex = vertices + (uint32)r_u16(primitive + 10 + index * 4) * 8;
                         gs_subdivision_copy_vector(scratch + 96 + index * 12, vertex);
-                        w_u32(scratch + 104 + index * 12, xport_load_le32(work + 1 + index * 2));
+                        w_u32(scratch + 104 + index * 12, (memcpy(&wire_word_228, work + 1 + index * 2, sizeof(wire_word_228)), wire_word_228));
                     }
                     w_u32(scratch + 20, gpu_packet_link((uintptr_t)work));
                     gs_subdivision_recurse_g4(scratch + 96, scratch, 0, &work);
@@ -8896,7 +8904,7 @@ uint32 *GsA4divG4LFG(uint32 primitive, uint32 vertices, uint32 normals, uint32 *
 static void gs_subdivision_link_tf3(uint32 **cursor, uint32 scratch, uint32 slot)
 {
     uint32 *work = gs_tmd_work_buffer(*cursor, 8);
-    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x07000000);
+    (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x07000000);
     w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
     *cursor = work + 8;
 }
@@ -8921,7 +8929,7 @@ static void gs_subdivision_emit_tf3(uint32 first, uint32 second, uint32 third, u
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 8);
-    xport_store_le32(work + 1, r_u32(scratch + 60));
+    (*(work + 1) = r_u32(scratch + 60));
     ((uint8 *)work)[3] = 7;
     ((uint8 *)work)[7] = 0x24;
     w_u32(scratch + 36, xport_gte_read_flag());
@@ -8929,13 +8937,13 @@ static void gs_subdivision_emit_tf3(uint32 first, uint32 second, uint32 third, u
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u16(first + 6));
-        xport_store_le32(work + 5, r_u16(second + 6));
-        xport_store_le32(work + 7, r_u16(third + 6));
-        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 70));
-        xport_store_le16((uint8 *)work + 22, r_u16(scratch + 78));
+        (*(work + 3) = r_u16(first + 6));
+        (*(work + 5) = r_u16(second + 6));
+        (*(work + 7) = r_u16(third + 6));
+        (*(uint16 *)((uint8 *)work + 14) = (uint16)(r_u16(scratch + 70)));
+        (*(uint16 *)((uint8 *)work + 22) = (uint16)(r_u16(scratch + 78)));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_tf3(cursor, scratch, slot);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -8982,7 +8990,7 @@ static void gs_subdivision_recurse_tf3(uint32 vertices, uint32 scratch, uint32 l
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 8);
         for (index = 0; index < 8; ++index)
-            xport_store_le32(work + index, r_u32(scratch + 56 + index * 4));
+            (*(work + index) = r_u32(scratch + 56 + index * 4));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_tf3(cursor, scratch, slot);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -9007,6 +9015,7 @@ static void gs_subdivision_recurse_tf3(uint32 vertices, uint32 scratch, uint32 l
 
 static uint32 *gs_a4_div_tf3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
 {
+    uint32 wire_word_242;
     uint32 base, index, addresses[3], vertex, slot, depth, threshold;
     uint32 colored = mode == 1;
     uint32 lit = mode >= 2;
@@ -9037,18 +9046,18 @@ static uint32 *gs_a4_div_tf3(uint32 primitive, uint32 vertices, uint32 normals, 
             gs_tmd_load_vector(addresses[index], index);
         xport_gte_execute(0x280030);
         work = gs_tmd_work_buffer(work, 8);
-        xport_store_le32(work + 3, r_u32(primitive + 4));
-        xport_store_le32(work + 7, r_u32(primitive + 12));
+        (*(work + 3) = r_u32(primitive + 4));
+        (*(work + 7) = r_u32(primitive + 12));
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0 && (r_u32(scratch + 36) & 0x40000) == 0)
         {
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
             xport_gte_execute(0x158002D);
             if (colored)
-                xport_store_le32(work + 1, r_u32(primitive + 16) | 0x24000000);
+                (*(work + 1) = r_u32(primitive + 16) | 0x24000000);
             w_u32(scratch + 24, xport_gte_read_data(7));
             if (lit)
             {
@@ -9056,10 +9065,10 @@ static uint32 *gs_a4_div_tf3(uint32 primitive, uint32 vertices, uint32 normals, 
                 gs_tmd_load_vector(vertex, 0);
                 xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
             }
-            xport_store_le32(work + 5, r_u32(primitive + 8));
+            (*(work + 5) = r_u32(primitive + 8));
             slot = gs_subdivision_slot(scratch);
             if (!colored)
-                xport_store_le32(work + 1, lit ? xport_gte_read_data(22) : 0x24808080);
+                (*(work + 1) = lit ? xport_gte_read_data(22) : 0x24808080);
             depth = r_u32(scratch + 24);
             threshold = r_u32(scratch + 28);
             if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0)
@@ -9067,7 +9076,7 @@ static uint32 *gs_a4_div_tf3(uint32 primitive, uint32 vertices, uint32 normals, 
                 if (lit)
                     w_u32(scratch + 60, xport_gte_read_data(22));
                 else if (colored)
-                    w_u32(scratch + 60, xport_load_le32(work + 1));
+                    w_u32(scratch + 60, (memcpy(&wire_word_242, work + 1, sizeof(wire_word_242)), wire_word_242));
                 for (index = 0; index < 3; ++index)
                 {
                     vertex = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
@@ -9119,7 +9128,7 @@ static void gs_subdivision_tf4_emit_triangle(uint32 first, uint32 second, uint32
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 8);
-    xport_store_le32(work + 1, r_u32(scratch + 64));
+    (*(work + 1) = r_u32(scratch + 64));
     ((uint8 *)work)[3] = 7;
     ((uint8 *)work)[7] = 0x24;
     w_u32(scratch + 40, xport_gte_read_flag());
@@ -9127,13 +9136,13 @@ static void gs_subdivision_tf4_emit_triangle(uint32 first, uint32 second, uint32
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u16(first + 6));
-        xport_store_le32(work + 5, r_u16(second + 6));
-        xport_store_le32(work + 7, r_u16(third + 6));
-        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 74));
-        xport_store_le16((uint8 *)work + 22, r_u16(scratch + 82));
+        (*(work + 3) = r_u16(first + 6));
+        (*(work + 5) = r_u16(second + 6));
+        (*(work + 7) = r_u16(third + 6));
+        (*(uint16 *)((uint8 *)work + 14) = (uint16)(r_u16(scratch + 74)));
+        (*(uint16 *)((uint8 *)work + 22) = (uint16)(r_u16(scratch + 82)));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 8);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -9188,7 +9197,7 @@ static void gs_subdivision_recurse_tf4(uint32 vertices, uint32 scratch, uint32 l
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 10);
         for (index = 0; index < 10; ++index)
-            xport_store_le32(work + index, r_u32(scratch + 60 + index * 4));
+            (*(work + index) = r_u32(scratch + 60 + index * 4));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 10);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -9217,6 +9226,7 @@ static void gs_subdivision_recurse_tf4(uint32 vertices, uint32 scratch, uint32 l
 
 static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
 {
+    uint32 wire_word_262;
     uint32 base, index, addresses[3], vertex, slot, depth, threshold;
     uint32 *packet;
     uint32 colored = mode == 1;
@@ -9275,17 +9285,17 @@ static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, 
             gs_tmd_load_vector(addresses[index], index);
         xport_gte_execute(0x280030);
         work = gs_tmd_work_buffer(work, 10);
-        xport_store_le32(work + 3, r_u32(primitive + 4));
+        (*(work + 3) = r_u32(primitive + 4));
         if (lit)
-            xport_store_le32(work + 7, r_u32(primitive + 12));
+            (*(work + 7) = r_u32(primitive + 12));
         if (colored)
-            xport_store_le32(work + 5, r_u32(primitive + 8));
+            (*(work + 5) = r_u32(primitive + 8));
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
         if (colored)
-            xport_store_le32(work + 7, r_u32(primitive + 12));
+            (*(work + 7) = r_u32(primitive + 12));
         else
-            xport_store_le32(work + 9, r_u32(primitive + 16));
+            (*(work + 9) = r_u32(primitive + 16));
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0)
         {
@@ -9294,30 +9304,30 @@ static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, 
                 vertex = normals + (uint32)r_u16(primitive + 20) * 8;
                 gs_tmd_load_vector(vertex, 0);
                 xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
-                xport_store_le32(work + 5, r_u32(primitive + 8));
+                (*(work + 5) = r_u32(primitive + 8));
             }
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
             vertex = vertices + (uint32)r_u16(primitive + index_offset + 6) * 8;
             gs_tmd_load_vector(vertex, 0);
             xport_gte_execute(0x180001);
             if (colored)
-                xport_store_le32(work + 9, r_u32(primitive + 16));
+                (*(work + 9) = r_u32(primitive + 16));
             else if (!lit)
-                xport_store_le32(work + 5, r_u32(primitive + 8));
+                (*(work + 5) = r_u32(primitive + 8));
             w_u32(scratch + 40, xport_gte_read_flag());
             if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
             {
-                xport_store_le32(work + 8, xport_gte_read_data(14));
+                (*(work + 8) = xport_gte_read_data(14));
                 xport_gte_execute(0x168002E);
                 if (colored)
-                    xport_store_le32(work + 1, r_u32(primitive + 20) | 0x2C000000);
+                    (*(work + 1) = r_u32(primitive + 20) | 0x2C000000);
                 else if (!lit)
-                    xport_store_le32(work + 7, r_u32(primitive + 12));
+                    (*(work + 7) = r_u32(primitive + 12));
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 slot = gs_subdivision_f4_slot(scratch);
                 if (!colored && !lit)
-                    xport_store_le32(work + 1, 0x2C808080);
+                    (*(work + 1) = 0x2C808080);
                 depth = r_u32(scratch + 24);
                 threshold = r_u32(scratch + 28);
                 if ((sint32)depth < (sint32)threshold || r_s32(scratch + 36) < 0 || (r_u32(scratch + 40) & 0x80000000) != 0)
@@ -9325,7 +9335,7 @@ static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, 
                     if (lit)
                         w_u32(scratch + 64, xport_gte_read_data(22));
                     else if (colored)
-                        w_u32(scratch + 64, xport_load_le32(work + 1));
+                        w_u32(scratch + 64, (memcpy(&wire_word_262, work + 1, sizeof(wire_word_262)), wire_word_262));
                     for (index = 0; index < 4; ++index)
                     {
                         vertex = vertices + (uint32)r_u16(primitive + index_offset + index * 2) * 8;
@@ -9343,7 +9353,7 @@ static uint32 *gs_a4_div_tf4(uint32 primitive, uint32 vertices, uint32 normals, 
                     packet = work;
                     gs_subdivision_f4_link(&work, scratch, slot, 10);
                     if (lit)
-                        xport_store_le32(packet + 1, xport_gte_read_data(22));
+                        (*(packet + 1) = xport_gte_read_data(22));
                 }
             }
         }
@@ -9417,7 +9427,7 @@ static uint32 gs_subdivision_tg3_bounds(uint32 packet, uint32 scratch)
 static void gs_subdivision_link_tg3(uint32 **cursor, uint32 scratch, uint32 slot)
 {
     uint32 *work = gs_tmd_work_buffer(*cursor, 10);
-    xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x09000000);
+    (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x09000000);
     w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
     *cursor = work + 10;
 }
@@ -9442,7 +9452,7 @@ static void gs_subdivision_emit_tg3(uint32 first, uint32 second, uint32 third, u
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 10);
-    xport_store_le32(work + 1, r_u32(first + 8));
+    (*(work + 1) = r_u32(first + 8));
     ((uint8 *)work)[3] = 9;
     ((uint8 *)work)[7] = 0x34;
     w_u32(scratch + 36, xport_gte_read_flag());
@@ -9450,15 +9460,15 @@ static void gs_subdivision_emit_tg3(uint32 first, uint32 second, uint32 third, u
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u16(first + 6));
-        xport_store_le32(work + 6, r_u16(second + 6));
-        xport_store_le32(work + 9, r_u16(third + 6));
-        xport_store_le32(work + 4, r_u32(second + 8));
-        xport_store_le32(work + 7, r_u32(third + 8));
-        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 70));
-        xport_store_le16((uint8 *)work + 26, r_u16(scratch + 82));
+        (*(work + 3) = r_u16(first + 6));
+        (*(work + 6) = r_u16(second + 6));
+        (*(work + 9) = r_u16(third + 6));
+        (*(work + 4) = r_u32(second + 8));
+        (*(work + 7) = r_u32(third + 8));
+        (*(uint16 *)((uint8 *)work + 14) = (uint16)(r_u16(scratch + 70)));
+        (*(uint16 *)((uint8 *)work + 26) = (uint16)(r_u16(scratch + 82)));
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_tg3(cursor, scratch, slot);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -9504,12 +9514,12 @@ static void gs_subdivision_recurse_tg3(uint32 vertices, uint32 scratch, uint32 l
     if (emit)
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 10);
-        xport_store_le32(work, r_u32(scratch + 56));
+        (*(work) = r_u32(scratch + 56));
         for (index = 0; index < 3; ++index)
         {
-            xport_store_le32(work + 1 + index * 3, r_u32(vertices + 8 + index * 12));
-            xport_store_le32(work + 2 + index * 3, r_u32(scratch + 64 + index * 12));
-            xport_store_le32(work + 3 + index * 3, r_u32(scratch + 68 + index * 12));
+            (*(work + 1 + index * 3) = r_u32(vertices + 8 + index * 12));
+            (*(work + 2 + index * 3) = r_u32(scratch + 64 + index * 12));
+            (*(work + 3 + index * 3) = r_u32(scratch + 68 + index * 12));
         }
         slot = gs_subdivision_slot(scratch);
         gs_subdivision_link_tg3(cursor, scratch, slot);
@@ -9535,6 +9545,7 @@ static void gs_subdivision_recurse_tg3(uint32 vertices, uint32 scratch, uint32 l
 
 static uint32 *gs_a4_div_tg3(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
 {
+    uint32 wire_word_289, wire_word_290;
     uint32 base, index, addresses[3], vertex, slot, depth, threshold;
     uint32 colored = mode == 1;
     uint32 lit = mode >= 2;
@@ -9583,27 +9594,27 @@ static uint32 *gs_a4_div_tg3(uint32 primitive, uint32 vertices, uint32 normals, 
             gs_tmd_load_vector(addresses[index], index);
         xport_gte_execute(0x280030);
         work = gs_tmd_work_buffer(work, 10);
-        xport_store_le32(work + 3, r_u32(primitive + 4));
+        (*(work + 3) = r_u32(primitive + 4));
         if (colored)
-            xport_store_le32(work + 6, r_u32(primitive + 8));
+            (*(work + 6) = r_u32(primitive + 8));
         else
-            xport_store_le32(work + 9, r_u32(primitive + 12));
+            (*(work + 9) = r_u32(primitive + 12));
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
         if (colored)
-            xport_store_le32(work + 9, r_u32(primitive + 12));
+            (*(work + 9) = r_u32(primitive + 12));
         else if (!lit)
-            xport_store_le32(work + 4, 0x808080);
+            (*(work + 4) = 0x808080);
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0 && (r_u32(scratch + 36) & 0x40000) == 0)
         {
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
             xport_gte_execute(0x158002D);
             if (colored)
-                xport_store_le32(work + 1, r_u32(primitive + 16) | 0x34000000);
+                (*(work + 1) = r_u32(primitive + 16) | 0x34000000);
             else if (!lit)
-                xport_store_le32(work + 7, 0x808080);
+                (*(work + 7) = 0x808080);
             w_u32(scratch + 24, xport_gte_read_data(7));
             if (lit)
             {
@@ -9615,21 +9626,21 @@ static uint32 *gs_a4_div_tg3(uint32 primitive, uint32 vertices, uint32 normals, 
             }
             if (colored)
             {
-                xport_store_le32(work + 4, r_u32(primitive + 20));
-                xport_store_le32(work + 7, r_u32(primitive + 24));
+                (*(work + 4) = r_u32(primitive + 20));
+                (*(work + 7) = r_u32(primitive + 24));
             }
             else
             {
                 vertex = r_u32(primitive + 8);
                 if (!lit)
-                    xport_store_le32(work + 1, 0x34808080);
-                xport_store_le32(work + 6, vertex);
+                    (*(work + 1) = 0x34808080);
+                (*(work + 6) = vertex);
             }
             slot = gs_subdivision_slot(scratch);
             if (lit)
             {
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                    (*(work + 1 + index * 3) = xport_gte_read_data(20 + index));
             }
             if (colored)
             {
@@ -9646,7 +9657,7 @@ static uint32 *gs_a4_div_tg3(uint32 primitive, uint32 vertices, uint32 normals, 
                 {
                     vertex = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
                     gs_subdivision_copy_vector(scratch + 96 + index * 12, vertex);
-                    w_u32(scratch + 104 + index * 12, lit ? xport_load_le32(work + 1 + index * 3) : colored ? xport_load_le32(work + 1 + index * 3) | 0x34000000 : 0x34808080);
+                    w_u32(scratch + 104 + index * 12, lit ? (memcpy(&wire_word_289, work + 1 + index * 3, sizeof(wire_word_289)), wire_word_289) : colored ? (memcpy(&wire_word_290, work + 1 + index * 3, sizeof(wire_word_290)), wire_word_290) | 0x34000000 : 0x34808080);
                 }
                 for (index = 0; index < 3; ++index)
                     w_u16(scratch + 102 + index * 12, r_u16(primitive + 4 + index * 4));
@@ -9736,7 +9747,7 @@ static void gs_subdivision_tg4_emit_triangle(uint32 first, uint32 second, uint32
     gs_tmd_load_vector(third, 2);
     xport_gte_execute(0x280030);
     work = gs_tmd_work_buffer(*cursor, 10);
-    xport_store_le32(work + 1, r_u32(first + 8));
+    (*(work + 1) = r_u32(first + 8));
     ((uint8 *)work)[3] = 9;
     ((uint8 *)work)[7] = 0x34;
     w_u32(scratch + 40, xport_gte_read_flag());
@@ -9744,15 +9755,15 @@ static void gs_subdivision_tg4_emit_triangle(uint32 first, uint32 second, uint32
     {
         xport_gte_execute(0x158002D);
         for (index = 0; index < 3; ++index)
-            xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+            (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
         w_u32(scratch + 24, xport_gte_read_data(7));
-        xport_store_le32(work + 3, r_u16(first + 6));
-        xport_store_le32(work + 6, r_u16(second + 6));
-        xport_store_le32(work + 9, r_u16(third + 6));
-        xport_store_le32(work + 4, r_u32(second + 8));
-        xport_store_le32(work + 7, r_u32(third + 8));
-        xport_store_le16((uint8 *)work + 14, r_u16(scratch + 74));
-        xport_store_le16((uint8 *)work + 26, r_u16(scratch + 86));
+        (*(work + 3) = r_u16(first + 6));
+        (*(work + 6) = r_u16(second + 6));
+        (*(work + 9) = r_u16(third + 6));
+        (*(work + 4) = r_u32(second + 8));
+        (*(work + 7) = r_u32(third + 8));
+        (*(uint16 *)((uint8 *)work + 14) = (uint16)(r_u16(scratch + 74)));
+        (*(uint16 *)((uint8 *)work + 26) = (uint16)(r_u16(scratch + 86)));
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 10);
         w_u32(scratch + 20, gpu_packet_link((uintptr_t)*cursor));
@@ -9806,12 +9817,12 @@ static void gs_subdivision_recurse_tg4(uint32 vertices, uint32 scratch, uint32 l
     if (emit)
     {
         uint32 *work = gs_tmd_work_buffer(*cursor, 13);
-        xport_store_le32(work, r_u32(scratch + 60));
+        (*(work) = r_u32(scratch + 60));
         for (index = 0; index < 4; ++index)
         {
-            xport_store_le32(work + 1 + index * 3, r_u32(vertices + 8 + index * 12));
-            xport_store_le32(work + 2 + index * 3, r_u32(scratch + 68 + index * 12));
-            xport_store_le32(work + 3 + index * 3, r_u32(scratch + 72 + index * 12));
+            (*(work + 1 + index * 3) = r_u32(vertices + 8 + index * 12));
+            (*(work + 2 + index * 3) = r_u32(scratch + 68 + index * 12));
+            (*(work + 3 + index * 3) = r_u32(scratch + 72 + index * 12));
         }
         slot = gs_subdivision_f4_slot(scratch);
         gs_subdivision_f4_link(cursor, scratch, slot, 13);
@@ -9841,6 +9852,7 @@ static void gs_subdivision_recurse_tg4(uint32 vertices, uint32 scratch, uint32 l
 
 static uint32 *gs_a4_div_tg4(uint32 primitive, uint32 vertices, uint32 normals, uint32 *work, uint32 count, uint32 shift, uint32 ordering_table, uint32 scratch, uint32 mode)
 {
+    uint32 wire_word_303, wire_word_304, wire_word_315, wire_word_316;
     uint32 base, index, addresses[3], vertex, slot, depth, threshold;
     uint32 colored = mode == 1;
     uint32 lit = mode >= 2;
@@ -9889,39 +9901,39 @@ static uint32 *gs_a4_div_tg4(uint32 primitive, uint32 vertices, uint32 normals, 
             gs_tmd_load_vector(addresses[index], index);
         xport_gte_execute(0x280030);
         work = gs_tmd_work_buffer(work, 13);
-        xport_store_le32(work + 3, r_u32(primitive + 4));
-        xport_store_le32(work + (lit ? 9 : 6), r_u32(primitive + (lit ? 12 : 8)));
+        (*(work + 3) = r_u32(primitive + 4));
+        (wire_word_303 = (uint32)(r_u32(primitive + (lit ? 12 : 8))), memcpy(work + (lit ? 9 : 6), &wire_word_303, sizeof(wire_word_303)));
         w_u32(scratch + 36, xport_gte_read_flag());
         xport_gte_execute(0x1400006);
-        xport_store_le32(work + (lit ? 12 : 9), r_u32(primitive + (lit ? 16 : 12)));
+        (wire_word_304 = (uint32)(r_u32(primitive + (lit ? 16 : 12))), memcpy(work + (lit ? 12 : 9), &wire_word_304, sizeof(wire_word_304)));
         w_u32(scratch + 24, xport_gte_read_data(24));
         if (r_s32(scratch + 24) > 0)
         {
             for (index = 0; index < 3; ++index)
-                xport_store_le32(work + 2 + index * 3, xport_gte_read_data(12 + index));
+                (*(work + 2 + index * 3) = xport_gte_read_data(12 + index));
             vertex = vertices + (uint32)r_u16(primitive + index_offset + 3 * index_stride) * 8;
             gs_tmd_load_vector(vertex, 0);
             xport_gte_execute(0x180001);
             if (!lit && colored)
             {
-                xport_store_le32(work + 12, r_u32(primitive + 16));
-                xport_store_le32(work + 1, r_u32(primitive + 20) | 0x3C000000);
+                (*(work + 12) = r_u32(primitive + 16));
+                (*(work + 1) = r_u32(primitive + 20) | 0x3C000000);
             }
             else if (!lit)
             {
                 vertex = r_u32(primitive + 16);
-                xport_store_le32(work + 1, 0x3C808080);
-                xport_store_le32(work + 12, vertex);
+                (*(work + 1) = 0x3C808080);
+                (*(work + 12) = vertex);
             }
             w_u32(scratch + 40, xport_gte_read_flag());
             if ((r_u32(scratch + 40) & 0x40000) == 0 || (r_u32(scratch + 36) & 0x40000) == 0)
             {
-                xport_store_le32(work + 11, xport_gte_read_data(14));
+                (*(work + 11) = xport_gte_read_data(14));
                 xport_gte_execute(0x168002E);
                 if (!lit)
                 {
                     for (index = 1; index < 4; ++index)
-                        xport_store_le32(work + 1 + index * 3, colored ? r_u32(primitive + 20 + index * 4) : 0x808080);
+                        (*(work + 1 + index * 3) = colored ? r_u32(primitive + 20 + index * 4) : 0x808080);
                 }
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 if (lit)
@@ -9931,17 +9943,17 @@ static uint32 *gs_a4_div_tg4(uint32 primitive, uint32 vertices, uint32 normals, 
                     for (index = 0; index < 3; ++index)
                         gs_tmd_load_vector(addresses[index], index);
                     xport_gte_execute(mode == 3 ? 0xF80416 : 0x118043F);
-                    xport_store_le32(work + 6, r_u32(primitive + 8));
+                    (*(work + 6) = r_u32(primitive + 8));
                 }
                 slot = gs_subdivision_f4_slot(scratch);
                 if (lit)
                 {
                     for (index = 0; index < 3; ++index)
-                        xport_store_le32(work + 1 + index * 3, xport_gte_read_data(20 + index));
+                        (*(work + 1 + index * 3) = xport_gte_read_data(20 + index));
                     vertex = normals + (uint32)r_u16(primitive + 32) * 8;
                     gs_tmd_load_vector(vertex, 0);
                     xport_gte_execute(mode == 3 ? 0xE80413 : 0x108041B);
-                    xport_store_le32(work + 10, xport_gte_read_data(22));
+                    (*(work + 10) = xport_gte_read_data(22));
                 }
                 depth = r_u32(scratch + 24);
                 threshold = r_u32(scratch + 28);
@@ -9951,7 +9963,7 @@ static uint32 *gs_a4_div_tg4(uint32 primitive, uint32 vertices, uint32 normals, 
                     {
                         vertex = vertices + (uint32)r_u16(primitive + index_offset + index * index_stride) * 8;
                         gs_subdivision_copy_vector(scratch + 112 + index * 12, vertex);
-                        w_u32(scratch + 120 + index * 12, lit ? xport_load_le32(work + 1 + index * 3) : colored ? xport_load_le32(work + 1 + index * 3) | 0x3C000000 : 0x3C808080);
+                        w_u32(scratch + 120 + index * 12, lit ? (memcpy(&wire_word_315, work + 1 + index * 3, sizeof(wire_word_315)), wire_word_315) : colored ? (memcpy(&wire_word_316, work + 1 + index * 3, sizeof(wire_word_316)), wire_word_316) | 0x3C000000 : 0x3C808080);
                     }
                     for (index = 0; index < 4; ++index)
                         w_u16(scratch + 118 + index * 12, r_u16(primitive + 4 + index * 4));
@@ -10019,7 +10031,7 @@ static uint32 *gs_tmd_fast_gradient_lit(uint32 primitive, uint32 vertices, uint3
             {
                 work = gs_tmd_work_buffer(work, 7);
                 for (index = 0; index < 3; ++index)
-                    xport_store_le32(work + 2 + index * 2, xport_gte_read_data(12 + index));
+                    (*(work + 2 + index * 2) = xport_gte_read_data(12 + index));
                 xport_gte_execute(0x158002D);
                 w_u32(scratch + 24, xport_gte_read_data(7));
                 xport_gte_write_data(6, r_u32(gouraud ? primitive + 4 : scratch));
@@ -10031,20 +10043,20 @@ static uint32 *gs_tmd_fast_gradient_lit(uint32 primitive, uint32 vertices, uint3
                 slot = (uint32)((sint32)depth >> (depth_shift & 31));
                 slot = (slot << 2) + r_u32(scratch + 16);
                 w_u32(scratch + 52, slot);
-                xport_store_le32(work + 1, xport_gte_read_data(22));
+                (*(work + 1) = xport_gte_read_data(22));
                 xport_gte_write_data(6, r_u32(primitive + 8));
                 normal = (uint32)r_u16(primitive + (gouraud ? 20 : 16)) * 8 + normals;
                 gs_tmd_load_vector(normal, 0);
                 xport_gte_execute(fog ? 0xE80413 : 0x108041B);
                 slot = r_u32(scratch + 52);
-                xport_store_le32(work, (r_u32(slot) & 0xFFFFFF) | 0x06000000);
-                xport_store_le32(work + 3, xport_gte_read_data(22));
+                (*(work) = (r_u32(slot) & 0xFFFFFF) | 0x06000000);
+                (*(work + 3) = xport_gte_read_data(22));
                 xport_gte_write_data(6, r_u32(primitive + 12));
                 normal = (uint32)r_u16(primitive + (gouraud ? 24 : 16)) * 8 + normals;
                 gs_tmd_load_vector(normal, 0);
                 xport_gte_execute(fog ? 0xE80413 : 0x108041B);
                 w_u32(r_u32(scratch + 52), gpu_packet_link((uintptr_t)work));
-                xport_store_le32(work + 5, xport_gte_read_data(22));
+                (*(work + 5) = xport_gte_read_data(22));
                 work += 7;
             }
         }
@@ -10469,9 +10481,10 @@ void GsSetAmbient(sint32 red, sint32 green, sint32 blue)
 
 void GsSetFogParam(const void *parameters)
 {
+    uint32 wire_word_322;
     const uint8 *fog = (const uint8 *)parameters;
-    xport_gte_write_control(27, (uint32)(sint32)(sint16)xport_load_le16(fog));
-    xport_gte_write_control(28, xport_load_le32(fog + 4));
+    xport_gte_write_control(27, (uint32)(sint32)(sint16)(*(const uint16 *)(fog)));
+    xport_gte_write_control(28, (memcpy(&wire_word_322, fog + 4, sizeof(wire_word_322)), wire_word_322));
     SetFarColor(fog[8], fog[9], fog[10]);
 }
 
@@ -10710,6 +10723,11 @@ void GsGetLws(uint32 coordinate, MATRIX *world, MATRIX *screen)
     gs_compose_matrices(&gs_state.view, screen, screen);
 }
 
+void gs_get_screen_matrix(MATRIX *matrix)
+{
+    memcpy(matrix, &gs_state.screen, sizeof(*matrix));
+}
+
 void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24)
 {
     uint32 index;
@@ -10820,6 +10838,7 @@ uint32 GsGetActiveBuff(void)
 
 void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
 {
+    uint32 wire_word_323;
     const uint8 *descriptor = (const uint8 *)ordering_table;
     uint32 *packet = gs_state.clear_packets[gs_state.active];
     uint32 width = (uint32)gs_screen_width;
@@ -10828,13 +10847,13 @@ void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
     xport_store_u8((uint8 *)packet + 4, red);
     xport_store_u8((uint8 *)packet + 5, green);
     xport_store_u8((uint8 *)packet + 6, blue);
-    xport_store_le16((uint8 *)packet + 8, (uint16)gs_state.buffer_x[gs_state.active]);
-    xport_store_le16((uint8 *)packet + 14, (uint16)gs_screen_height);
-    xport_store_le16((uint8 *)packet + 10, (uint16)gs_state.buffer_y[gs_state.active]);
+    (*(uint16 *)((uint8 *)packet + 8) = (uint16)((uint16)gs_state.buffer_x[gs_state.active]));
+    (*(uint16 *)((uint8 *)packet + 14) = (uint16)((uint16)gs_screen_height));
+    (*(uint16 *)((uint8 *)packet + 10) = (uint16)((uint16)gs_state.buffer_y[gs_state.active]));
     if (gs_state.display.isrgb24 != 0)
         width = width * 3 / 2;
-    xport_store_le16((uint8 *)packet + 12, (uint16)width);
-    AddPrim(psx_addr(xport_load_le32(descriptor + 16), 4), packet);
+    (*(uint16 *)((uint8 *)packet + 12) = (uint16)((uint16)width));
+    AddPrim(psx_addr((memcpy(&wire_word_323, descriptor + 16, sizeof(wire_word_323)), wire_word_323), 4), packet);
 }
 
 static uint32 *gs_work_packet(uint32 words)
@@ -10850,14 +10869,15 @@ static uint32 *gs_work_packet(uint32 words)
 
 static void gs_sort_packet(uint32 *packet, const void *ordering_table, uint16 priority, uint8 words, sint32 add_length)
 {
+    uint32 wire_word_324, wire_word_325;
     const uint8 *descriptor = (const uint8 *)ordering_table;
-    uint32 depth = (uint32)priority - xport_load_le32(descriptor + 8);
-    uint32 slot = xport_load_le32(descriptor + 4) + depth * 4;
+    uint32 depth = (uint32)priority - (memcpy(&wire_word_324, descriptor + 8, sizeof(wire_word_324)), wire_word_324);
+    uint32 slot = (memcpy(&wire_word_325, descriptor + 4, sizeof(wire_word_325)), wire_word_325) + depth * 4;
 #ifndef NDEBUG
     if (!add_length && (sint32)depth < 0)
         printf("ps_sort_sprite,bg: z resolution overflow\n");
 #endif
-    xport_store_le32(packet, ((uint32)words + (add_length ? r_u32(slot) >> 24 : 0)) << 24);
+    (*(packet) = ((uint32)words + (add_length ? r_u32(slot) >> 24 : 0)) << 24);
     AddPrim(psx_addr(slot, 4), packet);
     w_u8(slot + 3, 0);
     gs_work_cursor = packet + (uint32)words + 1;
@@ -10865,60 +10885,63 @@ static void gs_sort_packet(uint32 *packet, const void *ordering_table, uint16 pr
 
 void GsSortBoxFill(const void *box, void *ordering_table, uint32 priority)
 {
+    uint32 wire_word_327, wire_word_328;
     const uint8 *descriptor = (const uint8 *)box;
-    uint32 attribute = xport_load_le32(descriptor);
+    uint32 attribute = (memcpy(&wire_word_327, descriptor, sizeof(wire_word_327)), wire_word_327);
     uint32 *packet;
     uint8 *output;
     if ((sint32)attribute < 0)
         return;
     packet = gs_work_packet(5);
     output = (uint8 *)packet;
-    xport_store_le32(output + 4, 0xE1000200 | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60));
+    (wire_word_328 = (uint32)(0xE1000200 | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60)), memcpy(output + 4, &wire_word_328, sizeof(wire_word_328)));
     xport_store_u8(output + 8, descriptor[12]);
     xport_store_u8(output + 9, descriptor[13]);
     xport_store_u8(output + 11, (uint8)(0x60 | ((attribute >> 29) & 2)));
     xport_store_u8(output + 10, descriptor[14]);
-    xport_store_le16(output + 12, (uint16)(xport_load_le16(descriptor + 4) + gs_state.screen_offset_x));
-    xport_store_le16(output + 14, (uint16)(xport_load_le16(descriptor + 6) + gs_state.screen_offset_y));
-    xport_store_le16(output + 16, xport_load_le16(descriptor + 8));
-    xport_store_le16(output + 18, xport_load_le16(descriptor + 10));
+    (*(uint16 *)(output + 12) = (uint16)((uint16)((*(const uint16 *)(descriptor + 4)) + gs_state.screen_offset_x)));
+    (*(uint16 *)(output + 14) = (uint16)((uint16)((*(const uint16 *)(descriptor + 6)) + gs_state.screen_offset_y)));
+    (*(uint16 *)(output + 16) = (uint16)((*(const uint16 *)(descriptor + 8))));
+    (*(uint16 *)(output + 18) = (uint16)((*(const uint16 *)(descriptor + 10))));
     gs_sort_packet(packet, ordering_table, (uint16)priority, 4, 0);
 }
 
 void GsSortFastSprite(const void *sprite, void *ordering_table, uint32 priority)
 {
+    uint32 wire_word_329;
     const uint8 *descriptor = (const uint8 *)sprite;
-    uint32 attribute = xport_load_le32(descriptor);
+    uint32 attribute = (memcpy(&wire_word_329, descriptor, sizeof(wire_word_329)), wire_word_329);
     uint32 *packet;
     uint32 mode, x, y, red, green, blue, uv, clut_y, clut_x, width, height;
-    if ((sint32)attribute < 0 || xport_load_le16(descriptor + 8) == 0 || xport_load_le16(descriptor + 10) == 0)
+    if ((sint32)attribute < 0 || (*(const uint16 *)(descriptor + 8)) == 0 || (*(const uint16 *)(descriptor + 10)) == 0)
         return;
-    mode = (xport_load_le16(descriptor + 12) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60) | 0xE1000200;
-    y = xport_load_le16(descriptor + 6);
-    x = xport_load_le16(descriptor + 4);
+    mode = ((*(const uint16 *)(descriptor + 12)) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60) | 0xE1000200;
+    y = (*(const uint16 *)(descriptor + 6));
+    x = (*(const uint16 *)(descriptor + 4));
     packet = gs_work_packet(6);
-    xport_store_le32(packet + 1, mode);
+    (*(packet + 1) = mode);
     blue = descriptor[22];
     green = descriptor[21];
     red = descriptor[20];
     x += (uint16)gs_state.screen_offset_x;
     y += (uint16)gs_state.screen_offset_y;
-    xport_store_le32(packet + 3, (x & 0xFFFF) | (y << 16));
-    xport_store_le32(packet + 2, 0x64000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | (blue << 16) | (green << 8) | red);
+    (*(packet + 3) = (x & 0xFFFF) | (y << 16));
+    (*(packet + 2) = 0x64000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | (blue << 16) | (green << 8) | red);
     uv = descriptor[14] | ((uint32)descriptor[15] << 8);
-    clut_y = (uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22;
-    clut_x = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000;
-    xport_store_le32(packet + 4, uv | clut_y | clut_x);
-    height = xport_load_le16(descriptor + 10);
-    width = xport_load_le16(descriptor + 8);
-    xport_store_le32(packet + 5, width | (height << 16));
+    clut_y = (uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 18)) << 22;
+    clut_x = ((uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 16)) << 12) & 0x003F0000;
+    (*(packet + 4) = uv | clut_y | clut_x);
+    height = (*(const uint16 *)(descriptor + 10));
+    width = (*(const uint16 *)(descriptor + 8));
+    (*(packet + 5) = width | (height << 16));
     gs_sort_packet(packet, ordering_table, (uint16)priority, 5, 1);
 }
 
 void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority)
 {
+    uint32 wire_word_335, wire_word_338, wire_word_339, wire_word_340, wire_word_341, wire_word_342, wire_word_343, wire_word_344, wire_word_345, wire_word_346, wire_word_347, wire_word_348, wire_word_349, wire_word_350, wire_word_351, wire_word_352;
     const uint8 *descriptor = (const uint8 *)sprite;
-    uint32 attribute = xport_load_le32(descriptor);
+    uint32 attribute = (memcpy(&wire_word_335, descriptor, sizeof(wire_word_335)), wire_word_335);
     uint32 scale_word, rotation_word, simple, *packet, color, clut;
     uint32 u0, u1, v0, v1, tpage;
     sint32 x, y, origin_x, origin_y, angle, high, projection, flags;
@@ -10927,29 +10950,29 @@ void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority)
     VECTOR vector;
     SVECTOR angles = {0}, vertices[4] = {{0}};
     sint32 screen[4];
-    if ((sint32)attribute < 0 || xport_load_le16(descriptor + 8) == 0 || xport_load_le16(descriptor + 10) == 0)
+    if ((sint32)attribute < 0 || (*(const uint16 *)(descriptor + 8)) == 0 || (*(const uint16 *)(descriptor + 10)) == 0)
         return;
-    scale_word = xport_load_le32(descriptor + 28);
-    rotation_word = xport_load_le32(descriptor + 32);
+    memcpy(&scale_word, descriptor + 28, sizeof(scale_word));
+    memcpy(&rotation_word, descriptor + 32, sizeof(rotation_word));
     simple = (attribute >> 27) & 1;
     if (scale_word == 0x10001000 && rotation_word == 0 && (attribute & 0x00C00000) == 0)
         simple = 1;
     if (simple != 0)
     {
         packet = gs_work_packet(6);
-        x = (sint16)xport_load_le16(descriptor + 4);
-        y = (sint16)xport_load_le16(descriptor + 6);
-        xport_store_le32(packet + 1, 0xE1000200 | (xport_load_le16(descriptor + 12) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60));
+        x = (sint16)(*(const uint16 *)(descriptor + 4));
+        y = (sint16)(*(const uint16 *)(descriptor + 6));
+        (wire_word_338 = (uint32)(0xE1000200 | ((*(const uint16 *)(descriptor + 12)) & 0x1F) | ((attribute >> 17) & 0x180) | ((attribute >> 23) & 0x60)), memcpy(packet + 1, &wire_word_338, sizeof(wire_word_338)));
         color = 0x64000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | ((uint32)descriptor[22] << 16) | ((uint32)descriptor[21] << 8) | descriptor[20];
-        xport_store_le32(packet + 2, color);
-        origin_x = (sint16)xport_load_le16(descriptor + 24);
-        origin_y = (sint16)xport_load_le16(descriptor + 26);
+        (wire_word_339 = (uint32)(color), memcpy(packet + 2, &wire_word_339, sizeof(wire_word_339)));
+        origin_x = (sint16)(*(const uint16 *)(descriptor + 24));
+        origin_y = (sint16)(*(const uint16 *)(descriptor + 26));
         x = x + gs_state.screen_offset_x - origin_x;
         y = y + gs_state.screen_offset_y - origin_y;
-        xport_store_le32(packet + 3, ((uint32)x & 0xFFFF) | ((uint32)y << 16));
-        clut = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22) | (((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000);
-        xport_store_le32(packet + 4, xport_load_le16(descriptor + 14) | clut);
-        xport_store_le32(packet + 5, xport_load_le16(descriptor + 8) | ((uint32)xport_load_le16(descriptor + 10) << 16));
+        (wire_word_340 = (uint32)(((uint32)x & 0xFFFF) | ((uint32)y << 16)), memcpy(packet + 3, &wire_word_340, sizeof(wire_word_340)));
+        clut = ((uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 18)) << 22) | (((uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 16)) << 12) & 0x003F0000);
+        (wire_word_341 = (uint32)((*(const uint16 *)(descriptor + 14)) | clut), memcpy(packet + 4, &wire_word_341, sizeof(wire_word_341)));
+        (wire_word_342 = (uint32)((*(const uint16 *)(descriptor + 8)) | ((uint32)(*(const uint16 *)(descriptor + 10)) << 16)), memcpy(packet + 5, &wire_word_342, sizeof(wire_word_342)));
         gs_sort_packet(packet, ordering_table, (uint16)priority, 5, 0);
         return;
     }
@@ -10963,23 +10986,23 @@ void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority)
         angles.vz = (sint16)(((sint32)((uint32)high + rotation_word) >> 8) - (angle >> 31));
         RotMatrix(&angles, &matrix);
     }
-    if (xport_load_le32(descriptor + 28) != 0x10001000)
+    if ((memcpy(&wire_word_343, descriptor + 28, sizeof(wire_word_343)), wire_word_343) != 0x10001000)
     {
-        vector.vx = (sint16)xport_load_le16(descriptor + 28);
-        vector.vy = (sint16)xport_load_le16(descriptor + 30);
+        vector.vx = (sint16)(*(const uint16 *)(descriptor + 28));
+        vector.vy = (sint16)(*(const uint16 *)(descriptor + 30));
         vector.vz = 0;
         ScaleMatrix(&matrix, &vector);
     }
-    vector.vx = (sint16)xport_load_le16(descriptor + 4);
-    vector.vy = (sint16)xport_load_le16(descriptor + 6);
+    vector.vx = (sint16)(*(const uint16 *)(descriptor + 4));
+    vector.vy = (sint16)(*(const uint16 *)(descriptor + 6));
     vector.vz = (sint32)xport_gte_read_control(26);
     TransMatrix(&matrix, &vector);
     SetRotMatrix(&matrix);
     SetTransMatrix(&matrix);
-    origin_x = (sint16)xport_load_le16(descriptor + 24);
-    origin_y = (sint16)xport_load_le16(descriptor + 26);
-    width = xport_load_le16(descriptor + 8);
-    height = xport_load_le16(descriptor + 10);
+    origin_x = (sint16)(*(const uint16 *)(descriptor + 24));
+    origin_y = (sint16)(*(const uint16 *)(descriptor + 26));
+    width = (*(const uint16 *)(descriptor + 8));
+    height = (*(const uint16 *)(descriptor + 10));
     vertices[0].vx = (sint16)-origin_x;
     vertices[0].vy = (sint16)-origin_y;
     vertices[1].vx = (sint16)(width - origin_x);
@@ -11008,17 +11031,17 @@ void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority)
     v0 = (v0 & 255) << 8;
     v1 = (v1 & 255) << 8;
     color = 0x2C000000 | ((attribute >> 5) & 0x02000000) | ((attribute << 18) & 0x01000000) | ((uint32)descriptor[22] << 16) | ((uint32)descriptor[21] << 8) | descriptor[20];
-    xport_store_le32(packet + 2, (uint32)screen[0]);
-    xport_store_le32(packet + 1, color);
-    clut = ((uint32)(sint32)(sint16)xport_load_le16(descriptor + 18) << 22) | (((uint32)(sint32)(sint16)xport_load_le16(descriptor + 16) << 12) & 0x003F0000);
-    xport_store_le32(packet + 4, (uint32)screen[1]);
-    xport_store_le32(packet + 3, u0 | v0 | clut);
-    tpage = (xport_load_le16(descriptor + 12) & 0x1F) << 16;
-    xport_store_le32(packet + 6, (uint32)screen[2]);
-    xport_store_le32(packet + 7, u0 | v1);
-    xport_store_le32(packet + 8, (uint32)screen[3]);
-    xport_store_le32(packet + 9, u1 | v1);
-    xport_store_le32(packet + 5, u1 | v0 | tpage | ((attribute >> 1) & 0x01800000) | ((attribute >> 7) & 0x00600000));
+    (wire_word_344 = (uint32)((uint32)screen[0]), memcpy(packet + 2, &wire_word_344, sizeof(wire_word_344)));
+    (wire_word_345 = (uint32)(color), memcpy(packet + 1, &wire_word_345, sizeof(wire_word_345)));
+    clut = ((uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 18)) << 22) | (((uint32)(sint32)(sint16)(*(const uint16 *)(descriptor + 16)) << 12) & 0x003F0000);
+    (wire_word_346 = (uint32)((uint32)screen[1]), memcpy(packet + 4, &wire_word_346, sizeof(wire_word_346)));
+    (wire_word_347 = (uint32)(u0 | v0 | clut), memcpy(packet + 3, &wire_word_347, sizeof(wire_word_347)));
+    tpage = ((*(const uint16 *)(descriptor + 12)) & 0x1F) << 16;
+    (wire_word_348 = (uint32)((uint32)screen[2]), memcpy(packet + 6, &wire_word_348, sizeof(wire_word_348)));
+    (wire_word_349 = (uint32)(u0 | v1), memcpy(packet + 7, &wire_word_349, sizeof(wire_word_349)));
+    (wire_word_350 = (uint32)((uint32)screen[3]), memcpy(packet + 8, &wire_word_350, sizeof(wire_word_350)));
+    (wire_word_351 = (uint32)(u1 | v1), memcpy(packet + 9, &wire_word_351, sizeof(wire_word_351)));
+    (wire_word_352 = (uint32)(u1 | v0 | tpage | ((attribute >> 1) & 0x01800000) | ((attribute >> 7) & 0x00600000)), memcpy(packet + 5, &wire_word_352, sizeof(wire_word_352)));
     gs_sort_packet(packet, ordering_table, (uint16)priority, 9, 0);
 }
 
@@ -12976,6 +12999,7 @@ sint32 MemCardEndPSX(void)
 
 MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
 {
+    uint32 wire_word_363, wire_word_364, wire_word_365, wire_word_366, wire_word_367, wire_word_368, wire_word_369, wire_word_370;
     const uint8 *left_bytes = (const uint8 *)left;
     const uint8 *right_bytes = (const uint8 *)right;
     uint8 *output = (uint8 *)destination;
@@ -12983,26 +13007,26 @@ MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
     uint32 first, second, third;
     uint32 low[3], high[3], high_mac[3], result[3];
     uint32 component;
-    words[0] = xport_load_le32(left_bytes + 0u);
-    words[1] = xport_load_le32(left_bytes + 4u);
-    words[2] = xport_load_le32(left_bytes + 8u);
-    words[3] = xport_load_le32(left_bytes + 12u);
-    words[4] = xport_load_le32(left_bytes + 16u);
+    memcpy(&words[0], left_bytes + 0u, sizeof(words[0]));
+    memcpy(&words[1], left_bytes + 4u, sizeof(words[1]));
+    memcpy(&words[2], left_bytes + 8u, sizeof(words[2]));
+    memcpy(&words[3], left_bytes + 12u, sizeof(words[3]));
+    memcpy(&words[4], left_bytes + 16u, sizeof(words[4]));
     xport_gte_write_control(0u, words[0]);
     xport_gte_write_control(1u, words[1]);
     xport_gte_write_control(2u, words[2]);
     xport_gte_write_control(3u, words[3]);
     xport_gte_write_control(4u, words[4]);
-    first = xport_load_le16(right_bytes);
-    second = xport_load_le32(right_bytes + 4u);
-    third = xport_load_le32(right_bytes + 12u);
+    first = (*(const uint16 *)(right_bytes));
+    memcpy(&second, right_bytes + 4u, sizeof(second));
+    memcpy(&third, right_bytes + 12u, sizeof(third));
     first |= second & 0xFFFF0000u;
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    first = xport_load_le16(right_bytes + 2u);
-    second = xport_load_le32(right_bytes + 8u);
-    third = (uint32)(sint32)(sint16)xport_load_le16(right_bytes + 14u);
+    first = (*(const uint16 *)(right_bytes + 2u));
+    memcpy(&second, right_bytes + 8u, sizeof(second));
+    third = (uint32)(sint32)(sint16)(*(const uint16 *)(right_bytes + 14u));
     first |= second << 16;
     column1[0] = xport_gte_read_data(9u);
     column1[1] = xport_gte_read_data(10u);
@@ -13010,9 +13034,9 @@ MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    first = xport_load_le16(right_bytes + 4u);
-    second = xport_load_le32(right_bytes + 8u);
-    third = xport_load_le32(right_bytes + 16u);
+    first = (*(const uint16 *)(right_bytes + 4u));
+    memcpy(&second, right_bytes + 8u, sizeof(second));
+    memcpy(&third, right_bytes + 16u, sizeof(third));
     first |= second & 0xFFFF0000u;
     column2[0] = xport_gte_read_data(9u);
     column2[1] = xport_gte_read_data(10u);
@@ -13020,16 +13044,16 @@ MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
     xport_gte_write_data(0u, first);
     xport_gte_write_data(1u, third);
     xport_gte_execute(0x486012u);
-    xport_store_le32(output, (column1[0] & 0xFFFFu) | (column2[0] << 16));
-    xport_store_le32(output + 12u, (column1[2] & 0xFFFFu) | (column2[2] << 16));
+    (wire_word_363 = (uint32)((column1[0] & 0xFFFFu) | (column2[0] << 16)), memcpy(output, &wire_word_363, sizeof(wire_word_363)));
+    (wire_word_364 = (uint32)((column1[2] & 0xFFFFu) | (column2[2] << 16)), memcpy(output + 12u, &wire_word_364, sizeof(wire_word_364)));
     first = xport_gte_read_data(9u);
     second = xport_gte_read_data(10u);
-    xport_store_le32(output + 16u, xport_gte_read_data(11u));
-    xport_store_le32(output + 4u, (first & 0xFFFFu) | (column1[1] << 16));
-    xport_store_le32(output + 8u, (column2[1] & 0xFFFFu) | (second << 16));
+    (wire_word_365 = (uint32)(xport_gte_read_data(11u)), memcpy(output + 16u, &wire_word_365, sizeof(wire_word_365)));
+    (wire_word_366 = (uint32)((first & 0xFFFFu) | (column1[1] << 16)), memcpy(output + 4u, &wire_word_366, sizeof(wire_word_366)));
+    (wire_word_367 = (uint32)((column2[1] & 0xFFFFu) | (second << 16)), memcpy(output + 8u, &wire_word_367, sizeof(wire_word_367)));
     for (component = 0u; component < 3u; ++component)
     {
-        uint32 value = xport_load_le32(right_bytes + 20u + component * 4u);
+        uint32 value = (memcpy(&wire_word_368, right_bytes + 20u + component * 4u, sizeof(wire_word_368)), wire_word_368);
         uint32 magnitude = (sint32)value < 0 ? 0u - value : value;
         uint32 shifted = (magnitude >> 15u) | ((magnitude & 0x80000000u) ? 0xFFFF0000u : 0u);
         high[component] = (sint32)value < 0 ? 0u - shifted : shifted;
@@ -13046,9 +13070,9 @@ MATRIX *CompMatrixLV(MATRIX *left, MATRIX *right, MATRIX *destination)
     for (component = 0u; component < 3u; ++component)
         result[component] = xport_gte_read_data(25u + component) + (high_mac[component] << 3u);
     for (component = 0u; component < 3u; ++component)
-        result[component] += xport_load_le32(left_bytes + 20u + component * 4u);
+        result[component] += (memcpy(&wire_word_369, left_bytes + 20u + component * 4u, sizeof(wire_word_369)), wire_word_369);
     for (component = 0u; component < 3u; ++component)
-        xport_store_le32(output + 20u + component * 4u, result[component]);
+        (wire_word_370 = (uint32)(result[component]), memcpy(output + 20u + component * 4u, &wire_word_370, sizeof(wire_word_370)));
     return destination;
 }
 
@@ -13346,13 +13370,14 @@ static sint32 mc_status(sint32 channel, uint8 **image)
 
 static sint32 mc_find(const uint8 *image, const char *name)
 {
+    uint32 wire_word_371;
     uint32 block;
     if (!name || !*name || strlen(name) > 20u)
         return -1;
     for (block = 1u; block <= 15u; ++block)
     {
         const uint8 *entry = image + block * 128u;
-        if (xport_load_le32(entry) == 0x51u && memchr(entry + 10u, 0, 21u) && strcmp((const char *)entry + 10u, name) == 0)
+        if ((memcpy(&wire_word_371, entry, sizeof(wire_word_371)), wire_word_371) == 0x51u && memchr(entry + 10u, 0, 21u) && strcmp((const char *)entry + 10u, name) == 0)
             return (sint32)block;
     }
     return -1;
@@ -13360,16 +13385,17 @@ static sint32 mc_find(const uint8 *image, const char *name)
 
 static sint32 mc_chain(const uint8 *image, sint32 first, uint8 blocks[15])
 {
+    uint32 wire_word_372;
     uint32 visited = 0u, next, count = 0u;
     while (first >= 1 && first <= 15 && count < 15u)
     {
         const uint8 *entry = image + (uint32)first * 128u;
-        uint32 state = xport_load_le32(entry);
+        uint32 state = (memcpy(&wire_word_372, entry, sizeof(wire_word_372)), wire_word_372);
         if (visited & (1u << first) || entry[127] != mc_checksum(entry) || (!count && state != 0x51u) || (count && state != 0x52u && state != 0x53u))
             return -1;
         blocks[count++] = (uint8)first;
         visited |= 1u << first;
-        next = xport_load_le16(entry + 8u);
+        next = (*(const uint16 *)(entry + 8u));
         if (next == 0xFFFFu)
             return (sint32)count;
         if (state == 0x53u || next >= 15u)
@@ -13388,7 +13414,7 @@ static sint32 mc_transfer(uint8 *image)
     if (first < 0)
         return 5;
     count = mc_chain(image, first, blocks);
-    length = xport_load_le32(image + (uint32)first * 128u + 4u);
+    memcpy(&length, image + (uint32)first * 128u + 4u, sizeof(length));
     if (count < 1 || length != (uint32)count * 8192u)
         return 2;
     if (mc_offset < 0 || mc_bytes < 0 || (uint32)mc_offset > length || (uint32)mc_bytes > length - (uint32)mc_offset)
@@ -13542,6 +13568,7 @@ MemCB MemCardCallback(MemCB callback)
 
 sint32 MemCardFormat(sint32 channel)
 {
+    uint32 wire_word_374;
     sint32 socket = mc_socket(channel);
     uint8 *image;
     uint32 frame;
@@ -13560,8 +13587,8 @@ sint32 MemCardFormat(sint32 channel)
         if (frame < 16u)
             entry[0] = 0xA0u;
         else
-            xport_store_le32(entry, 0xFFFFFFFFu);
-        xport_store_le16(entry + 8u, 0xFFFFu);
+            (wire_word_374 = (uint32)(0xFFFFFFFFu), memcpy(entry, &wire_word_374, sizeof(wire_word_374)));
+        (*(uint16 *)(entry + 8u) = (uint16)(0xFFFFu));
         entry[127] = mc_checksum(entry);
     }
     memcpy(image + 63u * 128u, image, 128u);
@@ -13571,6 +13598,7 @@ sint32 MemCardFormat(sint32 channel)
 
 sint32 MemCardCreateFile(sint32 channel, char *name, sint32 count)
 {
+    uint32 wire_word_375, wire_word_376;
     uint8 *image = NULL, free_blocks[15];
     sint32 status, found = 0;
     uint32 block;
@@ -13587,7 +13615,7 @@ sint32 MemCardCreateFile(sint32 channel, char *name, sint32 count)
     for (block = 1u; block <= 15u && found < count; ++block)
     {
         uint8 *entry = image + block * 128u;
-        uint32 state = xport_load_le32(entry);
+        uint32 state = (memcpy(&wire_word_375, entry, sizeof(wire_word_375)), wire_word_375);
         if (entry[127] != mc_checksum(entry))
             return 2;
         if (state >= 0xA0u && state <= 0xA3u)
@@ -13600,10 +13628,10 @@ sint32 MemCardCreateFile(sint32 channel, char *name, sint32 count)
         uint8 *entry = image + (uint32)free_blocks[found] * 128u;
         memset(entry, 0, 128u);
         entry[0] = found == 0 ? 0x51u : found + 1 == count ? 0x53u : 0x52u;
-        xport_store_le16(entry + 8u, found + 1 == count ? 0xFFFFu : (uint16)(free_blocks[found + 1] - 1u));
+        (*(uint16 *)(entry + 8u) = (uint16)(found + 1 == count ? 0xFFFFu : (uint16)(free_blocks[found + 1] - 1u)));
         if (!found)
         {
-            xport_store_le32(entry + 4u, (uint32)count * 8192u);
+            (wire_word_376 = (uint32)((uint32)count * 8192u), memcpy(entry + 4u, &wire_word_376, sizeof(wire_word_376)));
             memcpy(entry + 10u, name, length + 1u);
         }
         entry[127] = mc_checksum(entry);
@@ -13665,6 +13693,7 @@ static sint32 mc_matches(const char *pattern, const char *name)
 
 sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, sint32 *files, sint32 offset, sint32 maximum)
 {
+    uint32 wire_word_377, wire_word_378;
     uint8 *image = NULL;
     sint32 status, skipped = 0, copied = 0;
     uint32 block;
@@ -13678,7 +13707,7 @@ sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, si
     for (block = 1u; block <= 15u && copied < maximum; ++block)
     {
         uint8 *entry = image + block * 128u;
-        if (xport_load_le32(entry) != 0x51u)
+        if ((memcpy(&wire_word_377, entry, sizeof(wire_word_377)), wire_word_377) != 0x51u)
             continue;
         if (entry[127] != mc_checksum(entry) || !memchr(entry + 10u, 0, 21u))
             return 2;
@@ -13689,7 +13718,7 @@ sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, si
         memset(&directory[copied], 0, sizeof(DIRENTRY));
         memcpy(directory[copied].name, entry + 10u, 20u);
         directory[copied].attr = 0x51;
-        directory[copied].size = (sint32)xport_load_le32(entry + 4u);
+        directory[copied].size = (sint32)(memcpy(&wire_word_378, entry + 4u, sizeof(wire_word_378)), wire_word_378);
         directory[copied].head = (sint32)block;
         ++copied;
     }
@@ -14393,6 +14422,324 @@ uint32 sprintfPSX(uint32 destination, uint32 format, uint32 value)
     }
     w_u8(destination + count, 0u);
     return count;
+}
+
+uint32 psx_format_arguments(XportMemoryRef destination, XportMemoryRef format, XportMemoryRef defaults, PsxFormatArgumentReader read_argument, void *context)
+{
+    uint32 wire_word_379, wire_word_380, wire_word_381, wire_word_382;
+    static const uint8 lower_digits[] = "0123456789abcdef";
+    static const uint8 upper_digits[] = "0123456789ABCDEF";
+    uint8 buffer[528];
+    uint32 cursor = 0, written = 0, flags, width, precision;
+    uint32 value, radix, start, length, source_offset, index, byte, sign;
+    sint32 character;
+    PsxFormatArgument argument;
+    PsxFormatArgumentKind kind;
+    XportMemoryRef source, target;
+    const uint8 *alphabet;
+    int backwards;
+
+    if ((destination.kind != XPORT_MEMORY_REF_HOST && destination.kind != XPORT_MEMORY_REF_GUEST) || (format.kind != XPORT_MEMORY_REF_HOST && format.kind != XPORT_MEMORY_REF_GUEST) || (defaults.kind != XPORT_MEMORY_REF_HOST && defaults.kind != XPORT_MEMORY_REF_GUEST) || (destination.kind == XPORT_MEMORY_REF_HOST && !destination.host_pointer) || (format.kind == XPORT_MEMORY_REF_HOST && !format.host_pointer) || (defaults.kind == XPORT_MEMORY_REF_HOST && !defaults.host_pointer))
+        abort();
+    character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address) : xport_load_u8(format.host_pointer));
+    while (character)
+    {
+        if (character != '%')
+        {
+            if (destination.kind == XPORT_MEMORY_REF_GUEST)
+                w_u8(destination.guest_address + written, character);
+            else
+                xport_store_u8((uint8 *)destination.host_pointer + written, character);
+            ++written;
+            goto next_format_character;
+        }
+        flags = defaults.kind == XPORT_MEMORY_REF_GUEST ? r_u32(defaults.guest_address) : (memcpy(&wire_word_379, defaults.host_pointer, sizeof(wire_word_379)), wire_word_379);
+        width = defaults.kind == XPORT_MEMORY_REF_GUEST ? r_u32(defaults.guest_address + 4) : (memcpy(&wire_word_380, (const uint8 *)defaults.host_pointer + 4, sizeof(wire_word_380)), wire_word_380);
+        precision = defaults.kind == XPORT_MEMORY_REF_GUEST ? r_u32(defaults.guest_address + 8) : (memcpy(&wire_word_381, (const uint8 *)defaults.host_pointer + 8, sizeof(wire_word_381)), wire_word_381);
+        for (;;)
+        {
+            ++cursor;
+            character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+            if (character == '-')
+                flags |= 1;
+            else if (character == '+')
+                flags |= 2;
+            else if (character == ' ')
+                flags = (flags & 0xFFFF00FFu) | 0x2000;
+            else if (character == '#')
+                flags |= 4;
+            else if (character == '0')
+                flags |= 8;
+            else
+                break;
+        }
+        if (character == '*')
+        {
+            if (!read_argument || !read_argument(context, PSX_FORMAT_SIGNED_WORD, &argument))
+                abort();
+            width = argument.value;
+            if ((sint32)width < 0)
+            {
+                width = 0u - width;
+                flags |= 1;
+            }
+            ++cursor;
+            character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+        }
+        else
+        {
+            while ((uint32)(character - '0') < 10)
+            {
+                width = width * 10 + (uint32)(character - '0');
+                ++cursor;
+                character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+            }
+        }
+        if (character == '.')
+        {
+            ++cursor;
+            character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+            if (character == '*')
+            {
+                if (!read_argument || !read_argument(context, PSX_FORMAT_SIGNED_WORD, &argument))
+                    abort();
+                precision = argument.value;
+                ++cursor;
+                character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+            }
+            else
+            {
+                while ((uint32)(character - '0') < 10)
+                {
+                    precision = precision * 10 + (uint32)(character - '0');
+                    ++cursor;
+                    character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+                }
+            }
+            if ((sint32)precision >= 0)
+                flags |= 0x10;
+        }
+        if (flags & 1)
+            flags &= ~8u;
+        while (character == 'h' || character == 'l' || character == 'L')
+        {
+            flags |= character == 'h' ? 0x20u : character == 'l' ? 0x40u : 0x80u;
+            ++cursor;
+            character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+        }
+        if (character == '%')
+        {
+            if (destination.kind == XPORT_MEMORY_REF_GUEST)
+                w_u8(destination.guest_address + written, '%');
+            else
+                xport_store_u8((uint8 *)destination.host_pointer + written, '%');
+            ++written;
+            goto next_format_character;
+        }
+        if (character == 'n')
+        {
+            kind = flags & 0x20 ? PSX_FORMAT_COUNT16_REFERENCE : PSX_FORMAT_COUNT32_REFERENCE;
+            if (!read_argument || !read_argument(context, kind, &argument))
+                abort();
+            if (argument.reference.kind == XPORT_MEMORY_REF_GUEST)
+            {
+                if (flags & 0x20)
+                    w_u16(argument.reference.guest_address, written);
+                else
+                    w_u32(argument.reference.guest_address, written);
+            }
+            else if (argument.reference.kind == XPORT_MEMORY_REF_HOST && argument.reference.host_pointer)
+            {
+                if (flags & 0x20)
+                    (*(uint16 *)(argument.reference.host_pointer) = (uint16)(written));
+                else
+                    (wire_word_382 = (uint32)(written), memcpy(argument.reference.host_pointer, &wire_word_382, sizeof(wire_word_382)));
+            }
+            else
+                abort();
+            goto next_format_character;
+        }
+        source_offset = 0;
+        if (character == 's')
+        {
+            if (!read_argument || !read_argument(context, PSX_FORMAT_STRING_REFERENCE, &argument))
+                abort();
+            source = argument.reference;
+            if (source.kind != XPORT_MEMORY_REF_GUEST && source.kind != XPORT_MEMORY_REF_HOST)
+                abort();
+            if (flags & 4)
+            {
+                if (source.kind == XPORT_MEMORY_REF_HOST && !source.host_pointer)
+                    abort();
+                length = source.kind == XPORT_MEMORY_REF_GUEST ? r_u8(source.guest_address) : xport_load_u8(source.host_pointer);
+                source_offset = 1;
+                if ((flags & 0x10) && (sint32)precision < (sint32)length)
+                    length = precision;
+            }
+            else
+            {
+                length = 0;
+                if ((source.kind == XPORT_MEMORY_REF_GUEST && !source.guest_address) || (source.kind == XPORT_MEMORY_REF_HOST && !source.host_pointer))
+                    length = flags & 0x10 ? precision : 0;
+                else if ((flags & 0x10) && (sint32)precision <= 0)
+                    length = precision;
+                else
+                {
+                    while (!(flags & 0x10) || (sint32)length < (sint32)precision)
+                    {
+                        byte = source.kind == XPORT_MEMORY_REF_GUEST ? r_u8(source.guest_address + length) : xport_load_u8((const uint8 *)source.host_pointer + length);
+                        if (!byte)
+                            break;
+                        ++length;
+                    }
+                }
+            }
+        }
+        else if (character == 'c')
+        {
+            if (!read_argument || !read_argument(context, PSX_FORMAT_SIGNED_WORD, &argument))
+                abort();
+            buffer[sizeof(buffer) - 1] = (uint8)argument.value;
+            source = xport_host_ref(buffer);
+            source_offset = (uint32)sizeof(buffer) - 1;
+            length = 1;
+        }
+        else if (character == 'd' || character == 'i' || character == 'u' || character == 'o' || character == 'x' || character == 'X' || character == 'p')
+        {
+            kind = character == 'd' || character == 'i' ? PSX_FORMAT_SIGNED_WORD : character == 'p' ? PSX_FORMAT_POINTER_WORD : PSX_FORMAT_UNSIGNED_WORD;
+            if (!read_argument || !read_argument(context, kind, &argument))
+                abort();
+            value = argument.value;
+            if (flags & 0x20)
+                value = character == 'd' || character == 'i' ? (uint32)(sint16)value : value & 0xFFFF;
+            radix = character == 'o' ? 8 : character == 'x' || character == 'X' || character == 'p' ? 16 : 10;
+            if (character == 'd' || character == 'i')
+            {
+                if ((sint32)value < 0)
+                {
+                    value = 0u - value;
+                    flags = (flags & 0xFFFF00FFu) | 0x2D00;
+                }
+                else if (flags & 2)
+                    flags = (flags & 0xFFFF00FFu) | 0x2B00;
+            }
+            else if (character == 'u')
+                flags &= 0xFFFF00FFu;
+            if (character == 'p')
+            {
+                precision = 8;
+                flags |= 0x50;
+            }
+            sign = (flags >> 8) & 255;
+            if (!(flags & 0x10))
+            {
+                if (flags & 8)
+                {
+                    precision = width;
+                    if (radix == 10 && sign)
+                        --precision;
+                    else if (radix == 16 && (flags & 4))
+                        precision -= 2;
+                }
+                if ((sint32)precision <= 0)
+                    precision = 1;
+            }
+            alphabet = character == 'X' || character == 'p' ? upper_digits : lower_digits;
+            start = (uint32)sizeof(buffer);
+            while (value)
+            {
+                buffer[--start] = alphabet[value % radix];
+                value /= radix;
+            }
+            if (radix == 8 && (flags & 4) && start < sizeof(buffer) && buffer[start] != '0')
+                buffer[--start] = '0';
+            while ((sint32)(sizeof(buffer) - start) < (sint32)precision)
+            {
+                if (!start)
+                    abort();
+                buffer[--start] = '0';
+            }
+            if (radix == 10 && sign)
+            {
+                if (!start)
+                    abort();
+                buffer[--start] = (uint8)sign;
+            }
+            else if (radix == 16 && (flags & 4))
+            {
+                if (start < 2)
+                    abort();
+                buffer[--start] = (uint8)character;
+                buffer[--start] = '0';
+            }
+            source = xport_host_ref(buffer);
+            source_offset = start;
+            length = (uint32)sizeof(buffer) - start;
+        }
+        else
+            break;
+        if (!(flags & 1))
+        {
+            while ((sint32)length < (sint32)width)
+            {
+                if (destination.kind == XPORT_MEMORY_REF_GUEST)
+                    w_u8(destination.guest_address + written, ' ');
+                else
+                    xport_store_u8((uint8 *)destination.host_pointer + written, ' ');
+                --width;
+                ++written;
+            }
+        }
+        if ((sint32)length > 0)
+        {
+            if (source.kind == XPORT_MEMORY_REF_HOST && !source.host_pointer)
+                abort();
+            if (source.kind == XPORT_MEMORY_REF_GUEST && destination.kind == XPORT_MEMORY_REF_GUEST)
+            {
+                backwards = destination.guest_address + written >= source.guest_address + source_offset;
+                for (index = 0; index < length; ++index)
+                {
+                    value = backwards ? length - index - 1 : index;
+                    byte = r_u8(source.guest_address + source_offset + value);
+                    w_u8(destination.guest_address + written + value, byte);
+                }
+            }
+            else if (source.kind == XPORT_MEMORY_REF_HOST && destination.kind == XPORT_MEMORY_REF_HOST)
+                memmove((uint8 *)destination.host_pointer + written, (const uint8 *)source.host_pointer + source_offset, length);
+            else
+            {
+                target = destination;
+                if (target.kind == XPORT_MEMORY_REF_GUEST)
+                    target.guest_address += written;
+                else
+                    target.host_pointer = (uint8 *)target.host_pointer + written;
+                if (source.kind == XPORT_MEMORY_REF_GUEST)
+                    source.guest_address += source_offset;
+                else
+                    source.host_pointer = (uint8 *)source.host_pointer + source_offset;
+                if (!xport_guest_copy(target, source, length))
+                    abort();
+            }
+        }
+        written += length;
+        while ((sint32)length < (sint32)width)
+        {
+            if (destination.kind == XPORT_MEMORY_REF_GUEST)
+                w_u8(destination.guest_address + written, ' ');
+            else
+                xport_store_u8((uint8 *)destination.host_pointer + written, ' ');
+            ++length;
+            ++written;
+        }
+    next_format_character:
+        ++cursor;
+        character = (sint8)(format.kind == XPORT_MEMORY_REF_GUEST ? r_u8(format.guest_address + cursor) : xport_load_u8((const uint8 *)format.host_pointer + cursor));
+    }
+    if (destination.kind == XPORT_MEMORY_REF_GUEST)
+        w_u8(destination.guest_address + written, 0);
+    else
+        xport_store_u8((uint8 *)destination.host_pointer + written, 0);
+    return written;
 }
 
 PsxCallbackDriver *psx_callback_reset_driver(void)

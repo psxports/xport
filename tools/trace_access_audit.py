@@ -23,8 +23,7 @@ DIRECT_REGIONS = {"DRAM", "SCRATCHPAD", "VRAM"}
 COMMON_ACCESS = {"r_u8", "r_u16", "r_u32", "r_s8", "r_s16",
                  "r_s32", "w_u8", "w_u16", "w_u32",
                  "w_masked_u32", "xport_update_u8", "xport_update_u16", "xport_update_u32",
-                 "xport_load_le16", "xport_load_le32", "xport_store_le16",
-                 "xport_store_le32", "xport_guest_copy", "xport_guest_fill", "xport_guest_ptr", "xport_guest_cptr"}
+                 "xport_guest_copy", "xport_guest_fill", "xport_guest_ptr", "xport_guest_cptr"}
 for _family_names in FAMILIES.values():
     _family_names.update(COMMON_ACCESS)
 
@@ -225,8 +224,8 @@ def _classification(family, node):
     if family == "rrj" and name == "rrj_write32":
         return "common_access", "write", True, "w_u32(ADDRESS, VALUE)", None
     if family == "rrj" and name in {"rrj_u16", "rrj_u32", "rrj_put16", "rrj_put32"}:
-        replacement = {"rrj_u16": "xport_load_le16", "rrj_u32": "xport_load_le32",
-                       "rrj_put16": "xport_store_le16", "rrj_put32": "xport_store_le32"}[name]
+        replacement = {"rrj_u16": "typed uint16 field", "rrj_u32": "typed uint32 field or bounded memcpy",
+                       "rrj_put16": "typed uint16 field assignment", "rrj_put32": "typed uint32 field or bounded memcpy"}[name]
         return "common_access", "read" if name.startswith("rrj_u") else "write", True, replacement, None
     if family == "rrj" and name == "rrj_at":
         if node["parent"] in {"rrj_u16", "rrj_u32", "rrj_put16", "rrj_put32"}:

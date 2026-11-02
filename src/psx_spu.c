@@ -71,9 +71,6 @@ static sint32 transfer_pending;
 static XportDeviceOperation transfer_operation;
 static void spu_irq_check_range(uint32 address, uint32 bytes);
 
-
-
-
 static void cd_notify_command(uint8 command);
 static void cd_record_stream_command_locked(uint8 command);
 
@@ -872,7 +869,6 @@ static void spu_reverb_reset_cursor(void)
     spu.reverb_cursor = 0u;
 }
 
-
 enum
 {
     VAB_BANK_COUNT = 16,
@@ -1116,7 +1112,6 @@ static void cd_queue_callback(uint32 kind, uint8 status, const uint8 *response)
 static CdlLOC cd_toc[100];
 
 static sint32 cd_toc_track_count;
-
 
 const uint16 spu_sequence_voice_defaults[8] = {0x0, 0x0, 0x1000, 0x3000, 0xbf, 0x0, 0x0, 0x0};
 const uint16 spu_sequence_common_defaults[16] = {0x3fff, 0x3fff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
@@ -1615,7 +1610,6 @@ static void spu_synchronize_device_clock(void)
 {
 }
 
-
 static sint32 spu_mmio_timed_read16(uint32 physical_address, uint16 *value)
 {
     spu_synchronize_device_clock();
@@ -2073,14 +2067,16 @@ static const VAB_PROGRAM *vab_get_program(sint16 bank, sint16 program)
 
 static const VAB_TONE *vab_get_tone(sint16 bank, sint16 program, sint16 tone)
 {
+    uint32 wire_word_1;
     const VAB_PROGRAM *program_entry = vab_get_program(bank, program);
     if (program_entry == 0 || tone < 0 || tone >= program_entry->tone_count)
         return 0;
-    return &libsnd.banks[bank].tones[xport_load_le32((const uint8 *)program_entry + 8)][tone];
+    return &libsnd.banks[bank].tones[(memcpy(&wire_word_1, (const uint8 *)program_entry + 8, sizeof(wire_word_1)), wire_word_1)][tone];
 }
 
 static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
 {
+    uint32 wire_word_2;
     const VAB_HEADER_RECORD *header_record = (const VAB_HEADER_RECORD *)header;
     VAB_BANK *parsed = &vab_parse_banks[0];
     uint16 program_count;
@@ -2124,7 +2120,7 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
         uint32 tone;
         memcpy(destination, source, sizeof(*destination));
         // PsyQ reserves the program word at8 for its compact tone group
-        xport_store_le32((uint8 *)destination + 8, tone_group);
+        (wire_word_2 = (uint32)(tone_group), memcpy((uint8 *)destination + 8, &wire_word_2, sizeof(wire_word_2)));
         if (source->tone_count == 0)
             continue;
         if (source->tone_count > VAB_TONES_PER_PROGRAM || tone_group >= program_count)
@@ -2149,7 +2145,7 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
         sample_offset += size;
         // Program tail halfwords hold SPU sample addresses in eight-byte units
         if (program <= sample_count)
-            xport_store_le16((uint8 *)parsed->programs + (program / 2) * 16 + ((program & 1) ? 14 : 12), (libsnd.next_sound_ram_address + sample_offset) >> 3);
+            (*(uint16 *)((uint8 *)parsed->programs + (program / 2) * 16 + ((program & 1) ? 14 : 12)) = (uint16)((libsnd.next_sound_ram_address + sample_offset) >> 3));
     }
     parsed->body_size = sample_offset;
     if (parsed->body_size == 0 || libsnd.next_sound_ram_address > SPU_RAM_SIZE || parsed->body_size > SPU_RAM_SIZE - libsnd.next_sound_ram_address)
@@ -2163,6 +2159,7 @@ static sint16 vab_open_head(const uint8 *header, sint16 requested_bank)
 
 sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16 requested_bank, uint32 body_address)
 {
+    uint32 wire_word_4, wire_word_5;
     VAB_BANK *parsed = &vab_parse_banks[1];
     uint32 magic, capacity, program_count, sample_count, size_offset;
     uint32 program, tone_group, sample, total, length, scale;
@@ -2170,12 +2167,12 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
     sint16 bank;
     if (header == NULL || header_bytes < sizeof(VAB_HEADER_RECORD) || body_address > SPU_RAM_SIZE)
         return -1;
-    magic = xport_load_le32(header);
-    version = (sint32)xport_load_le32(header + 4);
+    memcpy(&magic, header, sizeof(magic));
+    version = (sint32)(memcpy(&wire_word_4, header + 4, sizeof(wire_word_4)), wire_word_4);
     if ((magic >> 8) != 0x564142)
         return -1;
     capacity = (uint8)magic == 112 && version >= 5 ? 128 : 64;
-    program_count = xport_load_le16(header + 18);
+    program_count = (*(const uint16 *)(header + 18));
     sample_count = header[22];
     if (program_count > capacity)
         return -1;
@@ -2193,7 +2190,7 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
         VAB_PROGRAM *entry = parsed->programs + program;
         if (entry->tone_count > VAB_TONES_PER_PROGRAM)
             goto failed;
-        xport_store_le32((uint8 *)entry + 8, tone_group);
+        (wire_word_5 = (uint32)(tone_group), memcpy((uint8 *)entry + 8, &wire_word_5, sizeof(wire_word_5)));
         if (entry->tone_count != 0)
         {
             if (tone_group >= program_count)
@@ -2205,13 +2202,13 @@ sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16
     scale = version >= 5 ? 3 : 2;
     for (sample = 0; sample <= sample_count; ++sample)
     {
-        length = (uint32)xport_load_le16(header + size_offset + sample * 2) << scale;
+        length = (uint32)(*(const uint16 *)(header + size_offset + sample * 2)) << scale;
         if (length > SPU_RAM_SIZE - body_address - total)
             goto failed;
         if (sample != 0)
             parsed->sample_addresses[sample] = body_address + total;
         total += length;
-        xport_store_le16((uint8 *)parsed->programs + (sample / 2) * 16 + ((sample & 1) ? 14 : 12), (body_address + total) >> 3);
+        (*(uint16 *)((uint8 *)parsed->programs + (sample / 2) * 16 + ((sample & 1) ? 14 : 12)) = (uint16)((body_address + total) >> 3));
     }
     parsed->body_address = body_address;
     parsed->body_size = total;
@@ -2462,6 +2459,7 @@ sint16 SsUtGetVabHdr(sint16 bank, VabHdr *attributes)
 
 sint32 spu_vab_select_native(uint16 bank, sint16 program)
 {
+    uint32 wire_word_7;
     const VAB_BANK *entry;
     uint32 magic, capacity;
     sint32 version;
@@ -2472,8 +2470,8 @@ sint32 spu_vab_select_native(uint16 bank, sint16 program)
         return -1;
     }
     entry = libsnd.banks + bank;
-    magic = xport_load_le32(&entry->header);
-    version = (sint32)xport_load_le32((const uint8 *)&entry->header + 4);
+    memcpy(&magic, &entry->header, sizeof(magic));
+    version = (sint32)(memcpy(&wire_word_7, (const uint8 *)&entry->header + 4, sizeof(wire_word_7)), wire_word_7);
     capacity = (uint8)magic == 112 && version >= 5 ? 128 : 64;
     if (program < 0 || (uint32)program >= capacity)
     {
@@ -2537,7 +2535,7 @@ sint16 SsUtGetProgAtr(sint16 bank, sint16 program, ProgAtr *attributes)
         destination[index] = source[index];
     }
     source = (const uint8 *)(libsnd.banks[bank].programs + program);
-    value = xport_load_le16(source + 6);
+    value = (*(const uint16 *)(source + 6));
     memcpy(destination + 6, &value, sizeof(value));
     xport_audio_unlock();
     return 0;
@@ -2587,7 +2585,7 @@ sint16 spu_vab_get_vag_atr_native(sint16 bank, sint16 program, sint16 tone, VagA
 #endif
     for (index = 16; index < 24; index += 2)
     {
-        value = xport_load_le16(source + index);
+        value = (*(const uint16 *)(source + index));
         memcpy(destination + index, &value, sizeof(value));
     }
     xport_audio_unlock();
@@ -2626,7 +2624,7 @@ sint16 SsUtSetVagAtr(sint16 bank, sint16 program, sint16 tone, const VagAtr *att
     destination = (uint8 *)libsnd.banks[spu_vm_state()->note.bank].tones + displacement;
     for (index = 16; index < 24; index += 2)
     {
-        value = xport_load_le16(source + index);
+        value = (*(const uint16 *)(source + index));
         memcpy(destination + index, &value, sizeof(value));
     }
     xport_audio_unlock();
@@ -2895,13 +2893,14 @@ sint16 SsUtGetVagAtr(sint16 bank, sint16 program, sint16 tone, VagAtr *output)
 #else
 sint16 SsUtGetVagAtr(sint16 bank, sint16 program, sint16 tone, VagAtr *attributes)
 {
+    uint32 wire_word_8;
     sint16 result = -1;
     if (!attributes)
         return result;
     xport_audio_lock();
     if (bank >= 0 && bank < VAB_BANK_COUNT && libsnd.banks[bank].valid && program >= 0 && program < VAB_PROGRAM_COUNT && libsnd.banks[bank].programs[program].tone_count && tone >= 0 && tone < VAB_TONES_PER_PROGRAM)
     {
-        memcpy(attributes, &libsnd.banks[bank].tones[xport_load_le32((const uint8 *)&libsnd.banks[bank].programs[program] + 8)][tone], sizeof(*attributes));
+        memcpy(attributes, &libsnd.banks[bank].tones[(memcpy(&wire_word_8, (const uint8 *)&libsnd.banks[bank].programs[program] + 8, sizeof(wire_word_8)), wire_word_8)][tone], sizeof(*attributes));
         result = 0;
     }
     xport_audio_unlock();
@@ -3736,7 +3735,7 @@ static void spu_reset_write_by_io(const uint8 *source, uint32 bytes, sint32 nati
         port = SPU_REGISTER_BASE;
         for (written = 0; (sint32)written < (sint32)chunk; written += 2)
         {
-            spu_reset_write(port + 424, xport_load_le16(source), native);
+            spu_reset_write(port + 424, (*(const uint16 *)(source)), native);
             source += 2;
         }
         port = SPU_REGISTER_BASE;
@@ -4758,7 +4757,7 @@ sint16 SsGetActualProgFromProg(sint16 bank, sint16 program)
     SpuVabNativeView view;
     if (signed_program < 0 || !spu_vab_native_view((sint16)bank, &view) || (uint32)signed_program >= view.program_bytes / 16)
         return -1;
-    return (sint16)xport_load_le16(view.programs + signed_program * 16 + 8);
+    return (sint16)(*(const uint16 *)(view.programs + signed_program * 16 + 8));
 }
 
 #if defined(XPORT_NATIVE_VM) && XPORT_NATIVE_VM
@@ -4772,7 +4771,7 @@ sint32 SsUtGetVagAddr(sint16 bank, sint16 vag)
     index = ((sint32)(sint16)vag - 1) / 2;
     table = spu_vm_native_bank().programs;
     offset = (vag & 1) ? 12 : 14;
-    return (sint32)((uint32)xport_load_le16(table + ((uint32)index << 4) + offset) << 3);
+    return (sint32)((uint32)(*(const uint16 *)(table + ((uint32)index << 4) + offset)) << 3);
 }
 #else
 sint32 SsUtGetVagAddr(sint16 bank, sint16 vag)
@@ -5410,7 +5409,6 @@ static void decode_voice_block(SPU_VOICE *voice)
     voice->decoded_valid = 1;
 }
 
-
 static sint32 interpolate_voice(const SPU_VOICE *voice)
 {
     uint32 fraction = (voice->phase >> 4) & 0xff;
@@ -5722,8 +5720,7 @@ static uint8 *cd_track_load(const char *path, uint32 *size, FILE **opened_file)
         return 0;
     }
     data = (uint8 *)calloc(1, (size_t)length);
-    if (data == 0
-    )
+    if (data == 0)
     {
         free(data);
         fclose(file);
@@ -5874,8 +5871,7 @@ static sint32 cd_play_file_at(const char *path, sint32 mode, sint32 selected, si
     if (path == 0 || mode < 0 || sector < 0)
         return 0;
     data = cd_track_load(path, &size, &file);
-    if (data == 0
-    )
+    if (data == 0)
     {
 #ifdef AP_WEB
         web_music_close(data);
@@ -7196,10 +7192,6 @@ void spu_render_vblank(sint16 *interleaved_stereo, uint32 frame_count)
     spu_render(interleaved_stereo, frame_count);
 }
 
-
-
-
-
 static FILE *cd_image;
 static uint32 cd_image_sectors;
 static uint32 cd_sector_cursor;
@@ -7713,16 +7705,6 @@ typedef struct CD_XA_STATE
 } CD_XA_STATE;
 
 static CD_XA_STATE cd_xa;
-
-
-
-
-
-
-
-
-
-
 
 static void cd_xa_stop_locked(void)
 {
@@ -10536,18 +10518,18 @@ uint32 spu_sequence_vm_prepare_voice(void)
     sample = ((sint32)(sint16)value - 1) / 2;
     data = spu_vab_native_current().programs + (uint32)sample * 16;
     index = (uint32)(sint32)(sint16)spu_vm_state()->note.register_index;
-    value = xport_load_le16(data + ((value & 1) != 0 ? 12 : 14));
+    value = (*(const uint16 *)(data + ((value & 1) != 0 ? 12 : 14)));
     spu_vm_state()->registers[index + 3] = (uint16)(value);
     voice = (uint32)(sint32)(sint16)spu_vm_state()->note.voice;
     spu_vm_state()->dirty[voice] = (uint8)(spu_vm_state()->dirty[voice] | 8);
     tone = 16 * spu_vm_state()->note.program_tone_index + spu_vm_state()->note.tone;
     table = spu_vab_native_current().tones;
     index = (uint32)(sint32)(sint16)spu_vm_state()->note.register_index;
-    value = xport_load_le16(table + tone * 32 + 16);
+    value = (*(const uint16 *)(table + tone * 32 + 16));
     spu_vm_state()->registers[index + 4] = (uint16)(value);
     tone = 16 * spu_vm_state()->note.program_tone_index + spu_vm_state()->note.tone;
     index = (uint32)(sint32)(sint16)spu_vm_state()->note.register_index;
-    value = xport_load_le16(table + tone * 32 + 18);
+    value = (*(const uint16 *)(table + tone * 32 + 18));
     value += spu_vm_state()->release_offset;
     spu_vm_state()->registers[index + 5] = (uint16)(value);
     voice = (uint32)(sint32)(sint16)spu_vm_state()->note.voice;
@@ -11203,7 +11185,7 @@ uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, 
     data = spu_vab_native_current().header;
     spu_vm_state()->note.tone_count = (uint8)(value);
     value = spu_vm_state()->note.program_tone_index;
-    if (value >= xport_load_le16(data + 18))
+    if (value >= (*(const uint16 *)(data + 18)))
         return (uint32)-1;
     if (velocity == 0)
         return spu_sequence_vm_key_off(sequence, bank, program, note);
@@ -11390,7 +11372,7 @@ static sint16 spu_sequence_vm_key_on_tone(uint16 voice, sint16 bank, sint16 prog
     }
     data = view.tones + tone_index * 32;
     spu_vm_state()->note.priority = data[0];
-    spu_vm_state()->note.sample = xport_load_le16(data + 22);
+    spu_vm_state()->note.sample = (*(const uint16 *)(data + 22));
     spu_vm_state()->note.tone_volume = data[2];
     spu_vm_state()->note.tone_pan = data[3];
     spu_vm_state()->note.center_note = data[4];

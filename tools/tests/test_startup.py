@@ -407,7 +407,7 @@ class StartupSupervisorTests(unittest.TestCase):
             self.assertEqual(audit['Debug']['GDBServerPort'], '45000')
             self.assertEqual(audit['Audio']['OutputMuted'], 'true')
 
-    def test_emulator_preparation_is_the_final_startup_step(self):
+    def test_emulator_preparation_defers_icon_to_the_final_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'Example-xport'
             startup.initialize_project(root, 'Example Game', 'EX', 45300)
@@ -419,15 +419,16 @@ class StartupSupervisorTests(unittest.TestCase):
                          'ida_export': {'result': {'canonical': []}},
                          'psyq': {'result': {'classification': {}}}},
                      'inventory': {}, 'recoveries': [], 'attention': None, 'failure': None}
-            capture = {'schema': 1, 'original_image': 'MAIN.EXE'}
             with mock.patch.object(startup, 'run_shared', return_value='deployed') as run_shared, \
                  mock.patch.object(startup, 'stage_sources', return_value={'staged_files': 1}) as stage:
                 completed = startup.advance(root, state)
             stage.assert_called_once_with(root)
-            self.assertEqual(completed['status'], 'complete')
+            self.assertEqual(completed['status'], 'attention')
+            self.assertEqual(completed['attention']['kind'], 'icon_review')
+            self.assertNotIn('build', completed['steps'])
             self.assertTrue((root/'DuckStation.bat').is_file())
             self.assertEqual([call.args[2][1] for call in run_shared.call_args_list], ['user', 'audit'])
-            self.assertEqual(set(completed['completion']['duckstation']['deployments']), {'user', 'audit'})
+            self.assertEqual(set(completed['steps']['emulator']['result']['deployments']), {'user', 'audit'})
 
     def test_emulator_resume_refreshes_missing_frontier_index(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -442,8 +443,9 @@ class StartupSupervisorTests(unittest.TestCase):
                  mock.patch.object(startup, 'stage_sources', return_value={'staged_files': 1}) as stage:
                 completed = startup.advance(root, state)
             stage.assert_called_once_with(root)
-            self.assertEqual(completed['status'], 'complete')
-            self.assertEqual(completed['completion']['source_index'], 'ok')
+            self.assertEqual(completed['status'], 'attention')
+            self.assertEqual(completed['attention']['kind'], 'icon_review')
+            self.assertEqual(completed['steps']['verify_frontier']['result']['source_index'], 'ok')
             self.assertEqual(run_shared.call_args_list[0].args[1:],
                              ('source_index', '--rebuild', '--no-format'))
 
@@ -601,11 +603,14 @@ class StartupSupervisorTests(unittest.TestCase):
             prepared = {'receipt': 'receipt.json', 'tools': {'ida': 'ida', 'ghidra': 'ghidra', 'plugin': 'plugin'},
                         'capabilities': {'ready': True}, 'prepared_utc': '2026-09-25T00:00:00+00:00'}
             with mock.patch.object(startup, 'validate_toolchain_receipt', return_value=prepared) as validate, \
-                 mock.patch.object(startup, 'project_preflight', return_value={'platform': 'x86'}):
+                 mock.patch.object(startup, 'project_preflight', return_value={'platform': 'x86'}), \
+                 mock.patch.object(startup.convert_video, 'convert', return_value={'status': 'not_requested', 'clips': [], 'unsupported': []}), \
+                 mock.patch.object(startup, 'prepare_ida_export', side_effect=ValueError('Stop before IDA')):
                 result = startup.advance(root, state)
             validate.assert_called_once_with()
             self.assertEqual(result['steps']['preflight']['result']['toolchain'], prepared)
-            self.assertEqual(result['attention']['kind'], 'icon_review')
+            self.assertEqual(result['failure']['step'], 'ida_export')
+            self.assertNotIn('icon', result['steps'])
             self.assertNotIn('build', result['steps'])
 
     def test_build_requires_game_icon_before_compiler(self):

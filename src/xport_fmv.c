@@ -19,6 +19,13 @@ static sint32 source_active;
 static sint32 source_audio_active;
 static sint32 player_active;
 
+#if !defined(AP_WEB)
+static sint32 fmv_native_open(const char *path);
+static sint32 fmv_native_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame);
+static void fmv_native_pause(sint32 paused);
+static void fmv_native_close(void);
+#endif
+
 static sint32 fmv_uses_source(void)
 {
 #if defined(AP_WEB)
@@ -59,7 +66,7 @@ sint32 xport_fmv_open(const char *path)
 #if defined(AP_WEB)
         result = xport_web_fmv_open(path);
 #else
-        result = -1;
+        result = fmv_native_open(path);
 #endif
     }
     source_active = result > 0;
@@ -75,7 +82,7 @@ sint32 xport_fmv_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
 #if defined(AP_WEB)
     return xport_web_fmv_next(rgb, capacity, frame);
 #else
-    return -1;
+    return fmv_native_next(rgb, capacity, frame);
 #endif
 }
 
@@ -88,6 +95,9 @@ void xport_fmv_pause(sint32 paused)
 #if defined(AP_WEB)
     else
         xport_web_fmv_pause(paused);
+#else
+    else
+        fmv_native_pause(paused);
 #endif
 }
 
@@ -104,6 +114,9 @@ void xport_fmv_close(void)
 #if defined(AP_WEB)
     else
         xport_web_fmv_close();
+#else
+    else
+        fmv_native_close();
 #endif
     source_active = 0;
     source_audio_active = 0;
@@ -127,12 +140,27 @@ typedef struct FmvBuffers
     uint32 slice[24 * FMV_MAX_HEIGHT / 2];
 } FmvBuffers;
 
+#if !defined(AP_WEB)
+typedef struct
+{
+    FmvBuffers *buffers;
+    CdlCB sync, read, ready;
+    DecDCTCallback input, output;
+    XportCleanup cleanup;
+    uint64 last_frame;
+    uint32 vlc_limit;
+    sint32 paused, ended, failed;
+} FMV_NATIVE_SOURCE;
+
+static FMV_NATIVE_SOURCE native_source;
+#endif
+
 static struct
 {
     FmvBuffers *buffers;
     DISPENV display;
     SpuCommonAttr sound;
-    PsxInterruptCallback vsync;
+    PsxVsyncCallbacks vsync;
     CdlCB sync, read, ready;
     DecDCTCallback input, output;
     XportCleanup cleanup;
@@ -185,7 +213,7 @@ static void fmv_close(void)
     if (fmv.display_valid)
         PutDispEnv(&fmv.display);
     SetDispMask(fmv.displayed);
-    psx_bios_vsync_callback(fmv.vsync);
+    (void)psx_bios_vsync_exchange(fmv.vsync);
     gpu_set_raster(fmv.raster);
     free(fmv.buffers);
     fmv.buffers = NULL;
@@ -228,11 +256,11 @@ static sint32 fmv_rectangle(uint32 width, uint32 height, sint32 page, const Xpor
 }
 
 #if !defined(AP_WEB)
-static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const StHEADER *header, sint32 page, const XportFmvPresentation *presentation)
+static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const StHEADER *header, sint32 page, const XportFmvPresentation *presentation, uint8 *rgb)
 {
     PSX_RECT rect;
     sint32 height;
-    uint32 x;
+    uint32 x, y;
     if (!fmv_rectangle(header->width, header->height, page, presentation, &rect) || (src[0] & 0xFFFF) + 1 > FMV_VLC_WORDS)
         return 0;
     if (DecDCTvlc(src, vlc) != 0)
@@ -248,9 +276,162 @@ static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const St
             memset(slice + 12 * height, 0, (rect.h - height) * 48);
         if (presentation && presentation->strip && presentation->strip(presentation->context, (uint32)rect.x, (uint8 *)slice, (uint32)rect.h) <= 0)
             return 0;
-        LoadImagePSX(&rect, slice);
+        if (rgb)
+        {
+            for (y = 0; y < header->height; ++y)
+                memcpy(rgb + (y * header->width + x) * 3, (uint8 *)slice + y * 48, 48);
+        }
+        else
+            LoadImagePSX(&rect, slice);
         rect.x += rect.w;
     }
+    return 1;
+}
+
+static void fmv_native_shutdown(void)
+{
+    XportCleanup cleanup = native_source.cleanup;
+    fmv_native_close();
+    source_active = 0;
+    if (cleanup)
+        cleanup();
+}
+
+static void fmv_native_close(void)
+{
+    sint32 vlc_size;
+    if (!native_source.buffers)
+        return;
+    CdControlB(CdlStop, NULL, NULL);
+    StUnSetRing();
+    StSetRing(NULL, 0);
+    cd_unmount_image();
+    DecDCTReset(1);
+    /* The setter accepts half the internal word limit returned by its previous call */
+    vlc_size = native_source.vlc_limit >> 1;
+    if (native_source.vlc_limit == 0xFFFFFFFF)
+        vlc_size = 0;
+    DecDCTvlcSize(vlc_size);
+    DecDCTinCallback(native_source.input);
+    DecDCToutCallback(native_source.output);
+    CdReadyCallback(native_source.ready);
+    CdReadCallback(native_source.read);
+    CdSyncCallback(native_source.sync);
+    if (xport_get_cleanup() == fmv_native_shutdown)
+        xport_set_cleanup(native_source.cleanup);
+    free(native_source.buffers);
+    memset(&native_source, 0, sizeof(native_source));
+}
+
+static sint32 fmv_native_open(const char *path)
+{
+    FmvBuffers *buffers;
+    CdlLOC location;
+    if (player_active || native_source.buffers)
+        return -1;
+    buffers = malloc(sizeof(*buffers));
+    if (!buffers)
+        return -1;
+    if (!cd_mount_stream_file(path))
+    {
+        free(buffers);
+        return -1;
+    }
+    memset(&native_source, 0, sizeof(native_source));
+    native_source.buffers = buffers;
+    native_source.sync = CdSyncCallback(NULL);
+    native_source.read = CdReadCallback(NULL);
+    native_source.ready = CdReadyCallback(NULL);
+    native_source.input = DecDCTinCallback(NULL);
+    native_source.output = DecDCToutCallback(NULL);
+    native_source.cleanup = xport_get_cleanup();
+    xport_set_cleanup(fmv_native_shutdown);
+    xport_fmv_discard_audio();
+    DecDCTReset(0);
+    native_source.vlc_limit = DecDCTvlcSize(0);
+    StSetRing(buffers->ring, FMV_RING_SECTORS);
+    StSetChannel(0);
+    StSetStream(1, 0, 0xFFFFFFFF, NULL, NULL);
+    stream_set_read_mode(0xC0);
+    native_source.last_frame = xport_timer_get();
+    CdIntToPos(0, &location);
+    if (!CdControlB(CdlSeekL, (uint8 *)&location, NULL) || !CdRead2(0xC0))
+    {
+        fmv_native_close();
+        return -1;
+    }
+    return 1;
+}
+
+static void fmv_native_pause(sint32 paused)
+{
+    if (!native_source.buffers || native_source.paused == (paused != 0))
+        return;
+    native_source.paused = paused != 0;
+    cd_set_reading_native(!native_source.paused);
+    if (!native_source.paused)
+        native_source.last_frame = xport_timer_get();
+}
+
+static sint32 fmv_native_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
+{
+    uint32 *src = NULL, *record = NULL;
+    StHEADER header;
+    uint32 encoded_capacity;
+    sint32 progress;
+    uint16 status;
+    if (!native_source.buffers || native_source.failed)
+        return -1;
+    if (native_source.paused)
+        return 0;
+    if (native_source.ended)
+        return 2;
+    for (;;)
+    {
+        status = StNextStatus(&src, &record);
+        if (status == StCOMPLETE)
+            break;
+        progress = stream_pump();
+        if (progress == 0)
+        {
+            if (xport_timer_get() - native_source.last_frame <= 5000000)
+                return 0;
+            native_source.failed = 1;
+            return -1;
+        }
+        if (progress < 0)
+        {
+            if (progress == -3 && status != StBUSY && status != StLOCK)
+            {
+                native_source.ended = 1;
+                return 2;
+            }
+            native_source.failed = 1;
+            return -1;
+        }
+    }
+    header = *(const StHEADER *)record;
+    encoded_capacity = header.nSectors * 2016;
+    if (!header.width || header.width > FMV_MAX_WIDTH || (header.width & 15) || !header.height || header.height > FMV_MAX_HEIGHT || !header.nSectors || header.nSectors >= FMV_RING_SECTORS || !header.frameSize || header.frameSize > encoded_capacity)
+    {
+        native_source.failed = 1;
+        return -1;
+    }
+    if (capacity < (uint32)header.width * header.height * 3)
+        return -1;
+    if (StGetNext(&src, &record) != 0)
+        return 0;
+    progress = xport_fmv_decode(src, native_source.buffers->vlc, native_source.buffers->slice, &header, 0, NULL, rgb);
+    StFreeRing(src);
+    if (!progress)
+    {
+        native_source.failed = 1;
+        return -1;
+    }
+    frame->width = header.width;
+    frame->height = header.height;
+    frame->number = header.frameCount;
+    native_source.last_frame = xport_timer_get();
     return 1;
 }
 #endif
@@ -319,7 +500,10 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     fmv.display_valid = gpu_get_display_env(&fmv.display);
     fmv.displayed = (_status() & 0x800000) == 0;
     fmv.raster = gpu_get_raster();
-    fmv.vsync = psx_bios_vsync_callback(NULL);
+    {
+        PsxVsyncCallbacks disabled = {NULL, 0};
+        fmv.vsync = psx_bios_vsync_exchange(disabled);
+    }
     fmv.sync = CdSyncCallback(NULL);
     fmv.read = CdReadCallback(NULL);
     fmv.ready = CdReadyCallback(NULL);
@@ -446,7 +630,7 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                         failed = !fmv_upload_rgb(&decoded_frame, page, presentation);
 #if !defined(AP_WEB)
                     else
-                        failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation);
+                        failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation, NULL);
 #endif
                 }
                 if (!failed)

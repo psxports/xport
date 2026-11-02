@@ -81,13 +81,7 @@ extern "C"
     sint32 xport_update_u32(uint32 address, XportMemoryUpdate operation, uint32 value);
 
     uint8 xport_load_u8(const void *pointer);
-    uint16 xport_load_le16(const void *pointer);
-    uint32 xport_load_le32(const void *pointer);
-    sint16 xport_load_le_s16(const void *pointer);
-    sint32 xport_load_le_s32(const void *pointer);
     sint32 xport_store_u8(void *pointer, uint32 value);
-    sint32 xport_store_le16(void *pointer, uint32 value);
-    sint32 xport_store_le32(void *pointer, uint32 value);
 
     XportMemoryRef xport_host_ref(void *pointer);
     XportMemoryRef xport_guest_ref(uint32 address);
@@ -184,8 +178,6 @@ extern "C"
     sint32 xport_update_u8_at(uint32 address, XportMemoryUpdate operation, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context);
     sint32 xport_update_u16_at(uint32 address, XportMemoryUpdate operation, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context);
     sint32 xport_update_u32_at(uint32 address, XportMemoryUpdate operation, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context);
-    sint32 xport_store_le16_at(void *pointer, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context);
-    sint32 xport_store_le32_at(void *pointer, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context);
     sint32 xport_guest_copy_at(XportMemoryRef destination, XportMemoryRef source, size_t length, const char *file, uint32 line, const char *function, const char *semantic_context);
     sint32 xport_guest_fill_at(uint32 destination, uint8 value, size_t length, const char *file, uint32 line, const char *function, const char *semantic_context);
 
@@ -205,8 +197,6 @@ extern "C"
     #define xport_update_u8(address, operation, value) xport_update_u8_at((address), (operation), (value), __FILE__, __LINE__, __func__, NULL)
     #define xport_update_u16(address, operation, value) xport_update_u16_at((address), (operation), (value), __FILE__, __LINE__, __func__, NULL)
     #define xport_update_u32(address, operation, value) xport_update_u32_at((address), (operation), (value), __FILE__, __LINE__, __func__, NULL)
-    #define xport_store_le16(pointer, value) xport_store_le16_at((pointer), (value), __FILE__, __LINE__, __func__, NULL)
-    #define xport_store_le32(pointer, value) xport_store_le32_at((pointer), (value), __FILE__, __LINE__, __func__, NULL)
     #define xport_guest_copy(destination, source, length) xport_guest_copy_at((destination), (source), (length), __FILE__, __LINE__, __func__, NULL)
     #define xport_guest_fill(destination, value, length) xport_guest_fill_at((destination), (value), (length), __FILE__, __LINE__, __func__, NULL)
 #endif
@@ -233,7 +223,6 @@ typedef struct XportAuditRecord
 
 typedef void (*XportAuditSink)(void *user, const XportAuditRecord *record);
 
-
 #if defined(__cplusplus)
 extern "C"
 {
@@ -255,7 +244,7 @@ extern "C"
     #define XPORT_WIP(image, address, name) ((void)0)
     #define XPORT_FAILURE(image, address, name) ((void)0)
 #endif
-    #define FUNCTION_MARKER_ARGS(address, image, return_kind, argument_count, ...) FUNCTION_MARKER((address), (image))
+#define FUNCTION_MARKER_ARGS(address, image, return_kind, argument_count, ...) FUNCTION_MARKER((address), (image))
 #define FUNCTION_MARKER_ALIAS(address, image) FUNCTION_MARKER((address), (image))
 
 typedef enum XportCallEdge
@@ -432,7 +421,6 @@ extern "C"
 #if defined(__cplusplus)
 }
 #endif
-
 
 /* Diagnostic streams */
 #include <stdio.h>

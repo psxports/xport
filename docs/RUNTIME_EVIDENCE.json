@@ -2,6 +2,16 @@
   "schema": 1,
   "purpose": "Retained historical source/provenance notes, not executable task policy",
   "sections": {
+    "PsyQ typed formatting": {
+      "kind": "Project-scoped implementation evidence; native verification pending",
+      "notes": [
+        "MetalGearSolid-xport/status/overlays/typed-formatter-runtime.json binds the complete original9130C MIPS review, new psx_format_arguments source and typed native adapter",
+        "Original-only fixtures: tools/review_original_formatter_contract.py (15 selected cases with explicit call models) and tools/review_original_formatter_extended.py (62 formats plus4 overlaps through actual original string helpers)",
+        "Existing sprintfPSX ABI/body and platform sprintf remain unchanged. No game source indexing, native compile/execution or full runtime equivalence has been claimed during the selected translation pass",
+        "Deferred native regression: tests.test_psx_format_arguments covers typed argument order, host/guest combinations, embedded NULs, count stores and a cached/uncached virtual-address alias. It was added but not executed during the translation pass",
+        "Reader ABIs, caller spans,528-byte numeric scratch limit and actual native/Web behavior require their scoped final integration checks before caller completion"
+      ]
+    },
     "Native ClearImage2": {
       "kind": "Historical project provenance and rollout status; not current API policy",
       "notes": [

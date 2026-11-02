@@ -1,7 +1,9 @@
-#ifndef XPORT_PSX_GTE_H
-#define XPORT_PSX_GTE_H
+#include <string.h>
 
-#include "psx.h"
+#ifndef XPORT_PSX_GTE_H
+    #define XPORT_PSX_GTE_H
+
+    #include "psx.h"
 
 /* Native PsyQ inline helpers share the runtime COP2 register bank */
 static inline void gte_lwc2(uint32 index, uint32 value)
@@ -11,7 +13,8 @@ static inline void gte_lwc2(uint32 index, uint32 value)
 
 static inline void gte_swc2(uint32 index, void *output)
 {
-    xport_store_le32(output, xport_gte_read_data(index));
+    uint32 wire_word_1;
+    (wire_word_1 = (uint32)(xport_gte_read_data(index)), memcpy(output, &wire_word_1, sizeof(wire_word_1)));
 }
 
 static inline void gte_ctc2(uint32 value, uint32 index)
@@ -21,19 +24,21 @@ static inline void gte_ctc2(uint32 value, uint32 index)
 
 static inline void gte_SetRotMatrix(const void *matrix)
 {
+    uint32 wire_word_2;
     const uint8 *bytes = (const uint8 *)matrix;
     uint32 index;
     for (index = 0; index < 4; ++index)
-        xport_gte_write_control(index, xport_load_le32(bytes + 4u * index));
-    xport_gte_write_control(4u, xport_load_le16(bytes + 16u));
+        xport_gte_write_control(index, (memcpy(&wire_word_2, bytes + 4u * index, sizeof(wire_word_2)), wire_word_2));
+    xport_gte_write_control(4u, (*(const uint16 *)(bytes + 16u)));
 }
 
 static inline void gte_SetTransVector(const void *vector)
 {
+    uint32 wire_word_3;
     const uint8 *bytes = (const uint8 *)vector;
     uint32 index;
     for (index = 0; index < 3; ++index)
-        xport_gte_write_control(5u + index, xport_load_le32(bytes + 4u * index));
+        xport_gte_write_control(5u + index, (memcpy(&wire_word_3, bytes + 4u * index, sizeof(wire_word_3)), wire_word_3));
 }
 
 static inline void gte_SetTransMatrix(const void *matrix)
@@ -60,9 +65,10 @@ static inline void gte_ldtr(sint32 x, sint32 y, sint32 z)
 
 static inline void xport_gte_load_vertex(uint32 index, const void *vector)
 {
+    uint32 wire_word_4;
     const uint8 *bytes = (const uint8 *)vector;
-    xport_gte_write_data(2u * index, xport_load_le32(bytes));
-    xport_gte_write_data(2u * index + 1u, xport_load_le16(bytes + 4u));
+    xport_gte_write_data(2u * index, (memcpy(&wire_word_4, bytes, sizeof(wire_word_4)), wire_word_4));
+    xport_gte_write_data(2u * index + 1u, (*(const uint16 *)(bytes + 4u)));
 }
 
 static inline void gte_ldv0(const void *vector)
@@ -92,7 +98,7 @@ static inline void gte_ldsv(const void *vector)
     const uint8 *bytes = (const uint8 *)vector;
     uint32 index;
     for (index = 0; index < 3; ++index)
-        xport_gte_write_data(9u + index, xport_load_le16(bytes + 2u * index));
+        xport_gte_write_data(9u + index, (*(const uint16 *)(bytes + 2u * index)));
 }
 
 static inline void gte_stsv(void *vector)
@@ -100,7 +106,7 @@ static inline void gte_stsv(void *vector)
     uint8 *bytes = (uint8 *)vector;
     uint32 index;
     for (index = 0; index < 3; ++index)
-        xport_store_le16(bytes + 2u * index, (uint16)xport_gte_read_data(9u + index));
+        (*(uint16 *)(bytes + 2u * index) = (uint16)((uint16)xport_gte_read_data(9u + index)));
 }
 
 static inline void gte_ldclmv(const void *matrix_column)
@@ -108,7 +114,7 @@ static inline void gte_ldclmv(const void *matrix_column)
     const uint8 *bytes = (const uint8 *)matrix_column;
     uint32 index;
     for (index = 0; index < 3; ++index)
-        xport_gte_write_data(9u + index, xport_load_le16(bytes + 6u * index));
+        xport_gte_write_data(9u + index, (*(const uint16 *)(bytes + 6u * index)));
 }
 
 static inline void gte_stclmv(void *matrix_column)
@@ -116,7 +122,7 @@ static inline void gte_stclmv(void *matrix_column)
     uint8 *bytes = (uint8 *)matrix_column;
     uint32 index;
     for (index = 0; index < 3; ++index)
-        xport_store_le16(bytes + 6u * index, (uint16)xport_gte_read_data(9u + index));
+        (*(uint16 *)(bytes + 6u * index) = (uint16)((uint16)xport_gte_read_data(9u + index)));
 }
 
 static inline void gte_SetDQA(sint32 coefficient)
@@ -170,9 +176,10 @@ static inline void gte_stotz(void *output)
 
 static inline void gte_stflg(void *output)
 {
+    uint32 wire_word_5;
     PsxGteSnapshot state;
     psx_gte_snapshot(&state);
-    xport_store_le32(output, (uint32)state.flag);
+    (wire_word_5 = (uint32)((uint32)state.flag), memcpy(output, &wire_word_5, sizeof(wire_word_5)));
 }
 
 static inline void gte_stlvnl(void *output)
@@ -232,38 +239,41 @@ static inline void gte_mvmva(uint32 sf, uint32 matrix, uint32 vector, uint32 tra
     xport_gte_execute(0x400012u | ((sf & 1u) << 19u) | ((matrix & 3u) << 17u) | ((vector & 3u) << 15u) | ((translation & 3u) << 13u) | ((lm & 1u) << 10u));
 }
 
-#define gte_rtps_b() gte_rtps()
-#define gte_nclip_b() gte_nclip()
-#define gte_avsz4_b() gte_avsz4()
+    #define gte_rtps_b() gte_rtps()
+    #define gte_nclip_b() gte_nclip()
+    #define gte_avsz4_b() gte_avsz4()
 
 static inline void gte_ldVXY0(const void *p)
 {
-    gte_lwc2(0u, xport_load_le32(p));
+    uint32 wire_word_6;
+    gte_lwc2(0u, (memcpy(&wire_word_6, p, sizeof(wire_word_6)), wire_word_6));
 }
 
 static inline void gte_ldVZ0(const void *p)
 {
-    gte_lwc2(1u, xport_load_le16(p));
+    gte_lwc2(1u, (*(const uint16 *)(p)));
 }
 
 static inline void gte_ldVXY1(const void *p)
 {
-    gte_lwc2(2u, xport_load_le32(p));
+    uint32 wire_word_7;
+    gte_lwc2(2u, (memcpy(&wire_word_7, p, sizeof(wire_word_7)), wire_word_7));
 }
 
 static inline void gte_ldVZ1(const void *p)
 {
-    gte_lwc2(3u, xport_load_le16(p));
+    gte_lwc2(3u, (*(const uint16 *)(p)));
 }
 
 static inline void gte_ldVXY2(const void *p)
 {
-    gte_lwc2(4u, xport_load_le32(p));
+    uint32 wire_word_8;
+    gte_lwc2(4u, (memcpy(&wire_word_8, p, sizeof(wire_word_8)), wire_word_8));
 }
 
 static inline void gte_ldVZ2(const void *p)
 {
-    gte_lwc2(5u, xport_load_le16(p));
+    gte_lwc2(5u, (*(const uint16 *)(p)));
 }
 
 #endif

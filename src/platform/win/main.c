@@ -954,7 +954,11 @@ sint32 xport_audio_init(void)
 #ifdef _DEBUG
     g_xport_audio_output_muted = audible != 0 && strcmp(audible, "0") == 0;
 #else
-    g_xport_audio_output_muted = 0;
+    {
+        char audible[2];
+        DWORD length = GetEnvironmentVariableA("XPORT_AUDIO_OUTPUT", audible, sizeof(audible));
+        g_xport_audio_output_muted = length == 1 && audible[0] == '0';
+    }
 #endif
     memset(&output, 0, sizeof(output));
 #if XPORT_AUDIO_VBLANK_QUEUE
@@ -1238,7 +1242,7 @@ sint32 xport_file_read(const char *path, void *data, size_t capacity, size_t *si
 sint32 xport_memory_readable(const void *address, size_t size)
 {
     uintptr_t begin = (uintptr_t)address;
-    return begin >= 0x00200000u && size && size <= UINTPTR_MAX - begin;
+    return begin >= 0x00010000u && size && size <= UINTPTR_MAX - begin;
 }
 
 void xport_message_error(const char *title, const char *message)

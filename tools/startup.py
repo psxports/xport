@@ -1193,17 +1193,18 @@ def advance(root, state):
                 state.setdefault('decisions', {})['tools'] = toolchain['tools']
                 result = {'toolchain': toolchain, 'project': project_preflight(root)}
                 record_step(state, step, result, started)
-                state = publish(root, state, step='icon')
+                state = publish(root, state, step='music')
             elif step == 'icon':
                 state = set_attention(root, state, 'icon_review',
-                    'Prepare and independently verify the original Memory Card icon before building',
+                    'Prepare and independently verify the original Memory Card icon before the final native build',
                     ['status/memory-card-icon/extraction.json', 'status/memory-card-icon/verification.json'],
                     {'destination': 'src/platform/win/icon.ico'}, {'approved': False})
             elif step == 'build':
                 icon = validate_game_icon(root)
                 build = run_shared(root, 'build_native')
-                record_step(state, step, {'icon': icon, 'build': build}, started)
-                state = publish(root, state, step='music')
+                git_index = stage_sources(root)
+                record_step(state, step, {'icon': icon, 'build': build, 'git_index': git_index}, started)
+                state = publish(root, state, step='finalize')
             elif step == 'music':
                 config = project(root)
                 cues = list((root/config.get('paths', {}).get('music_source', 'iso')).glob('*.cue'))
@@ -1277,6 +1278,11 @@ def advance(root, state):
                             'deployments': deployments,
                             'shared_distribution': str((TOOLS/'duckstation/distribution').resolve())}
                 record_step(state, step, emulator, started)
+                state = publish(root, state, step='icon')
+            elif step == 'finalize':
+                config = project(root)
+                emulator = state['steps']['emulator']['result']
+                record_step(state, step, {'status': 'ready'}, started)
                 from project_context import queue
                 completion = {'project': config['name'], 'short_name': config.get('short_name'),
                               'project_root': str(root), 'inputs': state.get('inventory', {}),
@@ -1323,7 +1329,7 @@ def archive_failed_artifacts(root, state):
     if step == 'ida_export':
         labels = state.get('analysis_labels', {})
         targets.extend(root/'status/ida/runs'/name for name in (labels.get('ida_plan', 'startup-ida-plan'), labels.get('ida', 'startup-ida-v1')))
-    if step in ('psyq', 'database', 'verify_frontier'):
+    if step == 'psyq':
         targets.append(root/'status/ghidra/runs'/state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1'))
         targets.append(root/'status/psyq-analyzer/runs'/state.get('analysis_labels', {}).get('psyq', 'startup-psyq-v1'))
     recovery = root/'status/startup-recovery';blobs = recovery/'blobs';blobs.mkdir(parents=True, exist_ok=True)
@@ -1650,9 +1656,23 @@ def work(root):
         atomic_json(receipt_path, receipt)
 
 
+def migrate_early_icon_attention(root, state):
+    """Move an interrupted early icon gate behind analysis and emulator setup"""
+    if (state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'icon_review' or
+            'emulator' in state.get('steps', {})):
+        return state
+    with StartupLock(root):
+        state = load_state(root)
+        if (state.get('status') != 'attention' or state.get('attention', {}).get('kind') != 'icon_review' or
+                'emulator' in state.get('steps', {})):
+            return state
+        return publish(root, state, status='running', step='music', attention=None,
+                       progress={'detail': 'Deferring the Memory Card icon to the final native build'})
+
+
 def status(root, after_revision=None, resume=True):
     root = Path(root).resolve()
-    state = load_state(root)
+    state = migrate_early_icon_attention(root, load_state(root))
     if resume and state.get('status') == 'running':
         try:
             with StartupLock(root):
@@ -1738,7 +1758,7 @@ def main():
             result = compact(refresh_completion(args.project, args.expected_revision, advance_now=False))
             dispatch_worker(args.project)
         else:
-            state = load_state(args.project)
+            state = migrate_early_icon_attention(args.project, load_state(args.project))
             if state.get('status') == 'running':dispatch_worker(args.project)
             result = compact(load_state(args.project), changed=args.after_revision is None or state['revision'] > args.after_revision)
     except (OSError, ValueError, RuntimeError) as error:

@@ -419,7 +419,7 @@ static uint8 vm_vab_read8(VM_VAB_REF source, uint32 offset)
 static uint16 vm_vab_read16(VM_VAB_REF source, uint32 offset)
 {
 #if defined(XPORT_NATIVE_VAB) && XPORT_NATIVE_VAB
-    return xport_load_le16(source + offset);
+    return (*(const uint16 *)(source + offset));
 #else
     return r_u16(source + offset);
 #endif
@@ -439,7 +439,7 @@ sint32 _SsVmVSetUp(uint16 bank, sint16 program)
     uint32 group;
     if (!spu_vab_native_view((sint16)bank, &view) || program < 0 || program >= view.program_bytes / 16)
         return -1;
-    group = xport_load_le32(view.programs + program * 16 + 8);
+    memcpy(&group, view.programs + program * 16 + 8, sizeof(group));
     w_u8(binding.context + 1, bank);
     w_u8(binding.context + 6, program);
     w_u8(binding.context + 7, group);

@@ -75,6 +75,8 @@ The fixture links `/NODEFAULTLIB`, checks startup, actual global C++ constructio
 
 ## Minimal XCRT and C++ lifetime
 
+The x86 `__ltof3` helper takes a signed 64-bit value in `EDX:ECX` and returns binary32 in `XMM0`. Its fixture checks signed extrema, powers of two, rounding boundaries and 16384 additional bit patterns against an integer rounding oracle alongside the unsigned conversion checks.
+
 Keep `atexit` callbacks and static destruction available to shared consumers.
 
 `WinMainCRTStartup` initializes the heap, walks linker-sorted `.CRT$XCA` through `.CRT$XCZ` C++ initializers and calls `exit` after `WinMain`. `atexit` retains callbacks in a heap-backed LIFO list; callbacks run outside its lock and may register additional callbacks. `abort` does not run exit callbacks. This is ordinary C++ static lifetime support, independent of STL.
@@ -82,3 +84,5 @@ Keep `atexit` callbacks and static destruction available to shared consumers.
 Release excludes diagnostic formatting, output and diagnostic strings at compile time. Keep failure conditions and termination outside Debug-only output blocks. XCRT must not implement `printf`, `fprintf`, `vfprintf`, `fputs`, `fflush` or `__acrt_iob_func`; do not replace them with success stubs or pull in the standard CRT to satisfy diagnostic calls. Debug may use normal CRT diagnostics. BIOS standard-output writes validate their arguments and discard their payload in Release. Native XCRT file writes are synchronous and unbuffered; actual resource/save writes retain their byte-count checks.
 
 Existing `sprintf`/`snprintf` format into caller-owned buffers using Windows formatters and do not implement the complete ISO printf contract. They are distinct from diagnostic output and remain available for required game text/path construction.
+
+XCRT provides `floor` and `fmod`, plus the native x64 `floorf` entry. The existing runtime fixture compares their returned values with UCRT across finite values, signed zero, subnormals, infinities and NaNs. This does not certify floating-point exception flags. On x86 an intrinsic `fmod` can require the separate x87 `CIfmod` ABI; an explicit standard call under `#pragma function(fmod)` uses the provided C entry instead.

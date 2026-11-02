@@ -33,6 +33,10 @@ X refactor_source --baseline status/refactoring/before.zip --file src/old_module
 
 ## Current contracts and existing-goal adoption
 
+Use `X refactor_scope --symbol SYMBOL --callers --output status/refactoring/scope.json` to collect a current family, direct named calls, conservative identifier references and body/file hashes in one source scan. Repeat `--symbol` or use `--literal` for a storage token. This reuses the source parser without SQL refresh, source mutation or semantic acceptance; reuse one current report path. Indirect calls and payload lifetimes still need their affected review.
+
+Add `--cache status/refactoring/scope-cache.json` to reparse only changed files. The replaceable cache stores metadata, never source bodies, and invalidates on source, parser or tool changes. It is derived state, not verification evidence; remove it after final integration refreshes the canonical source index.
+
 - Keep one current project plan and one current contract per ownership family (or keyed sections of one existing report). Reuse existing paths and SQL context keys. Each family records owner/init/reset/release, types/ranges, direct/indirect consumers, binary/device boundaries, change classes, symbol/source mappings, qualifications and pending final checks
 - State shared rules once per type/format/family and list only meaningful exceptions. Create separate evidence for behavior changes or disputed contracts, not each rename/cast/parenthesis. Keep historical receipts immutable and read them only for a current question
 - On adoption read current goal/plan, baseline, current family and direct user restrictions. Do not recreate the goal, baseline, ledger or source tree; do not repeat accepted work or reopen completed refactor/enhance goals solely because this document changed

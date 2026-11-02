@@ -28,16 +28,18 @@ Use the existing toolchain receipt for licensed analysis tools. Bundled FFmpeg i
 
 ## Required dependency order
 
+Before startup work, use the chat's "Approve for me" permission mode: approvals_reviewer=auto_review, approval_policy=on-request, sandbox_mode=workspace-write. Do not use Full Access, disable the sandbox or create permission-template/config files. Verify the effective settings in the next turn_context; the visible selector or a previous chat's settings alone are insufficient. If a current turn still uses reviewer=user, finish at a safe boundary and resume the same goal with the corrected mode. Routine Git/build escalation then goes to automatic review; never bypass a denial or add per-command exceptions as the default solution.
+
 1. Initialize from the shared Windows sln/vcxproj, project README and .gitignore templates using exact names/GUID/substitutions. Never copy another game or hand-author replacement build templates. Preserve shared Debug/Release/x86/x64/XCRT settings
 2. Initialize the project Git index when absent through the supervisor's git_index step; stage .gitignore. Synchronize configured GitHub labels/issues and diagnose tools without building
 3. Extract all original discs to bin/DATA through extract_data; retain originals, accepted hashes and uncertain formats. Never replace files with different bytes on retry
 4. Inventory original PS-X EXE/images and verify actual entry/GP, load segments and code/data boundaries before listing/pseudocode export. Do not copy an executable into orig merely to satisfy an old path convention
-5. Discover the game's real Memory Card icon and establish its writer/resource provenance. Produce exact 16x16 indexed ICO at src/platform/win/icon.ico, with local MAINICON binding. This gate precedes the first scaffold Debug build. No guessed texture, cover art, resizing or default icon substitution
-6. Prepare configured Red Book audio and supported STR -> MP4 assets with shared tools; unsupported formats remain explicit decomp work. No automatic container/overlay discovery by filename
-7. Export complete original MIPS and available pseudocode; independently canonicalize and hash-bind accepted evidence. SDK/PsyQ recognition does not replace supplemental Ghidra listing/pseudocode requirements
-8. Review SDK identities, initialize static SQLite inventory and validated reuse index. Preserve unknown boundaries, unresolved indirect targets and failed original decompilation as unknown
-9. Preserve the full game-function queue for decomp; do not translate callees during setup. Create DuckStation.bat and deploy isolated settings/data for the actually reserved roles (new projects: user and audit), preserving BIOS/licenses and user sessions
-10. Publish the compact handoff and stage src plus root cover.png/README.md through X stage_sources. Complete the goal only after supervisor complete and all requested startup deliverables are verified
+5. Prepare configured Red Book audio and supported STR -> MP4 assets with shared tools; unsupported formats remain explicit decomp work. No automatic container/overlay discovery by filename
+6. Export complete original MIPS and available pseudocode; independently canonicalize and hash-bind accepted evidence. SDK/PsyQ recognition does not replace supplemental Ghidra listing/pseudocode requirements
+7. Review SDK identities, initialize static SQLite inventory and validated reuse index. Preserve unknown boundaries, unresolved indirect targets and failed original decompilation as unknown
+8. Preserve the full game-function queue for decomp; do not translate callees during setup. Create DuckStation.bat and deploy isolated settings/data for the actually reserved roles (new projects: user and audit), preserving BIOS/licenses and user sessions
+9. At the end of setup, discover the game's real Memory Card icon and establish its writer/resource provenance. Produce exact 16x16 indexed ICO at src/platform/win/icon.ico, with local MAINICON binding. No guessed texture, cover art, resizing or default icon substitution
+10. Run the final native build only after icon acceptance, then publish the compact handoff and stage src plus root cover.png/README.md through X stage_sources. Complete the goal only after supervisor complete and all requested startup deliverables are verified
 
 ## Technical routing
 

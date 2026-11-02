@@ -700,12 +700,13 @@ unsupported:
 
 static sint32 gpu_decode_tim_block(const uint8 *src, size_t size, PSX_RECT *rect, const uint8 **pixels, size_t *block_size)
 {
+    uint32 wire_word_1;
     size_t payload_size;
 
     if (size < 12u)
         return 0;
-    *block_size = xport_load_le32(src);
-    setRECT(rect, (sint16)xport_load_le16(src + 4u), (sint16)xport_load_le16(src + 6u), (sint16)xport_load_le16(src + 8u), (sint16)xport_load_le16(src + 10u));
+    *block_size = (memcpy(&wire_word_1, src, sizeof(wire_word_1)), wire_word_1);
+    setRECT(rect, (sint16)(*(const uint16 *)(src + 4u)), (sint16)(*(const uint16 *)(src + 6u)), (sint16)(*(const uint16 *)(src + 8u)), (sint16)(*(const uint16 *)(src + 10u)));
     if (rect->w < 0 || rect->h < 0)
         return 0;
     payload_size = (size_t)rect->w * (size_t)rect->h * 2u;
@@ -717,6 +718,7 @@ static sint32 gpu_decode_tim_block(const uint8 *src, size_t size, PSX_RECT *rect
 
 sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image)
 {
+    uint32 wire_word_2;
     const uint8 *bytes = (const uint8 *)src;
     GpuTimImage decoded = {0};
     size_t off = 4u;
@@ -724,7 +726,7 @@ sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image)
 
     if (!bytes || !image || size < 4u)
         return 0;
-    decoded.mode = xport_load_le32(bytes);
+    decoded.mode = (memcpy(&wire_word_2, bytes, sizeof(wire_word_2)), wire_word_2);
     if (decoded.mode & ~0x0Bu)
         return 0;
     if (decoded.mode & 8u)
@@ -995,16 +997,17 @@ static sint32 gpu_native_low24_to_guest(uint32 link, uint32 *address)
 
 void GsClearOt(uint32 offset, uint32 point, void *ordering_table)
 {
+    uint32 wire_word_3, wire_word_4, wire_word_6, wire_word_7, wire_word_8;
     uint8 *descriptor = (uint8 *)ordering_table;
-    uint32 rank = xport_load_le32(descriptor);
+    uint32 rank = (memcpy(&wire_word_3, descriptor, sizeof(wire_word_3)), wire_word_3);
     uint32 address, count, bytes;
-    xport_store_le32(descriptor + 8, offset & 0xFFFF);
-    address = xport_load_le32(descriptor + 4);
-    xport_store_le32(descriptor + 12, point & 0xFFFF);
+    (wire_word_4 = (uint32)(offset & 0xFFFF), memcpy(descriptor + 8, &wire_word_4, sizeof(wire_word_4)));
+    memcpy(&address, descriptor + 4, sizeof(address));
+    (wire_word_6 = (uint32)(point & 0xFFFF), memcpy(descriptor + 12, &wire_word_6, sizeof(wire_word_6)));
     bytes = 4u << (rank & 31);
-    count = 1u << (xport_load_le32(descriptor) & 31);
-    xport_store_le32(descriptor + 16, address + bytes - 4);
-    address = xport_load_le32(descriptor + 4);
+    count = 1u << ((memcpy(&wire_word_7, descriptor, sizeof(wire_word_7)), wire_word_7) & 31);
+    (wire_word_8 = (uint32)(address + bytes - 4), memcpy(descriptor + 16, &wire_word_8, sizeof(wire_word_8)));
+    memcpy(&address, descriptor + 4, sizeof(address));
     if (count > PSX_DRAM_SIZE / 4)
         abort();
     ClearOTagR((uint32 *)psx_addr(address, count * 4), (sint32)count);
@@ -1022,9 +1025,9 @@ uint32 *ClearOTagR(uint32 *ot, sint32 count)
 #endif
     if (count <= 0)
         return ot;
-    xport_store_le32(ot, 0x00ffffffu);
+    (*(ot) = 0x00ffffffu);
     for (index = 1; index < count; ++index)
-        xport_store_le32(ot + index, (address + (uint32)(index - 1) * 4u) & 0x00ffffffu);
+        (*(ot + index) = (address + (uint32)(index - 1) * 4u) & 0x00ffffffu);
     return ot;
 }
 
@@ -1041,8 +1044,8 @@ uint32 *ClearOTag(uint32 *ot, sint32 count)
     if (count <= 0)
         return ot;
     for (index = 0; index + 1 < count; ++index)
-        xport_store_le32(ot + index, (address + (uint32)(index + 1) * 4u) & 0x00ffffffu);
-    xport_store_le32(ot + count - 1, 0x00ffffffu);
+        (*(ot + index) = (address + (uint32)(index + 1) * 4u) & 0x00ffffffu);
+    (*(ot + count - 1) = 0x00ffffffu);
     return ot;
 }
 
@@ -2001,6 +2004,15 @@ static sint32 gpu_draw_state_word(uint32 word)
 
 static void gpu_draw_command(void *raw);
 
+typedef struct GpuDeferredPolygon
+{
+    const void *marker;
+    void *source, *packet;
+    size_t source_bytes, source_capacity, packet_capacity, offset;
+    uint16 page;
+    sint32 seen, resolved, page_effect;
+} GpuDeferredPolygon;
+
 struct GpuRenderList
 {
     DRAWENV environment;
@@ -2009,6 +2021,9 @@ struct GpuRenderList
     size_t count, capacity;
     uint32 generation;
     sint32 failed, valid;
+    GpuDeferredPolygon *slots;
+    uint32 slot_count, slot_capacity;
+    uintptr_t marker_min, marker_max;
 };
 
 static GpuRenderList *render_list_capture;
@@ -2027,11 +2042,18 @@ GpuRenderList *gpu_render_list_create(void)
 
 void gpu_render_list_free(GpuRenderList *list)
 {
+    uint32 i;
     if (!list)
         return;
     if (render_list_capture == list)
         render_list_capture = NULL;
     free(list->words);
+    for (i = 0; i < list->slot_capacity; ++i)
+    {
+        free(list->slots[i].source);
+        free(list->slots[i].packet);
+    }
+    free(list->slots);
     free(list);
 }
 
@@ -2042,6 +2064,8 @@ sint32 gpu_render_list_begin(GpuRenderList *list, const DRAWENV *environment)
     list->environment = *environment;
     gpu_export_raster(&list->initial);
     list->count = 0;
+    list->slot_count = 0;
+    list->marker_min = list->marker_max = 0;
     list->generation = render_list_generation;
     list->failed = list->valid = 0;
     render_list_capture = list;
@@ -2055,6 +2079,132 @@ sint32 gpu_render_list_end(GpuRenderList *list)
     render_list_capture = NULL;
     list->valid = !list->failed;
     return list->valid;
+}
+
+static sint32 gpu_render_list_defer(GpuRenderList *list, const void *marker, uint16 page, sint32 page_effect, const void *source, size_t bytes)
+{
+    uint32 wire_word_14;
+    uint32 i, link;
+    GpuDeferredPolygon *slot;
+    void *grown;
+    if (!list || render_list_capture != list || frame_raster || list->slot_count >= 0x1000000u || !marker || !source || !bytes || !gpu_packet_range_address(marker, &link) || (link & 3u) || ((memcpy(&wire_word_14, marker, sizeof(wire_word_14)), wire_word_14) >> 24))
+        return 0;
+    for (i = 0; i < list->slot_count; ++i)
+        if (list->slots[i].marker == marker)
+            return 0;
+    if (list->slot_count == list->slot_capacity)
+    {
+        uint32 capacity = list->slot_capacity ? list->slot_capacity * 2 : 64;
+        GpuDeferredPolygon *slots = realloc(list->slots, capacity * sizeof(*slots));
+        if (!slots)
+            return 0;
+        memset(slots + list->slot_capacity, 0, (capacity - list->slot_capacity) * sizeof(*slots));
+        list->slots = slots;
+        list->slot_capacity = capacity;
+    }
+    slot = &list->slots[list->slot_count];
+    if (bytes > slot->source_capacity)
+    {
+        grown = realloc(slot->source, bytes);
+        if (!grown)
+            return 0;
+        slot->source = grown;
+        slot->source_capacity = bytes;
+    }
+    memcpy(slot->source, source, bytes);
+    slot->source_bytes = bytes;
+    slot->marker = marker;
+    slot->page = page;
+    slot->page_effect = page_effect;
+    slot->seen = slot->resolved = 0;
+    if (!list->slot_count || (uintptr_t)marker < list->marker_min)
+        list->marker_min = (uintptr_t)marker;
+    if (!list->slot_count || (uintptr_t)marker > list->marker_max)
+        list->marker_max = (uintptr_t)marker;
+    ++list->slot_count;
+    return 1;
+}
+
+sint32 gpu_render_list_defer_polygon(GpuRenderList *list, const void *marker, uint16 page, const void *source, size_t bytes)
+{
+    return gpu_render_list_defer(list, marker, page, 1, source, bytes);
+}
+
+sint32 gpu_render_list_defer_draw(GpuRenderList *list, const void *marker, const void *source, size_t bytes)
+{
+    return gpu_render_list_defer(list, marker, 0, 0, source, bytes);
+}
+
+uint32 gpu_render_list_deferred_count(const GpuRenderList *list)
+{
+    return list && list->valid && list->generation == render_list_generation ? list->slot_count : 0;
+}
+
+const void *gpu_render_list_deferred_source(const GpuRenderList *list, uint32 index, size_t *bytes)
+{
+    if (!bytes || index >= gpu_render_list_deferred_count(list) || !list->slots[index].seen || list->slots[index].resolved)
+        return NULL;
+    *bytes = list->slots[index].source_bytes;
+    return list->slots[index].source;
+}
+
+static sint32 gpu_render_list_resolve(GpuRenderList *list, uint32 index, const void *raw, size_t bytes, sint32 page_effect)
+{
+    const uint32 *packet = raw;
+    uint32 code, vertices, length, page_word;
+    GpuDeferredPolygon *slot;
+    void *grown;
+    if (!raw || render_list_capture || index >= gpu_render_list_deferred_count(list) || bytes < 8)
+        return 0;
+    slot = &list->slots[index];
+    code = packet[1] >> 24;
+    if (!slot->seen || slot->resolved || slot->page_effect != page_effect)
+        return 0;
+    if (page_effect)
+    {
+        if ((code & 0xe4) != 0x24)
+            return 0;
+        vertices = code & 8 ? 4 : 3;
+        length = 1 + vertices * 2 + ((code & 16) ? vertices - 1 : 0);
+    }
+    else if ((code & 0xe4) == 0x20)
+    {
+        vertices = code & 8 ? 4 : 3;
+        length = 1 + vertices + ((code & 16) ? vertices - 1 : 0);
+    }
+    else if ((code & 0xe0) == 0x60)
+        length = 2 + ((code & 4) ? 1 : 0) + ((code & 0x18) ? 0 : 1);
+    else
+        return 0;
+    if (bytes != (length + 1) * 4 || (packet[0] >> 24) != length)
+        return 0;
+    if (page_effect)
+    {
+        page_word = (code & 16) ? 6 : 5;
+        if (((packet[page_word] >> 16) & 0x09ff) != (slot->page & 0x09ff))
+            return 0;
+    }
+    if (bytes > slot->packet_capacity)
+    {
+        grown = realloc(slot->packet, bytes);
+        if (!grown)
+            return 0;
+        slot->packet = grown;
+        slot->packet_capacity = bytes;
+    }
+    memcpy(slot->packet, packet, bytes);
+    slot->resolved = 1;
+    return 1;
+}
+
+sint32 gpu_render_list_resolve_polygon(GpuRenderList *list, uint32 index, const void *packet, size_t bytes)
+{
+    return gpu_render_list_resolve(list, index, packet, bytes, 1);
+}
+
+sint32 gpu_render_list_resolve_draw(GpuRenderList *list, uint32 index, const void *packet, size_t bytes)
+{
+    return gpu_render_list_resolve(list, index, packet, bytes, 0);
 }
 
 static void gpu_render_list_record(const uint32 *packet)
@@ -2094,6 +2244,36 @@ static void gpu_render_list_record(const uint32 *packet)
     }
     memcpy(list->words + list->count, packet, words * sizeof(*packet));
     list->count = required;
+}
+
+static sint32 gpu_render_list_record_deferred(const void *marker)
+{
+    GpuRenderList *list = render_list_capture;
+    uint32 i;
+    if (!list || !list->slot_count || (uintptr_t)marker < list->marker_min || (uintptr_t)marker > list->marker_max)
+        return 0;
+    for (i = 0; i < list->slot_count; ++i)
+        if (list->slots[i].marker == marker)
+        {
+            GpuDeferredPolygon *slot = &list->slots[i];
+            uint32 nop[2] = {0x01000000u, 0};
+            if (slot->seen || list->failed)
+            {
+                list->failed = 1;
+                return 1;
+            }
+            slot->offset = list->count;
+            gpu_render_list_record(nop);
+            if (list->failed)
+                return 1;
+            list->words[slot->offset] = i;
+            list->count = slot->offset + 1;
+            slot->seen = 1;
+            if (slot->page_effect)
+                gpu_set_polygon_tpage(slot->page);
+            return 1;
+        }
+    return 0;
 }
 
 static void draw_prim(void *raw)
@@ -2941,14 +3121,28 @@ sint32 gpu_render_list_replay(const GpuRenderList *list)
     sint32 raster = frame_raster;
     sint32 saved[8] = {raster_clip_x0, raster_clip_y0, raster_clip_x1, raster_clip_y1, raster_offset_x, raster_offset_y, raster_surface_x, raster_surface_y};
     size_t cursor;
+    uint32 i;
     if (!list || !list->valid || list->generation != render_list_generation || render_list_capture)
         return 0;
+    for (i = 0; i < list->slot_count; ++i)
+        if (list->slots[i].seen && !list->slots[i].resolved)
+            return 0;
     frame_raster = 1;
     gpu_vram_invalidate();
     gpu_port.mask = (list->initial.draw_flags >> 11) & 3;
     gpu_draw_env_native(&list->environment, 0, 0);
     for (cursor = 0; cursor < list->count; cursor += (list->words[cursor] >> 24) + 1)
-        gpu_draw_command(list->words + cursor);
+    {
+        if (list->words[cursor] >> 24)
+            gpu_draw_command(list->words + cursor);
+        else
+        {
+            uint32 slot = list->words[cursor];
+            if (slot >= list->slot_count || list->slots[slot].offset != cursor)
+                abort();
+            gpu_draw_command(list->slots[slot].packet);
+        }
+    }
     active_tpage = page;
     active_draw_flags = flags;
     texture_window = window;
@@ -2994,17 +3188,17 @@ static void gpu_put_draw_env_native(DRAWENV *environment, sint32 surface_x, sint
     uint32 wide = 0;
     uint32 mask = wide ? 4095u : 2047u, shift = wide ? 12u : 11u, mode, count = 6;
     sint32 x, y, w, h;
-    xport_store_le32(packet + 4, gpu_env_clip(0xe3000000u, read_s16_le_at(e, 0), read_s16_le_at(e, 2), wide));
-    xport_store_le32(packet + 8, gpu_env_clip(0xe4000000u, (sint16)((uint16)read_s16_le_at(e, 0) + (uint16)read_s16_le_at(e, 4) - 1), (sint16)((uint16)read_s16_le_at(e, 2) + (uint16)read_s16_le_at(e, 6) - 1), wide));
-    xport_store_le32(packet + 12, 0xe5000000u | ((uint32)read_s16_le_at(e, 8) & mask) | (((uint32)read_s16_le_at(e, 10) & mask) << shift));
+    (environment->dr_env.code[0] = gpu_env_clip(0xe3000000u, read_s16_le_at(e, 0), read_s16_le_at(e, 2), wide));
+    (environment->dr_env.code[1] = gpu_env_clip(0xe4000000u, (sint16)((uint16)read_s16_le_at(e, 0) + (uint16)read_s16_le_at(e, 4) - 1), (sint16)((uint16)read_s16_le_at(e, 2) + (uint16)read_s16_le_at(e, 6) - 1), wide));
+    (environment->dr_env.code[2] = 0xe5000000u | ((uint32)read_s16_le_at(e, 8) & mask) | (((uint32)read_s16_le_at(e, 10) & mask) << shift));
     mode = 0xe1000000u | ((uint16)read_s16_le_at(e, 20) & (wide ? 0x27ffu : 0x9ffu));
     if (e[22])
         mode |= wide ? 0x800u : 0x200u;
     if (e[23])
         mode |= wide ? 0x1000u : 0x400u;
-    xport_store_le32(packet + 16, mode);
-    xport_store_le32(packet + 20, 0xe2000000u | (((uint32)-read_s16_le_at(e, 16) & 255u) >> 3) | ((((uint32)-read_s16_le_at(e, 18) & 255u) >> 3) << 5) | ((uint32)(e[12] >> 3) << 10) | ((uint32)(e[14] >> 3) << 15));
-    xport_store_le32(packet + 24, 0xe6000000u);
+    (environment->dr_env.code[3] = mode);
+    (environment->dr_env.code[4] = 0xe2000000u | (((uint32)-read_s16_le_at(e, 16) & 255u) >> 3) | ((((uint32)-read_s16_le_at(e, 18) & 255u) >> 3) << 5) | ((uint32)(e[12] >> 3) << 10) | ((uint32)(e[14] >> 3) << 15));
+    (environment->dr_env.code[5] = 0xe6000000u);
     if (e[24])
     {
         x = read_s16_le_at(e, 0);
@@ -3018,13 +3212,13 @@ static void gpu_put_draw_env_native(DRAWENV *environment, sint32 surface_x, sint
             x = (sint16)(x - read_s16_le_at(e, 8));
             y = (sint16)(y - read_s16_le_at(e, 10));
         }
-        xport_store_le32(packet + 28, mode | e[25] | ((uint32)e[26] << 8) | ((uint32)e[27] << 16));
-        xport_store_le32(packet + 32, (uint16)x | ((uint32)(uint16)y << 16));
-        xport_store_le32(packet + 36, (uint16)w | ((uint32)(uint16)h << 16));
+        (environment->dr_env.code[6] = mode | e[25] | ((uint32)e[26] << 8) | ((uint32)e[27] << 16));
+        (environment->dr_env.code[7] = (uint16)x | ((uint32)(uint16)y << 16));
+        (environment->dr_env.code[8] = (uint16)w | ((uint32)(uint16)h << 16));
         count = 9;
     }
     xport_store_u8(packet + 3, (uint8)count);
-    xport_store_le32(packet, xport_load_le32(packet) | 0xffffffu);
+    environment->dr_env.tag |= 0x00ffffffu;
     if (linked_submit)
     {
         uint32 address;
@@ -3237,6 +3431,11 @@ static void gpu_draw_linked_dma_body(uint32 *ot, GpuNativeLinkedCursor *cursor)
    * exact degenerate black-line sentinel, as it did before original OT setup
    * was translated. Other flat line packets use the host rasterizer. */
         if (link == 0x10018u && tag == 0x03ffffffu && packet[1] == 0x40000000u && !packet[2] && !packet[3])
+        {
+            head = tag;
+            continue;
+        }
+        if (!(tag >> 24) && gpu_render_list_record_deferred(packet))
         {
             head = tag;
             continue;
@@ -3611,22 +3810,22 @@ DRAWENV *SetDefDrawEnv(DRAWENV *environment, sint32 x, sint32 y, sint32 width, s
     if (!environment)
         return 0;
     video_mode = GetVideoMode();
-    xport_store_le16(&environment->clip.x, (uint16)x);
-    xport_store_le16(&environment->clip.y, (uint16)y);
-    xport_store_le16(&environment->clip.w, (uint16)width);
-    xport_store_le16(&environment->tw.x, 0u);
-    xport_store_le16(&environment->tw.y, 0u);
-    xport_store_le16(&environment->tw.w, 0u);
-    xport_store_le16(&environment->tw.h, 0u);
+    environment->clip.x = (sint16)x;
+    environment->clip.y = (sint16)y;
+    environment->clip.w = (sint16)width;
+    environment->tw.x = 0;
+    environment->tw.y = 0;
+    environment->tw.w = 0;
+    environment->tw.h = 0;
     xport_store_u8(&environment->r0, 0u);
     xport_store_u8(&environment->g0, 0u);
     xport_store_u8(&environment->b0, 0u);
     xport_store_u8(&environment->dtd, 1u);
-    xport_store_le16(&environment->clip.h, (uint16)height);
+    environment->clip.h = (sint16)height;
     xport_store_u8(&environment->dfe, (uint8)(height < (video_mode ? 289 : 257)));
-    xport_store_le16(&environment->ofs[0], (uint16)x);
-    xport_store_le16(&environment->ofs[1], (uint16)y);
-    xport_store_le16(&environment->tpage, 10u);
+    environment->ofs[0] = (sint16)x;
+    environment->ofs[1] = (sint16)y;
+    environment->tpage = 10;
     xport_store_u8(&environment->isbg, 0u);
     return environment;
 }
@@ -3635,18 +3834,18 @@ DISPENV *SetDefDispEnv(DISPENV *environment, sint32 x, sint32 y, sint32 width, s
 {
     if (!environment)
         return 0;
-    xport_store_le16(&environment->disp.x, (uint16)x);
-    xport_store_le16(&environment->disp.y, (uint16)y);
-    xport_store_le16(&environment->disp.w, (uint16)width);
-    xport_store_le16(&environment->screen.x, 0u);
-    xport_store_le16(&environment->screen.y, 0u);
-    xport_store_le16(&environment->screen.w, 0u);
-    xport_store_le16(&environment->screen.h, 0u);
+    environment->disp.x = (sint16)x;
+    environment->disp.y = (sint16)y;
+    environment->disp.w = (sint16)width;
+    environment->screen.x = 0;
+    environment->screen.y = 0;
+    environment->screen.w = 0;
+    environment->screen.h = 0;
     xport_store_u8(&environment->isrgb24, 0u);
     xport_store_u8(&environment->isinter, 0u);
     xport_store_u8(&environment->pad1, 0u);
     xport_store_u8(&environment->pad0, 0u);
-    xport_store_le16(&environment->disp.h, (uint16)height);
+    environment->disp.h = (sint16)height;
     return environment;
 }
 
@@ -3678,42 +3877,44 @@ static uint32 gpu_draw_area_word(uint32 command, sint16 x, sint16 y)
 
 void SetDrawLoad(DR_LOAD *packet, const PSX_RECT *rectangle)
 {
+    uint32 wire_word_29, wire_word_31, wire_word_33, wire_word_34;
     uint8 *bytes = (uint8 *)packet;
     uint32 words, length, value;
     sint32 width, height;
     if (!packet || !rectangle)
         return;
-    width = (sint16)xport_load_le16(&rectangle->w);
-    height = (sint16)xport_load_le16(&rectangle->h);
+    width = rectangle->w;
+    height = rectangle->h;
     words = (uint32)((width * height + 1) / 2);
     length = words < 13 ? words + 4 : 0;
     bytes[3] = (uint8)length;
-    xport_store_le32(bytes + 4, 0xA0000000);
-    value = xport_load_le32(rectangle);
-    xport_store_le32(bytes + 8, value);
-    value = xport_load_le32((const uint8 *)rectangle + 4);
-    xport_store_le32(bytes + 12, value);
-    xport_store_le32(bytes + length * 4, 0x01000000);
+    (wire_word_29 = (uint32)(0xA0000000), memcpy(bytes + 4, &wire_word_29, sizeof(wire_word_29)));
+    memcpy(&value, rectangle, sizeof(value));
+    (wire_word_31 = (uint32)(value), memcpy(bytes + 8, &wire_word_31, sizeof(wire_word_31)));
+    memcpy(&value, (const uint8 *)rectangle + 4, sizeof(value));
+    (wire_word_33 = (uint32)(value), memcpy(bytes + 12, &wire_word_33, sizeof(wire_word_33)));
+    (wire_word_34 = (uint32)(0x01000000), memcpy(bytes + length * 4, &wire_word_34, sizeof(wire_word_34)));
 }
 
 uint32 SetDrawArea(DR_AREA *packet, const PSX_RECT *rectangle)
 {
+    uint32 wire_word_35, wire_word_36;
     uint32 x, y, width, height, word;
     const uint8 *input = (const uint8 *)rectangle;
     uint8 *output = (uint8 *)packet;
     if (!packet || !rectangle)
         return 0;
     xport_store_u8(output + 3, 2);
-    x = xport_load_le16(input);
-    y = xport_load_le16(input + 2);
+    x = (*(const uint16 *)(input));
+    y = (*(const uint16 *)(input + 2));
     word = gpu_draw_area_word(0xE3000000, (sint16)x, (sint16)y);
-    xport_store_le32(output + 4, word);
-    x = xport_load_le16(input);
-    width = xport_load_le16(input + 4);
-    y = xport_load_le16(input + 2);
-    height = xport_load_le16(input + 6);
+    (wire_word_35 = (uint32)(word), memcpy(output + 4, &wire_word_35, sizeof(wire_word_35)));
+    x = (*(const uint16 *)(input));
+    width = (*(const uint16 *)(input + 4));
+    y = (*(const uint16 *)(input + 2));
+    height = (*(const uint16 *)(input + 6));
     word = gpu_draw_area_word(0xE4000000, (sint16)(x + width - 1), (sint16)(y + height - 1));
-    xport_store_le32(output + 8, word);
+    (wire_word_36 = (uint32)(word), memcpy(output + 8, &wire_word_36, sizeof(wire_word_36)));
     return word;
 }
 
@@ -3901,7 +4102,7 @@ uint32 *ClearOTagRPSX(uint32 *ot, sint32 count, uint32 header_address, uint32 he
     (void)ClearOTagR(ot, count);
     xport_gpu_clear_otag_r_guest_driver(guest_ot, (uint32)count);
     w_u32(header_address, (header_target & 0xFFFFFFu) | 0x04000000u);
-    xport_store_le32(ot, header_address & 0xFFFFFFu);
+    (*(ot) = header_address & 0xFFFFFFu);
     return ot;
 }
 
@@ -3909,7 +4110,7 @@ uint32 *ClearOTagRNativePSX(uint32 *ot, sint32 count, uint32 header_address, uin
 {
     (void)ClearOTagR(ot, count);
     w_u32(header_address, (header_target & 0xFFFFFFu) | 0x04000000u);
-    xport_store_le32(ot, header_address & 0xFFFFFFu);
+    (*(ot) = header_address & 0xFFFFFFu);
     return ot;
 }
 
@@ -3938,23 +4139,25 @@ void gpu_resume_linked_draw(uint32 continuation)
 
 void SetDrawMove(DR_MOVE *packet, PSX_RECT *rectangle, sint32 x, sint32 y)
 {
+    uint32 wire_word_39, wire_word_40, wire_word_41, wire_word_42, wire_word_43, wire_word_44, wire_word_45;
     uint8 *bytes = (uint8 *)packet;
-    uint32 source = xport_load_le32(rectangle);
-    uint32 dimensions = xport_load_le32((uint8 *)rectangle + 4u);
+    uint32 source = (memcpy(&wire_word_39, rectangle, sizeof(wire_word_39)), wire_word_39);
+    uint32 dimensions = (memcpy(&wire_word_40, (uint8 *)rectangle + 4u, sizeof(wire_word_40)), wire_word_40);
     bytes[3] = rectangle->w && rectangle->h ? 5u : 0u;
-    xport_store_le32(bytes + 4u, 0x01000000u);
-    xport_store_le32(bytes + 8u, 0x80000000u);
-    xport_store_le32(bytes + 12u, source);
-    xport_store_le32(bytes + 16u, ((uint32)y << 16u) | ((uint32)x & 0xFFFFu));
-    xport_store_le32(bytes + 20u, dimensions);
+    (wire_word_41 = (uint32)(0x01000000u), memcpy(bytes + 4u, &wire_word_41, sizeof(wire_word_41)));
+    (wire_word_42 = (uint32)(0x80000000u), memcpy(bytes + 8u, &wire_word_42, sizeof(wire_word_42)));
+    (wire_word_43 = (uint32)(source), memcpy(bytes + 12u, &wire_word_43, sizeof(wire_word_43)));
+    (wire_word_44 = (uint32)(((uint32)y << 16u) | ((uint32)x & 0xFFFFu)), memcpy(bytes + 16u, &wire_word_44, sizeof(wire_word_44)));
+    (wire_word_45 = (uint32)(dimensions), memcpy(bytes + 20u, &wire_word_45, sizeof(wire_word_45)));
 }
 
 uint32 SetDrawMovePSX(uint32 destination, uint32 rectangle, uint32 x, uint32 y)
 {
+    uint32 wire_word_46;
     DR_MOVE *packet = (DR_MOVE *)psx_addr(destination, sizeof(DR_MOVE));
     PSX_RECT *source = (PSX_RECT *)psx_addr(rectangle, sizeof(PSX_RECT));
     SetDrawMove(packet, source, (sint32)x, (sint32)y);
-    return xport_load_le32((uint8 *)source + 4u);
+    return (memcpy(&wire_word_46, (uint8 *)source + 4u, sizeof(wire_word_46)), wire_word_46);
 }
 
 uint32 ClearOTagPSX(uint32 ot, uint32 count, uint32 header_address, uint32 header_target, uint32 debug_flag_address, uint32 debug_callback_slot, uint32 debug_format_address)

@@ -396,8 +396,28 @@ extern "C"
     extern "C"
     {
 #endif
-extern uint32 SCRATCHPAD[256];
-extern uint8 DRAM[PSX_DRAM_SIZE];
+        extern uint32 SCRATCHPAD[256];
+        extern uint8 DRAM[PSX_DRAM_SIZE];
+
+        typedef enum PsxFormatArgumentKind
+        {
+            PSX_FORMAT_SIGNED_WORD,
+            PSX_FORMAT_UNSIGNED_WORD,
+            PSX_FORMAT_POINTER_WORD,
+            PSX_FORMAT_STRING_REFERENCE,
+            PSX_FORMAT_COUNT16_REFERENCE,
+            PSX_FORMAT_COUNT32_REFERENCE
+        } PsxFormatArgumentKind;
+
+        typedef struct PsxFormatArgument
+        {
+            uint32 value;
+            XportMemoryRef reference;
+        } PsxFormatArgument;
+
+        typedef sint32 (*PsxFormatArgumentReader)(void *context, PsxFormatArgumentKind kind, PsxFormatArgument *argument);
+
+        uint32 psx_format_arguments(XportMemoryRef destination, XportMemoryRef format, XportMemoryRef defaults, PsxFormatArgumentReader read_argument, void *context);
 
 /* PsyQ LIBETC offsets are 32-bit words in the single shared scratchpad */
 #define getScratchAddr(offset) (&SCRATCHPAD[(uint32)(offset)])
@@ -1003,30 +1023,30 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 
     typedef DR_MODE DR_STP;
 
-#define setVector(vector, _x, _y, _z) (xport_store_le16(&(vector)->vx, (uint16)(_x)), xport_store_le16(&(vector)->vy, (uint16)(_y)), xport_store_le16(&(vector)->vz, (uint16)(_z)))
-#define setRECT(rect, _x, _y, width, height) (xport_store_le16(&(rect)->x, (uint16)(_x)), xport_store_le16(&(rect)->y, (uint16)(_y)), xport_store_le16(&(rect)->w, (uint16)(width)), xport_store_le16(&(rect)->h, (uint16)(height)))
+#define setVector(vector, _x, _y, _z) (((vector)->vx = (sint16)(_x)), ((vector)->vy = (sint16)(_y)), ((vector)->vz = (sint16)(_z)))
+#define setRECT(rect, _x, _y, width, height) (((rect)->x = (sint16)(_x)), ((rect)->y = (sint16)(_y)), ((rect)->w = (sint16)(width)), ((rect)->h = (sint16)(height)))
 #define setRGB0(packet, red, green, blue) (xport_store_u8((uint8 *)(packet) + 4u, (red)), xport_store_u8((uint8 *)(packet) + 4u + 1u, (green)), xport_store_u8((uint8 *)(packet) + 4u + 2u, (blue)))
 #define setRGB1(packet, red, green, blue) (xport_store_u8(&(packet)->p[1].rgbc.r, (red)), xport_store_u8(&(packet)->p[1].rgbc.g, (green)), xport_store_u8(&(packet)->p[1].rgbc.b, (blue)))
 #define setRGB2(packet, red, green, blue) (xport_store_u8(&(packet)->p[2].rgbc.r, (red)), xport_store_u8(&(packet)->p[2].rgbc.g, (green)), xport_store_u8(&(packet)->p[2].rgbc.b, (blue)))
 #define setRGB3(packet, red, green, blue) (xport_store_u8(&(packet)->p[3].rgbc.r, (red)), xport_store_u8(&(packet)->p[3].rgbc.g, (green)), xport_store_u8(&(packet)->p[3].rgbc.b, (blue)))
-#define setXY0(packet, _x0, _y0) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)))
-#define setXY2(packet, _x0, _y0, _x1, _y1) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)))
-#define setXY3(packet, _x0, _y0, _x1, _y1, _x2, _y2) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])), (uint16)(_x2)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])) + 2u, (uint16)(_y2)))
-#define setXY4(packet, _x0, _y0, _x1, _y1, _x2, _y2, _x3, _y3) (xport_store_le16((uint8 *)(packet) + 8u, (uint16)(_x0)), xport_store_le16((uint8 *)(packet) + 8u + 2u, (uint16)(_y0)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])), (uint16)(_x1)), xport_store_le16((uint8 *)(packet) + (8u + 1u * sizeof((packet)->p[0])) + 2u, (uint16)(_y1)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])), (uint16)(_x2)), xport_store_le16((uint8 *)(packet) + (8u + 2u * sizeof((packet)->p[0])) + 2u, (uint16)(_y2)), xport_store_le16((uint8 *)(packet) + (8u + 3u * sizeof((packet)->p[0])), (uint16)(_x3)), xport_store_le16((uint8 *)(packet) + (8u + 3u * sizeof((packet)->p[0])) + 2u, (uint16)(_y3)))
-#define setWH(packet, width, height) (xport_store_le16(&(packet)->w, (uint16)(width)), xport_store_le16(&(packet)->h, (uint16)(height)))
+#define setXY0(packet, _x0, _y0) ((((XY *)&(packet)->p[0])->x = (sint16)(_x0)), (((XY *)&(packet)->p[0])->y = (sint16)(_y0)))
+#define setXY2(packet, _x0, _y0, _x1, _y1) ((((XY *)&(packet)->p[0])->x = (sint16)(_x0)), (((XY *)&(packet)->p[0])->y = (sint16)(_y0)), (((XY *)&(packet)->p[1])->x = (sint16)(_x1)), (((XY *)&(packet)->p[1])->y = (sint16)(_y1)))
+#define setXY3(packet, _x0, _y0, _x1, _y1, _x2, _y2) ((((XY *)&(packet)->p[0])->x = (sint16)(_x0)), (((XY *)&(packet)->p[0])->y = (sint16)(_y0)), (((XY *)&(packet)->p[1])->x = (sint16)(_x1)), (((XY *)&(packet)->p[1])->y = (sint16)(_y1)), (((XY *)&(packet)->p[2])->x = (sint16)(_x2)), (((XY *)&(packet)->p[2])->y = (sint16)(_y2)))
+#define setXY4(packet, _x0, _y0, _x1, _y1, _x2, _y2, _x3, _y3) ((((XY *)&(packet)->p[0])->x = (sint16)(_x0)), (((XY *)&(packet)->p[0])->y = (sint16)(_y0)), (((XY *)&(packet)->p[1])->x = (sint16)(_x1)), (((XY *)&(packet)->p[1])->y = (sint16)(_y1)), (((XY *)&(packet)->p[2])->x = (sint16)(_x2)), (((XY *)&(packet)->p[2])->y = (sint16)(_y2)), (((XY *)&(packet)->p[3])->x = (sint16)(_x3)), (((XY *)&(packet)->p[3])->y = (sint16)(_y3)))
+#define setWH(packet, width, height) (((packet)->w = (sint16)(width)), ((packet)->h = (sint16)(height)))
 #define setUV0(packet, _u0, _v0) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)))
 #define setUV3(packet, _u0, _v0, _u1, _v1, _u2, _v2) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)))
 #define setUV4(packet, _u0, _v0, _u1, _v1, _u2, _v2, _u3, _v3) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)), xport_store_u8(&(packet)->p[3].uv.u, (_u3)), xport_store_u8(&(packet)->p[3].uv.v, (_v3)))
 #define setlen(packet, length) xport_store_u8((uint8 *)(packet) + 3u, (length))
     uint32 gpu_packet_link(uintptr_t address);
 #if defined(AP_X64)
-    #define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | gpu_packet_link((uintptr_t)(address)))
+    #define setaddr(packet, address) (((P_TAG *)(packet))->addr = gpu_packet_link((uintptr_t)(address)))
 #else
-    #define setaddr(packet, address) xport_store_le32((packet), (xport_load_le32(packet) & 0xff000000u) | ((uint32)(intptr)(address) & 0x00ffffffu))
+    #define setaddr(packet, address) (((P_TAG *)(packet))->addr = (uint32)(intptr)(address) & 0x00ffffffu)
 #endif
 #define setcode(packet, command) xport_store_u8(&((P_TAG *)(packet))->rgbc.code, (command))
 #define getlen(packet) xport_load_u8((const uint8 *)(packet) + 3u)
-#define getaddr(packet) (xport_load_le32(packet) & 0x00ffffffu)
+#define getaddr(packet) (((const P_TAG *)(packet))->addr)
 #define getcode(packet) xport_load_u8(&((P_TAG *)(packet))->rgbc.code)
 #define nextPrim(packet) ((void *)(intptr)(getaddr(packet) | 0x80000000UL))
 #define isendprim(packet) (getaddr(packet) == 0xffffffUL)
@@ -1037,13 +1057,13 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
 #define setShadeTex(packet, raw_texture) ((raw_texture) ? setcode(packet, getcode(packet) | 1) : setcode(packet, getcode(packet) & ~1))
 #define getTPage(depth, abr, x, y) ((((depth) & 3) << 7) | (((abr) & 3) << 5) | (((y) & 0x100) >> 4) | (((x) & 0x3ff) >> 6) | (((y) & 0x200) << 2))
 #define getClut(x, y) (((y) << 6) | (((x) >> 4) & 0x3f))
-#define setTPage(packet, depth, abr, x, y) xport_store_le16(&(packet)->p[1].attr, getTPage(depth, abr, x, y))
-#define setClut(packet, x, y) xport_store_le16(&(packet)->p[0].attr, getClut(x, y))
+#define setTPage(packet, depth, abr, x, y) ((packet)->p[1].attr = getTPage(depth, abr, x, y))
+#define setClut(packet, x, y) ((packet)->p[0].attr = getClut(x, y))
 #define psx_draw_mode(dfe, dtd, tpage) (0xe1000000UL | ((dtd) ? 0x0200UL : 0) | ((dfe) ? 0x0400UL : 0) | ((tpage) & 0x9ff))
 #define psx_texture_window(texture_window) ((texture_window) ? (0xe2000000UL | (((texture_window)->y & 0xff) >> 3 << 15) | (((texture_window)->x & 0xff) >> 3 << 10) | ((~((texture_window)->h - 1) & 0xff) >> 3 << 5) | ((~((texture_window)->w - 1) & 0xff) >> 3)) : 0)
-#define setDrawMode1(packet, dfe, dtd, tpage) (setlen(packet, 1), xport_store_le32((uint32 *)(packet) + 1, psx_draw_mode(dfe, dtd, tpage)))
-#define setDrawMode(packet, dfe, dtd, tpage, texture_window) (setlen(packet, 2), xport_store_le32((uint32 *)(packet) + 1, psx_draw_mode(dfe, dtd, tpage)), xport_store_le32((uint32 *)(packet) + 2, psx_texture_window((PSX_RECT *)(texture_window))))
-#define setTexWindow(packet, texture_window) (setlen(packet, 2), xport_store_le32((uint32 *)(packet) + 1, psx_texture_window((PSX_RECT *)(texture_window))), xport_store_le32((uint32 *)(packet) + 2, 0))
+#define setDrawMode1(packet, dfe, dtd, tpage) (setlen(packet, 1), (((DR_MODE *)(packet))->code[0] = psx_draw_mode(dfe, dtd, tpage)))
+#define setDrawMode(packet, dfe, dtd, tpage, texture_window) (setlen(packet, 2), (((DR_MODE *)(packet))->code[0] = psx_draw_mode(dfe, dtd, tpage)), (((DR_MODE *)(packet))->code[1] = psx_texture_window((PSX_RECT *)(texture_window))))
+#define setTexWindow(packet, texture_window) (setlen(packet, 2), (((DR_TWIN *)(packet))->code[0] = psx_texture_window((PSX_RECT *)(texture_window))), (((DR_TWIN *)(packet))->code[1] = 0))
 #define setLineF2(line) (setlen(line, 3), setcode(line, 0x40))
 #define setLineG2(line) (setlen(line, 4), setcode(line, 0x50))
 #define setLineF3(line) (setlen(line, 5), setcode(line, 0x48), (line)->pad = 0x55555555u)
@@ -1244,6 +1264,7 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority);
         void GsGetLs(uint32 coordinate, MATRIX *screen);
         void GsGetLws(uint32 coordinate, MATRIX *world, MATRIX *screen);
+        void gs_get_screen_matrix(MATRIX *matrix);
         sint32 GsSetRefView2(uint32 view);
         void GsSetLightMode(sint32 mode);
         void gs_sort_object4(uint32 object, uint32 ordering_table, uint32 shift, uint32 scratch);
@@ -1403,6 +1424,14 @@ extern uint8 DRAM[PSX_DRAM_SIZE];
         PsxCallbackDriver *restartIntr(void);
         PsxInterruptCallback InterruptCallback(sint32 interrupt, PsxInterruptCallback callback);
         PsxInterruptCallback psx_bios_vsync_callback(PsxInterruptCallback callback);
+
+        typedef struct PsxVsyncCallbacks
+        {
+            PsxInterruptCallback native_callback;
+            uint32 guest_callback;
+        } PsxVsyncCallbacks;
+
+        PsxVsyncCallbacks psx_bios_vsync_exchange(PsxVsyncCallbacks callbacks);
         PsxInterruptCallback setIntrVSync(uint32 slot, PsxInterruptCallback callback);
         void trapIntrVSync(void);
         void psx_interrupt_raise(uint32 interrupt);

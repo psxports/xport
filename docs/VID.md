@@ -46,6 +46,7 @@ Native GP0(E6) uses the existing GPU mask owner for primitive writes: bit0 force
 
 ## Resources
 
+- `vid_mesh_static` seals committed vertices against edits and invalidates CPU data views. VID retains staging until upload, then releases it; already uploaded meshes release it immediately. Queued GPU ownership remains unchanged
 - `vid_mesh_create` owns a fixed-capacity CPU vertex array; `vid_mesh_data` exposes that array. With an initialized context it also creates the GL buffer handle immediately; pre-init/headless handles remain CPU resources until rendering
 - `VID_VERTEX` contains homogeneous clip coordinates, normalized UV and floating-point RGBA; `vid_mesh_create` / `vid_mesh_data` select this 40-byte layout
 - `vid_mesh_create_3d` / `vid_mesh_data_3d` select the 72-byte `VID_VERTEX3D` layout: `pos[4]`, `uv[2]`, `color[4]`, `n[4]`, `extra[4]`. Wrong-layout accessors return NULL; both layouts share commit/free ownership
@@ -59,7 +60,10 @@ Native GP0(E6) uses the existing GPU mask owner for primitive writes: bit0 force
 - Fragment input omits a version header; VID supplies `vUV`, `vColor`, `uTex`, `uTextured`, `uParams[2]` and `outColor`. Supply a `main` body compatible with GLSL 330 and GLSL ES 300
 - Material `params[8]` are copied with each legacy draw or explicit pass; a committed material retains its shader
 - `vid_mat_create` owns the material data; `vid_mat_commit` retains its selected texture and `aux[2]` textures. Custom shaders access auxiliary texture units through `uAux0` and `uAux1`
+- `vid_tex_create_array_fmt(width, height, layers, format)` supports RGBA8 and RGBA5551 array storage; the original `vid_tex_create_array` remains RGBA8
+- `vid_tex_static` seals a committed CPU-backed texture against further edits. Returned CPU data pointers become invalid; VID retains staging until its first upload, then frees it. An already uploaded texture discards CPU staging immediately. This does not itself draw or upload; queued resources retain their ordinary GPU ownership. Headless resources retain staging until upload or release
 - After writing mesh or texture data, call its `commit` operation before drawing
+- `vid_tex_commit_rows(texture, first, count)` commits changed full-width rows of the CPU image. Pending row commits accumulate their enclosing interval; ordinary `vid_tex_commit` marks the whole image. Initial allocation uploads the complete image. A zero count is a no-op; invalid ranges abort. Queued draws still sample the final committed image at execution
 - Resource data pointers remain stable until the owning resource is freed, except index pointers invalidated by `vid_index_static`
 - Queued commands retain their mesh, indices, material, shader and textures until `vid_end` or `vid_cancel`
 - Mesh/material data cannot be changed while queued. Texture data can be updated and committed before `vid_end`; all queued draws sample the final committed image. This supports uploading a shared dynamic texture after geometry collection
@@ -74,6 +78,7 @@ The game stores semantic resource selections and VID references. It never alloca
 - After `vid_begin`, call `vid_target_select(target)` before recording any draw, pass or probe. Selection fails for NULL/released targets, an existing selection, a nonempty queue or a target image referenced by queued draws
 - `vid_end` renders color and depth into the selected target at the actual drawable size, presents its color image, and retains the completed image after presentation. Targets are opt-in; ordinary `vid_begin` and OG `vid_blit` keep their existing destination
 - `vid_target_select_offscreen(target)` uses the same selection validation and target lifetime. `vid_end` completes the target without copying its color to the previous framebuffer or swapping the window. Use this for native frozen-scene reconstruction at an image-capture boundary while OG remains selected; do not use it to render an extra scene every tick
+- `vid_target_select_offset(target, y)` presents the retained target with a vertical sampling offset in pixels of the drawable captured by `vid_begin`. Positive values sample higher source rows in bottom-left coordinates; exposed bands are black. Execution scales the offset to a resized drawable and uses nearest sampling with half-pixel rounding. The target image stays unshifted for later copying. Nonfinite offsets are rejected. Cancellation resets the offset; zero matches ordinary target selection
 - Allocation and resizing occur on execution. A minimized frame leaves the previous target image unchanged. `vid_cancel` releases the selection and preserves the previous completed image
 - `vid_target_texture` returns a borrowed RGBA8 texture. Do not free or commit this texture; `vid_tex_data` returns NULL. Materials retain it through the ordinary texture ownership contract. UV origin is bottom-left, unlike top-row-first uploaded CPU images
 - Sample a target only after a successful rendered frame or copy. Draw/pass recording rejects sampling the selected output as the primary or auxiliary texture
@@ -91,6 +96,8 @@ The game stores semantic resource selections and VID references. It never alloca
 5. Call `vid_end` once, or `vid_cancel` on an abandoned frame
 
 An explicit pass snapshots viewport, fog, material and current draw uniforms. Each subsequent `vid_submit` snapshots its current draw uniforms; zero vectors leave the pass/object uniforms unchanged. Change viewport/fog by starting another pass. A legacy `vid_draw` ends the explicit-pass recording scope; call `vid_pass` again before another submit. Keep referenced mesh/index/material data immutable while commands are queued. `vid_sample` uses its own viewport and preserves command order; begin a new pass after a probe before resuming geometry
+
+`vid_clear_depth()` queues a depth-only clear in the current viewport of the selected target. It preserves color and follows recorded command order, including viewport scaling if the drawable changes before execution. It requires an active frame, returns zero on failure and ends the current explicit pass; call `vid_pass` before the next `vid_submit`. The backend enables depth writes for the clear and the next pass restores its material state. Cancellation discards the command. The clear performs no presentation, readback, simulation or VRAM operation. Use an explicit game-owned layering boundary, such as a screen-space 3D group, rather than clearing between ordinary world objects
 
 The renderer sets viewport/scissor, depth/blend/cull, program and textures once per explicit pass. Submissions bind their mesh VAO, upload changed resources and object uniforms, and issue the draw. Mesh attribute layout is configured once in its owned VAO. Retain one explicit pass across adjacent submissions with the same material state; changing object uniforms alone does not require another pass
 
@@ -160,3 +167,27 @@ RapidRacer's `hd.c` selects the mode-8 showcase path at the scene boundary. Its 
 - `extract_topology.py` extracts current river/shore builders and range selection; `topology_test.c` covers quad/triangle/hole topology, binary anchoring, both circular directions and duplicate shore group selection. Its frustum test is stubbed visible; it does not prove game culling
 - `webgl.html` compiles/links current shaders and renders integer-texture water interpolation/anchoring pixels in WebGL 2.0
 - Debug Windows/Web builds verify integration. These fixtures do not establish gameplay appearance, FPS or actual RenderDoc call totals; the user verifies the game
+
+
+## Mipmapped anisotropic material sampling
+
+VID_MATERIAL_DATA.filter accepts VID_FILTER_NEAREST (0), VID_FILTER_LINEAR (1) and opt-in VID_FILTER_ANISOTROPIC (2). Mode2 builds the requested mip chain after each changed texture upload, uses linear mip interpolation for minification and linear magnification, and requests min(8, device maximum) anisotropy through EXT/ARB texture_filter_anisotropic. Without that extension it retains trilinear mip sampling. Integer textures retain nearest sampling. Existing0/1materials retain their previous behavior
+
+Anisotropic sampling requires an independently decoded bounded image: filtering packed VRAM/palette indices or generating mipmaps for a shared atlas does not preserve palette or region semantics. The game owns decoded asset caches, source invalidation, STP/alpha class images and texture boundaries. VID owns mip generation, sampler capabilities/settings and queued GPU resource lifetime
+
+
+## Queue-local GL state submission
+
+An uninterrupted frame-queue flush compares the applied viewport/scissor, cull/depth/blend state, program, uniforms, texture-unit bindings, VAO and element buffer before emitting GL calls. All applied-state knowledge is discarded at the flush boundary; there is no global GL state cache shared with other owners. A depth-clear command updates the known depth-write mask. Program changes invalidate the local uniform values; VAO changes invalidate the local element-buffer binding. Texture checks include uploaded versions and the texture object's actual sampler settings, including integer-format overrides and cross-unit sampler changes. The active texture unit is restored before returning
+
+The queue still executes the same draws, index ranges, transparent ordering, probes, clears and target operations. This optimization removes redundant API calls; it does not promise a particular frame rate or change game geometry/materials
+
+
+## Texture arrays
+
+`vid_tex_create_array(width, height, layers)` creates an RGBA8 2D array with 1..256 equally sized layers. `vid_tex_data` exposes contiguous layer-major pixels, each layer containing width*height*4 bytes. Commit, material ownership and queued lifetime follow the ordinary texture contract. Each layer has its own mip chain; filtering never interpolates between layers. Row commits on arrays upload the complete array. The existing texture factories retain their 2D target and formats.
+
+`vid_shader_create_array(vertex, fragment)` uses the ordinary custom-shader interface with `uTex` declared as a high-precision sampler2DArray; sample it with vec3(normalizedUV, layer). Only the primary texture is an array; auxiliary textures retain their existing sampler declarations. A material must pair an array shader with an array texture. Nearest, linear and anisotropic x8 modes use the same settings as 2D textures. Atlas layouts, gutters, palette decoding and alpha classes remain game-owned.
+
+
+`vid_tex_set_mip_levels(texture, levels)` sets an individual texture's maximum mip count, including level0. Zero (the default) retains the complete natural chain;1 keeps only the base image. Call it before submission, with no queued draw references. A changed limit invalidates mip/sampler state. Before generation the backend applies GL_TEXTURE_MAX_LEVEL=levels-1 to both 2D and array textures, so it limits generation as well as sampling; small images naturally stop earlier. Existing consumers retain full chains unless they opt in.

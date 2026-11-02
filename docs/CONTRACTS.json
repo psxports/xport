@@ -27,6 +27,7 @@
     }
   },
   "rule_owners": {
+    "git_execution_authorization": "docs/GIT.md",
     "build_execution": "docs/BUILD_POLICY.md",
     "context_binding_staging": "docs/CONTEXT.md",
     "host_discovery_auth": "docs/HOST_TOOLS.md",

@@ -21,6 +21,7 @@
 #include <time.h>
 #include <limits.h>
 #include <stddef.h>
+#include <math.h>
 
 #ifdef AP_X64
 typedef char XCRT_JUMP_SIZE[sizeof(jmp_buf) == 256 ? 1 : -1];
@@ -29,6 +30,7 @@ typedef char XCRT_JUMP_MXCSR[offsetof(_JUMP_BUFFER, MxCsr) == 88 ? 1 : -1];
 typedef char XCRT_JUMP_XMM[offsetof(_JUMP_BUFFER, Xmm6) == 96 ? 1 : -1];
 #endif
 #pragma function(memcpy, memmove, memset, memcmp, memchr, strlen, strcmp, strcpy, strcat, abs)
+#pragma function(fmod, floor)
 
 static HANDLE process_heap;
 static INIT_ONCE errno_once = INIT_ONCE_STATIC_INIT;
@@ -64,6 +66,102 @@ float fmaxf(float a, float b)
 {
     return float_extremum(a, b, 1);
 }
+
+double floor(double value)
+{
+    union
+    {
+        double value;
+        uint64_t bits;
+    } number = {value};
+
+    int exponent = (int)((number.bits >> 52) & 2047) - 1023;
+    uint64_t mask;
+    if (exponent >= 52 || value == 0.0)
+        return value;
+    if (exponent < 0)
+        return number.bits >> 63 ? -1.0 : 0.0;
+    mask = (UINT64_C(1) << (52 - exponent)) - 1;
+    if (number.bits & mask)
+    {
+        if (number.bits >> 63)
+            number.bits += mask + 1;
+        number.bits &= ~mask;
+    }
+    return number.value;
+}
+
+double fmod(double value, double divisor)
+{
+    union
+    {
+        double value;
+        uint64_t bits;
+    } numerator = {value}, denominator = {divisor};
+
+    const uint64_t sign = numerator.bits & (UINT64_C(1) << 63);
+    const uint64_t implicit = UINT64_C(1) << 52;
+    uint64_t left = numerator.bits & ~(UINT64_C(1) << 63);
+    uint64_t right = denominator.bits & ~(UINT64_C(1) << 63);
+    int left_exponent, right_exponent, encoded;
+    if (left > UINT64_C(0x7ff0000000000000) || right > UINT64_C(0x7ff0000000000000))
+        return value + divisor;
+    if (!right || left == UINT64_C(0x7ff0000000000000))
+    {
+        errno = EDOM;
+        numerator.bits = UINT64_C(0x7ff8000000000000);
+        return numerator.value;
+    }
+    if (left < right || !left)
+        return value;
+    left_exponent = (int)(left >> 52);
+    right_exponent = (int)(right >> 52);
+    left = (left & (implicit - 1)) | (left_exponent ? implicit : 0);
+    right = (right & (implicit - 1)) | (right_exponent ? implicit : 0);
+    left_exponent = left_exponent ? left_exponent - 1075 : -1074;
+    right_exponent = right_exponent ? right_exponent - 1075 : -1074;
+    while (left < implicit)
+    {
+        left <<= 1;
+        --left_exponent;
+    }
+    while (right < implicit)
+    {
+        right <<= 1;
+        --right_exponent;
+    }
+    while (left_exponent > right_exponent)
+    {
+        if (left >= right)
+            left -= right;
+        if (!left)
+            break;
+        left <<= 1;
+        --left_exponent;
+    }
+    if (left >= right)
+        left -= right;
+    if (!left)
+        numerator.bits = sign;
+    else
+    {
+        while (left < implicit)
+        {
+            left <<= 1;
+            --left_exponent;
+        }
+        encoded = left_exponent + 1075;
+        numerator.bits = sign | (encoded > 0 ? ((uint64_t)encoded << 52) | (left & (implicit - 1)) : left >> (1 - encoded));
+    }
+    return numerator.value;
+}
+
+#ifdef AP_X64
+float floorf(float value)
+{
+    return (float)floor(value);
+}
+#endif
 
 void *malloc(size_t size)
 {

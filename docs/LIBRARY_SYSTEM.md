@@ -10,7 +10,15 @@ Section routing and verification provenance: [LIBRARY.md](LIBRARY.md).
 
 ## sprintfPSX
 
-`sprintfPSX(destination, format, value)` accepts numeric guest addresses and one uint32 argument: literals, signed `%d` and `%%`; writes a terminating NUL and returns the character count. Unsupported conversions or a second decimal argument abort explicitly. This is a limited compatibility formatter for reviewed callers, not full variadic sprintf. Verify from tools with `python -B -m unittest tests.test_sprintf_psx -v`. No existing ABI or consumer migration changes.
+`sprintfPSX(destination, format, value)` accepts numeric guest addresses and one uint32 argument: literals, signed `%d`, lowercase `%x`, guest-string `%s` and `%%`; writes a terminating NUL and returns the character count. Its null string value emits no bytes. Unsupported conversions or a second consumed argument abort explicitly. This limited compatibility entry keeps its existing ABI and behavior. Verify from tools with `python -B -m unittest tests.test_sprintf_psx -v`.
+
+## psx_format_arguments
+
+`psx_format_arguments(destination, format, defaults, read_argument, context)` is the typed PsyQ integer/string formatter in the existing psx.c owner. Destination, format and the three little-endian default words (flags, width, precision) are explicit `XportMemoryRef` values. Defaults are read afresh for each conversion. The reader supplies a 32-bit numeric value or a host/guest reference for strings and count outputs; host pointers are never narrowed. Reader failure aborts when an argument is actually needed; unsupported and incomplete conversions terminate output without consuming their conversion argument.
+
+Supported conversions are d/i/u/o/x/X/p/c/s/n, escaped percent, flags -/+ /#/0, decimal or star width/precision and h/l/L modifiers. Numeric arguments remain one32-bit word; h narrows to16 bits and l/L do not consume64-bit words. `%p` formats a guest32-bit pointer token as eight uppercase hex digits. `%#s` reads an unsigned length byte followed by that many bytes, including embedded NULs. `%n`/`%hn` write32/16-bit counts. String copies happen after padding and preserve overlap; guest-to-guest copies retain the original unsigned virtual-address direction. Output receives a terminating NUL and the returned count excludes it. Floating conversions are unsupported and terminate at that conversion.
+
+Plain `%s` with a null reference has zero length, matching the original strlen boundary; width padding still applies. References must identify readable/writable spans whenever the conversion actually accesses bytes. The caller owns complete input/output spans and argument types. Numeric fields must fit the original 528-byte scratch region; a larger field aborts rather than corrupting host memory. This is an explicit supported-domain limit, not acceptance of original stack-overflow behavior. Platform sprintf and the old sprintfPSX entry are unchanged. Project rollout and unexecuted checks belong to RUNTIME_EVIDENCE.json.
 
 ## mallocPSX
 
@@ -108,6 +116,8 @@ After `PadInitDirect`, call `PadStartCom` to enable native packet publication. A
 Each platform backend owns the native process entrypoint and calls the required game-owned `void xport_main(void)`. The backend consumes common flags directly and receives the result through `xport_set_exit_code`. A port to another operating system implements the platform service declarations from `xport.h` in its own `platform/<name>/main.c`; `psx.c` contains no operating-system calls.
 
 ### psx 2
+
+The host-pointer `xport_*_le*` APIs and their diagnostic adapters have been removed. Supported native/Web targets are Little Endian. Use declared fields/arrays and direct typed pointers for host data, or explicit `memcpy` where alignment requires it. Known SDK packet fields use their owning structures. Numeric guest-memory access still uses `r_u*`/`r_s*`/`w_u*` for mapping, MMIO and observation; direct host writes do not generate guest-memory trace events. See the [refactoring scalar-access contract](REFACTORING_CONTRACTS.md#residual-scalar-access-gate)
 
 Translated code must include `psx.h` and use the shared debugger-visible `r_u8`, `r_u16`, `r_u32`, `r_s8`, `r_s16`, `r_s32`, `w_u8`, `w_u16`, `w_u32` and `w_masked_u32` functions for numeric guest-memory access. These functions preserve PSX aliases, unaligned little-endian access, DRAM/Scratchpad selection through the canonical `psx_addr` mapping, MMIO dispatch and trace observation. Do not add game-owned memory helpers, macros or DRAM/Scratchpad address decoders. Debug builds export stable function symbols so a debugger can break on every read or write; memory diagnostics may wrap writes with source metadata but still call the same shared symbols. The shared `w_u8_at`, `w_u16_at`, `w_u32_at` and `w_masked_u32_at` diagnostic adapters attach C source metadata and are never implemented or called explicitly by a game.
 

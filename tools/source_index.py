@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 
 PARSER_VERSION='c-cpp-source-index-v12'
 CODE_EXTENSIONS=('.c','.cpp')
@@ -21,6 +22,14 @@ KEYWORDS={'auto','break','case','char','const','continue','default','do','double
 
 
 def sha(data):return hashlib.sha256(data).hexdigest()
+
+
+def replace_database(source,temporary):
+    if os.name!='nt':return temporary.replace(source)
+    import ctypes
+    kernel32=ctypes.WinDLL('kernel32',use_last_error=True)
+    if not kernel32.ReplaceFileW(str(source),str(temporary),None,1,None,None):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def source_relative(root,path):
@@ -541,7 +550,14 @@ def rebuild(format_changed=True):
         db.commit()
         if db.execute('PRAGMA integrity_check').fetchone()[0]!='ok' or db.execute('PRAGMA foreign_key_check').fetchall():raise ValueError('Indexed database validation failed')
     finally:original.close();db.close()
-    temporary.replace(source);return summary
+    for attempt in range(8):
+        try:
+            replace_database(source,temporary)
+            break
+        except PermissionError:
+            if os.name!='nt' or attempt==7:raise
+            time.sleep(0.25*(attempt+1))
+    return summary
 
 
 def main():

@@ -61,6 +61,12 @@ extern "C"
     void gpu_render_list_free(GpuRenderList *list);
     sint32 gpu_render_list_begin(GpuRenderList *list, const DRAWENV *environment);
     sint32 gpu_render_list_end(GpuRenderList *list);
+    sint32 gpu_render_list_defer_polygon(GpuRenderList *list, const void *marker, uint16 page, const void *source, size_t bytes);
+    uint32 gpu_render_list_deferred_count(const GpuRenderList *list);
+    const void *gpu_render_list_deferred_source(const GpuRenderList *list, uint32 slot, size_t *bytes);
+    sint32 gpu_render_list_resolve_polygon(GpuRenderList *list, uint32 slot, const void *packet, size_t bytes);
+    sint32 gpu_render_list_defer_draw(GpuRenderList *list, const void *marker, const void *source, size_t bytes);
+    sint32 gpu_render_list_resolve_draw(GpuRenderList *list, uint32 slot, const void *packet, size_t bytes);
     sint32 gpu_render_list_replay(const GpuRenderList *list);
     sint32 gpu_get_display_env(DISPENV *environment);
     // Preserve an embedded polygon texture page without emitting geometry

@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 from web_output_permissions import inherit_output_permissions
 from video_mp4 import index_mp4
-from convert_video import inspect_str
+from convert_video import inspect_str, reviewed_sector_count
 from xport_project import player_count
 
 
@@ -171,7 +171,12 @@ def prepared_videos(project):
         else:
             if type(sector_rate) is not int or sector_rate not in (75, 150):
                 raise ValueError('STR movies require reviewed video.sector_rate (75 or 150)')
-            observed = inspect_str(original, include_completions=True)
+            source_range = clip.get('source_range')
+            configured_range = config.get('video', {}).get('source_ranges', {}).get(source)
+            if source_range != configured_range:
+                raise ValueError('Prepared movie source range differs from configuration: '+source)
+            observed = inspect_str(original, include_completions=True,
+                                   sector_count=reviewed_sector_count(original, source_range))
             if ([(row['frame'], row['sector']) for row in observed['frames']] !=
                     [(row['frame'], row['sector']) for row in frame_list]):
                 raise ValueError('Original movie frame locations differ from receipt: '+source)

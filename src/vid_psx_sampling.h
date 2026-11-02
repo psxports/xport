@@ -4,6 +4,7 @@
 // The shader supplies vidPsxWord for its exact VRAM transport
 #define VID_PSX_SAMPLING_GLSL \
     "\n#ifndef VID_PSX_ADDRESS\n#define VID_PSX_ADDRESS vidPsxAddress\n#endif\n" \
+    "\n#ifndef VID_PSX_DECODE\n#define VID_PSX_DECODE vidPsxDecode\n#endif\n" \
     "uint vidPsxWord(ivec2 address);\n" \
     "int vidPsxAxis(int p,int size,bool repeatAxis){\n" \
     "if(!repeatAxis)return clamp(p,0,size-1);\n" \
@@ -22,7 +23,7 @@
     "if((word==0u&&!zeroOpaque)||(stpClass==1u&&stp)||(stpClass==2u&&!stp))return vec4(0.0);\n" \
     "uvec3 c=uvec3(word,word>>5,word>>10)&uvec3(31u);return vec4(vec3((c<<3)|(c>>2))/255.0,1.0);}\n" \
     "vec4 vidPsxTap(ivec2 pixel,uint tpage,uint clut,ivec4 region,uint repeatAxes,uint stpClass,bool zeroOpaque){\n" \
-    "return vidPsxColor(vidPsxDecode(tpage,clut,VID_PSX_ADDRESS(pixel,region,repeatAxes)),stpClass,zeroOpaque);}\n" \
+    "return vidPsxColor(VID_PSX_DECODE(tpage,clut,VID_PSX_ADDRESS(pixel,region,repeatAxes)),stpClass,zeroOpaque);}\n" \
     "vec4 vidPsxFilter(vec2 uv,uint tpage,uint clut,ivec4 region,uint repeatAxes,uint stpClass,bool zeroOpaque){\n" \
     "vec2 p=uv-0.5;ivec2 base=ivec2(floor(p));vec2 f=fract(p);\n" \
     "vec4 a=vidPsxTap(base,tpage,clut,region,repeatAxes,stpClass,zeroOpaque);\n" \
@@ -32,7 +33,7 @@
     "vec4 color=mix(mix(a,b,f.x),mix(c,d,f.x),f.y);\n" \
     "return color.a>0.0?vec4(color.rgb/color.a,1.0):vec4(0.0);}\n" \
     "vec4 vidPsxSample(vec2 uv,uint tpage,uint clut,ivec4 region,uint repeatAxes,uint stpClass,bool filtered,bool zeroOpaque,out uint nearestWord){\n" \
-    "nearestWord=vidPsxDecode(tpage,clut,VID_PSX_ADDRESS(ivec2(floor(uv)),region,repeatAxes));\n" \
+    "nearestWord=VID_PSX_DECODE(tpage,clut,VID_PSX_ADDRESS(ivec2(floor(uv)),region,repeatAxes));\n" \
     "vec4 color=vidPsxColor(nearestWord,stpClass,zeroOpaque);\n" \
     "return color.a==0.0||!filtered?color:vidPsxFilter(uv,tpage,clut,region,repeatAxes,stpClass,zeroOpaque); }\n"
 

@@ -33,8 +33,9 @@ def msbuild_path():
 
 def process_running(name):
     if os.name!='nt' or not name:return False
-    result=subprocess.run(['tasklist','/FI','IMAGENAME eq '+name,'/FO','CSV','/NH'],capture_output=True,text=True,env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    return result.returncode==0 and any(line.lower().startswith(('"'+name+'"').lower()) for line in result.stdout.splitlines())
+    result=subprocess.run(['tasklist','/FI','IMAGENAME eq '+name,'/FO','CSV','/NH'],capture_output=True,text=True,encoding='oem',env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    if result.returncode:raise RuntimeError('Cannot inspect running native processes: tasklist exit '+str(result.returncode))
+    return any(line.lower().startswith(('"'+name+'"').lower()) for line in result.stdout.splitlines())
 
 
 def run_command(argv,root,log,environment=None):

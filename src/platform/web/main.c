@@ -458,8 +458,9 @@ EM_ASYNC_JS(void, platform_wait_frame, (void), {
     if (!state)
     {
         var channel = new MessageChannel();
-        state = { channel: channel, pending: [] };
-        channel.port1.onmessage = function() {
+        state = {channel : channel, pending : []};
+        channel.port1.onmessage = function()
+        {
             var wake = state.pending.shift();
             if (wake)
                 wake();

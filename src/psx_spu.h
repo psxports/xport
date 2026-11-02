@@ -658,6 +658,14 @@ extern "C"
         sint16 pan;
     } SndVoiceStats;
 
+    sint32 _SpuRSetVoiceAttr(const SpuVoiceAttr *attributes, sint32 first, sint32 last, sint32 deferred);
+    void _SsSndCrescendo(sint16 sequence, sint16 separation);
+    void _SsSndDecrescendo(sint16 sequence, sint16 separation);
+    void _SsSndTempo(sint16 sequence, sint16 separation);
+    void _SsSndPause(sint16 sequence, sint16 separation);
+    void _SsSndReplay(sint16 sequence, sint16 separation);
+    void SsSetTableSize(SpuSequenceSchedulerTrack *table, sint16 sequences, sint16 separations);
+    void _SsVmSeqKeyOff(sint16 sequence);
     void SsSetSerialAttr(sint8 serial, sint8 attribute, sint8 value);
     sint8 SsSetReservedVoice(sint8 count);
     sint8 SsBlockVoiceAllocation(void);

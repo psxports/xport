@@ -216,9 +216,9 @@ sint32 xport_memory_write(uint32 address, uint32 width, uint32 value, uint32 byt
     if (!xport_map(&memory_context, address, width, 1, &mapped))
         return 0;
     before = xport_bytes_load(mapped.pointer, width);
-        for (index = 0; index < width; ++index)
-            if (byte_mask & (1u << index))
-                mapped.pointer[index] = (uint8)(value >> (index * 8u));
+    for (index = 0; index < width; ++index)
+        if (byte_mask & (1u << index))
+            mapped.pointer[index] = (uint8)(value >> (index * 8u));
     xport_observe(&memory_context, XPORT_MEMORY_WRITE, mapped.region, mapped.offset, width, before, xport_bytes_load(mapped.pointer, width), byte_mask);
     return 1;
 }
@@ -410,54 +410,6 @@ uint8 xport_load_u8(const void *pointer)
     return value;
 }
 
-uint16 xport_load_le16(const void *pointer)
-{
-    XportMemoryContext *context = &memory_context;
-    XportMemoryRegion region;
-    uint32 offset;
-    sint32 readonly;
-    uint16 value;
-    if (!pointer)
-    {
-        xport_set_error(context, XPORT_MEMORY_ERROR_ARGUMENT);
-        return 0;
-    }
-    value = (uint16)xport_bytes_load((const uint8 *)pointer, 2u);
-    if (xport_host_range(context, pointer, 2u, &region, &offset, &readonly))
-        xport_observe(context, XPORT_MEMORY_READ, region, offset, 2u, value, value, 3u);
-    return value;
-}
-
-uint32 xport_load_le32(const void *pointer)
-{
-    XportMemoryContext *context = &memory_context;
-    XportMemoryRegion region;
-    uint32 offset;
-    sint32 readonly;
-    uint32 value;
-    if (!pointer)
-    {
-        xport_set_error(context, XPORT_MEMORY_ERROR_ARGUMENT);
-        return 0;
-    }
-    value = xport_bytes_load((const uint8 *)pointer, 4u);
-    if (xport_host_range(context, pointer, 4u, &region, &offset, &readonly))
-        xport_observe(context, XPORT_MEMORY_READ, region, offset, 4u, value, value, 15u);
-    return value;
-}
-
-sint16 xport_load_le_s16(const void *pointer)
-{
-    sint16 value = xport_load_le16(pointer);
-    return value;
-}
-
-sint32 xport_load_le_s32(const void *pointer)
-{
-    sint32 value = xport_load_le32(pointer);
-    return value;
-}
-
 static sint32 xport_store_host(void *pointer, uint32 width, uint32 value)
 {
     XportMemoryContext *context = &memory_context;
@@ -482,19 +434,9 @@ static sint32 xport_store_host(void *pointer, uint32 width, uint32 value)
     return 1;
 }
 
-sint32 xport_store_le16(void *pointer, uint32 value)
-{
-    return xport_store_host(pointer, 2u, value);
-}
-
 sint32 xport_store_u8(void *pointer, uint32 value)
 {
     return xport_store_host(pointer, 1u, value);
-}
-
-sint32 xport_store_le32(void *pointer, uint32 value)
-{
-    return xport_store_host(pointer, 4u, value);
 }
 
 XportMemoryRef xport_host_ref(void *pointer)
@@ -574,8 +516,6 @@ sint32 xport_guest_fill(uint32 destination, uint8 value, size_t length)
     xport_observe(context, XPORT_MEMORY_FILL, mapped.region, mapped.offset, length, 0u, value, 0u);
     return 1;
 }
-
-
 
 /* Memory observation */
 #include <string.h>
@@ -782,16 +722,6 @@ sint32 xport_update_u16_at(uint32 address, XportMemoryUpdate operation, uint32 v
 sint32 xport_update_u32_at(uint32 address, XportMemoryUpdate operation, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context)
 {
     XPORT_OBSERVED_CALL(xport_update_u32(address, operation, value));
-}
-
-sint32 xport_store_le16_at(void *pointer, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context)
-{
-    XPORT_OBSERVED_CALL(xport_store_le16(pointer, value));
-}
-
-sint32 xport_store_le32_at(void *pointer, uint32 value, const char *file, uint32 line, const char *function, const char *semantic_context)
-{
-    XPORT_OBSERVED_CALL(xport_store_le32(pointer, value));
 }
 
 sint32 xport_guest_copy_at(XportMemoryRef destination, XportMemoryRef source, size_t length, const char *file, uint32 line, const char *function, const char *semantic_context)
@@ -1066,7 +996,6 @@ sint32 xport_device_trace_enabled(void)
 {
     return device_sink != NULL;
 }
-
 
 /* Diagnostic stream persistence */
 #include <stdlib.h>
@@ -1565,11 +1494,10 @@ sint32 xport_memory_snapshot_capture_psx(XportMemorySnapshotWriter *writer, Xpor
     return token && xport_memory_snapshot_region(writer, token, 1u) && xport_memory_snapshot_region(writer, token, 2u) && xport_memory_snapshot_region(writer, token, 3u) && xport_memory_snapshot_region(writer, token, 4u) && xport_memory_snapshot_commit(writer, token);
 }
 
-#ifndef NDEBUG
 int xport_journal_file_sha256(const char *path, char output[65])
 {
     XportSha256 hash;
-    uint8 data[16384], digest[32];
+    uint8 data[1024], digest[32];
     size_t count;
     uint32 index;
     int failed;
@@ -1582,11 +1510,11 @@ int xport_journal_file_sha256(const char *path, char output[65])
     xport_sha256_init(&hash);
     while ((count = fread(data, 1, sizeof(data), stream)) != 0)
         xport_sha256_update(&hash, data, count);
-    #ifndef NDEBUG
+#ifndef NDEBUG
     failed = ferror(stream);
-    #else
+#else
     failed = 0;
-    #endif
+#endif
     if (fclose(stream))
         failed = 1;
     if (failed)
@@ -1597,6 +1525,8 @@ int xport_journal_file_sha256(const char *path, char output[65])
     output[64] = 0;
     return 1;
 }
+
+#ifndef NDEBUG
 
 static int quoted(FILE *stream, const char *value)
 {
@@ -1783,8 +1713,6 @@ int xport_trace_close_streams(XportTraceStreams *streams)
     memset(streams, 0, sizeof(*streams));
     return ok;
 }
-
-
 
 int xport_trace_write_progress(const char *path, uint32_t sequence, const uint32_t *values, size_t count)
 {

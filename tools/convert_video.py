@@ -36,7 +36,17 @@ def digest(path):
     return result.hexdigest()
 
 
-def inspect_str(path, include_completions=False):
+def reviewed_sector_count(path, source_range):
+    if source_range is None:
+        return None
+    if (not isinstance(source_range, dict) or set(source_range) != {'sector_count', 'source_sha256'}
+            or type(source_range['sector_count']) is not int or source_range['sector_count'] <= 0
+            or source_range['source_sha256'] != digest(path)):
+        raise ValueError('Invalid or stale reviewed STR source range')
+    return source_range['sector_count']
+
+
+def inspect_str(path, include_completions=False, sector_count=None):
     """Accept standard STR in raw2048, raw2352 or RIFF/CDXA sectors"""
     frames = []
     audio = {}
@@ -49,9 +59,14 @@ def inspect_str(path, include_completions=False):
         sector_bytes = 2048 if not offset and header[:4] == b'\x60\x01\x01\x80' else 2352
         if (Path(path).stat().st_size-offset) % sector_bytes:
             raise ValueError('Expected complete STR sectors or RIFF/CDXA')
+        physical_sectors = (Path(path).stat().st_size-offset) // sector_bytes
+        if sector_count is not None and (type(sector_count) is not int or not 0 < sector_count <= physical_sectors):
+            raise ValueError('STR source range exceeds complete physical sectors')
         stream.seek(offset)
         sector = 0
         while True:
+            if sector_count is not None and sector == sector_count:
+                break
             block = stream.read(sector_bytes)
             if not block:
                 break
@@ -173,8 +188,9 @@ def convert(root, config, ffmpeg=None):
         if not path.resolve().is_relative_to(root):
             raise ValueError('Video input escapes project')
         source = path.relative_to(root).as_posix()
+        source_range = config.get('video', {}).get('source_ranges', {}).get(source)
         try:
-            info = inspect_str(path)
+            info = inspect_str(path, sector_count=reviewed_sector_count(path, source_range))
         except ValueError as error:
             unsupported.append(dict(source=source, reason=str(error)))
             continue
@@ -196,10 +212,13 @@ def convert(root, config, ffmpeg=None):
             version = run_hidden_desktop([executable, '-version'], check=True, capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
             encoder = dict(path=executable, sha256=digest(executable) if Path(executable).is_file() else None, version=version)
         source_hash = digest(path)
-        name = source_hash[:20]+'-'+hashlib.sha256((source+fps+json.dumps(encoding,sort_keys=True)).encode()).hexdigest()[:12]+'.mp4'
+        range_key = json.dumps(source_range, sort_keys=True) if source_range is not None else ''
+        name = source_hash[:20]+'-'+hashlib.sha256((source+fps+json.dumps(encoding,sort_keys=True)+range_key).encode()).hexdigest()[:12]+'.mp4'
         destination = output/name
         identity = dict(source=source, source_sha256=source_hash, frame_rate=fps, encoding=encoding,
                         encoder=encoder, original=info)
+        if source_range is not None:
+            identity['source_range'] = source_range
         old = next((clip for clip in previous.get('clips', []) if clip.get('source') == source), None)
         if destination.exists():
             if not old or any(old.get(key) != value for key, value in identity.items()) or old.get('sha256') != digest(destination):
@@ -210,11 +229,15 @@ def convert(root, config, ffmpeg=None):
         with tempfile.TemporaryDirectory(prefix='encode-', dir=status) as temporary:
             encoded = Path(temporary)/'movie.mp4'
             demux_source = path
-            if info['layout'] == 'raw2048':
+            if info['layout'] == 'raw2048' or source_range is not None:
                 demux_source = Path(temporary)/'movie.str'
                 with path.open('rb') as src, demux_source.open('wb') as dst:
-                    for payload in iter(lambda: src.read(2048), b''):
-                        dst.write(wrap_video_sector(payload))
+                    src.seek(info['header_bytes'])
+                    for _ in range(info['sectors']):
+                        payload = src.read(info['sector_bytes'])
+                        if len(payload) != info['sector_bytes']:
+                            raise ValueError('STR source changed during preparation')
+                        dst.write(wrap_video_sector(payload) if info['layout'] == 'raw2048' else payload)
             command = [executable, '-nostdin', '-hide_banner', '-v', 'error', '-err_detect', 'explode',
                        '-r', fps, '-f', 'psxstr', '-i', str(demux_source), '-map', '0:v:0', '-map', '0:a?',
                        '-c:v', 'libx264', '-preset', 'slow', '-crf', str(crf), '-pix_fmt', 'yuv420p', '-bf', '0',
