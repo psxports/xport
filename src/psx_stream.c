@@ -323,8 +323,13 @@ sint32 stream_pump(void)
         sint32 available = cd_stream_pop_sector_native(raw);
         if (available > 0)
         {
-            memcpy(&location, raw + 12, sizeof(CdlLOC));
-            result = stream_feed_sector(raw + 24, &location);
+            // consume neutral XA sectors without interpreting their payload as STR
+            result = 1;
+            if (raw[15] != 2 || (raw[18] & 0x0E) != 0)
+            {
+                memcpy(&location, raw + 12, sizeof(CdlLOC));
+                result = stream_feed_sector(raw + 24, &location);
+            }
         }
         else
             result = available < 0 ? -3 : 0;

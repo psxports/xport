@@ -60,6 +60,7 @@ Keep those contracts distinct.
 ### SsSeqCalledTbyT
 
 - Original `SsSeqCalledTbyT` native entry has a void callback ABI because callers do not consume its result;preserve effects/reentrancy/loop control and original markers. Do not cast incompatible function pointers
+- `XPORT_SPU_SEQUENCE_TICK_PSYQ43` selects the existing `SpuSequenceManager.locked` as the primary scheduler pump guard. It also makes the tempo ramp clear both tempo flags and return when its decremented countdown is signed-negative. Other consumers retain the default scheduler guard and tempo behavior
 
 Legacy generic IRQ/DMA/graphics and mixed SDK reset ownership remain separate work
 
@@ -110,6 +111,7 @@ Structural work remains unverified;final Debug x86 controls/reverb scenarios pen
 ## Native VAB sample sources
 
 - `SpuWrite` accepts native sources with the native transfer binding;the current implementation copies source bytes during submission and handles DMA tail padding internally. Keep caller-owned storage alive through its established completion phase;do not serialize host pointers as guest DMA addresses
+- `spu_vab_trans_body_with_dma_tail(body, body_bytes, source_capacity, bank)` preserves the containing source bytes through the rounded DMA extent. `body_bytes` validates the logical member and `source_capacity` bounds the available tail. It uses the existing transfer path and completion contract;existing VAB and `SpuWrite` APIs retain their padding behavior
 
 Original loader phases own separate-file native storage;borrowed menu spans are mapped only at the remaining resource boundary. Loop VH/SEQ copies outlive their released parent bundle
 
@@ -141,7 +143,9 @@ Earlier numeric track-offset documentation is historical; its migration boundary
 
 ## Sequence volume output ABI
 
-Keep output write order,original signed return and partial-buffer lifetime. No wrapper/getter was added
+Keep output write order, original signed return and partial-buffer lifetime.
+
+`SsSeqGetVol(sequence, separation, left, right)` combines the low 16 bits of `sequence | (separation << 8)` and delegates to `spu_sequence_vm_get_sequence_volume` on the existing common scheduler. Signed 16-bit output pointers receive the stored volume bits, left before right. The public SDK entry has no return value; internal callers retain the existing getter return contract.
 
 - Record120/122 output mappings now use aligned native storage directly. The unused mixed numeric/address return carriers were removed after scoped MIPS/caller review.
 
@@ -188,6 +192,10 @@ Final Debug x86 reverb,reservation and repeated-init scenarios pending
 No mixer or sequence scheduling change; final Debug x86 validation pending
 
 ## Native voice event state
+
+`XPORT_SPU_VM_KEY_OFF_PSYQ43=1` requires `XPORT_NATIVE_VM=1`. In `spu_sequence_vm_key_off`, protected voices are skipped before identity matching; a matching sample255 voice uses the existing logical clear operation without changing device noise or queued key masks. Other matching voices retain the existing selected-note key-off operation and result count. Callers hold the recursive audio lock across the operation and supply a valid native voice count in 0..24. The default implementation is unchanged; no new VM or device state owner is introduced.
+
+`XPORT_SPU_VM_ACTIVE_MASK_PSYQ43=1` requires `XPORT_NATIVE_VM=1`. It selects active-voice preservation in `SsFlush`: reverb/noise bits outside the current 0..24 voice domain are retained through the existing SPU owner. Invalid counts above 24 abort before shifting; the default branch is unchanged. `spu_sequence_vm_initialize_phase(uint8 voices)` reuses the canonical voice-record initialization, resets the existing VAB owner and reverb input mask/mode/depth defaults, flushes and returns the current noise mask. The phase holds the existing audio lock; callers initialize the native SDK first and quiesce voices, VAB resources and borrowed buffers before resetting their heap. It does not reset the sequence scheduler, callback driver or whole device, allocate a second state owner, or redefine the separate legacy `spu_sequence_vm_initialize` variant.
 
 - `SpuVoiceEventState` holds caller-owned key-on/key-off/reverb low/high halfword masks,16 silence-history words,a history index,voice count and silence-cleanup flag. Keep device addresses and shift/narrowing semantics numeric; the record is native state, not a serialized format
 - Migrate queueing, cancellation, flush and reset consumers together. Preserve the original history window and partial-reset behavior; capacity does not prove every history record participates in a reduction. Keep actual SPU writes through the shared device interface
@@ -315,6 +323,12 @@ Native VM voices/cache/timers/callbacks and full SDK ownership consolidation rem
 - Define `XPORT_NATIVE_VM=1` only together with `XPORT_NATIVE_VAB=1` and `XPORT_NATIVE_SEQUENCE=1`. Game voice setup, sequencer allocation/key events, `SsQueueRegisters`, `SsVoiceCheck`, `SsUtSetDetVVol` and direct voice API limits must use the same `SpuVmState` returned by `spu_vm_state()`
 - `SpuVoiceState` and `SpuNoteContext` are native semantic records; their C layout is not the original 54-byte voice or packed context encoding. MIDI channel and note are separate fields. Use `spu_vm_voice()` for checked voice selection, never byte offsets or guest bindings
 - The VM owns 24 voice records, selected note, key-on/off/reverb/noise halves, 16 silence-history masks, count/cleanup policy, protection, mono/release settings, 192 deferred register halfwords and 24 dirty bytes. Register words retain the hardware word order; they are not host pointers
+- Native-only `spu_sequence_vm_clear_voice` clears just status, sample and pitch in one checked VM voice, without changing device noise or queued key masks. It is distinct from the existing noise-off operation that updates device registers
+- Native-only `spu_sequence_vm_key_off_voice` checks the existing manager lock and a selected voice among 24, then compares signed bank/program/tone/note and sample255. A matching noise voice receives only the logical clear; otherwise the existing selected-note key-off operation runs. Both modulation enable fields are cleared. Existing VM/manager owners and recursive audio lock are reused; native execution and concurrent pump integration remain unverified
+- Native `SsQueueKeyOn` updates the existing event masks below the signed configured voice count and clears corresponding queued key-off bits. `SsQueueReverb` updates only selected voices among the 24 native voices; neither call flushes or keys the device immediately
+- `SsUtAllKeyOff(sint16 mode)` requires `XPORT_NATIVE_VM`. It resets unprotected voices below the signed configured count through the existing attribute and selected-key-off operations under the recursive audio lock. It does not flush or reset VAB/scheduler state; `mode` is unused. Native semantic voice records do not expose the retired effective-velocity cache from the original private layout
+- Native `SsUtGetVagAddrFromTone` uses the existing VAB attribute/view services and retains the selected bank/program context. It returns the packed sample-table address in bytes, or `0xFFFFFFFF` for failed selection or an invalid native span; it does not reselect program 0 through `SsUtGetVagAddr`
+- These three entrypoints require `XPORT_NATIVE_VM`; other profiles abort if called. Their native execution, concurrent VAB lifetime, flush and audio output remain unverified
 - `spu_vm_reset()` resets this owner at the consuming game's cold-start/BSS reset boundary. `SsInit`/`SsQuit` do not additionally zero these records: the translated sequencer initializer retains its original partial field resets. Borrowed pointers expire semantically at explicit reset; callers must not retain selected-record values across callbacks that can select or reset voices. Existing guest binding APIs and default implementations remain available outside this explicit mode
 - SPU hardware/transfer/malloc/reverb state and native VM state are distinct owners.
 - Native VM structural migration is uncompiled and unverified; allocation ties, partial initialization, event masks, volume order, playback, reset/reentry and affected default clients require final verification
@@ -347,6 +361,8 @@ spu_vab_open_head_sticky(header,header_bytes,bank,body_address) and spu_vab_tran
 spu_vab_select_native selects the same owner through native_vm.note.bank/program/program_tone_index with low-byte group semantics. Native partial GetProg writes0..4 andhalf6;native GetVag/SetVag use bytes0..5,7,6,8..13 thenhalf16/18/20/22,leaving other fields unchanged. Bounds precede access. Invalid native pending/negative/out-of-span cases return-1 as an explicit invalid-access repair;do not claim original malformed-input equivalence. Keep guest profile branches and public view layout.
 
 spu_vab_reset_native clears only VAB metadata,cursor and completion at the SDK owner reset point;never invoke it lazily while loading. spu_vab_native_current borrows the view selected by native_vm.note without another current-bank cache. The private validity byte is0empty,1legacy-auto,2bounded-sticky;prior readers use logical validity. spu_vab_close_sticky accepts only producer2:invalid bank returns0,empty bank returnsbank*4,open bank frees the SDK heap address,clears its entry and returns remaining valid-bank count. It must not reclaim the automatic cursor or disturb another pending transfer. Impossible mixed producer/pending ownership returnsFFFFFFFF without mutation. Legacy SsVabClose retains its original auto-cursor reclaim.
+
+spu_vab_open_head_allocated(header,header_bytes,bank) adds bounded normal VAB opening to this same owner and parser. It requires the native SPU transfer binding with no pending device transfer, selects an available bank, and requests the sample total rounded to64 bytes through existing SpuMalloc. Only aligned8-byte SPU addresses within the complete rounded allocation are published. The owner rebases its parsed sample addresses and packed program tails, retains the unrounded sample byte length, and publishes the bank only after allocation succeeds. Failure publishes no bank; an invalid returned allocation is released through SpuFree. The existing native transfer completion latch is cleared on success and released on allocation failure; VAB completion remains a separate existing field. Close allocated banks through spu_vab_close_sticky, which releases their SDK heap allocation. This entry uses the existing bounded producer2 and does not change the legacy automatic-cursor APIs or the existing explicit-base sticky operation.
 
 These structural changes are not runtime validation.
 
@@ -396,6 +412,8 @@ Do not claim adoption from shared-file visibility alone. Final Debug x86 integra
 
 Volume callbacks use SpuSequenceVolumeGet/Set with packed sint16 handles and original uint32 results. Play-tick uses SpuSequenceHandler for event dispatch. Preserve captured record pointers, subsequent live slot reloads and callback order. Callers must supply the same live native context and valid callbacks used by their sequence engine. Do not turn the remaining AP native track into a scheduler track with a cast. Complete engine/owner unification remains a coordinated migration.
 
+`XPORT_SPU_SEQUENCE_LINEAR_VOLUME_PSYQ43` selects the signed linear elapsed/duration algorithm in `spu_sequence_scheduler_crescendo`, with the quotient cache and final volume-get callback retained. The default reference algorithm and separate decrescendo entry remain unchanged. Consumers whose two volume flags name this same operation must bind both pump callbacks to it explicitly.
+
 P2 keeps original marker bridges for800759D4,800750F0,80074A98,80074D74,80075DF4,80075BB4. Shared bodies have no game-specific marker. This is an applied structural extraction, not a claim of current execution equivalence; final Debug x86 verification remains pending.
 
 ## Common reference SEQ events and transport
@@ -424,7 +442,7 @@ Full AP adoption, VM consolidation and final Debug x86 validation remain pending
 
 ## Common reference voice backend and lifecycle
 
-The extracted `spu_sequence_vm_*` operations implement P2 volume, voice/tone selection, pitch/bend, noise, key-on/off, initialization, flush and reverb controls in common psx_spu.c. Use the existing single SpuVmState/VAB owners. Operations that read tracks take an explicit live SpuSequenceScheduler. Do not introduce a project VM table or redirect to older AP algorithms merely because the PsyQ name matches. Public P2 original functions retain typed marker bridges; common internal calls use common backends.
+The extracted `spu_sequence_vm_*` operations implement P2 volume, voice/tone selection, pitch/bend, noise, key-on/off, initialization, flush and reverb controls in common psx_spu.c. `SsSetMono()` and `SsSetStereo()` set the existing VM `mono_mode` to 1 and 0 respectively; they do not create a separate mixer or device state. Use the existing single SpuVmState/VAB owners. Operations that read tracks take an explicit live SpuSequenceScheduler. Do not introduce a project VM table or redirect to older AP algorithms merely because the PsyQ name matches. Public P2 original functions retain typed marker bridges; common internal calls use common backends.
 
 Preserve P2 priority/envelope/age selection order, unsigned/signed narrowing,192-entry pitch lookup, fine quantization, masked shifts and quadratic volume. ADSR2 adds release_offset to the entire halfword. Noise-off keeps sample, clears NOISEL/H and returns52*voice. Noise voice masks retain queued mode and only mode0/1 mutation. Sequence33 key-on still applies quadratic volume. Full noise-on is implemented; the old AP static abort stub is not the reference.
 
@@ -444,7 +462,31 @@ AP adoption and retirement of its older competing algorithms remain pending. Cur
 
 AP adoption/old implementation retirement and final Debug x86 validation remain pending; no current execution proof is claimed.
 
+## Native CD command parameter guard
+
+XPORT_CD_CW_REQUIRED_PARAMETERS=1 enables required-parameter presence checks in the existing unbound CD_cw path. Commands2,13,14,18 and20 reject a null parameter with-2 before command dispatch, completion/response publication, output writes or callback notification. This applies to synchronous and asynchronous calls and null or nonnull result buffers.
+
+With the flag absent or zero, the previous implementation is retained. The existing bound SDK table validation and all nonnull-parameter or no-parameter-command paths are unchanged. This guard does not validate parameter spans, add command support, alter transports, or establish completion/ready/reset behavior. Select the option consistently in the consuming native/Web builds; native execution remains a separate verification gate.
+
 ## Extracted XA music files
+
+### Interleaved raw XA files
+
+`xport_xa_stream_open(path, first, sectors, sector)` opens an extracted raw XA/STR file through `xport_fopen`, checks its exact `sectors*2352` length and the requested packet/header, and positions it at `sector-first`. It returns0 on success or-1 without replacing current playback on open/size/seek/read failure or an intervening audio-owner reset. Opening may await Web DATA loading outside the audio lock. Calls that replace/close playback must be serialized on the game thread. No image, directory, controller command or DMA source is involved.
+
+`xport_xa_stream_mode(rate, audio, filter)` selects75 or150 packets per second and audio/filter enablement; `xport_xa_stream_filter(file, channel)` selects the interleaved XA identity. The current XA decoder, PCM ring, filter fields, mixer and audio lock remain the only owners. Packet reads use `xport_fread` under that lock. `xport_xa_stream_play(playing)` returns0 for a live nonfailed file, otherwise-1; pause retains buffered PCM and file position. File open starts paused. Decoder state resets on replacement or filter change. No file-level loop policy is added.
+
+`xport_xa_stream_position(header, sector)` returns0 for current file metadata, otherwise-1; either output may beNULL. Header receives the original eight bytes at packet offset12, and sector receives the original numeric position. Open validates the first requested packet before exposing its metadata. `xport_xa_stream_status()` returns0 for no file,1 for a live file,2 after EOF PCM drains, or-1 for a failed read/decode. EOF schedules the existing ready callback with `CdlDataEnd` on the game thread; failure remains an error and does not signal EOF. Close/reset releases the file, PCM and pending EOF. `xport_xa_stream_close()` affects only this file input. Existing image/legacy XA and single-channel file APIs keep their paths when this input is absent. Native playback, callback timing and Web loading still require consuming-project integration checks.
+
+### Stereo VAG music streams
+
+`xport_vag_open/info/available/read/close` in `psx_spu.h` provide an owned, nonblocking compressed SPU ADPCM source through the existing MUSIC transport. They do not take the CD audio owner or allocate SPU voices: consumers submit returned blocks through their existing voice/packet player, or use `spu_decode_adpcm_block` with independent predictor histories per channel. Close only after the caller stops reading; returned blocks are copied into caller-owned memory.
+
+The explicitly identified xport stereo VAG variant has a 64-byte big-endian header: `VAGp` at 0, version `0x00010000` at 4, per-channel interleave 16 at 8, payload byte count at 12, sample rate at 16, `XPRT` marker at 20, exact sample frames per channel at 24, channels 1 or 2 at 28, and 32 bytes of display name at 32. Payload consists of one 16-byte block per channel in channel order, repeated. Each channel block decodes to 28 samples; the exact frame count trims final padding. This is a documented VAG extension, not automatic detection of every proprietary stereo VAG layout. Source block flags remain untouched; file-level repetition belongs to the caller.
+
+Open starts the ordinary progressive MUSIC fetch on Web; native file payload reads are deferred until polling. `info` returns 1 when validated, 0 while the header is pending, -1 on failure. `available` reports complete unread block groups, 0 for an incomplete pair or EOF, -1 on failure. `read(stream,left,right,blocks)` copies up to the requested count into separate channel planes, each needing `blocks*16` bytes, and returns complete block groups. The right pointer may be NULL for mono. Incomplete channel groups never advance the cursor; malformed headers/blocks and failed transport latch failure. The stream reserves the whole compressed-file size, as existing WAV/XA transport does. No separate bounded ring-buffer or HTTP Range contract is introduced.
+
+The Web packager accepts `bin/MUSIC/*.VAG` under the same hashed, lazy MUSIC namespace as WAV and XA. Validate the reader with `tests.test_vag_stream`, existing formats with `tests.test_xa_file_stream`, packaging with `tests.test_web_packager`, and the shared JS transport with `web_assets_test.cjs`. Consuming-game packet lifetime, pause/fade and real playback remain integration checks.
 
 `xport_xa_play_file_at(path, repeat, sector)` starts at the first complete XA packet whose original BCD header identifies an LBA greater than or equal to `sector`. Zero starts at the beginning; negative values fail. Skipping uses the existing incremental transport, resets decoder history at the requested start, and counts skipped packets in the absolute file mixer frame position. A target beyond the final packet reports EOF through the existing owner and position API. Repeat starts subsequent passes at the beginning. Stop releases the owner; reopening at a saved sector works after another stream occupied it.
 

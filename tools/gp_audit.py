@@ -47,11 +47,36 @@ def literal_count(source, address):
     return len(re.findall(rf'0x0*{address:X}u?\b', source, re.IGNORECASE))
 
 
-def audit(root, config, suspect_bases):
+def complete_binding_rows(root, config):
+    from contextlib import closing
+    from project_context import connect, source_body, translation_state
     database = root/config['paths']['analysis_database']
-    db = sqlite3.connect(database)
-    rows = db.execute("""SELECT image,address,source_path,start_offset,end_offset
-                         FROM implementations WHERE mapping_status='mapped' ORDER BY image,address""").fetchall()
+    rows = []
+    cache = {}
+    saved = connect(root, config)
+    if saved is None:
+        raise ValueError('Complete translation database is unavailable')
+    with closing(saved), closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True)) as originals:
+        originals.row_factory = sqlite3.Row
+        for binding in saved.execute('SELECT * FROM translations ORDER BY image,address'):
+            original = originals.execute('SELECT * FROM functions WHERE image=? AND address=?',
+                                         (binding['image'], binding['address'])).fetchone()
+            if original is None or not translation_state(root, original, binding, cache)['decompiled']:
+                raise ValueError(f"Stale complete translation binding: {binding['image']}:{binding['address']:08X}")
+            body = source_body(root, binding['source'], binding['symbol'], cache,
+                               image=binding['image'], address=binding['address'])
+            rows.append((binding['image'], binding['address'], binding['source'], body['start'], body['end']))
+    return rows
+
+
+def audit(root, config, suspect_bases, complete_bindings=False):
+    database = root/config['paths']['analysis_database']
+    if complete_bindings:
+        rows = complete_binding_rows(root, config)
+    else:
+        with sqlite3.connect(database.as_uri()+'?mode=ro', uri=True) as db:
+            rows = db.execute("""SELECT image,address,source_path,start_offset,end_offset
+                             FROM implementations WHERE mapping_status='mapped' ORDER BY image,address""").fetchall()
     profiles = root/config.get('paths', {}).get('ida_configs', 'tools/ida')
     profile_cache = {}
     source_cache = {}
@@ -76,8 +101,8 @@ def audit(root, config, suspect_bases):
         if type(gp) is not int or not 0 < gp <= 0xffffffff:
             raise ValueError('Missing reviewed runtime GP for '+image)
         if source_path not in source_cache:
-            source_cache[source_path] = (root/source_path).read_bytes()
-        source = source_cache[source_path][start:end].decode('utf-8', errors='replace')
+            source_cache[source_path] = (root/source_path).read_text(encoding='utf-8-sig')
+        source = source_cache[source_path][start:end]
         expected_addresses = {(gp+offset) & 0xffffffff for offset in offsets}
         memory_literals = [int(match.group(1), 16) for match in MEMORY_LITERAL.finditer(source)]
         listing_absolutes = {int(value, 16) for value in re.findall(r'\b0x(8[0-9A-Fa-f]{7})\b', listing)}
@@ -124,7 +149,8 @@ def audit(root, config, suspect_bases):
                           'gp': gp, 'operands': operands, 'inferred_base_candidates': inferred_rows})
     ranked = sorted(candidate_bases.items(), key=lambda item: (-item[1], item[0]))[:32]
     inferred_ranked = sorted(inferred_bases.items(), key=lambda item: (-item[1]['matched_offsets'], item[0]))
-    return {'schema': 1, 'suspect_bases': suspect_bases, 'totals': totals,
+    return {'schema': 1, 'source_scope': 'complete_bindings' if complete_bindings else 'derived_implementations',
+            'suspect_bases': suspect_bases, 'totals': totals,
             'candidate_bases': [{'base': base, 'pair_count': count} for base, count in ranked],
             'inferred_bases': [{'base': base, **counts} for base, counts in inferred_ranked],
             'functions': functions}
@@ -169,9 +195,11 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--emit-patch', action='store_true')
     parser.add_argument('--strict', action='store_true')
+    parser.add_argument('--complete-bindings', action='store_true',
+                        help='Read current audited project bindings without creating a native source index')
     args = parser.parse_args()
     root, config = load_project()
-    result = audit(root, config, args.suspect_base)
+    result = audit(root, config, args.suspect_base, args.complete_bindings)
     if args.emit_patch:
         print(correction_patch(root, result), end='')
         return 0

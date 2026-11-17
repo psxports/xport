@@ -47,6 +47,36 @@ upper_half:
     ret
 __ultof3 endp
 
+; convert unsigned EDX:ECX to binary64 in XMM0
+public __ultod3
+__ultod3 proc
+    sub esp, 8
+    test edx, edx
+    js upper_half_double
+    mov [esp], ecx
+    mov [esp+4], edx
+    fild QWORD PTR[esp]
+    fstp QWORD PTR[esp]
+    movsd xmm0, QWORD PTR[esp]
+    add esp, 8
+    ret
+upper_half_double:
+    ; retain the discarded low bit for halfway rounding
+    mov eax, ecx
+    and eax, 1
+    shrd ecx, edx, 1
+    shr edx, 1
+    or ecx, eax
+    mov [esp], ecx
+    mov [esp+4], edx
+    fild QWORD PTR[esp]
+    fstp QWORD PTR[esp]
+    movsd xmm0, QWORD PTR[esp]
+    addsd xmm0, xmm0
+    add esp, 8
+    ret
+__ultod3 endp
+
 ; convert signed EDX:ECX to binary32 in XMM0
 public __ltof3
 __ltof3 proc

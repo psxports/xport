@@ -395,12 +395,26 @@ def run_shared(root, tool, arguments=()):
 
 def inventory(root):
     root = Path(root)
+    original_root = (root/'orig').resolve()
+    generated_roots = [original_root/'images', original_root/'ghidra']
+    if (root/CONFIG_NAME).is_file():
+        configured = project(root).get('paths', {}).get('ida_exports')
+        if configured:
+            generated_roots.append((root/configured).resolve())
+    receipts = list((root/'status/ida/accepted').glob('*.json'))
+    receipts += list((root/'status/ghidra').glob('accepted-*.json'))
+    for receipt in receipts:
+        destination = read_json(receipt).get('destination')
+        if destination:
+            generated_roots.append((root/destination).resolve())
+    generated_roots = [path for path in generated_roots
+                       if path != original_root and path.is_relative_to(original_root)]
     candidates = []
     for base in (root/'iso', root/'bin/DATA', root/'orig'):
         if not base.exists():
             continue
         for path in sorted(item for item in base.rglob('*') if item.is_file()):
-            if base.name == 'orig' and path.relative_to(base).parts[0] in ('images', 'ghidra'):
+            if base.name == 'orig' and any(path.resolve().is_relative_to(folder) for folder in generated_roots):
                 continue
             item = {'path': relative(root, path), 'bytes': path.stat().st_size, 'sha256': digest_file(path)}
             with path.open('rb') as stream:
@@ -483,6 +497,9 @@ def validate_gp_config(root, profile):
     if isinstance(evidence, dict) and evidence.get('source') in ('inherited_named_loader', 'inherited_resource_loader'):
         from overlay_gp_named import validate as validate_named_loader
         return validate_named_loader(root, profile, evidence)
+    if isinstance(evidence, dict) and evidence.get('source') == 'inherited_thread_resource_loader':
+        from overlay_gp_thread import validate as validate_thread_loader
+        return validate_thread_loader(root, profile, evidence)
     if isinstance(evidence, dict) and evidence.get('source') in ('inherited_runtime_initializer', 'accepted_overlay_profile', 'inherited_static_loader'):
         from overlay_gp import validate as validate_overlay_gp
         return validate_overlay_gp(root, profile, evidence)
@@ -566,12 +583,21 @@ def project_preflight(root):
 
 
 
-def prepare_ida_export(root, ida, label, images=None, export_existing=False, plan=False):
+def _ida_config_directory(root, config, override=None):
+    if override is None:
+        return project_path(root, config, 'ida_configs', 'tools/ida')
+    path = (root / override).resolve()
+    if not path.is_relative_to(root / 'tools/ida') or not path.is_dir():
+        raise ValueError('Additional IDA profiles must use an existing project tools/ida directory')
+    return path
+
+
+def prepare_ida_export(root, ida, label, images=None, export_existing=False, plan=False, *, config_root=None):
     if not LABEL_PATTERN.fullmatch(label):
         raise ValueError('Invalid label')
     root = Path(root).resolve()
     config = project(root)
-    configs = project_path(root, config, 'ida_configs', 'tools/ida')
+    configs = _ida_config_directory(root, config, config_root)
     images = images or config.get('analysis', {}).get('images')
     if not images:
         raise ValueError('Specify images explicitly')
@@ -725,7 +751,7 @@ def verify_ida_image(root, run, configs, image):
             'config': relative(root, config), 'config_sha256': digest_file(config), 'files': files}
 
 
-def accept_ida(root, label, selected=None, *, snapshot=False):
+def accept_ida(root, label, selected=None, *, snapshot=False, config_root=None):
     if not LABEL_PATTERN.fullmatch(label):
         raise ValueError('Invalid IDA run label')
     root = Path(root).resolve()
@@ -747,7 +773,7 @@ def accept_ida(root, label, selected=None, *, snapshot=False):
     receipt_path = root/'status/ida/accepted'/(label+'.json')
     if receipt_path.exists():
         raise ValueError('Accepted immutable receipt already exists: '+relative(root, receipt_path))
-    configs = project_path(root, config, 'ida_configs', 'tools/ida')
+    configs = _ida_config_directory(root, config, config_root)
     manifests = [verify_ida_image(root, run, configs, image) for image in images]
     collisions = [relative(root, destination/image) for image in images if (destination/image).exists()]
     if collisions:
@@ -1559,7 +1585,7 @@ def start(root, name, short_name, first_port=2400, advance_now=True):
         return advance(root, state) if advance_now else state
 
 
-def refresh_completion(root, expected_revision, advance_now=True):
+def refresh_completion(root, expected_revision, advance_now=True, psyq_label=None):
     """Regenerate a completed startup handoff from current derived source state"""
     root = Path(root).resolve()
     with StartupLock(root):
@@ -1568,7 +1594,21 @@ def refresh_completion(root, expected_revision, advance_now=True):
             raise ValueError('STARTUP_REVISION_MISMATCH')
         if state.get('status') != 'complete':
             raise ValueError('STARTUP_NOT_COMPLETE')
-        state = publish(root, state, status='running', step='verify_frontier',
+        step = 'verify_frontier'
+        if psyq_label is not None:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', psyq_label):
+                raise ValueError('STARTUP_INVALID_PSYQ_LABEL')
+            if project(root).get('analysis', {}).get('sdk_detector', 'xport') != 'xport':
+                raise ValueError('STARTUP_PSYQ_REFRESH_REQUIRES_XPORT_DETECTOR')
+            if (root/'status/psyq-analyzer/runs'/psyq_label).exists():
+                raise ValueError('STARTUP_PSYQ_LABEL_EXISTS')
+            state.setdefault('history', []).append({
+                'kind': 'psyq_refresh', 'revision': expected_revision,
+                'previous_classification': project(root).get('paths', {}).get('sdk_classification'),
+                'label': psyq_label})
+            state.setdefault('analysis_labels', {})['psyq'] = psyq_label
+            step = 'psyq'
+        state = publish(root, state, status='running', step=step,
                         completion=None, attention=None, failure=None)
         return advance(root, state) if advance_now else state
 
@@ -1715,6 +1755,7 @@ def main():
     completion_parser = subparsers.add_parser('refresh-completion')
     completion_parser.add_argument('--project', type=Path, default=Path.cwd())
     completion_parser.add_argument('--expected-revision', required=True, type=int)
+    completion_parser.add_argument('--psyq-label')
     reexport_parser = subparsers.add_parser('reexport')
     reexport_parser.add_argument('--project', type=Path, default=Path.cwd())
     reexport_parser.add_argument('--expected-revision', required=True, type=int)
@@ -1755,7 +1796,8 @@ def main():
             result = compact(defer_frontier(args.project, args.expected_revision))
             dispatch_worker(args.project)
         elif args.action == 'refresh-completion':
-            result = compact(refresh_completion(args.project, args.expected_revision, advance_now=False))
+            result = compact(refresh_completion(args.project, args.expected_revision, advance_now=False,
+                                                psyq_label=args.psyq_label))
             dispatch_worker(args.project)
         else:
             state = migrate_early_icon_attention(args.project, load_state(args.project))

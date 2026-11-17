@@ -179,6 +179,7 @@ static void *bios_native_dispatch_context;
 static PsxNativeExec bios_native_exec;
 static void *bios_native_exec_context;
 static void bios_native_pad_poll(void);
+static void bios_native_pad_vblank(void);
 static uint32 bios_card_copy_source, bios_card_first_source, bios_card_second_source;
 static uint32 bios_card_first_destination, bios_card_second_destination;
 static uint32 bios_card_patches_bound;
@@ -1270,7 +1271,7 @@ void psx_vblank_signal(void)
         return;
     }
     xport_audio_vblank(vblank_count, FIELD_RATE);
-    bios_native_pad_poll();
+    bios_native_pad_vblank();
     psx_interrupt_raise(0u);
     if (!bios_callbacks_running)
         return;
@@ -1290,6 +1291,9 @@ void psx_vblank_signal(void)
         vblank_dispatching = 0;
         return;
     }
+#if defined(XPORT_CALLBACK_CONTEXT_PSYQ43) && XPORT_CALLBACK_CONTEXT_PSYQ43
+    vblank_dispatching = 1;
+#endif
     if (vblank_native_guest_counter)
         vblank_count = ++*vblank_native_guest_counter;
     else
@@ -1309,6 +1313,9 @@ void psx_vblank_signal(void)
     if (bios_callbacks_running && vsync_callback)
         vsync_callback();
     mc_poll();
+#if defined(XPORT_CALLBACK_CONTEXT_PSYQ43) && XPORT_CALLBACK_CONTEXT_PSYQ43
+    vblank_dispatching = 0;
+#endif
 }
 
 static uint32 *psx_vblank_guest_words(uint32 address, uint32 count)
@@ -1818,6 +1825,13 @@ PsxInterruptCallback InterruptCallback(sint32 interrupt, PsxInterruptCallback ca
 }
 
 static uint32 native_irq_dispatching;
+
+#if defined(XPORT_CALLBACK_CONTEXT_PSYQ43) && XPORT_CALLBACK_CONTEXT_PSYQ43
+sint32 CheckCallback(void)
+{
+    return native_irq_dispatching != 0 || vblank_dispatching != 0;
+}
+#endif
 
 static void bios_native_irq_dispatch(void)
 {
@@ -4695,6 +4709,9 @@ sint32 AverageZ4(sint32 a, sint32 b, sint32 c, sint32 d)
 
 static void psx_native_vblank_poll(void)
 {
+#if defined(AP_WEB) && AP_WEB
+    static uint64 pending_fields;
+#endif
     uint64 now, elapsed, fields;
     uint32 present_field;
     if (native_vblank_polling || vsync_sample || vblank_wait)
@@ -4704,6 +4721,9 @@ static void psx_native_vblank_poll(void)
     now = xport_timer_get();
     if (!native_vblank_clock_started)
     {
+#if defined(AP_WEB) && AP_WEB
+        pending_fields = 0;
+#endif
         native_vblank_last_us = now;
         native_vblank_clock_started = 1u;
         native_vblank_polling = 0u;
@@ -4715,6 +4735,11 @@ static void psx_native_vblank_poll(void)
     native_vblank_fraction += ((elapsed / 1000000u) * FIELD_RATE_NUMERATOR % FIELD_RATE_DENOMINATOR) * 1000000u + (elapsed % 1000000u) * FIELD_RATE_NUMERATOR;
     fields += native_vblank_fraction / ((uint64)1000000u * FIELD_RATE_DENOMINATOR);
     native_vblank_fraction %= (uint64)1000000u * FIELD_RATE_DENOMINATOR;
+#if defined(AP_WEB) && AP_WEB
+    pending_fields += fields;
+    fields = pending_fields > 4u ? 4u : pending_fields;
+    pending_fields -= fields;
+#endif
     present_field = fields != 0u;
     while (fields && !vblank_wait_failed)
     {
@@ -4790,6 +4815,7 @@ static uint8 *pad_actuators[2];
 static uint8 pad_actuator_lengths[2];
 static uint8 pad_alignment[2][6];
 static sint32 pad_active;
+static sint32 pad_vsync_pending;
 static sint32 pad_main_mode[2];
 static uint8 pad_main_mode_lock[2];
 static uint8 pad_current_id[2];
@@ -5105,6 +5131,20 @@ static void bios_native_pad_poll(void)
 void PadStartCom(void)
 {
     pad_active = 1;
+}
+
+static void bios_native_pad_vblank(void)
+{
+    if (pad_active)
+        pad_vsync_pending = 1;
+    bios_native_pad_poll();
+}
+
+sint32 PadChkVsync(void)
+{
+    sint32 pending = pad_vsync_pending;
+    pad_vsync_pending = 0;
+    return pending;
 }
 
 void PadStopCom(void)
@@ -6022,6 +6062,12 @@ uint32 StartPAD(void)
     ChangeClearPAD(1u);
     ChangeClearRCnt(3u, 0u);
     return 1u;
+}
+
+void StopPAD(void)
+{
+    PadStopCom();
+    bios_pad_initialized = 0u;
 }
 
 uint32 ChangeClearPAD(uint32 mode)
@@ -10296,6 +10342,20 @@ static void gs_apply_center(void)
     }
 }
 
+void GsSetDrawBuffOffset(void)
+{
+    gs_apply_center();
+}
+
+void gs_initialize_geometry_phase(void)
+{
+    InitGeom();
+    SetFarColor(0, 0, 0);
+    SetGeomOffset(0, 0);
+    gs_state.screen_offset_x = 0;
+    gs_state.screen_offset_y = 0;
+}
+
 void gs_set_screen_dimensions(sint32 width, sint32 height)
 {
     gs_screen_width = width;
@@ -10472,6 +10532,22 @@ void GsSetLightMatrix(const MATRIX *matrix)
     MulMatrix0(&light, (MATRIX *)matrix, &light);
     PopMatrix();
     SetLightMatrix(&light);
+}
+
+void GsSetLightMatrix2(MATRIX *matrix)
+{
+    if (matrix == NULL || gte_gs_light_directions == NULL)
+        abort();
+    SetLightMatrix(MulMatrix2(gte_gs_light_directions, matrix));
+}
+
+void gs_set_color_matrix(MATRIX *matrix)
+{
+    if (matrix == NULL || gte_gs_light_colors == NULL)
+        abort();
+    if (matrix != gte_gs_light_colors)
+        memcpy(gte_gs_light_colors, matrix, sizeof(MATRIX));
+    SetColorMatrix(matrix);
 }
 
 void GsSetAmbient(sint32 red, sint32 green, sint32 blue)
@@ -10728,13 +10804,17 @@ void gs_get_screen_matrix(MATRIX *matrix)
     memcpy(matrix, &gs_state.screen, sizeof(*matrix));
 }
 
-void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24)
+void gs_set_display_screen(const PSX_RECT *screen)
 {
-    uint32 index;
-    width = (uint16)width;
-    height = (uint16)height;
-    mode = (uint16)mode;
-    SetDispMask(0);
+    gs_state.display.screen = *screen;
+}
+
+DISPENV *gs_initialize_display_phase(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24, uint32 reset_graph)
+{
+    if (reset_graph)
+        ResetGraph(((mode >> 4) & 3) == 3 ? 3 : 0);
+    else
+        SetDispMask(0);
     gs_state.draw.ofs[0] = 0;
     gs_state.draw.ofs[1] = 0;
     memset(&gs_state.draw.tw, 0, sizeof(gs_state.draw.tw));
@@ -10756,12 +10836,21 @@ void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32
     gs_state.display.isinter = (uint8)(mode & 1);
     gs_state.display.isrgb24 = (uint8)rgb24;
     gs_state.mode = mode & 4;
-    PutDispEnv(&gs_state.display);
-    InitGeom();
-    SetFarColor(0, 0, 0);
-    SetGeomOffset(0, 0);
-    gs_state.screen_offset_x = 0;
-    gs_state.screen_offset_y = 0;
+    return PutDispEnv(&gs_state.display);
+}
+
+void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24)
+{
+    uint32 index;
+    width = (uint16)width;
+    height = (uint16)height;
+    mode = (uint16)mode;
+#if defined(XPORT_GS_DISPLAY_RESET_PSYQ43) && XPORT_GS_DISPLAY_RESET_PSYQ43
+    gs_initialize_display_phase(width, height, mode, dither, rgb24, 1);
+#else
+    gs_initialize_display_phase(width, height, mode, dither, rgb24, 0);
+#endif
+    gs_initialize_geometry_phase();
     gs_state.active = 0;
     gs_set_screen_dimensions((sint32)width, (sint32)height);
     if (width == 0)
@@ -10836,10 +10925,8 @@ uint32 GsGetActiveBuff(void)
     return gs_state.active;
 }
 
-void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
+static uint32 *gs_prepare_clear_packet(uint8 red, uint8 green, uint8 blue)
 {
-    uint32 wire_word_323;
-    const uint8 *descriptor = (const uint8 *)ordering_table;
     uint32 *packet = gs_state.clear_packets[gs_state.active];
     uint32 width = (uint32)gs_screen_width;
     if (!gpu_register_packet_range(gs_state.clear_packets, sizeof(gs_state.clear_packets)))
@@ -10853,7 +10940,21 @@ void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
     if (gs_state.display.isrgb24 != 0)
         width = width * 3 / 2;
     (*(uint16 *)((uint8 *)packet + 12) = (uint16)((uint16)width));
+    return packet;
+}
+
+void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table)
+{
+    uint32 wire_word_323;
+    const uint8 *descriptor = (const uint8 *)ordering_table;
+    uint32 *packet = gs_prepare_clear_packet(red, green, blue);
     AddPrim(psx_addr((memcpy(&wire_word_323, descriptor + 16, sizeof(wire_word_323)), wire_word_323), 4), packet);
+}
+
+void GsSortClearNative(uint8 red, uint8 green, uint8 blue, uint32 *ordering_tail)
+{
+    uint32 *packet = gs_prepare_clear_packet(red, green, blue);
+    AddPrim(ordering_tail, packet);
 }
 
 static uint32 *gs_work_packet(uint32 words)
@@ -14252,6 +14353,24 @@ void xport_memory_control_write32_missing(uint32 address, uint32 value)
     (void)address;
     (void)value;
     abort();
+}
+
+uint32 SquareRoot0WithNegativeTable(uint32 input, const sint16 negative[192])
+{
+    uint32 even, normalized, coefficient;
+    sint32 shift;
+    xport_gte_write_data(30u, input);
+    even = xport_gte_read_data(31u) & 0xFFFEu;
+    if (!input)
+        return 0;
+    shift = 24 - (sint32)even;
+    if (shift >= 0)
+        normalized = (uint32)((sint32)input >> ((uint32)shift & 31u));
+    else
+        normalized = input << ((even - 24u) & 31u);
+    coefficient = input & 0x80000000u ? (uint32)(sint32)negative[(sint32)normalized + 256] : (uint32)(sint32)psyq_sqrt_table[normalized - 64u];
+    shift = (sint32)(31u - even) >> 1;
+    return (coefficient << ((uint32)shift & 31u)) >> 12;
 }
 
 uint32 SquareRoot0PSX(uint32 input, uint32 table_address)

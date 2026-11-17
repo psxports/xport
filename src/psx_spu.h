@@ -26,9 +26,31 @@ extern "C"
 #endif
 
     void cd_dispatch_ready_event(void);
+    typedef struct XportVagStream XportVagStream;
+
+    typedef struct XportVagInfo
+    {
+        uint32 sample_rate;
+        uint32 channels;
+        uint32 frames;
+    } XportVagInfo;
+
+    XportVagStream *xport_vag_open(const char *path);
+    sint32 xport_vag_info(XportVagStream *stream, XportVagInfo *info);
+    sint32 xport_vag_available(XportVagStream *stream);
+    sint32 xport_vag_read(XportVagStream *stream, uint8 *left, uint8 *right, uint32 blocks);
+    void xport_vag_close(XportVagStream *stream);
     sint32 xport_xa_play_file(const char *path, sint32 repeat);
     sint32 xport_xa_play_file_at(const char *path, sint32 repeat, sint32 sector);
     sint32 xport_xa_file_position(CdlLOC *position, uint32 *frames);
+    /* direct raw XA files use the existing decoder, filter, mixer and EOF callback */
+    sint32 xport_xa_stream_open(const char *path, uint32 first, uint32 sectors, uint32 sector);
+    void xport_xa_stream_close(void);
+    sint32 xport_xa_stream_play(sint32 playing);
+    void xport_xa_stream_mode(uint32 rate, sint32 audio, sint32 filter);
+    void xport_xa_stream_filter(uint8 file, uint8 channel);
+    sint32 xport_xa_stream_position(uint8 header[8], uint32 *sector);
+    sint32 xport_xa_stream_status(void);
     sint32 CdInit(void);
     sint32 CdLastCom(void);
     sint32 cd_mount_cue(const char *cue_path);
@@ -533,9 +555,14 @@ extern "C"
 
     uint32 spu_sequence_vm_set_sequence_volume(SpuSequenceScheduler *scheduler, sint16 handle, sint16 left, sint16 right, sint16 mode);
     sint16 SsIsEos(sint16 sequence, sint16 separation);
+    void SsUtAllKeyOff(sint16 mode);
+    void SsSetMono(void);
+    void SsSetStereo(void);
+    void SsSeqGetVol(sint16 sequence, sint16 separation, sint16 *left, sint16 *right);
     void SsSeqSetVol(sint16 sequence, sint16 left, sint16 right);
     uint32 SsSeqPlay(sint16 sequence, uint8 mode, sint16 repetitions);
     void SsSeqStop(sint16 sequence);
+    void SsSeqClose(sint16 sequence);
     uint32 spu_sequence_vm_get_sequence_volume(SpuSequenceScheduler *scheduler, sint16 handle, uint16 *left, uint16 *right);
     uint32 spu_sequence_vm_sequence_key_off(sint16 sequence);
     uint32 spu_sequence_vm_set_volume(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 volume, uint16 pan);
@@ -545,6 +572,8 @@ extern "C"
     uint32 spu_sequence_vm_prepare_voice(void);
     uint16 spu_sequence_vm_note_pitch(void);
     uint32 spu_sequence_vm_noise_off(uint8 voice);
+    void spu_sequence_vm_clear_voice(uint8 voice);
+    sint32 spu_sequence_vm_key_off_voice(sint16 voice, sint16 bank, sint16 program, sint16 tone, sint16 note);
     uint32 spu_sequence_vm_select_tones(uint8 *tones, uint8 *samples);
     uint16 spu_sequence_vm_tone_pitch(uint16 note, uint16 fraction);
     uint32 spu_sequence_vm_voice_bend(sint16 voice, sint16 sequence, sint16 bank, sint16 program, uint16 bend);
@@ -558,6 +587,9 @@ extern "C"
 
     uint32 spu_sequence_vm_flush(void);
     uint32 spu_sequence_vm_initialize(uint8 voices);
+#if defined(XPORT_SPU_VM_ACTIVE_MASK_PSYQ43) && XPORT_SPU_VM_ACTIVE_MASK_PSYQ43
+    uint32 spu_sequence_vm_initialize_phase(uint8 voices);
+#endif
     uint32 spu_sequence_vm_key_on(SpuSequenceScheduler *scheduler, sint16 sequence, sint16 bank, sint16 program, uint16 note, uint16 velocity, uint16 pan);
     uint32 spu_sequence_vm_noise_on(SpuSequenceScheduler *scheduler, uint8 voice);
     void spu_sequence_vm_noise_key_on_direct(uint8 voice, sint16 left, sint16 right);
@@ -674,6 +706,9 @@ extern "C"
     void SsSetVoiceSettings(sint32 voice, SndVoiceStats *settings);
     sint16 SsGetActualProgFromProg(sint16 bank, sint16 program);
     sint32 SsUtGetVagAddr(sint16 bank, sint16 vag);
+    uint32 SsUtGetVagAddrFromTone(sint16 bank, sint16 program, sint16 tone);
+    void SsQueueKeyOn(uint32 mask);
+    void SsQueueReverb(uint32 mask, uint32 reverb);
     void SsFlush(void);
     uint32 SpuSetNoiseVoice(sint32 mode, uint32 mask);
     sint16 SsUtSetReverbType(sint16 type);
@@ -809,7 +844,9 @@ extern "C"
     } SpuVabNativeView;
 
     sint16 spu_vab_open_head_sticky(const uint8 *header, uint32 header_bytes, sint16 bank, uint32 body_address);
+    sint16 spu_vab_open_head_allocated(const uint8 *header, uint32 header_bytes, sint16 bank);
     sint16 spu_vab_trans_body_native(const uint8 *body, uint32 body_bytes, sint16 bank);
+    sint16 spu_vab_trans_body_with_dma_tail(const uint8 *body, uint32 body_bytes, uint32 source_capacity, sint16 bank);
     sint32 spu_vab_select_native(uint16 bank, sint16 program);
     uint32 spu_vab_set_program_volume(sint16 bank, sint16 program, uint8 value);
     uint32 spu_vab_set_program_pan(sint16 bank, sint16 program, uint8 value);

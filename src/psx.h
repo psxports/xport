@@ -137,6 +137,7 @@ extern "C"
     uint32 InitPAD(uint32 buffer0, uint32 size0, uint32 buffer1, uint32 size1);
     uint32 InitPADNative(uint8 *buffer0, uint32 size0, uint8 *buffer1, uint32 size1);
     uint32 StartPAD(void);
+    void StopPAD(void);
     uint32 PAD_init2(uint32 type, uint32 destination);
     uint32 PAD_dr(void);
     uint32 ChangeClearPAD(uint32 mode);
@@ -1039,7 +1040,22 @@ extern "C"
 #define setUV4(packet, _u0, _v0, _u1, _v1, _u2, _v2, _u3, _v3) (xport_store_u8(&(packet)->p[0].uv.u, (_u0)), xport_store_u8(&(packet)->p[0].uv.v, (_v0)), xport_store_u8(&(packet)->p[1].uv.u, (_u1)), xport_store_u8(&(packet)->p[1].uv.v, (_v1)), xport_store_u8(&(packet)->p[2].uv.u, (_u2)), xport_store_u8(&(packet)->p[2].uv.v, (_v2)), xport_store_u8(&(packet)->p[3].uv.u, (_u3)), xport_store_u8(&(packet)->p[3].uv.v, (_v3)))
 #define setlen(packet, length) xport_store_u8((uint8 *)(packet) + 3u, (length))
     uint32 gpu_packet_link(uintptr_t address);
-#if defined(AP_X64)
+#if defined(XPORT_REGISTERED_GPU_PACKETS) && defined(__cplusplus)
+    extern "C++"
+    {
+        template <class T>
+        static inline uint32 xport_gpu_tag_link(T *packet)
+        {
+            return gpu_packet_link((uintptr_t)packet);
+        }
+
+        static inline uint32 xport_gpu_tag_link(uintptr_t link)
+        {
+            return (uint32)link & 0x00ffffffu;
+        }
+    }
+    #define setaddr(packet, address) (((P_TAG *)(packet))->addr = xport_gpu_tag_link(address))
+#elif defined(AP_X64)
     #define setaddr(packet, address) (((P_TAG *)(packet))->addr = gpu_packet_link((uintptr_t)(address)))
 #else
     #define setaddr(packet, address) (((P_TAG *)(packet))->addr = (uint32)(intptr)(address) & 0x00ffffffu)
@@ -1152,6 +1168,7 @@ extern "C"
         sint32 rcos(sint32 a);
         sint32 rsin(sint32 a);
         uint32 SquareRoot0(sint32 input);
+        uint32 SquareRoot0WithNegativeTable(uint32 input, const sint16 negative[192]);
         uint32 SquareRoot0PSX(uint32 input, uint32 table_address);
         uint32 SquareRoot12(sint32 input);
         uint32 SquareRoot12PSX(uint32 input, uint32 table_address);
@@ -1250,6 +1267,8 @@ extern "C"
         void GsMapModelingData(uint32 model);
         void GsLinkObject4(uint32 model, uint32 object, uint32 index);
         void GsClearOt(uint32 offset, uint32 point, void *ordering_table);
+        void gs_set_display_screen(const PSX_RECT *screen);
+        DISPENV *gs_initialize_display_phase(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24, uint32 reset_graph);
         void GsInitGraph(uint32 width, uint32 height, uint32 mode, uint32 dither, uint32 rgb24);
         void GsDefDispBuff(uint32 x0, uint32 y0, uint32 x1, uint32 y1);
         sint32 GsInit3D(void);
@@ -1259,6 +1278,7 @@ extern "C"
         uint32 GsGetActiveBuff(void);
         uint32 GsSwapDispBuff(void);
         void GsSortClear(uint8 red, uint8 green, uint8 blue, void *ordering_table);
+        void GsSortClearNative(uint8 red, uint8 green, uint8 blue, uint32 *ordering_tail);
         void GsSortBoxFill(const void *box, void *ordering_table, uint32 priority);
         void GsSortFastSprite(const void *sprite, void *ordering_table, uint32 priority);
         void GsSortSprite(const void *sprite, void *ordering_table, uint32 priority);
@@ -1270,6 +1290,10 @@ extern "C"
         void gs_sort_object4(uint32 object, uint32 ordering_table, uint32 shift, uint32 scratch);
         void gte_bind_gs_light_matrices(MATRIX *directions, MATRIX *colors);
         void GsSetLightMatrix(const MATRIX *matrix);
+        void GsSetDrawBuffOffset(void);
+        void gs_initialize_geometry_phase(void);
+        void GsSetLightMatrix2(MATRIX *matrix);
+        void gs_set_color_matrix(MATRIX *matrix);
         void GsSetAmbient(sint32 red, sint32 green, sint32 blue);
         void GsSetFogParam(const void *parameters);
         sint32 GsSetFlatLight(sint32 index, const GsF_LIGHT *light);
@@ -1364,6 +1388,7 @@ extern "C"
         sint32 PadSetMainMode(sint32 port, sint32 mode, sint32 lock);
         void PadStartCom(void);
         void PadStopCom(void);
+        sint32 PadChkVsync(void);
         uint32 setRC2wait(uint32 wait);
         void PopMatrix(void);
         void PushMatrix(void);
@@ -1409,6 +1434,9 @@ extern "C"
         sint32 MemCardDeleteFile(sint32 channel, char *name);
         sint32 MemCardGetDirentry(sint32 channel, char *pattern, DIRENTRY *directory, sint32 *files, sint32 offset, sint32 maximum);
         sint32 ResetCallback(void);
+#if defined(XPORT_CALLBACK_CONTEXT_PSYQ43) && XPORT_CALLBACK_CONTEXT_PSYQ43
+        sint32 CheckCallback(void);
+#endif
         typedef void (*PsxInterruptCallback)(void);
 
         typedef struct PsxCallbackDriver

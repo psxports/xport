@@ -16,6 +16,18 @@ Section routing and verification provenance: [LIBRARY.md](LIBRARY.md).
 - `SetFogFar(distance, projection)` uses wrapped32-bit negative distance shifted6, signed division and DQA/DQB writes. DQB is0x01400000. Division by zero or INT_MIN/-1 aborts; this API is not interchangeable with `SetFogNear`
 - Verify `python -B tools/tests/graphics_readback_sdk_test.py --architecture x86 --output OUTPUT` and repeat with `--architecture x64`. The isolated fixture checks actual publication/getter functions, GTE accessors, matrix bytes, fog arithmetic and trap boundaries. Raster consumers use a test sink; reset invalidation is checked statically, not by a game/render/Web run
 
+## Native LIBGS phase entrypoints
+
+`gs_initialize_display_phase(width, height, mode, dither, rgb24, reset_graph)` updates only the existing GS draw/display environments and mode. A nonzero reset_graph selects ResetGraph(3) when mode bits4..5 are3, otherwise ResetGraph(0); zero retains SetDispMask(0). It publishes PutDrawEnv before PutDispEnv and returns the borrowed display-environment pointer. PAL initialization retains its existing screen offset and pad behavior. Define XPORT_GS_DISPLAY_RESET_PSYQ43=1 consistently to select this reset policy in GsInitGraph; its default branch and later geometry/matrix/buffer phases retain their previous behavior.
+
+GsSetDrawBuffOffset delegates to the existing gs_apply_center owner only. Mode4 updates the active draw-buffer offset and publishes PutDrawEnv while clearing native sprite screen offsets. Other modes send the full signed sum of center and inactive buffer to SetGeomOffset before retaining its low16 bits in the existing screen-offset fields. It does not reinitialize buffers, clipping, frame count or matrices.
+
+gs_initialize_geometry_phase calls InitGeom, SetFarColor(0,0,0), SetGeomOffset(0,0), then clears only the existing LIBGS screen-offset pair. GsInitGraph uses this extracted phase in its prior position; calling the phase directly does not reset world/light/view/clip/buffer ownership.
+
+GsSetLightMatrix2 requires a writable native MATRIX and the direction matrix installed by gte_bind_gs_light_matrices. It delegates in-place multiplication to MulMatrix2, then publishes that same resulting pointer through SetLightMatrix. It does not use the nonmutating GsSetLightMatrix path or save/restore the intervening GTE state.
+
+gs_set_color_matrix requires a readable native MATRIX and the existing bound color source. It copies the complete32 bytes, including native padding and translation, into that same source before SetColorMatrix. Exact self-alias is supported without memcpy; other inputs must be disjoint from the destination object. The caller's matrix is not changed. No new matrix owner, device/math algorithm or callback registry is introduced. Native Debug/Web execution and rendering remain separate verification.
+
 ## Native GTE render contexts
 
 - Data register23 (RES1) retains a full32-bit value through `xport_gte_read_data`/`xport_gte_write_data`. It does not affect GTE arithmetic. Native context save/restore includes it; `PsxGteSnapshot` remains unchanged
@@ -30,6 +42,12 @@ The new context does not include the PsyQ SDK matrix stack,game matrix slots or 
 - Use a saved caller context around isolated OG render calculations. Restore it before returning;do not change simulation time or repeat gameplay updates to rebuild a render result
 - Verify `python -B -m unittest tests.test_gte_context tests.test_gte_scale tests.test_gte_math_sdk -v` from tools. The context check covers all readable data/control registers,fractional screen offsets,FIFO/IRGB aliases,LZ state and nested restores
 
+## SquareRoot0WithNegativeTable
+
+`SquareRoot0WithNegativeTable(uint32 input, const sint16 negative[192])` writes the full input through existing GTE LZCS and reads LZCR before testing for zero. It uses the shared positive square-root coefficients and caller-owned signed coefficients for normalized negative indices -256 through -65. Every negative input requires a readable 192-element native array, including `FFFFFFFF`; positive and zero inputs do not read that array. Coefficients are read-only and are not retained.
+
+Arithmetic uses the original 32-bit wrapping and masked shifts. The zero test is on the full input, so `FFFFFFFF` uses `negative[0]` and a final left shift of 31. No GTE command, callback, allocation, guest-memory lookup or additional device state is introduced. Existing `SquareRoot0`, `SquareRoot0PSX` and `SquareRoot12` behavior is unchanged. Caller-specific coefficient provenance and current verification limits belong to the consuming project.
+
 ## GPU reset and status boundaries
 
 - Genuine PsyQ `_status(void)` reads GP1/status at1F801814. P2 status-bit31 wrapper has no driver argument:its original omitted prelude loads a fixed jump table,not an object parameter
@@ -42,6 +60,18 @@ The new context does not include the PsyQ SDK matrix stack,game matrix slots or 
 - Genuine PsyQ `_ctl(command)` writes GP1 port1F801814 before caching its low byte by command>>24;`_getctl(index)` returns the zero-extended cache byte. Invalid indices>=256 abort instead of reading unrelated memory. Direct queue-reset GP1 writes bypass this cache as in the original
 
 Existing guest observation bindings remain separate contracts;full shared LIBGPU ownership and snapshot compatibility policy are not declared complete
+
+## PsyQ 4.3 display environment profile
+
+Define XPORT_GPU_DISP_ENV_PSYQ43=1 consistently for a consuming native/Web build to select the reviewed mode-dependent horizontal table, signed screen scaling and clamps in the existing PutDispEnv owner. Mode changes send command08 before ranges06/07, set pad0=8 to force those ranges, then retain the video byte in the published20-byte environment. Origin05 is always sent first. Native reverse uses the existing gpu_graph_control owner; bound observation retains its configured reverse source. No second cache or device owner is allocated.
+
+The default branch is byte-preserved. The profile retains the existing native first-use/cache-invalidation force, graph-type/video validation, observer path, cache publication and display presentation. It does not claim malformed or zero-extent cold-cache equality, observer-side state mutation, pixels or timing. Initializing an original numeric SDK cache is not required. Consumer fixtures/evidence and final Debug/native/Web verification remain separate from this API contract.
+
+## Native PsyQ 4.3 reset profile
+
+Define XPORT_GPU_RESET_PSYQ43=1 for ResetGraph with the existing unbound synchronous native backend. The profile applies only when no PsyQ observation binding, transfer observer, linked-submit/sync provider or legacy soft-reset queue indices are configured; every other backend retains its existing branch. Mode classification uses the low three bits. Modes0/3/5 initialize the existing callback owner, clear graph debug/reverse/type, enable the graph queue and invalidate the native draw/display environment caches. Modes0/5 reset through the existing GPU port owner and clear the existing256-byte command cache. Other modes acknowledge the GPU interrupt and clear its command FIFO through that same owner, preserving the SDK flags/cache; mode3 also uses this soft device reset.
+
+The native GPU type remains0. Modes0/5 retain headless success and window-initialization failure(-1); mode3 retains its existing no-window-creation behavior. No guest SDK environment, DMA queue, interrupt-mask mirror or hardware type probe is introduced. The default branch and all bound/provider paths are unchanged. Original RAM layout, diagnostics, hardware timing, renderer/provider teardown and final native/Web execution are separate contracts.
 
 ## Native GPU debug ownership
 
@@ -84,11 +114,15 @@ Run `python -B xport/tools/tests/gte_float_test.py --output PROJECT_ROOT/status/
 
 The shared shader-only VID interface, OpenGL/WebGL build inputs, resource ownership and OG/HD transition contract are in [VID.md](VID.md).
 
-Single-segment Gouraud GP0 `50/52` lines use native integer color interpolation with the existing clipping, draw offset and semitransparency path. The GPU observer fixture covers endpoints, midpoint, clipping, offset and blending; this does not establish hardware-exact line coverage or interpolation. Gouraud polylines are outside this implementation.
+Gouraud GP0 `50/52` lines and `58/5A/5C/5E` polylines use the same native integer color interpolation, clipping, draw offset, mask and semitransparency path. Polyline parsing respects packet length and terminators; shared endpoints blend once. The GPU observer fixture covers G2/G3/G4 colors, joints, terminators, clipping, offset, masks and blending; this does not establish hardware-exact line coverage or interpolation.
 
 ## Native screen matrix readback
 
 `gs_get_screen_matrix(MATRIX *output)` copies the current screen/aspect matrix owned by the existing GS state. `GsInitGraph` initializes this matrix from the screen dimensions. The caller supplies a writable, nonoverlapping 32-byte native `MATRIX`; the copy includes padding and translation. The getter changes no GS or GTE state and invokes no callbacks.
+
+## Native display screen rectangle
+
+`gs_set_display_screen(const PSX_RECT *screen)` copies the four signed 16-bit fields into the existing GS display environment. The caller supplies a readable native rectangle. `GsSwapDispBuff` publishes the saved rectangle through its existing `PutDispEnv` call. The setter itself only updates that owner.
 
 ## Native INTPL and unmodulated lighting commands
 
@@ -164,9 +198,15 @@ PsyQ GPU packet types remain declared in `psx.h`. Use their fixed-width fields d
 
 GPU packet views: `XY.xy` or `XY.x/y`; `RGBC.rgbc` or `RGBC.r/g/b/code`; `UV.uv` or `UV.u/v`. Vertex records are `POINT_C` (RGBC rgbc + XY xy, 8 bytes), `POINT_T` (XY xy + UV uv + uint16 attr, 8 bytes) and `POINT_CT` (RGBC rgbc + XY xy + UV uv + uint16 attr, 12 bytes). `P_TAG` has `RGBC rgbc` at byte 4 and remains 8 bytes; generic command access uses `rgbc.code`. Flat packets keep one `RGBC rgbc`; all vertices are stored only in `p[]`. `attr` is CLUT at vertex 0, texture page at vertex 1, and the original format's reserved/depth-bias word at later vertices; retain each audited consumer's meaning. `LINE_F2..5` use `XY p[]`; `LINE_G2..5` use `POINT_C p[]`. F5/G5 are xport extensions, not original PsyQ typedefs; repeat vertex 0 at vertex 4 to close a quad. `setLineF/G2..5` preserve command/length/terminator semantics. Binary packet layouts remain unchanged; source callers must migrate removed named vertex/color/UV/texture fields to these views. Sprite/tile owners use `p[0]`; generic PsyQ setters remain callable.
 
+## GsSortClearNative
+
+`GsSortClearNative(red, green, blue, ordering_tail)` appends the existing GS clear packet to a writable native OT tail through `AddPrim`. It uses the same active buffer, dimensions, 24-bit display width adjustment and packet storage as `GsSortClear`. The caller keeps the tail alive through submission and registers native packet storage before linking. The old wire-descriptor entrypoint retains its interface and reads its tail after preparing the packet. No native GS descriptor, registry or device state is added. Clear native OT arrays with the existing `ClearOTagR`.
+
 ## gpu_register_packet_range
 
-For native packet owners, call `gpu_register_packet_range(begin, size)` before linking their packets. It returns one for a registered range, including an exact repeated registration, and zero for null, empty, unaligned, overlapping, guest-memory, exhausted-count or exhausted-link-space requests. Ranges must remain allocated at the same address for the process lifetime; no unregister operation exists. The registry accepts at most 32 disjoint ranges and allocates aligned 24-bit links in `[0x200000, 0x800000)`. Use the native PsyQ functions `ClearOTag`, `ClearOTagR`, `AddPrim` and `AddPrims`; the raw lowercase tag macros do not encode these registered links. `DrawOTag` resolves registered links alongside ordinary guest RAM chains and rejects a registered packet whose header length exceeds its range. Registration is opt-in; existing `gpu_register_dma_range` and legacy pointer tags retain their compatibility path. Do not combine registered links with unregistered native pointer tags in one chain: their 24-bit domains can overlap. Native or guest ordering tables with guest and registered packets are supported.
+For native packet owners, call `gpu_register_packet_range(begin, size)` before linking their packets. It returns one for a registered range, including an exact repeated registration, and zero for null, empty, unaligned, overlapping, guest-memory, exhausted-count or exhausted-link-space requests. Ranges must remain allocated at the same address for the process lifetime; no unregister operation exists. The registry accepts at most 32 disjoint ranges and allocates aligned 24-bit links in `[0x200000, 0x800000)`. Use the native PsyQ functions `ClearOTag`, `ClearOTagR`, `AddPrim` and `AddPrims`; C++ consumers can opt into range-aware lowercase tag macros with `XPORT_REGISTERED_GPU_PACKETS`. Typed packet pointers use `gpu_packet_link`; numeric tags and the terminator retain their 24-bit representation. `DrawOTag` resolves registered links alongside ordinary guest RAM chains and rejects a registered packet whose header length exceeds its range. Registration is opt-in; existing `gpu_register_dma_range` and legacy pointer tags retain their compatibility path. Do not combine registered links with unregistered native pointer tags in one chain: their 24-bit domains can overlap. Native or guest ordering tables with guest and registered packets are supported.
+
+`gpu_register_packet_range_at(begin, size, link)` uses the same registry and process lifetime with an explicit physical link span ending at or below `0x200000`. The host pointer, size and link must be four-byte aligned. It rejects null/empty ranges, host overflow, guest-memory starts, overlap with another registered host or link span, and exhausted registry slots. An exact host-span repeat succeeds only for the same link. It does not advance the automatic allocator or add another decoder; registered links already take precedence over guest DRAM during traversal. Keep the storage alive at the same address for the process lifetime.
 
 ## PutDrawEnv
 
@@ -192,6 +232,10 @@ Use `rsincos(angle, &sine, &cosine)` when a translated game function reads PsyQ'
 
 `gpu_decode_tim_body(src, size, image)` is a bounded native TIM codec in `psx_gpu.c`. The input starts at the mode word after the four-byte TIM magic; full-file callers validate magic `0x10` themselves. `GpuTimImage` owns rectangle values and borrows pixel/CLUT pointers from the input for its lifetime. Decode supports pixel modes 0..3 with optional CLUT, checks the CLUT block extent and both rectangle payload lengths against the supplied span, requires four-byte CLUT block alignment and leaves the output unchanged on failure. The final pixel block length word is ignored, as in the existing SDK-style readers; actual pixel extent is derived from rectangle dimensions. This also accepts files whose final length word excludes the block header. Pixel payloads may have two-byte padding; no pixel-format reinterpretation or allocation occurs. This codec is not an implementation of the stateful PsyQ `OpenTIM`/`ReadTIM` ABI.
 
+## gpu_read_tim_body
+
+`gpu_read_tim_body(src, size, image)` reads TIM header metadata into `GpuTimImage` without validating pixel geometry. Input starts at the mode word after magic, which the caller validates. It preserves all mode bits and follows the optional CLUT length rounded down to a multiple of four. Each referenced block header must fit the supplied span; the output is unchanged on failure. Rectangle values, including negative dimensions and carried bytes after short blocks, are preserved. Returned CLUT/pixel pointers borrow the input and do not establish readable pixel payload extents. Allocation, upload validation and cursor ownership remain with the caller. The geometry-validating `gpu_decode_tim_body` contract is unchanged. This stateless metadata operation does not implement the PsyQ debug callbacks or the `OpenTIM`/`ReadTIM` cursor ABI.
+
 ## gpu_render_list
 
 `gpu_render_list_create/free` owns an opaque CPU copy of native drawing commands for frozen OG reconstruction. After applying the initial native `DRAWENV` in canonical VRAM coordinates, call `gpu_render_list_begin(list, environment)`, execute the original `DrawPrim`/`DrawOTag` stream once and call `gpu_render_list_end(list)`. Collection does not enable rasterization. The GPU's existing command decoder copies complete commands; the game does not parse packets. Only one collection may be active; linked-submit providers and nonzero alternate raster surfaces are unsupported. Freeing an active list detaches collection. A later begin reuses its capacity.
@@ -204,4 +248,17 @@ For deferred native textured polygons, `gpu_render_list_defer_polygon(list, mark
 
 After end, `gpu_render_list_deferred_count` bounds slot iteration; `gpu_render_list_deferred_source` returns copied facts for encountered unresolved slots and NULL otherwise. The game supplies a complete single textured polygon through `gpu_render_list_resolve_polygon`, which validates its length and matching TPAGE and copies its bytes. Source pointers last until the next begin/free; no caller packet or marker is borrowed during replay. An unresolved encountered slot makes replay fail before changing VRAM. Resolved polygons use the original command decoder at their recorded positions. Begin reuses capacities and resets all slot identities; reset generation and free retain the ordinary list lifetime contract.
 
-`gpu_render_list_defer_draw(list, marker, source, bytes)` provides the same ownership and ordering contract for drawing commands with no embedded drawing-state effect. `gpu_render_list_resolve_draw` accepts one complete untextured flat/Gouraud polygon or rectangle (including textured sprites and fixed-size rectangles), validates its command length and copies it. These slots inherit the recorded drawing state; collection does not change TPAGE. Textured polygons, lines, state and transfer commands are rejected by this resolver. Use the polygon variant for geometry with an embedded TPAGE effect, and retain actual state commands in the original stream.
+`gpu_render_list_defer_draw(list, marker, source, bytes)` provides the same ownership and ordering contract for drawing commands with no embedded drawing-state effect. `gpu_render_list_resolve_draw` accepts one complete untextured flat/Gouraud polygon, fixed two-point flat/Gouraud line or rectangle (including textured sprites and fixed-size rectangles), validates its command length and copies it. These slots inherit the recorded drawing state; collection does not change TPAGE. Textured polygons, polylines, state and transfer commands are rejected by this resolver. Fixed line commands 0x40..0x43 and 0x50..0x53 retain their exact three/four-word payload lengths. Use the polygon variant for geometry with an embedded TPAGE effect, and retain actual state commands in the original stream.
+
+
+## VRAM change revisions
+
+`gpu_vram_version()` identifies the existing GPU owner's invalidation boundary. `gpu_vram_row_version(row)` returns the revision of a potentially changed row0..511, or0 for an invalid row. Consumers retain their own last-seen revisions; querying never clears another consumer's changes. A new cache reads every row. Equal row revisions permit skipping comparison; differing revisions are conservative and do not prove changed pixel bytes
+
+Native/guest image uploads, copies and fills mark their wrapped destination rows; GP0 upload words conservatively mark up to two rows. Bulk restore/reset, list replay, raster handoff and existing readback invalidation boundaries mark the full image. Version rollover invalidates all rows. These revisions preserve the existing execution/invalidation checkpoints; they are not a concurrent write observer or a replacement VRAM owner. Direct VRAM writes outside the GPU contract must retain their existing full invalidation boundary before consumers read
+
+## Optional signed-byte font glyphs
+
+Define XPORT_FONT_SIGNED_GLYPH=1 to select the original signed-byte glyph-coordinate calculation in the existing FntFlush owner. Lowercase ASCII retains its uppercase atlas mapping. Other bytes are sign-extended before subtracting32, then signed quotient/remainder by16 determine the UV bytes. The conversion uses an explicit0..255 to-128..127 expression, independent of the host char signedness. Atlas data, packet ownership, ordering, geometry and default behavior are unchanged.
+
+This profile does not change FntOpen validation, text bounds, negative capacities, color-control parsing or other font lifecycle behavior. It establishes no complete FntOpen/FntFlush or renderer equivalence; consumer domains and native/Release/Web checks remain separate.

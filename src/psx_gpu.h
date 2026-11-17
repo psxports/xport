@@ -11,6 +11,7 @@ extern "C"
     extern const uint32 gpu_dma_nop_terminator[5];
     extern uint16 VRAM[GPU_VRAM_WIDTH * GPU_VRAM_HEIGHT];
     uint32 gpu_vram_version(void);
+    uint32 gpu_vram_row_version(uint32 row);
     sint32 gpu_port_read(uint32 offset, uint32 *value);
     sint32 gpu_port_write(uint32 offset, uint32 value);
     extern sint32 graph_debug_level;
@@ -40,6 +41,7 @@ extern "C"
 
     // Decode the TIM body starting at its mode word
     sint32 gpu_decode_tim_body(const void *src, size_t size, GpuTimImage *image);
+    sint32 gpu_read_tim_body(const void *src, size_t size, GpuTimImage *image);
 
     typedef void (*GpuTransferObserver)(void *context, uint32 operation, uint32 guest_address, const uint32 *words, uint32 count);
     void gpu_set_transfer_observer(GpuTransferObserver observer, void *context);
@@ -175,6 +177,7 @@ extern "C"
     } GpuRasterState;
 
     sint32 gpu_import_raster(const GpuRasterState *state, const void *vram, size_t bytes);
+    sint32 gpu_restore_raster(const GpuRasterState *state);
     void gpu_export_raster(GpuRasterState *state);
 
     typedef struct GpuPsyqStateBinding
@@ -219,6 +222,7 @@ extern "C"
     void gpu_packet(void *packet);
     void gpu_register_dma_range(void *begin, uint32 size);
     sint32 gpu_register_packet_range(void *begin, uint32 size);
+    sint32 gpu_register_packet_range_at(void *begin, uint32 size, uint32 link);
     sint32 gpu_present(void);
     // Suppress presentation until all passes of a host frame are complete
     void gpu_frame_begin(void);

@@ -116,6 +116,10 @@ Signed `ADD`, `ADDI` and `SUB` reject signed 32-bit overflow before writing thei
 
 Full-pass allocation/integration is owned by [DECOMP.md](DECOMP.md).
 
+### Audit registration
+
+Register/rebind reviewed audits with `python -B [XPORT_ROOT]/tools/register_decomp.py --project PROJECT_ROOT AUDIT.json [AUDIT.json ...]`; repeat `--address 0xADDRESS` to select entries. It accepts single-function documents or a `functions` array, rejects incomplete audits and runs `project_context decompile` validation per selected function. It neither edits C nor performs MIPS semantic review.
+
 ## 8. Translation presence and scoped verification
 
 ### Reviewed data prefixes before a code entry
@@ -137,6 +141,8 @@ Compare the entire declared range, expected counts, selected structures, ordered
 Update a complete-body SQL binding after audited source changes. Refresh derived source indexes only at the workflow's integration gate. Preserve immutable proof history; do not render the retired progress dashboard.
 
 For retained additional image exports, configure `analysis.additional_index_exports` as a list or `{path, sha256}` referencing a project `status` JSON list. Each binding supplies `image`, export-folder `path`, `config`, `config_sha256`, `review`, `review_sha256`, `original_sha256` and `files` mapping every consumed export file to its SHA-256. Prepare derived copies with `startup.canonicalize_ida` when retained IDA inventories lack `raw_instructions`; never normalize immutable snapshots in place. The index validates image/profile/GP identity, original GP initializer bytes, every function word/chunk/hash and listing/pseudocode bindings. Additional images cannot replace an existing image input. These checks establish input provenance, not semantic completeness, SDK classification or runtime equivalence.
+
+Additional raw images using `inherited_thread_resource_loader` revalidate their complete accepted parent/selector/task GP contract through `startup.validate_gp_config`; they do not invent an initializer inside the overlay. The index compares their original profile with the exported execution profile after removing only `output`/`rebuild` and resolving original load/symbol paths back to project-relative paths. All remaining profile fields, raw words and artifact hashes must agree.
 
 ## Reviewed indirect call edges
 

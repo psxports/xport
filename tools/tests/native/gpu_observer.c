@@ -559,7 +559,32 @@ static sint32 test_raster_import(void)
     if (!gpu_import_raster(&initial, initial_vram, sizeof(initial_vram)))
         return 0;
     gpu_export_raster(&actual);
-    return !memcmp(&initial, &actual, sizeof(initial));
+    if (memcmp(&initial, &actual, sizeof(initial)))
+        return 0;
+    initial.draw_flags = 0x1e00u;
+    initial.texture_window = 0xfffffu;
+    for (i = 0; i < 2; ++i)
+    {
+        gpu_set_raster((sint32)i);
+        if (!gpu_restore_raster(&initial) || gpu_get_raster() != (sint32)i)
+            return 0;
+        gpu_export_raster(&actual);
+        if (memcmp(&initial, &actual, sizeof(initial)) || memcmp(VRAM, initial_vram, sizeof(initial_vram)))
+            return 0;
+        invalid = initial;
+        invalid.offset[0] = 1024;
+        if (gpu_restore_raster(&invalid) || gpu_restore_raster(NULL))
+            return 0;
+        gpu_export_raster(&actual);
+        if (memcmp(&initial, &actual, sizeof(initial)) || memcmp(VRAM, initial_vram, sizeof(initial_vram)) || gpu_get_raster() != (sint32)i)
+            return 0;
+    }
+    initial.draw_flags = 0x400u;
+    initial.texture_window = 0u;
+    if (!gpu_restore_raster(&initial))
+        return 0;
+    gpu_set_raster(1);
+    return 1;
 }
 
 sint32 xport_window_init(void)
@@ -831,6 +856,79 @@ static sint32 test_gouraud_line(void)
     DrawPrim(line);
     if (VRAM[10u * GPU_VRAM_WIDTH + 10u] != 15u || VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0x3C00u)
         return 0;
+    {
+        uint32 polyline[] = {0x09FFFFFFu, 0x5C0000FFu, 0x000A000Au,
+            0x00FF0000u, 0x000A000Eu, 0x0000FF00u, 0x000E000Eu,
+            0x000000FFu, 0x000E000Au, 0x55555555u};
+        uint32 index;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[10u * GPU_VRAM_WIDTH + 10u] != 31u ||
+            VRAM[10u * GPU_VRAM_WIDTH + 12u] != 0x3C0Fu ||
+            VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0x7C00u ||
+            VRAM[12u * GPU_VRAM_WIDTH + 14u] != 0x3DE0u ||
+            VRAM[14u * GPU_VRAM_WIDTH + 14u] != 0x03E0u ||
+            VRAM[14u * GPU_VRAM_WIDTH + 10u] != 31u)
+            return 0;
+        polyline[0] = 0x07FFFFFFu;
+        polyline[1] = 0x580000FFu;
+        polyline[7] = 0x55555555u;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[14u * GPU_VRAM_WIDTH + 14u] != 0x03E0u ||
+            VRAM[14u * GPU_VRAM_WIDTH + 12u] != 0u)
+            return 0;
+        polyline[0] = 0x05FFFFFFu;
+        polyline[1] = 0x5C0000FFu;
+        polyline[5] = 0x55555555u;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0x7C00u ||
+            VRAM[12u * GPU_VRAM_WIDTH + 14u] != 0u)
+            return 0;
+        polyline[0] = 0x09FFFFFFu;
+        polyline[1] = 0x5EFFFFFFu;
+        for (index = 3u; index < 9u; index += 2u)
+            polyline[index] = 0x00FFFFFFu;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0x3DEFu ||
+            VRAM[14u * GPU_VRAM_WIDTH + 14u] != 0x3DEFu ||
+            VRAM[14u * GPU_VRAM_WIDTH + 10u] != 0x3DEFu)
+            return 0;
+        state.area[2] = 16u;
+        state.area[3] = 14u;
+        state.offset[0] = 3;
+        state.offset[1] = 2;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[12u * GPU_VRAM_WIDTH + 13u] != 0x3DEFu ||
+            VRAM[12u * GPU_VRAM_WIDTH + 16u] != 0x3DEFu ||
+            VRAM[12u * GPU_VRAM_WIDTH + 17u] != 0u)
+            return 0;
+        state.offset[0] = state.offset[1] = 0;
+        state.area[2] = 1023u;
+        state.area[3] = 511u;
+        state.draw_flags = 0x800u;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0xBDEFu)
+            return 0;
+        initial_vram[10u * GPU_VRAM_WIDTH + 14u] = 0x8001u;
+        state.draw_flags = 0x1000u;
+        if (!gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+            return 0;
+        DrawPrim(polyline);
+        if (VRAM[10u * GPU_VRAM_WIDTH + 14u] != 0x8001u ||
+            VRAM[14u * GPU_VRAM_WIDTH + 14u] != 0x3DEFu)
+            return 0;
+    }
     return 1;
 }
 
@@ -1343,14 +1441,17 @@ static sint32 pause_gpu_break(void *context, uint32 *continuation)
 static sint32 test_break_draw(void)
 {
     GPU_BREAK_CASE test = {0};
+    GpuPsyqStateBinding binding = {0x13000u, 0x13100u, 0x13200u, 0x13201u, 0x13204u, 0x13300u};
     GpuRasterState state = {0u, 0u, 0x310u, {0u, 0u, 1023u, 511u}, {0, 0}};
     uint32 *first = (uint32 *)psx_addr(0x1D0000u, 16u);
     uint32 *second = (uint32 *)psx_addr(0x1D0010u, 16u);
     memset(initial_vram, 0, sizeof(initial_vram));
     gpu_bind_linked_submit(NULL, NULL);
     gpu_set_transfer_observer(NULL, NULL);
-    if (BreakDraw() || !gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+    if (!gpu_bind_psyq_state(&binding))
         return 0;
+    if (BreakDraw() || !gpu_import_raster(&state, initial_vram, sizeof(initial_vram)))
+        return (printf("FAIL: BreakDraw boundary 1\n"), 0);
     first[0] = 0x031D0010u;
     first[1] = 0x600000FFu;
     first[2] = 0x00100010u;
@@ -1362,41 +1463,66 @@ static sint32 test_break_draw(void)
     fixture_gpu_callbacks = 1;
     fixture_gpu_completions = 0;
     if (DrawSyncCallback(count_gpu_completion) != NULL)
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 2\n"), 0);
     gpu_set_transfer_observer(observe_gpu_break, &test);
     DrawOTag(first);
     if (test.error || !test.entered || test.headers != 2u || test.payloads != 1u || fixture_gpu_completions != 1u || VRAM[16u * GPU_VRAM_WIDTH + 16u] != 0x03E0u || gpu_transfer_observation_failed() || BreakDraw())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 3 error=%d entered=%d headers=%u payloads=%u completions=%u pixel=%x failed=%d pause=%x\n", test.error, test.entered, test.headers, test.payloads, fixture_gpu_completions, VRAM[16u * GPU_VRAM_WIDTH + 16u], gpu_transfer_observation_failed(), BreakDraw()), 0);
     DrawSyncCallback(NULL);
     fixture_gpu_callbacks = 0;
     gpu_set_transfer_observer(NULL, NULL);
     gpu_bind_linked_submit(submit_gpu_break, &test);
     if (BreakDraw() != 0xFFFFFFFFu || !gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 4\n"), 0);
     gpu_bind_linked_submit(submit_gpu_break, &test);
     gpu_bind_linked_pause(pause_gpu_break);
     test.provider_result = 0;
     if (BreakDraw() || gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 5\n"), 0);
     test.provider_result = -1;
     if (BreakDraw() != 0xFFFFFFFFu || gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 6\n"), 0);
     test.provider_result = 1;
     test.continuation = 0xFFFFFFu;
     if (BreakDraw() || gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 7\n"), 0);
     test.continuation = 0x1D0010u;
     if (BreakDraw() != test.continuation)
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 8\n"), 0);
     gpu_resume_linked_draw(test.continuation);
     if (test.provider_calls != 1u || test.submitted != test.continuation || gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 9\n"), 0);
     gpu_bind_linked_submit(submit_gpu_break, &test);
     if (BreakDraw() != 0xFFFFFFFFu || !gpu_linked_submit_failed())
-        return 0;
+        return (printf("FAIL: BreakDraw boundary 10\n"), 0);
     gpu_bind_linked_submit(NULL, NULL);
     gpu_reset_graph_state();
-    return BreakDraw() == 0;
+    return BreakDraw() == 0 && gpu_bind_psyq_state(NULL);
+}
+
+static sint32 test_startup_graph_reset(void)
+{
+    GpuRasterState before, after;
+    GpuGraphControl saved_control = gpu_graph_control;
+    uint32 status;
+    uint16 saved = VRAM[0];
+    VRAM[0] = 0x4210;
+    gpu_export_raster(&before);
+    if (!gpu_port_write(0, 0x1f000000u) || !gpu_port_write(0, 0x600000ffu) ||
+        !gpu_port_read(4, &status) || !(status & (1u << 24)))
+        return 0;
+    if (ResetGraph(3) != 0 || !gpu_port_read(4, &status) || (status & (1u << 24)) ||
+        !(status & (1u << 26)) || gpu_graph_control.queue_enabled != 1)
+        return 0;
+    if (!gpu_port_write(0, 0u) || !gpu_port_write(0, 0x00010001u))
+        return 0;
+    gpu_export_raster(&after);
+    if (memcmp(&before, &after, sizeof(before)) || VRAM[0] != 0x4210)
+        return 0;
+    VRAM[0] = saved;
+    gpu_graph_control = saved_control;
+    gpu_reset_graph_state();
+    return 1;
 }
 
 int main(void)
@@ -1407,6 +1533,22 @@ int main(void)
     DRAWENV *guest_draw = psx_addr(0x14100u, sizeof(DRAWENV));
     uint32 *root = psx_addr(0x10000u, 4);
     uint32 *terminal = psx_addr(0x10018u, 16);
+    if (getenv("XPORT_GPU_GOURAUD_ONLY"))
+    {
+        if (!test_gouraud_line())
+            return 68;
+        puts("PASS: Gouraud G2/G3/G4 colors, terminator, single-blend joints, clipping, offset and masks");
+        return 0;
+    }
+    if (getenv("XPORT_GPU_RASTER_STATE_ONLY"))
+    {
+        if (!test_raster_import())
+            return 13;
+        puts("PASS: raster state import/restore, validation, masks, unchanged VRAM and raster enablement");
+        return 0;
+    }
+    if (!test_startup_graph_reset())
+        return 65;
     if (!test_break_draw())
         return 64;
     xport_device_trace_bind(observe_device, &device_events);
@@ -1631,6 +1773,13 @@ int main(void)
         gpu_export_raster(&after);
         if (memcmp(&before, &after, sizeof(before)))
             return 46;
+        *head = 5u;
+        *tail = 2u;
+        seen = 0u;
+        if (ResetGraph(11) || gpu_transfer_observation_failed() || seen != 2u || *head || *tail ||
+            operations[0] != 1u || operations[1] != 1u || addresses[0] != 4u || addresses[1] != 4u ||
+            payloads[0][0] != 0x02000000u || payloads[1][0] != 0x01000000u)
+            return 66;
     }
     {
         GpuRasterState state = {0u, 0u, 0u, {0u, 0u, 1023u, 511u}, {0, 0}};

@@ -14,10 +14,11 @@ def main():
     parser.add_argument('--label', required=True)
     parser.add_argument('--export-existing', action='store_true')
     parser.add_argument('--plan', action='store_true')
+    parser.add_argument('--config-root', type=Path)
     args = parser.parse_args()
     root, _ = load_project()
     result = startup.prepare_ida_export(root, args.ida, args.label, args.image,
-                                        args.export_existing, args.plan)
+                                        args.export_existing, args.plan, config_root=args.config_root)
     print(json.dumps(result))
 
 

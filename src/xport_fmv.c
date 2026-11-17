@@ -18,6 +18,8 @@ static void *source_context;
 static sint32 source_active;
 static sint32 source_audio_active;
 static sint32 player_active;
+static char native_source_logical[260];
+static char native_source_prepared[260];
 
 #if !defined(AP_WEB)
 static sint32 fmv_native_open(const char *path);
@@ -34,6 +36,37 @@ static sint32 fmv_uses_source(void)
     return source_backend.open != NULL;
 #endif
 }
+
+sint32 xport_fmv_set_native_source(const char *logical_path, const char *prepared_path)
+{
+    size_t logical_length, prepared_length;
+    if (source_active || player_active)
+        return 0;
+    if (!logical_path && !prepared_path)
+    {
+        native_source_logical[0] = 0;
+        native_source_prepared[0] = 0;
+        return 1;
+    }
+    if (!logical_path || !prepared_path)
+        return 0;
+    logical_length = strlen(logical_path);
+    prepared_length = strlen(prepared_path);
+    if (!logical_length || !prepared_length || logical_length >= sizeof(native_source_logical) || prepared_length >= sizeof(native_source_prepared))
+        return 0;
+    memcpy(native_source_logical, logical_path, logical_length + 1);
+    memcpy(native_source_prepared, prepared_path, prepared_length + 1);
+    return 1;
+}
+
+#if !defined(AP_WEB)
+static const char *fmv_native_source_path(const char *logical_path)
+{
+    if (native_source_logical[0] && !strcmp(native_source_logical, logical_path))
+        return native_source_prepared;
+    return logical_path;
+}
+#endif
 
 sint32 xport_fmv_set_backend(const XportFmvBackend *backend, void *context)
 {
@@ -66,7 +99,7 @@ sint32 xport_fmv_open(const char *path)
 #if defined(AP_WEB)
         result = xport_web_fmv_open(path);
 #else
-        result = fmv_native_open(path);
+        result = fmv_native_open(fmv_native_source_path(path));
 #endif
     }
     source_active = result > 0;
@@ -230,7 +263,7 @@ static void fmv_shutdown(void)
         cleanup();
 }
 
-static sint32 fmv_rectangle(uint32 width, uint32 height, sint32 page, const XportFmvPresentation *presentation, PSX_RECT *rect)
+static sint32 fmv_rectangle(uint32 width, uint32 height, sint32 page, const XportFmvPresentation *presentation, uint32 page_stride, PSX_RECT *rect)
 {
     uint32 canvas_width = presentation && presentation->width ? presentation->width : width;
     uint32 canvas_height = presentation && presentation->height ? presentation->height : height;
@@ -248,20 +281,35 @@ static sint32 fmv_rectangle(uint32 width, uint32 height, sint32 page, const Xpor
     rows = decoded_height + (presentation ? presentation->bottom_rows : 0);
     if (rows > available)
         rows = available;
+    if (page_stride && (page_stride < page_height || page_stride > FMV_MAX_HEIGHT || (page_stride & 15)))
+        return 0;
     rect->x = (sint16)(x * 3 / 2);
-    rect->y = (sint16)(page * page_height + y);
+    rect->y = (sint16)(page * (page_stride ? page_stride : page_height) + y);
     rect->w = 24;
     rect->h = (sint16)rows;
     return 1;
 }
 
+static void fmv_clear_pages(uint32 width, uint32 height, uint32 page_stride)
+{
+    PSX_RECT clear = {0, 0, width * 3 / 2, (height + 15) & ~15};
+    if (page_stride)
+    {
+        ClearImage(&clear, 0, 0, 0);
+        clear.y = (sint16)page_stride;
+    }
+    else
+        clear.h *= 2;
+    ClearImage(&clear, 0, 0, 0);
+}
+
 #if !defined(AP_WEB)
-static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const StHEADER *header, sint32 page, const XportFmvPresentation *presentation, uint8 *rgb)
+static sint32 xport_fmv_decode(uint32 *src, uint32 *vlc, uint32 *slice, const StHEADER *header, sint32 page, const XportFmvPresentation *presentation, uint32 page_stride, uint8 *rgb)
 {
     PSX_RECT rect;
     sint32 height;
     uint32 x, y;
-    if (!fmv_rectangle(header->width, header->height, page, presentation, &rect) || (src[0] & 0xFFFF) + 1 > FMV_VLC_WORDS)
+    if (!fmv_rectangle(header->width, header->height, page, presentation, page_stride, &rect) || (src[0] & 0xFFFF) + 1 > FMV_VLC_WORDS)
         return 0;
     if (DecDCTvlc(src, vlc) != 0)
         return 0;
@@ -421,7 +469,7 @@ static sint32 fmv_native_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
         return -1;
     if (StGetNext(&src, &record) != 0)
         return 0;
-    progress = xport_fmv_decode(src, native_source.buffers->vlc, native_source.buffers->slice, &header, 0, NULL, rgb);
+    progress = xport_fmv_decode(src, native_source.buffers->vlc, native_source.buffers->slice, &header, 0, NULL, 0, rgb);
     StFreeRing(src);
     if (!progress)
     {
@@ -436,11 +484,11 @@ static sint32 fmv_native_next(uint8 *rgb, uint32 capacity, XportFmvFrame *frame)
 }
 #endif
 
-static sint32 fmv_upload_rgb(const XportFmvFrame *frame, sint32 page, const XportFmvPresentation *presentation)
+static sint32 fmv_upload_rgb(const XportFmvFrame *frame, sint32 page, const XportFmvPresentation *presentation, uint32 page_stride)
 {
     uint32 x, y;
     PSX_RECT rect;
-    if (!fmv_rectangle(frame->width, frame->height, page, presentation, &rect))
+    if (!fmv_rectangle(frame->width, frame->height, page, presentation, page_stride, &rect))
         return 0;
     for (x = 0; x < frame->width; x += 16)
     {
@@ -455,8 +503,13 @@ static sint32 fmv_upload_rgb(const XportFmvFrame *frame, sint32 page, const Xpor
     return 1;
 }
 
-sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 repeat, const XportFmvPresentation *presentation)
+sint32 xport_fmv_play_configured(const char *path, uint32 final_frame, sint32 repeat, const XportFmvPlayback *playback)
 {
+    const XportFmvPresentation *presentation = playback ? playback->presentation : NULL;
+    uint32 page_stride = playback ? playback->page_stride : 0;
+    uint32 *interrupted_buttons = playback ? playback->interrupted_buttons : NULL;
+    uint32 interruption = 0;
+    sint32 skip_after_present = playback && playback->skip_after_present;
     XportFmvPresentation options;
     FmvBuffers *buffers;
     SpuCommonAttr sound = {0};
@@ -474,6 +527,10 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     uint64 last_frame;
     if (path == NULL || fmv.active || source_active || (controllers & ~3) || !xport_window_init())
         return -1;
+    if (page_stride > FMV_MAX_HEIGHT || (page_stride & 15) || (skip_after_present && (!presentation || !presentation->skip_held)))
+        return -1;
+    if (interrupted_buttons)
+        *interrupted_buttons = 0;
     xport_fmv_discard_audio();
     if (presentation)
     {
@@ -485,7 +542,7 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
         return -1;
     if (fmv_uses_source() ? xport_fmv_open(path) <= 0 :
 #if !defined(AP_WEB)
-                          !cd_mount_stream_file(path)
+                          !cd_mount_stream_file(fmv_native_source_path(path))
 #else
                           1
 #endif
@@ -511,7 +568,7 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
     fmv.output = DecDCToutCallback(NULL);
     fmv.sound.mask = SPU_COMMON_MVOLL | SPU_COMMON_MVOLR | SPU_COMMON_CDVOLL | SPU_COMMON_CDVOLR | SPU_COMMON_CDMIX | SPU_COMMON_CDREV;
     SpuGetCommonAttr(&fmv.sound);
-    sound.mask = fmv.sound.mask;
+    sound.mask = playback && playback->preserve_volume ? SPU_COMMON_CDMIX : fmv.sound.mask;
     sound.mvol.left = sound.mvol.right = 0x3FFF;
     sound.cd.volume.left = sound.cd.volume.right = 0x3FFF;
     sound.cd.mix = SPU_ON;
@@ -561,8 +618,12 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
         for (controller = 0; controller < 2; ++controller)
             if (controllers & (1 << controller))
                 buttons |= xport_input_read(controller) & skip_buttons;
-        if (!held || (presentation && presentation->skip_held))
+        if (!skip_after_present && (!held || (presentation && presentation->skip_held)))
+        {
             skipped |= buttons != 0;
+            if (skipped)
+                interruption = buttons;
+        }
         else if (!buttons)
             held = 0;
         if (finishing)
@@ -611,14 +672,13 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
             if (!skipped && !failed && progress == 1)
             {
                 PSX_RECT rectangle;
-                if (!fmv_rectangle(header->width, header->height, page, presentation, &rectangle))
+                if (!fmv_rectangle(header->width, header->height, page, presentation, page_stride, &rectangle))
                     failed = 1;
                 if (!failed && !width)
                 {
                     uint32 canvas_width = presentation && presentation->width ? presentation->width : header->width;
                     uint32 canvas_height = presentation && presentation->height ? presentation->height : header->height;
-                    PSX_RECT clear = {0, 0, canvas_width * 3 / 2, ((canvas_height + 15) & ~15) * 2};
-                    ClearImage(&clear, 0, 0, 0);
+                    fmv_clear_pages(canvas_width, canvas_height, page_stride);
                 }
                 if ((width && width != header->width) || (height && height != header->height))
                     failed = 1;
@@ -627,10 +687,10 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                 if (!failed)
                 {
                     if (fmv_uses_source())
-                        failed = !fmv_upload_rgb(&decoded_frame, page, presentation);
+                        failed = !fmv_upload_rgb(&decoded_frame, page, presentation, page_stride);
 #if !defined(AP_WEB)
                     else
-                        failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation, NULL);
+                        failed = !xport_fmv_decode(src, buffers->vlc, buffers->slice, header, page, presentation, page_stride, NULL);
 #endif
                 }
                 if (!failed)
@@ -651,7 +711,7 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
                         }
                     }
                     last_frame = xport_timer_get();
-                    display.disp.y = page * (((presentation && presentation->height ? presentation->height : height) + 15) & ~15);
+                    display.disp.y = page * (page_stride ? page_stride : ((presentation && presentation->height ? presentation->height : height) + 15) & ~15);
                     PutDispEnv(&display);
                     SetDispMask(1);
                     fmv.decoded = 1;
@@ -672,7 +732,20 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
             failed = 1;
         gpu_frame_end();
         if (!failed && !skipped && (!ended || presented))
+        {
             gpu_present();
+#if defined(AP_WEB)
+            xport_present_complete();
+#endif
+        }
+        if (!failed && !skipped && skip_after_present && presented)
+        {
+            interruption = 0;
+            for (controller = 0; controller < 2; ++controller)
+                if (controllers & (1 << controller))
+                    interruption |= xport_input_read(controller) & skip_buttons;
+            skipped = interruption != 0;
+        }
 #if !defined(AP_WEB)
         if (!fmv_uses_source() && !failed && !skipped && ended && !repeat && !finishing)
             fmv_audio_ready = spu_save_xa_pcm();
@@ -725,7 +798,15 @@ sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 rep
         xport_fmv_discard_audio();
     fmv_close();
     xport_set_cleanup(fmv.cleanup);
+    if (interrupted_buttons)
+        *interrupted_buttons = failed ? 0 : interruption;
     return failed ? -1 : skipped ? 2 : 1;
+}
+
+sint32 xport_fmv_play_presented(const char *path, uint32 final_frame, sint32 repeat, const XportFmvPresentation *presentation)
+{
+    XportFmvPlayback playback = {presentation, 0, NULL, 0, 0};
+    return xport_fmv_play_configured(path, final_frame, repeat, &playback);
 }
 
 sint32 xport_fmv_play_range(const char *path, uint32 final_frame, sint32 repeat)

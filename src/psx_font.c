@@ -242,7 +242,12 @@ uint32 *FntFlush(sint32 id)
             {
                 if (*src != ' ')
                 {
+#if defined(XPORT_FONT_SIGNED_GLYPH) && XPORT_FONT_SIGNED_GLYPH
+                    sint32 character = *src < 128 ? *src : *src - 256;
+                    sint32 glyph = character - (*src >= 'a' && *src <= 'z' ? 64 : 32);
+#else
                     sint32 glyph = *src >= 'a' && *src <= 'z' ? *src - 64 : *src - 32;
+#endif
                     SPRT_8 *prim = &font->glyphs[idx++];
                     setUV0(prim, 8 * (glyph % 16), 8 * (glyph / 16));
                     setXY0(prim, x, y);

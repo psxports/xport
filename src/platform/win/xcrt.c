@@ -30,7 +30,7 @@ typedef char XCRT_JUMP_MXCSR[offsetof(_JUMP_BUFFER, MxCsr) == 88 ? 1 : -1];
 typedef char XCRT_JUMP_XMM[offsetof(_JUMP_BUFFER, Xmm6) == 96 ? 1 : -1];
 #endif
 #pragma function(memcpy, memmove, memset, memcmp, memchr, strlen, strcmp, strcpy, strcat, abs)
-#pragma function(fmod, floor)
+#pragma function(fmod, floor, ceil)
 
 static HANDLE process_heap;
 static INIT_ONCE errno_once = INIT_ONCE_STATIC_INIT;
@@ -89,6 +89,11 @@ double floor(double value)
         number.bits &= ~mask;
     }
     return number.value;
+}
+
+double ceil(double value)
+{
+    return -floor(-value);
 }
 
 double fmod(double value, double divisor)
@@ -287,14 +292,12 @@ void *memchr(const void *src, int value, size_t size)
     return NULL;
 }
 
-#if defined(AP_X86)
 int tolower(int character)
 {
     if (character >= 'A' && character <= 'Z')
         return character + ('a' - 'A');
     return character;
 }
-#endif
 
 size_t strlen(const char *src)
 {

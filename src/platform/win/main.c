@@ -126,6 +126,7 @@ static sint32 platform_quit;
 static jmp_buf platform_game_exit;
 static sint32 platform_game_exit_active;
 static void (*platform_cleanup)(void);
+static XportQuitHandoff platform_quit_handoff;
 static uint32 platform_pad_buttons[2];
 static uint32 platform_gamepad_buttons[2];
 // Zero selects keyboard, one selects gamepad
@@ -526,7 +527,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
                 return 0;
             if (wparam == VK_TAB)
             {
-                if (message == WM_KEYDOWN)
+                if (message == WM_KEYDOWN && !(lparam & (1L << 30)))
                     xport_hd = !xport_hd;
                 return 0;
             }
@@ -577,6 +578,8 @@ sint32 xport_poll(void)
         DispatchMessage(&message);
     }
     /* Return to native cleanup after the window message has unwound */
+    if (platform_quit && platform_game_exit_active && platform_quit_handoff)
+        platform_quit_handoff();
     if (platform_quit && platform_game_exit_active)
         longjmp(platform_game_exit, 1);
     psx_root_counter_poll();
@@ -1248,6 +1251,13 @@ sint32 xport_memory_readable(const void *address, size_t size)
 void xport_message_error(const char *title, const char *message)
 {
     MessageBoxA(platform_window, message, title, MB_OK | MB_ICONERROR);
+}
+
+XportQuitHandoff xport_set_quit_handoff(XportQuitHandoff handoff)
+{
+    XportQuitHandoff previous = platform_quit_handoff;
+    platform_quit_handoff = handoff;
+    return previous;
 }
 
 void xport_set_cleanup(void (*cleanup)(void))

@@ -22,6 +22,16 @@ sint32 mdec_rle_decode(MdecRleBlock *block, const uint16 *input, uint32 count, u
 sint32 mdec_idct(sint16 coefficients[64], const sint16 scale[64]);
 sint32 mdec_color(uint32 pixels[256], const sint16 blocks[384], uint32 signed_output);
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+    /* reuse the decoder's rounded RGB555 packing for uploaded RGB24 frames */
+    uint32 mdec_rgb_fifteen(uint32 rgb, uint32 high_bit);
+#ifdef __cplusplus
+}
+#endif
+
 #if defined(XPORT_MDEC_TESTING)
 void mdec_idct_test_1d(const sint16 values[8], sint16 optimized[8], sint16 reference[8]);
 void mdec_idct_test_reference(sint16 coefficients[64], const sint16 scale[64]);

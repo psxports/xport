@@ -110,11 +110,13 @@ static int test_math(void)
     double (__cdecl *ref_cos)(double) = (void *)GetProcAddress(crt, "cos");
     double (__cdecl *ref_atan2)(double, double) = (void *)GetProcAddress(crt, "atan2");
     double (__cdecl *ref_sqrt)(double) = (void *)GetProcAddress(crt, "sqrt");
+    double (__cdecl *ref_ceil)(double) = (void *)GetProcAddress(crt, "ceil");
+    double (__cdecl *own_ceil)(double) = ceil;
     double (__cdecl *ref_floor)(double) = (void *)GetProcAddress(crt, "floor");
     double (__cdecl *ref_fmod)(double, double) = (void *)GetProcAddress(crt, "fmod");
     double (__cdecl *own_floor)(double) = floor;
     double (__cdecl *own_fmod)(double, double) = fmod;
-    CHECK(crt && ref_sin && ref_cos && ref_atan2 && ref_sqrt && ref_floor && ref_fmod, 50);
+    CHECK(crt && ref_sin && ref_cos && ref_atan2 && ref_sqrt && ref_floor && ref_fmod && ref_ceil, 50);
     {
         uint64_t state = UINT64_C(0x1b98765a45678901);
         static const uint64_t edges[] = {0, UINT64_C(0x8000000000000000), 1, UINT64_C(0x8000000000000001), UINT64_C(0x000fffffffffffff), UINT64_C(0x0010000000000000), UINT64_C(0x3ff8000000000000), UINT64_C(0xbff8000000000000), UINT64_C(0x7fefffffffffffff), UINT64_C(0x7ff0000000000000), UINT64_C(0x7ff8000000000000)};
@@ -125,6 +127,8 @@ static int test_math(void)
             x.bits = i < (int)(sizeof(edges)/sizeof(edges[0])) ? edges[i] : state;
             state = state * UINT64_C(6364136223846793005) + 1;
             y.bits = state;
+            actual.value = own_ceil(x.value); expected.value = ref_ceil(x.value);
+            CHECK(actual.bits == expected.bits || (actual.value != actual.value && expected.value != expected.value), 81);
             actual.value = own_floor(x.value); expected.value = ref_floor(x.value);
             CHECK(actual.bits == expected.bits || (actual.value != actual.value && expected.value != expected.value), 59);
             actual.value = own_fmod(x.value, y.value); expected.value = ref_fmod(x.value, y.value);
@@ -187,6 +191,7 @@ static void exit_b(void)
 
 #ifdef _M_IX86
 extern void _ultof3(void);
+extern void _ultod3(void);
 extern void _ltof3(void);
 
 static uint32_t unsigned_float_bits(uint64_t value)
@@ -214,6 +219,45 @@ static uint32_t unsigned_float_bits(uint64_t value)
     return expected;
 }
 
+static uint64_t unsigned_double_bits(uint64_t value)
+{
+    uint32_t exponent = 0;
+    uint64_t expected;
+    uint64_t scan = value, significand;
+    if (!value) return 0;
+    while (scan >>= 1) ++exponent;
+    if (exponent <= 52) significand = value << (52 - exponent);
+    else
+    {
+        unsigned shift = exponent - 52;
+        uint64_t discarded = value & ((UINT64_C(1) << shift) - 1);
+        uint64_t half = UINT64_C(1) << (shift - 1);
+        significand = value >> shift;
+        if (discarded > half || (discarded == half && (significand & 1)))
+            ++significand;
+        if (significand == UINT64_C(0x20000000000000))
+        {
+            significand >>= 1;
+            ++exponent;
+        }
+    }
+    expected = ((uint64_t)(exponent + 1023) << 52) | (significand & UINT64_C(0xfffffffffffff));
+    return expected;
+}
+
+static int check_unsigned_double(uint64_t value)
+{
+    uint32_t low_word = (uint32_t)value, high_word = (uint32_t)(value >> 32);
+    union { double value; uint64_t bits; } converted;
+    __asm {
+        mov ecx, low_word
+        mov edx, high_word
+        call _ultod3
+        movsd converted.value, xmm0
+    }
+    return converted.bits == unsigned_double_bits(value);
+}
+
 static int check_unsigned_float(uint64_t value)
 {
     uint32_t low_word = (uint32_t)value, high_word = (uint32_t)(value >> 32), actual;
@@ -225,7 +269,7 @@ static int check_unsigned_float(uint64_t value)
         movss converted, xmm0
     }
     memcpy(&actual, &converted, sizeof(actual));
-    return actual == unsigned_float_bits(value);
+    return actual == unsigned_float_bits(value) && check_unsigned_double(value);
 }
 
 static int check_signed_float(uint64_t bits)
@@ -271,6 +315,13 @@ static int test_unsigned_float(void)
             }
         }
         CHECK(check_unsigned_float(value) && check_unsigned_float(value-1) && check_unsigned_float(value+1), 73);
+        if (bit > 52)
+        {
+            uint64_t half = UINT64_C(1) << (bit - 53);
+            for (unsigned multiple = 1; multiple <= 3; multiple += 2)
+                for (int offset = -1; offset <= 1; ++offset)
+                    CHECK(check_unsigned_double(value + multiple * half + offset), 82);
+        }
         if (bit > 23)
         {
             uint64_t half = UINT64_C(1) << (bit-24);

@@ -95,7 +95,7 @@ Projects compile this canonical PSX/PsyQ runtime directly. Game code calls its P
 
 ### XPORT_DISABLE_FUNCTION_MARKERS
 
-`XPORT_DISABLE_FUNCTION_MARKERS` makes `FUNCTION_MARKER(address, image)` a compile-time no-op without evaluating arguments. It is opt-in per consuming build configuration; other projects retain their existing marker behavior.
+`XPORT_DISABLE_FUNCTION_MARKERS` makes `FUNCTION_MARKER(address, image)` a compile-time no-op without evaluating arguments. The shared platform header enables it automatically whenever `NDEBUG` is defined, covering Release Web, x86 and x64 builds. Debug retains markers unless the consuming build explicitly disables them.
 
 ### xport_cd_file_size_native
 
@@ -114,6 +114,8 @@ After `PadInitDirect`, call `PadStartCom` to enable native packet publication. A
 ### xport_main
 
 Each platform backend owns the native process entrypoint and calls the required game-owned `void xport_main(void)`. The backend consumes common flags directly and receives the result through `xport_set_exit_code`. A port to another operating system implements the platform service declarations from `xport.h` in its own `platform/<name>/main.c`; `psx.c` contains no operating-system calls.
+
+On Windows, `xport_set_quit_handoff` installs an optional native callback and returns the previous callback. After dispatching pending messages, `xport_poll` calls it when quit is requested and the platform exit context is active, immediately before its existing `longjmp`. A native fiber scheduler can yield to its root stack and release its tasks before polling again there. A root invocation of the callback must return normally. The default NULL callback preserves the existing exit path; the hook does not own message pumping or resource cleanup. This API is Windows-only.
 
 ### psx 2
 
@@ -185,6 +187,12 @@ The native `LIBMATH` globals `math_errno` and `math_err_point` belong to `psx.c`
 
 `_SsVmKeyOff` scans unprotected voice records with signed halfword matching and fresh signed voice-count reads. `vmNoiseOff` clears the original record fields; `_SsVmKeyOffNow` clears record key/pitch fields and updates pending-keyoff and key-on masks in original order. All three reuse the existing numeric VM binding. Device playback and physical interrupt timing are separate from SDK cache publication.
 
+## Absolute logic clock
+
+`xport_frame_fract_ex(idx, rate)` returns the absolute integer-rate tick index and fractional phase from the same application-start clock used by `xport_frame_fract`. `idx` is required; `rate` is an integer frequency in Hz, such as 128. The elapsed microseconds are multiplied by the requested rate, then integer quotient and remainder produce the index and phase. Intended game logic rates are at most 256 Hz. Repeated calls do not accumulate a delta or depend on render cadence. The float result is a fraction of the requested tick in [0,1), obtained by float division of the bounded integer remainder; timer resolution remains one microsecond. The caller owns the processed cursor, bounded catch-up, fixed-step subdivisions and lifecycle resets.
+
+This API does not change `FIELD_RATE`, the rational physical-field clock, VBlank delivery, audio cadence or presentation pacing. Keep physical timing on `xport_frame`/`xport_frame_fract`; use the explicit-rate variant for a game's original independently clocked logic. It observes time without advancing gameplay or waiting.
+
 ## Windows Release runtime contract
 
 - Release uses ordinary `fseek`/`ftell`; native disc/stream files and offsets must fit signed 32-bit positions
@@ -202,7 +210,7 @@ SPU rendering and XA sector decoding use private transient static workspaces und
 
 ### xcrt
 
-`xcrt.c` supplies `atoi`, `strncpy`, `strcspn`, `strncat`, ASCII C-locale `toupper` and `sprintf`. `strncat` preserves bytes after its terminating NUL; `strcspn` scans until a rejected byte or NUL; `toupper` maps ASCII lowercase and preserves other byte values and EOF. `atoi` accepts ASCII whitespace, optional sign and decimal digits with 32-bit unsigned accumulation. `strncpy` copies at most the requested count and pads the remaining bytes with zero. Debug and standard-CRT Release do not compile these definitions.
+`xcrt.c` supplies `atoi`, `strncpy`, `strcspn`, `strncat`, ASCII C-locale `tolower`/`toupper` and `sprintf` on x86 and x64. `strncat` preserves bytes after its terminating NUL; `strcspn` scans until a rejected byte or NUL; `tolower` maps ASCII uppercase and `toupper` maps ASCII lowercase, preserving other byte values and EOF. `atoi` accepts ASCII whitespace, optional sign and decimal digits with 32-bit unsigned accumulation. `strncpy` copies at most the requested count and pads the remaining bytes with zero. Debug and standard-CRT Release do not compile these definitions.
 
 ### platform
 
@@ -290,6 +298,10 @@ BIOS legacy joypad entry points `PAD_init2(type, destination)` and `PAD_dr()` us
 
 For game asset reads, [DECOMP_REFERENCE.md#runtime-file-access](DECOMP_REFERENCE.md#runtime-file-access) takes precedence: use extracted DATA and `xport_fopen`, replace drive-only readiness/seek wrappers, and never use disc images during gameplay. The CD compatibility contracts below describe retained shared stream/audio services; they do not require reimplementing a CD controller in each game.
 
+### StopPAD
+
+`StopPAD()` stops communication through existing `PadStopCom` (including rumble shutdown), then clears the existing PAD initialization flag read by `ReadInitPadFlag`. Registered packet buffers and controller modes are retained. Call a successful PAD initialization before restarting through `StartPAD`; stopping alone does not release caller-owned buffer lifetime or make a RAM reload safe. This native service does not install or emulate original BIOS interrupt patches.
+
 ### XPORT_NATIVE_CD
 
 - Define `XPORT_NATIVE_CD=1` to select native CD ownership independently of the renderer. `xport.h` makes the four legacy CD address bindings zero in this mode; consuming games must remove their corresponding symbol definitions. `XPORT_NATIVE_GPU_CD` retains its existing combined behavior and default clients retain their address-binding contract
@@ -315,3 +327,9 @@ Canonical void SpuSetKey delegates to shared spu_set_key(sint32,uint32). The lat
 SpuKeyControl owns pending key_on/key_off/pitch_mask/noise_mask/reverb_mask pairs in that reset order. These CPU queues are distinct from live DSP masks. With no guest-key binding and event_mode bit0 set, SpuSetReverbVoice modes0/1 modify only the pending reverb pair and OR event_flags with8; other modes query without mutation, except mode8 retains its existing configuration-specific contract: native VM immediately replaces live registers, non-VM queries the live mask. Selection and pending read/modify/query share one audio lock. The private pending helper assumes that lock and performs no MMIO. VM immediate MMIO retains its prior lock span. Guest bindings remain setup-owned and must not change concurrently merely because the reader is locked. No new public pitch setter, flush, noise behavior, transfer rebinding or DSP metadata setter is introduced.
 
 The expanded SpuKeyControl changes nested SPU_STATE layout. No complete failed-load rollback is promised.
+
+## Native callback-context query
+
+With XPORT_CALLBACK_CONTEXT_PSYQ43=1, CheckCallback() returns1 while the existing native IRQ dispatcher or VBlank dispatcher is active and0 outside them. It is a context query, not a query of whether callbacks are enabled. It uses the existing native_irq_dispatching/vblank_dispatching owners and introduces no BIOS driver image, busy-word mirror or saved CPU context.
+
+The profile brackets the native VBlank callback path with the same existing dispatch flag already used by the guest VBlank path. Nested VBlank signaling consequently follows the existing reentry failure guard. The flag clears after the native callback path and card poll return; callback registration, ordering, interrupt acknowledgement, queues and device services are otherwise unchanged. With the profile disabled, both source files reconstruct their previous contents exactly and the new entry is not declared or compiled. Native callback reentry/lifetime checks and consuming Windows/Web flag selection remain integration work.

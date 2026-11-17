@@ -29,6 +29,7 @@ XPORT_SOURCES := \
 	$(XPORT_ROOT)/src/xport_fmv.c \
 	$(XPORT_ROOT)/src/xport_trace.c
 SOURCES := $(XPORT_SOURCES) $(APP_SOURCES)
+CXX_SOURCES := $(filter %.cpp %.cc %.cxx,$(SOURCES))
 OBJ_DIR := ../../../_build/web/$(CONFIG)
 LINK_RESPONSE := $(OBJ_DIR)/link.rsp
 object_for = $(OBJ_DIR)/$(subst :,_,$(subst /,_,$(basename $(1)))).o
@@ -36,19 +37,27 @@ dep_for = $(patsubst %.o,%.d,$(call object_for,$(1)))
 OBJECTS := $(foreach source,$(SOURCES),$(call object_for,$(source)))
 DEPFILES := $(foreach source,$(SOURCES),$(call dep_for,$(source)))
 
-COMMON_FLAGS := -fdeclspec -fno-strict-aliasing -fwrapv -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
+COMMON_FLAGS := -fdeclspec -fms-extensions -funsigned-char -fno-strict-aliasing -fwrapv -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
 C_FLAGS ?= -std=c11
-CXX_FLAGS ?= -std=c++17
+CXX_STANDARD := c++98
+CXX_FLAGS ?= -std=$(CXX_STANDARD)
+CXX_FLAGS += -fno-exceptions -fno-rtti
+ASYNCIFY_STACK_SIZE ?= 65536
+APP_COMPILE_FLAGS ?=
+APP_C_FLAGS ?=
+APP_CXX_FLAGS ?=
+APP_LINK_FLAGS ?=
+RELEASE_BUILD_FLAGS ?= -O3 -DNDEBUG -flto
 COMMON_FLAGS += -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-ignored-attributes -Wno-incompatible-library-redeclaration
 COMMON_FLAGS += -DAP_WEB=1 -DGAPI_OGL -DXPORT_NATIVE -I$(PROJECT_ROOT)/src -I$(XPORT_ROOT)/src $(APP_DEFINES)
 COMMON_FLAGS += -DSHORT_NAME=\"$(SHORT_NAME)\"
-LINK_FLAGS := -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sASYNCIFY -sEMULATE_FUNCTION_POINTER_CASTS -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=0 -sENVIRONMENT=web
+LINK_FLAGS := -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sASYNCIFY -sASYNCIFY_STACK_SIZE=$(ASYNCIFY_STACK_SIZE) -sSTACK_OVERFLOW_CHECK=2 -fno-exceptions -sEMULATE_FUNCTION_POINTER_CASTS -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=0 -sENVIRONMENT=web
 LINK_FLAGS += -sEXPORTED_RUNTIME_METHODS=callMain,FS,addRunDependency,removeRunDependency
 
 ifeq ($(CONFIG),Debug)
 BUILD_FLAGS := -O0 -gsource-map -D_DEBUG -sASSERTIONS=2
 else
-BUILD_FLAGS := -O3 -DNDEBUG
+BUILD_FLAGS := $(RELEASE_BUILD_FLAGS)
 endif
 
 .PHONY: all clean packages
@@ -63,7 +72,7 @@ $(OBJ_DIR):
 
 define compile_rule
 $(call object_for,$(1)): $(1) $(XPORT_WEB_DIR)/Makefile $(PROJECT_WEB_MAKEFILE) | $(OBJ_DIR)
-	$(if $(filter %.cpp %.cc %.cxx,$(1)),$$(EMXX) $$(CXX_FLAGS),$$(EMCC) $$(C_FLAGS)) $$(COMMON_FLAGS) $$(BUILD_FLAGS) -MMD -MP -MF $(call dep_for,$(1)) -c $(1) -o $$@
+	$(if $(filter $(1),$(CXX_SOURCES)),$$(EMXX) $$(CXX_FLAGS) $$(APP_CXX_FLAGS),$$(EMCC) $$(C_FLAGS) $$(APP_C_FLAGS)) $$(COMMON_FLAGS) $$(BUILD_FLAGS) $$(APP_COMPILE_FLAGS) -MMD -MP -MF $(call dep_for,$(1)) -c $(1) -o $$@
 endef
 
 $(foreach source,$(SOURCES),$(eval $(call compile_rule,$(source))))
@@ -72,7 +81,7 @@ $(foreach source,$(SOURCES),$(eval $(call compile_rule,$(source))))
 
 $(OUTPUT): $(OBJECTS) $(WEB_OUTPUT_PERMISSIONS) | $(DIST_DIR)
 	$(file >$(LINK_RESPONSE),$(OBJECTS))
-	$(if $(filter %.cpp %.cc %.cxx,$(SOURCES)),$(EMXX),$(EMCC)) $(filter-out -x c++,$(COMMON_FLAGS)) $(BUILD_FLAGS) $(LINK_FLAGS) @$(LINK_RESPONSE) -o $(OUTPUT)
+	$(if $(CXX_SOURCES),$(EMXX),$(EMCC)) $(COMMON_FLAGS) $(BUILD_FLAGS) $(LINK_FLAGS) $(APP_LINK_FLAGS) @$(LINK_RESPONSE) -o $(OUTPUT)
 	$(EMSDK_PYTHON) $(WEB_OUTPUT_PERMISSIONS) --runtime $(OUTPUT)
 
 packages: $(OUTPUT) $(XPORT_WEB_DIR)/index.html | $(DIST_DIR)

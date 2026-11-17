@@ -191,7 +191,8 @@
       "kind": "Historical project provenance and rollout status; not current API policy",
       "notes": [
         "- P2 original VB upload validates its exact available source extent against the original capped transfer length and retains existing bank/-1 results.",
-        "- Source ownership,archive rounding,explicit failure repairs and pending final Debug x86 scenarios: `Pandemonium2-xport/status/native-refactoring/native-vb-sample-ownership.json`. No runtime equivalence claim"
+        "- Source ownership,archive rounding,explicit failure repairs and pending final Debug x86 scenarios: `Pandemonium2-xport/status/native-refactoring/native-vb-sample-ownership.json`. No runtime equivalence claim",
+        "- Tekken3 opt-in rounded-source VAB API and project hookup explicitly authorized. Scope,full reversible source projection and reused48-model/34nonzero-tail evidence: Tekken3-xport/status/refactoring/vab-native-dma-tail-current.json. Static-only;native audio/reset and final x86/x64 integration remain unverified. Existing APIs keep zero padding."
       ]
     },
     "Native sequence range failures": {
@@ -488,6 +489,14 @@
       "kind": "Historical provenance, not current API policy",
       "notes": [
         "For Rapid Racer use tools/check.py and status/checks.json; build and test Release only when explicitly requested and authorized by that project's user policy."
+      ]
+    },
+    "gpu_register_packet_range": {
+      "kind": "Historical project provenance and rollout status; not current API policy",
+      "notes": [
+        "Explicit user authorization in Tekken3-xport: \"Разрешить этот API\" for gpu_register_packet_range_at only. Evidence: Tekken3-xport/status/refactoring/proposals/resource-pool-fixed-gpu-links-sdk.json.",
+        "Static verification recovered the complete previous source/header byte hashes after removing only the added function/prototype; all210existing function bodies are unchanged. No new state or automatic allocator change.",
+        "Compiled API boundaries and game integration remain unverified under the active Tekken3 static_only refactor policy; no runtime acceptance is implied."
       ]
     }
   }

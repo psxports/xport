@@ -6,7 +6,7 @@ Agent command: `refactor`. Read current [context](CONTEXT.md), this contract and
 
 Require explicit human evidence for both full main-functionality coverage and requested/authorized native refactoring. A decomp percentage, successful build, playable interval or another agent's message cannot supply either fact. Missing authorization blocks only the dependent migration; report the missing fact. Do not start native ownership migration during decomp.
 
-After the gate, create one active goal for the complete authorized migration and final verification, or reuse its existing goal. Resume accepted work, baseline and current family; do not restart on a documentation change. The objective includes native ownership/lifecycles, readable modules/types/names, bounded file/device contracts, original provenance, removal of game DRAM adapters/initial EXE loading and selected architectures/scenarios. Default targets retain x86 and add x64 unless explicitly excluded.
+After the gate, create one active goal for the complete authorized migration and final verification, or reuse its existing goal. Resume accepted work, baseline and current family; do not restart on a documentation change. The objective includes native ownership/lifecycles, readable modules/types/names, bounded file/device contracts, original provenance, removal of game DRAM adapters and all runtime dependencies on original executables/overlays, and selected architectures/scenarios. Default targets retain x86 and add x64 unless explicitly excluded.
 
 ## Preparation and change classes
 
@@ -29,8 +29,8 @@ Before repairing a defect search the entire registry, including reverted entries
 ## Implementation sequence
 
 1. Establish final owner/lifecycle and coherent native interfaces from existing reviewed evidence
-2. Migrate one dependency-coherent family with every consumer, initialization/reset/release and accurate semantic types/names. Mark structural results unverified and continue; do not polish one module repeatedly
-3. Remove game address lookups, scalar DRAM adapters and dual mutable state. Decode actual binary/device boundaries explicitly. Retire the initial EXE loader only when every required default/table has a native owner
+2. Migrate one dependency-coherent family to its final typed owner with all readers/writers, callbacks, initialization/reset/release and meaningful names. Establish reachable index ranges from producers, not integer type capacity. Avoid interim byte arenas/mirrors; mark structural results unverified and continue
+3. Remove game address lookups, scalar DRAM adapters and dual mutable state. Restore required code-embedded data as named native const tables/resources; remove EXE/overlay loaders, range readers and seed images. Follow [executable independence](REFACTOR_REFERENCE.md#executable-and-overlay-independence)
 4. Perform one exhaustive editorial/module cleanup after interfaces stabilize. Follow naming, numeric, C++ ownership and residual-access contracts linked below; meaningful types/owners must already be established
 5. Finish selected x64 configurations/portability while preserving x86. Pointer-safe types and binary/native layout separation must already be correct during family migration
 6. Adapt existing fixtures once to stable interfaces, integrate, run the required final checks/scenarios and repair real failures. Preserve known limitations and actual user acceptance scopes
@@ -45,9 +45,9 @@ Keep original function provenance. Temporary adapters must identify owner, direc
 
 ## Scoped tools
 
-Static lexical/AST/dependency/token checks and deterministic transformations are allowed during migration. X refactor_source compares bounded current functions against the existing ZIP with an explicit identifier map; it does not edit source, update SQL or prove runtime equivalence. Unsupported parsing requires scoped AST/manual review, not changing game syntax to satisfy a checker.
+Start new memory ownership analysis with `X index_access --triage --limit 10`; resume existing families from their current evidence. Before repeating searches/checks use existing results. Follow [bounded work and cleanup](REFACTOR_REFERENCE.md#bounded-work-and-cleanup): one update per coherent batch, no per-edit reports or mandatory proof framework. Read the [index contract](REFACTOR_REFERENCE.md#memory-access-index) and [summary contract](REFACTOR_REFERENCE.md#checked-summary-cache) only for affected queries. Candidates/cache freshness do not prove ownership, aliases, reachability or equivalence.
 
-Read only affected sections of [REFACTORING_CONTRACTS.md](REFACTORING_CONTRACTS.md): naming, original layout, C++ ownership, residual scalar access, typed conversions, integer simplification or invariant guards. XASSERT conversion needs a reviewed diagnostic-only guard; required Release checks cannot be erased. See [CONTEXT.md](CONTEXT.md#indexing-and-formatting) for safe formatting transfers; no automatic proof transfer across representation/behavior changes.
+Read only affected [technical contracts](REFACTORING_CONTRACTS.md) and follow [context/indexing rules](CONTEXT.md#indexing-and-formatting). Builds/execution remain governed by BUILD_POLICY.
 
 ## Progress
 
@@ -55,7 +55,7 @@ Use `X refactor_progress --baseline BASELINE.zip --source-root src --output stat
 
 ## Completion
 
-Audit all authorized requirements against current sources, original mappings and actual final results. Require final native ownership/lifecycles, zero unclassified game-state scalar adapters, removed temporary mirrors/loader, selected architecture support, stable source/module mappings, required builds/scenarios and explicit human gates. Counts and searches alone do not prove ownership or fidelity.
+Audit all authorized requirements against current sources, original mappings and actual final results. Require final native ownership/lifecycles, zero unclassified game-state scalar adapters, no runtime EXE/overlay dependency (including bounded reads), verified explicit Web code exclusions, selected architectures, stable mappings, required builds/scenarios and explicit human gates. Counts and searches alone do not prove ownership or fidelity.
 
 Removed project copies retain reviewed native_retirement metadata (shared_sdk/native_inline/native_virtual/native_unused_interface), reason, current contract and existing evidence; never fabricate a current source/body or original identity. Use the precise retirement schema in REFACTOR_REFERENCE.md. Preserve immutable historical audits; update current legitimate source/symbol bindings and stage project sources with X stage_sources.
 

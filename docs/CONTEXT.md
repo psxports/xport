@@ -1,26 +1,26 @@
-# Current context and source bindings
+# Context and source bindings
 
-Resolve project and X through [../AGENTS.md](../AGENTS.md). Before a stage run `X project_context show`; for an owner use `X query 0xADDRESS --image IMAGE`, for a subsystem use `X project_context show --subsystem NAME`. Read complete original evidence only for the current question; missing context is unknown.
+Resolve project/X through [../AGENTS.md](../AGENTS.md). Before a stage run `X project_context show`; narrow owners with `X query 0xADDRESS --image IMAGE` or subsystems with `X project_context show --subsystem NAME`. Read full original evidence; missing context is unknown.
 
 ## Current state
 
-`status/project.sqlite` owns current tasks/findings/checks/questions and complete translation bindings. `analysis.sqlite` is derived/rebuildable. Reads do not initialize storage; `X project_context init` does. Keep one current record per issue/family, never a diary or duplicate JSON progress hierarchy.
+`status/project.sqlite` owns current tasks/findings/checks/questions and complete bindings; `analysis.sqlite` is rebuildable. Reads never initialize storage; use `X project_context init`. Keep one current record per issue/family, no diary or duplicate JSON progress hierarchy.
 
-`X project_context set --key KEY --kind task|finding|check|question --summary TEXT --scope TEXT --next-step TEXT` updates a key. Use --stage, --image/--address, --subsystem, --configuration and repeat --evidence for dependencies; shared evidence uses @xport/src/.... Findings/checks require scope/evidence. Text fields have a 1200-character cap. --closed hides resolved questions. `show --key KEY` narrows reading; --after continues pages (default 8, maximum 32).
+Update keys with `X project_context set --key KEY --kind task|finding|check|question --summary TEXT --scope TEXT --next-step TEXT`. Options: --stage, --image/--address, --subsystem, --configuration, repeated --evidence (shared paths: @xport/src/...). Findings/checks require scope/evidence; text fields allow 1200 characters. --closed hides resolved questions. Read with `show --key KEY`; --after pages results (default 8, maximum 32).
 
-Unchanged hashes do not prove semantics or approval. Changed references need review. Preserve immutable historical evidence and limitations without reloading them each turn.
+Hashes prove neither semantics nor approval. Review changed references; retain historical evidence/limits without rereading each turn.
 
 ## Translation bindings
 
-`X project_context queue [--image IMAGE] [--state uncovered|decompiled|sdk] [--limit N] [--after CURSOR]` reads the current inventory. SDK entries require reviewed identities and existing API/caller-ABI checks. Legacy TODO/WIP/DONE/SKIP labels do not promote a body. Candidate source is not automatically a complete translation.
+`X project_context queue [--image IMAGE] [--state uncovered|decompiled|sdk] [--limit N] [--after CURSOR]` reads current inventory. SDK entries need reviewed identities and existing API/caller-ABI checks. Legacy TODO/WIP/DONE/SKIP labels or candidate source do not establish completeness.
 
-After complete MIPS review use `X project_context decompile --image IMAGE --address 0xADDRESS --source src/batch_1.cpp --symbol SYMBOL --complete --evidence AUDIT_PATH`. Preserve image-qualified original identity and exact current source/symbol/body hash. Prototypes, partial bodies and fail-fast stubs do not count. Resume existing audited bodies by binding their evidence; do not retranslate them just to change accounting.
+After full MIPS review run `X project_context decompile --image IMAGE --address 0xADDRESS --source src/batch_1.cpp --symbol SYMBOL --complete --evidence AUDIT_PATH`. Preserve image-qualified original identity/current source/symbol/body hash. Inline .h/.hpp bodies bind by qualified scope; header constructor initializers are unsupported. No credit for prototypes, partial bodies or fail-fast stubs. Bind audited bodies/evidence without retranslating for accounting.
 
-`X query 0xADDRESS --image IMAGE --view callers|callees|data_refs|indirect|reuse_peers --limit 8 [--fields COLUMN,...] [--cursor NEXT]` pages relations. --view sdk reads classification. --audit-context binds original/source evidence; a bounded window or summary is not the complete MIPS required for audit. Read the exact returned path/range when full evidence exceeds the response budget.
+`X query 0xADDRESS --image IMAGE --view callers|callees|data_refs|indirect|reuse_peers --limit 8 [--fields COLUMN,...] [--cursor NEXT]` pages relations; --view sdk reads classification. --audit-context binds original/source evidence. Bounded windows/summaries never replace full MIPS: read the returned path/range when evidence exceeds the response budget.
 
-Queue exclusions use project-local `analysis.decompilation_exclusions`. Schema 1 retains duplicate `groups`; schema 2 additionally accepts `removals` with image, integer address, original sha256, reason `user_removal`, explicit authorization text and nonempty evidence entries `{path, sha256}`. Record actual human authorization before using removals. Queue reads reject stale originals/evidence and duplicate identities; they preserve original inventory and translation bindings. Report removals separately from SDK exclusions and completed translations.
+Queue exclusions use project-local `analysis.decompilation_exclusions`. Schema1: duplicate `groups`. Schema2 adds `removals`: image, integer address, original sha256, reason `user_removal`, explicit human authorization text and nonempty `{path, sha256}` evidence. Record actual authorization before removal. Queue reads reject stale originals/evidence and duplicate identities; preserve original inventory/bindings. Report removals separately from SDK exclusions and translations.
 
-Schema 3 adds `native_replacements`: image/address/sha256, `reason: native_file_replacement`, `reviewed: true`, scope, source/symbol/source_body_sha256 and nonempty SHA-bound evidence. Authorization: kind `runtime_file_access`, path `@xport/docs/DECOMP_REFERENCE.md`, current sha256 and exact contract quote. Optional dependencies bind source/symbol/body hash. Validate every original, authority, evidence and body; replacements grant no SDK/MIPS credit and retain final checks
+Schema3 `native_replacements`: image/address/sha256, `reason: native_file_replacement`, `reviewed: true`, scope, source/symbol/source_body_sha256, nonempty SHA-bound evidence. Authority: kind `runtime_file_access`, path `@xport/docs/DECOMP_REFERENCE.md`, current sha256/exact quote. Optional dependencies bind source/symbol/body hash. Validate originals/authority/evidence/bodies; no SDK/MIPS credit or waiver of final checks
 
 
 Save replacements use `native_save_replacement`, kind `runtime_game_save` and the exact quote starting `Replace card-sector I/O, card managers`. Apply schema-3 checks; retain payload/gameplay
@@ -28,16 +28,20 @@ Save replacements use `native_save_replacement`, kind `runtime_game_save` and th
 Movie replacements use `native_movie_replacement`, kind `runtime_game_movie` and the exact quote starting `Fullscreen movies call xport_fmv_play;`. Apply schema-3 checks; retain scene logic and final verification
 
 
-Queue, SDK queries and decompile checks read configured `paths.sdk_classification` directly. Validate accepted entries against image/address/original SHA; reject stale, duplicate or missing input. An explicit file replaces the derived SQL view, including an empty accepted list. Without this setting use SQL. This refreshes no analysis or SDK acceptance
+Queue/SDK/decompile checks read `paths.sdk_classification` directly: validate image/address/original SHA and reject stale/duplicate/missing input. An explicit file replaces derived SQL even for an empty accepted list; without it use SQL. No analysis refresh or SDK acceptance is implied
 
 ## Indexing and formatting
 
-At the integration gate, code_refresh/source_index update derived C/C++ tables and reject invalid mappings. Follow [BUILD_POLICY.md](BUILD_POLICY.md); do not refresh after each translated function.
+At integration, code_refresh/source_index update derived C/C++ tables and reject invalid mappings. Follow [BUILD_POLICY.md](BUILD_POLICY.md); never refresh per function.
 
-The formatter snapshots current registered bodies before editing. It may rebind only across unchanged full-file tokens/directives, preserved sensitive macro spelling, unchanged .h/.hpp headers and original identities. Changed/stale bodies, unsupported syntax, line-sensitive expressions and changed header contracts remain needs_review. formatting_rebindings stores the latest scoped transfer; formatting_transfers retains deduplicated hash provenance without source copies. Immutable original audits and runtime evidence are not rewritten or promoted. A formatting transfer proves only that the checked editorial transformation preserves the existing source contract.
+After reviewed decomp boundary corrections, `X build_database --original-only` refreshes accepted original inventory/relations/similarity without native formatting/indexing. Native derived tables stay absent until integration; complete bindings remain in project.sqlite. Preserve frozen scope and explicitly record reviewed additions/superseded occurrences.
 
-Source/configuration/header changes outside this narrow transfer require their affected review. Never update hashes just to conceal a semantic change. Refresh source locations after legitimate moves/renames and retain original provenance.
+`X gp_audit --complete-bindings` reads current complete bindings without native derived tables. Reject stale original/source hashes. Review lexical unresolved indexed addresses semantically; missing literals prove neither mismatch nor correctness.
+
+Before editing the formatter snapshots current registered bodies. Rebind only with unchanged full-file tokens/directives, sensitive macro spelling, .h/.hpp headers and original identities. Changed/stale bodies, unsupported syntax, line-sensitive expressions or changed header contracts remain needs_review. formatting_rebindings holds the latest scoped transfer; formatting_transfers stores deduplicated hash provenance, no source copies. Original audits/runtime evidence stay immutable and unpromoted. A transfer proves only the checked editorial change preserves the source contract.
+
+Review source/configuration/header changes outside this narrow transfer. Never update hashes to hide semantic changes. Refresh source locations after legitimate moves/renames; retain original provenance.
 
 ## Git source index
 
-Before a consuming-project stage completes, run `X stage_sources`. It stages all additions/edits/deletions under src plus existing or tracked root cover.png and README.md, including ignored source files as explicitly requested by the user. It preserves unrelated staged paths and performs no commit/push. README is staged without being edited or regenerated. Successful code_refresh includes this step. A non-repository or nested Git root is a reported blocker, not permission to initialize/reconfigure an unrelated repository.
+Before a consuming-project stage completes run `X stage_sources`: stage all src additions/edits/deletions (including ignored sources requested by the user), plus existing/tracked root cover.png and README.md. Preserve unrelated staged paths; no commit/push or README edits/regeneration. Successful code_refresh includes staging. Report non-repositories/nested Git roots as blockers; never initialize/reconfigure an unrelated repository.

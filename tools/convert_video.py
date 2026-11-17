@@ -46,13 +46,29 @@ def reviewed_sector_count(path, source_range):
     return source_range['sector_count']
 
 
-def inspect_str(path, include_completions=False, sector_count=None):
-    """Accept standard STR in raw2048, raw2352 or RIFF/CDXA sectors"""
+def reviewed_audio_identity(path, selection):
+    """validate an explicit XA identity against the complete original source"""
+    if selection is None:
+        return None
+    if (not isinstance(selection, dict) or set(selection) != {'file', 'channel', 'source_sha256'}
+            or type(selection['file']) is not int or not 0 <= selection['file'] <= 255
+            or type(selection['channel']) is not int or not 0 <= selection['channel'] < 32
+            or selection['source_sha256'] != digest(path)):
+        raise ValueError('Invalid or stale reviewed XA audio selection')
+    return selection['file'], selection['channel']
+
+
+def inspect_str(path, include_completions=False, sector_count=None, audio_selection=None):
+    """Inspect STR and repeated DATA padding without changing physical sector identities"""
     frames = []
     audio = {}
     pending = None
     video_channel = None
     dimensions = None
+    last_video_chunk = None
+    padding_sectors = []
+    audio_identity = reviewed_audio_identity(path, audio_selection)
+    omitted_audio_sectors = []
     with Path(path).open('rb') as stream:
         header = stream.read(44)
         offset = 44 if header[:4] == b'RIFF' and header[8:12] == b'CDXA' else 0
@@ -89,6 +105,10 @@ def inspect_str(path, include_completions=False, sector_count=None):
                     dimensions = (width, height)
                 if channel != video_channel or (width, height) != dimensions:
                     raise ValueError('Multiple video channels or changing dimensions require a reviewed adapter')
+                if kind == 8 and last_video_chunk == (block[16:18], block[24:2072]):
+                    padding_sectors.append(sector)
+                    sector += 1
+                    continue
                 if part == 0:
                     if pending is not None or frames and number != frames[-1]['frame']+1:
                         raise ValueError('Incomplete, repeated or discontinuous STR frames')
@@ -98,6 +118,7 @@ def inspect_str(path, include_completions=False, sector_count=None):
                         pending['frame'], pending['sector_count'], pending['compressed_bytes']):
                     raise ValueError('Out-of-order STR frame chunks')
                 next_part += 1
+                last_video_chunk = (block[16:18], block[24:2072]) if kind == 2 else None
                 if next_part == parts:
                     if include_completions:
                         pending['end_sector'] = sector
@@ -106,6 +127,10 @@ def inspect_str(path, include_completions=False, sector_count=None):
             elif kind == 4:
                 if channel >= 32:
                     raise ValueError('Unsupported XA audio channel')
+                if audio_identity is not None and (block[16], channel) != audio_identity:
+                    omitted_audio_sectors.append(sector)
+                    sector += 1
+                    continue
                 entry = audio.setdefault(channel, dict(channel=channel, first_sector=sector, coding=block[19], sectors=0))
                 if entry['coding'] != block[19]:
                     raise ValueError('Changing XA audio format requires a reviewed adapter')
@@ -117,10 +142,38 @@ def inspect_str(path, include_completions=False, sector_count=None):
         raise ValueError('No complete standard STR movie')
     if len(audio) > 1:
         raise ValueError('Multiple XA audio channels require a reviewed selection')
-    return dict(layout='riff_cdxa' if offset else 'raw'+str(sector_bytes), header_bytes=offset,
+    if audio_identity is not None and not audio:
+        raise ValueError('Reviewed XA audio identity is absent from selected STR range')
+    result = dict(layout='riff_cdxa' if offset else 'raw'+str(sector_bytes), header_bytes=offset,
                 sector_bytes=sector_bytes, sectors=sector, channel=video_channel,
                 width=dimensions[0], height=dimensions[1], frames=frames,
                 audio=list(audio.values()))
+    if padding_sectors:
+        result['padding_sectors'] = padding_sectors
+    if audio_identity is not None:
+        result['audio_identity'] = dict(file=audio_identity[0], channel=audio_identity[1])
+        result['omitted_audio_sectors'] = omitted_audio_sectors
+    return result
+
+
+def prepare_str(path, destination, info, audio_selection=None):
+    """prepare a bounded demux copy, retaining every physical sector position"""
+    audio_identity = reviewed_audio_identity(path, audio_selection)
+    with Path(path).open('rb') as src, Path(destination).open('xb') as dst:
+        src.seek(info['header_bytes'])
+        for _ in range(info['sectors']):
+            payload = src.read(info['sector_bytes'])
+            if len(payload) != info['sector_bytes']:
+                raise ValueError('STR source changed during preparation')
+            if info['layout'] == 'raw2048':
+                payload = wrap_video_sector(payload)
+            if (audio_identity is not None and (payload[18] & 0x0e) == 4
+                    and (payload[16], payload[17]) != audio_identity):
+                payload = bytearray(payload)
+                # retain the slot as empty; never compact the source timeline
+                payload[18] &= ~0x0e
+                payload[22] &= ~0x0e
+            dst.write(payload)
 
 
 def frame_rate(config, source):
@@ -189,10 +242,15 @@ def convert(root, config, ffmpeg=None):
             raise ValueError('Video input escapes project')
         source = path.relative_to(root).as_posix()
         source_range = config.get('video', {}).get('source_ranges', {}).get(source)
+        audio_selection = config.get('video', {}).get('audio_selections', {}).get(source)
         try:
-            info = inspect_str(path, sector_count=reviewed_sector_count(path, source_range))
+            info = inspect_str(path, sector_count=reviewed_sector_count(path, source_range),
+                               audio_selection=audio_selection)
         except ValueError as error:
             unsupported.append(dict(source=source, reason=str(error)))
+            continue
+        if info.get('padding_sectors'):
+            unsupported.append(dict(source=source, reason='Repeated DATA padding requires a reviewed preparation adapter'))
             continue
         fps = frame_rate(config, source)
         audio_rate = config.get('video', {}).get('audio_sample_rates', {}).get(source)
@@ -213,31 +271,34 @@ def convert(root, config, ffmpeg=None):
             encoder = dict(path=executable, sha256=digest(executable) if Path(executable).is_file() else None, version=version)
         source_hash = digest(path)
         range_key = json.dumps(source_range, sort_keys=True) if source_range is not None else ''
+        if audio_selection is not None:
+            range_key += json.dumps(audio_selection, sort_keys=True)
         name = source_hash[:20]+'-'+hashlib.sha256((source+fps+json.dumps(encoding,sort_keys=True)+range_key).encode()).hexdigest()[:12]+'.mp4'
         destination = output/name
         identity = dict(source=source, source_sha256=source_hash, frame_rate=fps, encoding=encoding,
                         encoder=encoder, original=info)
         if source_range is not None:
             identity['source_range'] = source_range
+        if audio_selection is not None:
+            identity['audio_selection'] = audio_selection
         old = next((clip for clip in previous.get('clips', []) if clip.get('source') == source), None)
         if destination.exists():
-            if not old or any(old.get(key) != value for key, value in identity.items()) or old.get('sha256') != digest(destination):
+            old_encoder = old.get('encoder') if old else None
+            if (not old or any(old.get(key) != value for key, value in identity.items() if key != 'encoder')
+                    or not isinstance(old_encoder, dict) or not old_encoder.get('path')
+                    or not old_encoder.get('version') or 'sha256' not in old_encoder
+                    or old.get('sha256') != digest(destination)):
                 raise ValueError('Unverified or modified MP4 already exists: '+str(destination))
+            # retain the actual producing encoder when a verified asset is reused
             clips.append(old)
             continue
         output.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='encode-', dir=status) as temporary:
             encoded = Path(temporary)/'movie.mp4'
             demux_source = path
-            if info['layout'] == 'raw2048' or source_range is not None:
+            if info['layout'] == 'raw2048' or source_range is not None or audio_selection is not None:
                 demux_source = Path(temporary)/'movie.str'
-                with path.open('rb') as src, demux_source.open('wb') as dst:
-                    src.seek(info['header_bytes'])
-                    for _ in range(info['sectors']):
-                        payload = src.read(info['sector_bytes'])
-                        if len(payload) != info['sector_bytes']:
-                            raise ValueError('STR source changed during preparation')
-                        dst.write(wrap_video_sector(payload) if info['layout'] == 'raw2048' else payload)
+                prepare_str(path, demux_source, info, audio_selection)
             command = [executable, '-nostdin', '-hide_banner', '-v', 'error', '-err_detect', 'explode',
                        '-r', fps, '-f', 'psxstr', '-i', str(demux_source), '-map', '0:v:0', '-map', '0:a?',
                        '-c:v', 'libx264', '-preset', 'slow', '-crf', str(crf), '-pix_fmt', 'yuv420p', '-bf', '0',

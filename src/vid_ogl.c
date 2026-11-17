@@ -18,6 +18,8 @@ struct VID_GEOMETRY
     uint32 stride;
     uint32 count, version, uploaded, object, array;
     uint32 refs, released, immutable;
+    size_t storage_bytes;
+    uint32 dirty_first, dirty_last;
 };
 
 struct VID_INDEX
@@ -25,6 +27,7 @@ struct VID_INDEX
     VID_INDEX *next;
     uint32 *values;
     uint32 capacity, count, version, uploaded, object, refs, released, immutable;
+    size_t storage_bytes;
 };
 
 static VID_INDEX *index_buffers;
@@ -35,26 +38,43 @@ struct VID_TEXTURE
     uint8 *pixels;
     uint32 width, height, format, version, uploaded, object, allocated, layers, array;
     uint32 refs, released, draw_refs, immutable;
-    uint32 sampler_flags, mip_version, mip_levels;
-    uint32 dirty_first, dirty_last;
+    uint32 sampler_flags, mip_version, mip_levels, compare_ready;
+    uint32 dirty_first, dirty_last, cube;
 };
 
 struct VID_TARGET
 {
     VID_TARGET *next;
-    VID_TEXTURE *texture;
+    VID_TEXTURE *texture, *depth_texture, *surface_texture;
     uint32 framebuffer, depth, refs, released, ready;
+    uint32 fixed_width, fixed_height, face, completed_faces;
+    uint32 *framebuffers;
+    uint32 framebuffer_count, storage_valid;
+    uint32 mip_storage_levels, mip_written, mip_base_version;
+    uint32 mip_framebuffers[32], mip_fbo_valid;
 };
+
+// gpu writes invalidate derived mips without scheduling a CPU upload
+static void vid_texture_rendered(VID_TEXTURE *texture)
+{
+    if (!++texture->version)
+        texture->version = 1;
+    texture->uploaded = texture->version;
+    texture->mip_version = 0;
+}
 
 static VID_TARGET *targets, *frame_target;
 static sint32 frame_target_present = 1;
 static float frame_target_offset;
+static uint32 frame_target_mip;
 
 struct VID_SHADER
 {
     struct VID_SHADER *next;
     uint32 program, refs, released;
-    sint32 textured, params, fog, uniforms, aux[2];
+    sint32 textured, params, fog, uniforms, aux[VID_AUX_TEXTURES];
+    uint32 uniform_vectors, aux_shadow_mask, aux_2d_mask;
+    uint64 draw_count;
 };
 
 static VID_SHADER *shaders;
@@ -64,9 +84,10 @@ struct VID_MATERIAL
     struct VID_MATERIAL *next;
     VID_MATERIAL_DATA data;
     VID_TEXTURE *held_texture;
-    VID_TEXTURE *held_aux[2];
+    VID_TEXTURE *held_aux[VID_AUX_TEXTURES];
     VID_SHADER *held_shader;
     uint32 refs, released;
+    uint64 revision;
 };
 
 struct VID_SAMPLE
@@ -90,7 +111,7 @@ typedef struct VID_DRAW
     VID_SAMPLE *sample;
     float fog[12];
     float sample_x, sample_y;
-    float uniforms[VID_UNIFORM_VECTORS * 4];
+    const float *uniforms;
     uint32 uniform_count;
 } VID_DRAW;
 
@@ -145,6 +166,12 @@ static PFNGLUSEPROGRAMPROC vid_glUseProgram;
     #define glUseProgram vid_glUseProgram
 static PFNGLGETUNIFORMLOCATIONPROC vid_glGetUniformLocation;
     #define glGetUniformLocation vid_glGetUniformLocation
+static PFNGLCLEARBUFFERFVPROC vid_glClearBufferfv;
+    #define glClearBufferfv vid_glClearBufferfv
+static PFNGLDRAWBUFFERSPROC vid_glDrawBuffers;
+    #define glDrawBuffers vid_glDrawBuffers
+static PFNGLGETACTIVEUNIFORMPROC vid_glGetActiveUniform;
+    #define glGetActiveUniform vid_glGetActiveUniform
 static PFNGLUNIFORM4FVPROC vid_glUniform4fv;
     #define glUniform4fv vid_glUniform4fv
 static PFNGLUNIFORM1IPROC vid_glUniform1i;
@@ -161,6 +188,8 @@ static PFNGLBINDBUFFERPROC vid_glBindBuffer;
     #define glBindBuffer vid_glBindBuffer
 static PFNGLBUFFERDATAPROC vid_glBufferData;
     #define glBufferData vid_glBufferData
+static PFNGLBUFFERSUBDATAPROC vid_glBufferSubData;
+    #define glBufferSubData vid_glBufferSubData
 static PFNGLDELETEBUFFERSPROC vid_glDeleteBuffers;
     #define glDeleteBuffers vid_glDeleteBuffers
 static PFNGLDISABLEVERTEXATTRIBARRAYPROC vid_glDisableVertexAttribArray;
@@ -183,6 +212,8 @@ static PFNGLDELETEFRAMEBUFFERSPROC vid_glDeleteFramebuffers;
     #define glDeleteFramebuffers vid_glDeleteFramebuffers
 static PFNGLFRAMEBUFFERTEXTURE2DPROC vid_glFramebufferTexture2D;
     #define glFramebufferTexture2D vid_glFramebufferTexture2D
+static PFNGLFRAMEBUFFERTEXTURELAYERPROC vid_glFramebufferTextureLayer;
+    #define glFramebufferTextureLayer vid_glFramebufferTextureLayer
 static PFNGLCHECKFRAMEBUFFERSTATUSPROC vid_glCheckFramebufferStatus;
     #define glCheckFramebufferStatus vid_glCheckFramebufferStatus
 static PFNGLGENRENDERBUFFERSPROC vid_glGenRenderbuffers;
@@ -259,6 +290,11 @@ static sint32 vid_load_gl(void)
     vid_glGetUniformLocation = (PFNGLGETUNIFORMLOCATIONPROC)vid_proc("glGetUniformLocation");
     if (!vid_glGetUniformLocation)
         return 0;
+    vid_glClearBufferfv = (PFNGLCLEARBUFFERFVPROC)vid_proc("glClearBufferfv");
+    vid_glDrawBuffers = (PFNGLDRAWBUFFERSPROC)vid_proc("glDrawBuffers");
+    vid_glGetActiveUniform = (PFNGLGETACTIVEUNIFORMPROC)vid_proc("glGetActiveUniform");
+    if (!vid_glDrawBuffers || !vid_glGetActiveUniform || !vid_glClearBufferfv)
+        return 0;
     vid_glUniform4fv = (PFNGLUNIFORM4FVPROC)vid_proc("glUniform4fv");
     if (!vid_glUniform4fv)
         return 0;
@@ -281,7 +317,8 @@ static sint32 vid_load_gl(void)
     if (!vid_glBindBuffer)
         return 0;
     vid_glBufferData = (PFNGLBUFFERDATAPROC)vid_proc("glBufferData");
-    if (!vid_glBufferData)
+    vid_glBufferSubData = (PFNGLBUFFERSUBDATAPROC)vid_proc("glBufferSubData");
+    if (!vid_glBufferData || !vid_glBufferSubData)
         return 0;
     vid_glDeleteBuffers = (PFNGLDELETEBUFFERSPROC)vid_proc("glDeleteBuffers");
     if (!vid_glDeleteBuffers)
@@ -308,6 +345,7 @@ static sint32 vid_load_gl(void)
     vid_glBindFramebuffer = (PFNGLBINDFRAMEBUFFERPROC)vid_proc("glBindFramebuffer");
     vid_glDeleteFramebuffers = (PFNGLDELETEFRAMEBUFFERSPROC)vid_proc("glDeleteFramebuffers");
     vid_glFramebufferTexture2D = (PFNGLFRAMEBUFFERTEXTURE2DPROC)vid_proc("glFramebufferTexture2D");
+    vid_glFramebufferTextureLayer = (PFNGLFRAMEBUFFERTEXTURELAYERPROC)vid_proc("glFramebufferTextureLayer");
     vid_glCheckFramebufferStatus = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)vid_proc("glCheckFramebufferStatus");
     vid_glGenRenderbuffers = (PFNGLGENRENDERBUFFERSPROC)vid_proc("glGenRenderbuffers");
     vid_glBindRenderbuffer = (PFNGLBINDRENDERBUFFERPROC)vid_proc("glBindRenderbuffer");
@@ -315,7 +353,7 @@ static sint32 vid_load_gl(void)
     vid_glRenderbufferStorage = (PFNGLRENDERBUFFERSTORAGEPROC)vid_proc("glRenderbufferStorage");
     vid_glFramebufferRenderbuffer = (PFNGLFRAMEBUFFERRENDERBUFFERPROC)vid_proc("glFramebufferRenderbuffer");
     vid_glBlitFramebuffer = (PFNGLBLITFRAMEBUFFERPROC)vid_proc("glBlitFramebuffer");
-    if (!vid_glGenFramebuffers || !vid_glBindFramebuffer || !vid_glDeleteFramebuffers || !vid_glFramebufferTexture2D || !vid_glCheckFramebufferStatus || !vid_glGenRenderbuffers || !vid_glBindRenderbuffer || !vid_glDeleteRenderbuffers || !vid_glRenderbufferStorage || !vid_glFramebufferRenderbuffer || !vid_glBlitFramebuffer)
+    if (!vid_glGenFramebuffers || !vid_glBindFramebuffer || !vid_glDeleteFramebuffers || !vid_glFramebufferTexture2D || !vid_glFramebufferTextureLayer || !vid_glCheckFramebufferStatus || !vid_glGenRenderbuffers || !vid_glBindRenderbuffer || !vid_glDeleteRenderbuffers || !vid_glRenderbufferStorage || !vid_glFramebufferRenderbuffer || !vid_glBlitFramebuffer)
         return 0;
     return 1;
 }
@@ -331,10 +369,11 @@ static const char *vid_vertex_source = VID_GLSL "layout(location=0) in vec4 aPos
                                                 "vFog=clamp(vec2(log(max(d,uFog[0].x)/uFog[0].x)/log(uFog[0].y/uFog[0].x),"
                                                 "log(max(d,uFog[0].y)/uFog[0].y)/log(uFog[0].z/uFog[0].y)),0.0,1.0);vFog*=vFog;}}\n";
 
-static GLuint vid_program, vid_array, vid_blit_buffer, vid_blit_texture;
+static GLuint vid_program, vid_array, vid_blit_buffer, vid_blit_texture, vid_empty_shadow, vid_empty_2d;
 static GLint vid_textured;
 static uint8 *vid_blit_pixels;
-static size_t vid_blit_capacity;
+static size_t vid_blit_capacity, vid_blit_storage;
+static sint32 vid_blit_width, vid_blit_height;
 
 static GLuint vid_compile_shader(GLenum type, const char *source)
 {
@@ -367,10 +406,15 @@ static void vid_context_free(void)
         glDeleteBuffers(1, &vid_blit_buffer);
     if (vid_blit_texture)
         glDeleteTextures(1, &vid_blit_texture);
-    vid_program = vid_array = vid_blit_buffer = vid_blit_texture = 0;
+    if (vid_empty_shadow)
+        glDeleteTextures(1, &vid_empty_shadow);
+    if (vid_empty_2d)
+        glDeleteTextures(1, &vid_empty_2d);
+    vid_program = vid_array = vid_blit_buffer = vid_blit_texture = vid_empty_shadow = vid_empty_2d = 0;
     free(vid_blit_pixels);
     vid_blit_pixels = NULL;
-    vid_blit_capacity = 0;
+    vid_blit_capacity = vid_blit_storage = 0;
+    vid_blit_width = vid_blit_height = 0;
 #if defined(AP_WEB)
     if (vid_context)
         emscripten_webgl_destroy_context(vid_context);
@@ -393,7 +437,7 @@ static sint32 vid_context_init(void *window)
     char log[1024];
     const char *fragment_source = VID_GLSL "in vec2 vUV; in vec4 vColor;\n"
                                            "uniform sampler2D uTex; uniform int uTextured;\n"
-                                           "out vec4 outColor;\n"
+                                           "layout(location=0) out vec4 outColor;\n"
                                            "void main(){vec4 c=vColor; if(uTextured!=0)c*=texture(uTex,vUV);"
                                            "if(c.a<0.001)discard;outColor=c;}\n";
 #if defined(AP_WEB)
@@ -524,12 +568,55 @@ static void vid_update_size(sint32 *width, sint32 *height)
 #endif
 }
 
+static uint32 vid_allocation_failed;
+
+static sint32 vid_render_status(void)
+{
+#if defined(AP_WEB) && defined(NDEBUG)
+    return !vid_allocation_failed && !emscripten_is_webgl_context_lost(vid_context);
+#else
+    return !vid_allocation_failed && glGetError() == GL_NO_ERROR;
+#endif
+}
+
+static VID_STATS vid_stats;
+
+void vid_stats_read(VID_STATS *stats)
+{
+    if (stats)
+        *stats = vid_stats;
+}
+
+uint64 vid_shader_draw_count(const VID_SHADER *shader)
+{
+    return shader ? shader->draw_count : 0;
+}
+
+static void vid_buffer_upload(GLenum target, size_t bytes, const void *data, GLenum usage, size_t *storage, size_t capacity)
+{
+    if (*storage < capacity)
+    {
+        glBufferData(target, (GLsizeiptr)capacity, NULL, usage);
+        if (glGetError() != GL_NO_ERROR)
+        {
+            vid_allocation_failed = 1;
+            return;
+        }
+        *storage = capacity;
+    }
+    glBufferSubData(target, 0, (GLsizeiptr)bytes, data);
+    if (target == GL_ARRAY_BUFFER)
+        vid_stats.vertex_bytes += bytes;
+    else if (target == GL_ELEMENT_ARRAY_BUFFER)
+        vid_stats.index_bytes += bytes;
+}
+
 static sint32 vid_swap(void)
 {
 #if defined(AP_WEB)
-    return glGetError() == GL_NO_ERROR;
+    return vid_render_status();
 #else
-    return SwapBuffers(vid_device) && glGetError() == GL_NO_ERROR;
+    return !vid_allocation_failed && SwapBuffers(vid_device) && glGetError() == GL_NO_ERROR;
 
 #endif
 }
@@ -614,28 +701,46 @@ static float vid_anisotropy(void)
     return vid_anisotropy_limit;
 }
 
+typedef struct VID_FORMAT_INFO
+{
+    GLenum internal, external, type;
+    uint32 bytes, depth, nearest, comparison;
+} VID_FORMAT_INFO;
+
+static const VID_FORMAT_INFO vid_formats[] = {{GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 0, 0, 0}, {GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, 2, 0, 0, 0}, {GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 1, 0, 1, 0}, {GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, 8, 0, 1, 0}, {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 4, 1, 0, 1}, {GL_RGBA32F, GL_RGBA, GL_FLOAT, 16, 0, 1, 0}, {GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, 8, 0, 0, 0}, {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 4, 1, 1, 0}, {GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1, 0, 0, 0}};
+
+static const VID_FORMAT_INFO *vid_format(uint32 format)
+{
+    if (format >= sizeof(vid_formats) / sizeof(vid_formats[0]))
+        abort();
+    return &vid_formats[format];
+}
+
 static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
 {
-    GLenum target = texture->array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    GLenum target = texture->cube ? GL_TEXTURE_CUBE_MAP : texture->array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    const VID_FORMAT_INFO *info = vid_format(texture->format);
     if (!texture->object)
         glGenTextures(1, &texture->object);
     glBindTexture(target, texture->object);
+    ++vid_stats.texture_binds;
     if (texture->uploaded != texture->version)
     {
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        GLenum format = texture->format == VID_R8UI ? GL_RED_INTEGER : texture->format == VID_RGBA16UI ? GL_RGBA_INTEGER : GL_RGBA;
-        GLenum type = texture->format == VID_RGBA5551 ? GL_UNSIGNED_SHORT_5_5_5_1 : texture->format == VID_RGBA16UI ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+        GLenum format = info->external, type = info->type;
         if (!texture->allocated)
         {
             if (texture->array)
-                glTexImage3D(target, 0, texture->format == VID_RGBA5551 ? GL_RGB5_A1 : GL_RGBA8, texture->width, texture->height, texture->layers, 0, format, type, texture->pixels);
+                glTexImage3D(target, 0, info->internal, texture->width, texture->height, texture->layers, 0, format, type, texture->pixels);
             else
-                glTexImage2D(target, 0, texture->format == VID_RGBA5551 ? GL_RGB5_A1 : texture->format == VID_R8UI ? GL_R8UI : texture->format == VID_RGBA16UI ? GL_RGBA16UI : GL_RGBA, texture->width, texture->height, 0, format, type, texture->pixels);
+                glTexImage2D(target, 0, info->internal, texture->width, texture->height, 0, format, type, texture->pixels);
             texture->allocated = 1;
+            if (glGetError() != GL_NO_ERROR)
+                vid_allocation_failed = 1;
         }
         else
         {
-            uint32 stride = texture->width * (texture->format == VID_RGBA5551 ? 2 : texture->format == VID_R8UI ? 1 : texture->format == VID_RGBA16UI ? 8 : 4);
+            uint32 stride = texture->width * info->bytes;
             if (texture->array)
                 glTexSubImage3D(target, 0, 0, 0, 0, texture->width, texture->height, texture->layers, format, type, texture->pixels);
             else
@@ -648,10 +753,28 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
             texture->pixels = NULL;
         }
     }
-    if (texture->format >= VID_R8UI)
+    if (info->nearest)
         filter = repeat = 0;
+    if (info->depth && !info->comparison)
+    {
+        filter = repeat = 0;
+        if (!texture->compare_ready)
+            glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+        texture->compare_ready = 1;
+    }
+    if (info->comparison)
+    {
+        filter = VID_FILTER_LINEAR;
+        repeat = 0;
+        if (!texture->compare_ready)
+        {
+            glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+            glTexParameteri(target, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+            texture->compare_ready = 1;
+        }
+    }
     uint32 sampler = 8 | (filter << 1) | (repeat ? 1 : 0);
-    if (filter == VID_FILTER_ANISOTROPIC && texture->mip_version != texture->version)
+    if ((filter == VID_FILTER_ANISOTROPIC || filter == VID_FILTER_TRILINEAR) && texture->mip_version != texture->version)
     {
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, texture->mip_levels ? (GLint)texture->mip_levels - 1 : 1000);
         glGenerateMipmap(target);
@@ -660,7 +783,7 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
     if (!(texture->sampler_flags & 8) || ((texture->sampler_flags ^ sampler) & 6))
     {
         float anisotropy = vid_anisotropy();
-        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, filter == VID_FILTER_ANISOTROPIC ? GL_LINEAR_MIPMAP_LINEAR : filter ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, (filter == VID_FILTER_ANISOTROPIC || filter == VID_FILTER_TRILINEAR) ? GL_LINEAR_MIPMAP_LINEAR : filter ? GL_LINEAR : GL_NEAREST);
         glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter ? GL_LINEAR : GL_NEAREST);
         if (anisotropy > 1.0f)
             glTexParameterf(target, 0x84FE, filter == VID_FILTER_ANISOTROPIC ? anisotropy : 1.0f);
@@ -669,6 +792,8 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
     {
         glTexParameteri(target, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
         glTexParameteri(target, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        if (texture->cube)
+            glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
     }
     texture->sampler_flags = sampler;
 }
@@ -676,30 +801,172 @@ static void vid_tex_upload(VID_TEXTURE *texture, uint32 filter, uint32 repeat)
 static sint32 vid_target_storage(VID_TARGET *target, uint32 width, uint32 height)
 {
     VID_TEXTURE *texture = target->texture;
-    if (texture->draw_refs || width == 0 || height == 0)
+    uint32 count = texture->cube ? 6 : texture->array ? texture->layers : 1;
+    if (texture->draw_refs || (target->depth_texture && target->depth_texture->draw_refs) || (target->surface_texture && target->surface_texture->draw_refs) || !width || !height || target->face >= count)
         return 0;
-    if (!target->framebuffer)
-        glGenFramebuffers(1, &target->framebuffer);
-    if (!target->depth)
+    if (target->storage_valid && texture->allocated && width == texture->width && height == texture->height)
+    {
+        target->framebuffer = target->framebuffers[target->face];
+        glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+        if (target->surface_texture)
+        {
+            GLenum buffers[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+            glDrawBuffers(2, buffers);
+        }
+        return 1;
+    }
+    target->storage_valid = target->ready = target->completed_faces = 0;
+    target->mip_storage_levels = 1;
+    target->mip_fbo_valid = 0;
+    target->mip_written = target->mip_base_version = 0;
+    if (!target->framebuffers)
+    {
+        target->framebuffers = calloc(count, sizeof(*target->framebuffers));
+        if (!target->framebuffers)
+            return 0;
+        target->framebuffer_count = count;
+        glGenFramebuffers(count, target->framebuffers);
+    }
+    if (!target->depth && !target->depth_texture && texture->format != VID_DEPTH24)
         glGenRenderbuffers(1, &target->depth);
     if (!texture->object)
         glGenTextures(1, &texture->object);
-    glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
-    if (!texture->allocated || width != texture->width || height != texture->height)
+    glBindTexture(texture->cube ? GL_TEXTURE_CUBE_MAP : texture->array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, texture->object);
+    const VID_FORMAT_INFO *info = vid_format(texture->format);
+    if (texture->cube)
     {
-        target->ready = 0;
-        glBindTexture(GL_TEXTURE_2D, texture->object);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        for (uint32 face = 0; face < 6; ++face)
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, info->internal, width, height, 0, info->external, info->type, NULL);
+    }
+    else if (texture->array)
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, info->internal, width, height, texture->layers, 0, info->external, info->type, NULL);
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, info->internal, width, height, 0, info->external, info->type, NULL);
+    if (target->depth_texture)
+    {
+        VID_TEXTURE *depth = target->depth_texture;
+        if (!depth->object)
+            glGenTextures(1, &depth->object);
+        glBindTexture(depth->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, depth->object);
+        for (uint32 face = 0; face < (depth->cube ? 6u : 1u); ++face)
+            glTexImage2D(depth->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : GL_TEXTURE_2D, 0, vid_format(depth->format)->internal, width, height, 0, vid_format(depth->format)->external, vid_format(depth->format)->type, NULL);
+        depth->width = width;
+        depth->height = height;
+        depth->allocated = 1;
+        depth->uploaded = depth->version;
+        depth->sampler_flags = 0;
+    }
+    else if (texture->format != VID_DEPTH24)
+    {
         glBindRenderbuffer(GL_RENDERBUFFER, target->depth);
         glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
-        texture->width = width;
-        texture->height = height;
-        texture->allocated = 1;
-        texture->uploaded = texture->version;
     }
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture->object, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target->depth);
-    return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE && glGetError() == GL_NO_ERROR;
+    if (target->surface_texture)
+    {
+        VID_TEXTURE *surface = target->surface_texture;
+        if (!surface->object)
+            glGenTextures(1, &surface->object);
+        glBindTexture(GL_TEXTURE_2D, surface->object);
+        glTexImage2D(GL_TEXTURE_2D, 0, vid_format(surface->format)->internal, width, height, 0, vid_format(surface->format)->external, vid_format(surface->format)->type, NULL);
+        surface->width = width;
+        surface->height = height;
+        surface->allocated = 1;
+        surface->uploaded = surface->version;
+        surface->sampler_flags = 0;
+    }
+    for (uint32 face = 0; face < count; ++face)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffers[face]);
+        if (texture->format == VID_DEPTH24)
+        {
+            GLenum none = GL_NONE;
+            if (texture->array)
+                glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, texture->object, 0, face);
+            else
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, texture->object, 0);
+            glDrawBuffers(1, &none);
+            glReadBuffer(GL_NONE);
+        }
+        else
+        {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : GL_TEXTURE_2D, texture->object, 0);
+            if (target->depth_texture)
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, target->depth_texture->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : GL_TEXTURE_2D, target->depth_texture->object, 0);
+            else
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target->depth);
+        }
+        if (target->surface_texture)
+        {
+            GLenum buffers[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, target->surface_texture->object, 0);
+            glDrawBuffers(2, buffers);
+        }
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            return 0;
+    }
+    if (glGetError() != GL_NO_ERROR)
+        return 0;
+    texture->width = width;
+    texture->height = height;
+    texture->allocated = 1;
+    texture->uploaded = texture->version;
+    target->storage_valid = 1;
+    target->framebuffer = target->framebuffers[target->face];
+    glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+    return 1;
+}
+
+static uint32 vid_texture_mip_count(const VID_TEXTURE *texture)
+{
+    uint32 levels = 1, size = texture->width > texture->height ? texture->width : texture->height;
+    for (; size > 1; size >>= 1)
+        ++levels;
+    return texture->mip_levels && texture->mip_levels < levels ? texture->mip_levels : levels;
+}
+
+static sint32 vid_target_mip_storage(VID_TARGET *target, uint32 level)
+{
+    VID_TEXTURE *texture = target->texture;
+    const VID_FORMAT_INFO *info = vid_format(texture->format);
+    uint32 levels = vid_texture_mip_count(texture);
+    if ((target->mip_fbo_valid & (1u << level)) && target->mip_storage_levels == levels)
+    {
+        target->framebuffer = target->mip_framebuffers[level];
+        glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+        return 1;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture->object);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+    for (uint32 index = target->mip_storage_levels; index < levels; ++index)
+    {
+        uint32 width = texture->width >> index, height = texture->height >> index;
+        glTexImage2D(GL_TEXTURE_2D, index, info->internal, width ? width : 1, height ? height : 1, 0, info->external, info->type, NULL);
+    }
+    target->mip_storage_levels = levels;
+    if (!target->mip_framebuffers[level])
+        glGenFramebuffers(1, &target->mip_framebuffers[level]);
+    target->framebuffer = target->mip_framebuffers[level];
+    glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture->object, level);
+    GLenum color = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &color);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || glGetError() != GL_NO_ERROR)
+        return 0;
+    target->mip_fbo_valid |= 1u << level;
+    return 1;
+}
+
+static void vid_target_mip_written(VID_TARGET *target, uint32 level)
+{
+    VID_TEXTURE *texture = target->texture;
+    if (target->mip_base_version != texture->version)
+    {
+        target->mip_base_version = texture->version;
+        target->mip_written = 1;
+    }
+    target->mip_written |= 1u << level;
+    // explicit mip rendering owns this chain; later passes may sample written levels
+    texture->mip_version = texture->version;
 }
 
 static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame_width, sint32 frame_height)
@@ -710,27 +977,54 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
     const VID_MATERIAL_DATA *pass = NULL;
     // only this uninterrupted queue owns GL state; discard all knowledge after the flush
     VID_RECT applied_viewport = {0};
-    uint32 viewport_valid = 0, applied_cull = UINT32_MAX, applied_depth = UINT32_MAX;
+    uint32 viewport_valid = 0, applied_cull = UINT32_MAX, applied_depth = UINT32_MAX, applied_surface = UINT32_MAX;
     uint32 applied_write = UINT32_MAX, applied_blend = UINT32_MAX;
+    uint32 applied_offset = UINT32_MAX;
+    float applied_offset_slope = 0, applied_offset_units = 0;
     GLuint applied_program = 0, applied_array = 0, applied_indices = UINT32_MAX;
-    uint32 active_unit = 0, uniform_valid = 0, params_valid = 0, fog_valid = 0, aux_valid = 0;
+    uint32 active_unit = 0, uniform_valid = 0, params_valid = 0, fog_valid = 0, texture_valid = 0;
     sint32 applied_textured = -1;
     uint32 applied_uniform_count = 0;
+    const float *applied_uniform_snapshot = NULL;
     float applied_uniforms[VID_UNIFORM_VECTORS * 4], applied_params[8], applied_fog[12];
-    VID_TEXTURE *applied_textures[3] = {0};
-    uint32 texture_filters[3] = {0}, texture_repeats[3] = {0};
+    VID_TEXTURE *applied_textures[VID_AUX_TEXTURES + 1] = {0};
+    uint32 missing_shadow_mask = 0, missing_2d_mask = 0;
+    uint32 texture_filters[VID_AUX_TEXTURES + 1] = {0}, texture_repeats[VID_AUX_TEXTURES + 1] = {0};
     vid_update_size(&width, &height);
     if (width <= 0 || height <= 0)
         return 1;
     if (frame_target)
     {
+#if !defined(AP_WEB) || !defined(NDEBUG)
         glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
-        if (!vid_target_storage(frame_target, width, height))
+#endif
+        if (frame_target->fixed_width)
+        {
+            width = (sint32)frame_target->fixed_width;
+            height = (sint32)frame_target->fixed_height;
+        }
+        if (frame_target_mip)
+        {
+            width = frame_target->texture->width;
+            height = frame_target->texture->height;
+        }
+        if (!vid_target_storage(frame_target, width, height) || (frame_target_mip && !vid_target_mip_storage(frame_target, frame_target_mip)))
         {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+            if (frame_target_mip)
+                frame_target->framebuffer = frame_target->framebuffers[frame_target->face];
             return 0;
+        }
+        if (frame_target_mip)
+        {
+            width >>= frame_target_mip;
+            height >>= frame_target_mip;
+            if (!width)
+                width = 1;
+            if (!height)
+                height = 1;
         }
         frame_target->ready = 0;
     }
@@ -738,12 +1032,33 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
     glDepthMask(GL_TRUE);
     glClearColor(clear[0], clear[1], clear[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (frame_target && !frame_target_mip && frame_target->surface_texture)
+    {
+        const float zero[4] = {0};
+        glClearBufferfv(GL_COLOR, 1, zero);
+    }
     glUseProgram(vid_program);
     glActiveTexture(GL_TEXTURE0);
     glDisable(GL_CULL_FACE);
     glEnable(GL_SCISSOR_TEST);
     while (draws)
     {
+        if (draws->pass == 4)
+        {
+            if (frame_target->texture->cube)
+                frame_target->completed_faces |= 1u << frame_target->face;
+            frame_target->face = draws->first;
+            frame_target->framebuffer = frame_target->framebuffers[frame_target->face];
+            glBindFramebuffer(GL_FRAMEBUFFER, frame_target->framebuffer);
+            glDisable(GL_SCISSOR_TEST);
+            glDepthMask(GL_TRUE);
+            glClear(GL_DEPTH_BUFFER_BIT | (frame_target->texture->format == VID_DEPTH24 ? 0 : GL_COLOR_BUFFER_BIT));
+            glEnable(GL_SCISSOR_TEST);
+            applied_write = 1;
+            pass = NULL;
+            draws = draws->next;
+            continue;
+        }
         VID_GEOMETRY *geometry = draws->geometry;
         const VID_MATERIAL_DATA *material = draws->pass == 2 ? pass : &draws->data;
         VID_RECT viewport = draws->viewport;
@@ -791,8 +1106,15 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             uint32 blend = material->blend;
             GLuint program = material->shader ? material->shader->program : vid_program;
             sint32 textured = material->texture != NULL;
+            if (frame_target && frame_target->surface_texture && applied_surface != (material->surface_write != 0))
+            {
+                GLenum buffers[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+                glDrawBuffers(material->surface_write ? 2 : 1, buffers);
+                applied_surface = material->surface_write != 0;
+            }
             if (applied_cull != material->cull)
             {
+                ++vid_stats.state_changes;
                 if (material->cull)
                 {
                     glEnable(GL_CULL_FACE);
@@ -805,6 +1127,7 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             }
             if (applied_depth != (material->depth_test != 0))
             {
+                ++vid_stats.state_changes;
                 if (material->depth_test)
                     glEnable(GL_DEPTH_TEST);
                 else
@@ -813,18 +1136,36 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             }
             if (applied_write != (material->depth_write != 0))
             {
+                ++vid_stats.state_changes;
                 glDepthMask(material->depth_write ? GL_TRUE : GL_FALSE);
                 applied_write = material->depth_write != 0;
             }
+            uint32 offset = material->depth_bias_slope != 0 || material->depth_bias_units != 0;
+            if (applied_offset != offset)
+            {
+                ++vid_stats.state_changes;
+                if (offset)
+                    glEnable(GL_POLYGON_OFFSET_FILL);
+                else
+                    glDisable(GL_POLYGON_OFFSET_FILL);
+            }
+            if (offset && (applied_offset == UINT32_MAX || applied_offset_slope != material->depth_bias_slope || applied_offset_units != material->depth_bias_units))
+            {
+                glPolygonOffset(material->depth_bias_slope, material->depth_bias_units);
+                applied_offset_slope = material->depth_bias_slope;
+                applied_offset_units = material->depth_bias_units;
+            }
+            applied_offset = offset;
             if (!blend && material->shader && draws->fog[1] > draws->fog[0])
                 blend = VID_BLEND_ALPHA;
             if (applied_blend != blend)
             {
+                ++vid_stats.state_changes;
                 if (blend)
                 {
                     glEnable(GL_BLEND);
                     glBlendEquation(blend == VID_BLEND_SUBTRACT ? GL_FUNC_REVERSE_SUBTRACT : GL_FUNC_ADD);
-                    glBlendFunc(GL_SRC_ALPHA, blend == VID_BLEND_ALPHA ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE);
+                    glBlendFunc(blend == VID_BLEND_PREMULTIPLIED ? GL_ONE : GL_SRC_ALPHA, blend == VID_BLEND_ALPHA || blend == VID_BLEND_PREMULTIPLIED ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE);
                 }
                 else
                     glDisable(GL_BLEND);
@@ -833,9 +1174,10 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             if (applied_program != program)
             {
                 glUseProgram(program);
+                ++vid_stats.program_changes;
                 applied_program = program;
                 applied_textured = -1;
-                uniform_valid = params_valid = fog_valid = aux_valid = 0;
+                uniform_valid = params_valid = fog_valid = 0;
             }
             if (textured != applied_textured)
             {
@@ -862,12 +1204,15 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
                     fog_valid = 1;
                 }
             }
-            for (uint32 unit = 0; unit < 3; ++unit)
+            for (uint32 unit = 0; unit < VID_AUX_TEXTURES + 1; ++unit)
             {
                 VID_TEXTURE *texture = unit == 0 ? material->texture : material->aux[unit - 1];
-                uint32 filter = unit == 0 ? material->filter : 0;
+                uint32 filter = texture && texture->format == VID_DEPTH24 ? VID_FILTER_LINEAR : unit == 0 ? material->filter : material->aux_filter[unit - 1];
                 uint32 repeat = unit == 0 ? material->repeat : 0;
-                uint32 sampler = 8 | ((texture && texture->format >= VID_R8UI ? 0 : filter) << 1) | (texture && texture->format >= VID_R8UI ? 0 : repeat ? 1 : 0);
+                const VID_FORMAT_INFO *info = texture ? vid_format(texture->format) : NULL;
+                uint32 effective_filter = info && info->comparison ? VID_FILTER_LINEAR : info && info->nearest ? 0 : filter;
+                uint32 effective_repeat = info && (info->depth || info->nearest) ? 0 : repeat;
+                uint32 sampler = 8 | (effective_filter << 1) | (effective_repeat ? 1 : 0);
                 if (texture != NULL && (applied_textures[unit] != texture || texture->uploaded != texture->version || texture_filters[unit] != filter || texture_repeats[unit] != repeat || texture->sampler_flags != sampler))
                 {
                     if (active_unit != unit)
@@ -877,22 +1222,84 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
                     }
                     vid_tex_upload(texture, filter, repeat);
                     applied_textures[unit] = texture;
+                    missing_shadow_mask &= ~(1u << unit);
+                    missing_2d_mask &= ~(1u << unit);
                     texture_filters[unit] = filter;
                     texture_repeats[unit] = repeat;
                 }
-                if (unit != 0 && texture != NULL && material->shader && material->shader->aux[unit - 1] >= 0 && !(aux_valid & (1u << unit)))
+                uint32 empty_shadow = !texture && unit != 0 && material->shader && (material->shader->aux_shadow_mask & (1u << (unit - 1)));
+                uint32 empty_2d = !texture && unit != 0 && material->shader && (material->shader->aux_2d_mask & (1u << (unit - 1)));
+                if (!texture && (applied_textures[unit] || !(texture_valid & (1u << unit)) || !!(missing_shadow_mask & (1u << unit)) != !!empty_shadow || !!(missing_2d_mask & (1u << unit)) != !!empty_2d))
                 {
-                    glUniform1i(material->shader->aux[unit - 1], unit);
-                    aux_valid |= 1u << unit;
+                    if (active_unit != unit)
+                    {
+                        glActiveTexture(GL_TEXTURE0 + unit);
+                        active_unit = unit;
+                    }
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+                    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+                    if (empty_shadow)
+                    {
+                        // inactive shadow branches still require a valid comparison texture
+                        if (!vid_empty_shadow)
+                        {
+                            const uint32 depth = UINT32_MAX;
+                            glGenTextures(1, &vid_empty_shadow);
+                            glBindTexture(GL_TEXTURE_2D_ARRAY, vid_empty_shadow);
+                            glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24, 1, 1, 1, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &depth);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+                        }
+                        else
+                            glBindTexture(GL_TEXTURE_2D_ARRAY, vid_empty_shadow);
+                        missing_shadow_mask |= 1u << unit;
+                    }
+                    else
+                        missing_shadow_mask &= ~(1u << unit);
+                    if (empty_2d)
+                    {
+                        if (!vid_empty_2d)
+                        {
+                            const uint8 pixel[4] = {0, 0, 0, 255};
+                            glGenTextures(1, &vid_empty_2d);
+                            glBindTexture(GL_TEXTURE_2D, vid_empty_2d);
+                            ++vid_stats.texture_binds;
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        }
+                        else
+                            glBindTexture(GL_TEXTURE_2D, vid_empty_2d);
+                        ++vid_stats.texture_binds;
+                        missing_2d_mask |= 1u << unit;
+                    }
+                    else
+                        missing_2d_mask &= ~(1u << unit);
+                    applied_textures[unit] = NULL;
                 }
+                texture_valid |= 1u << unit;
             }
         }
-        if (material->shader && material->shader->uniforms >= 0 && draws->uniform_count && (!uniform_valid || applied_uniform_count != draws->uniform_count || memcmp(applied_uniforms, draws->uniforms, draws->uniform_count * 4 * sizeof(float)) != 0))
+        uint32 uniform_count = material->shader && draws->uniform_count > material->shader->uniform_vectors ? material->shader->uniform_vectors : draws->uniform_count;
+        if (material->shader && material->shader->uniforms >= 0 && uniform_count)
         {
-            glUniform4fv(material->shader->uniforms, draws->uniform_count, draws->uniforms);
-            memcpy(applied_uniforms, draws->uniforms, draws->uniform_count * 4 * sizeof(float));
-            applied_uniform_count = draws->uniform_count;
-            uniform_valid = 1;
+            if (!uniform_valid || applied_uniform_count != uniform_count || (applied_uniform_snapshot != draws->uniforms && memcmp(applied_uniforms, draws->uniforms, uniform_count * 4 * sizeof(float)) != 0))
+            {
+                glUniform4fv(material->shader->uniforms, uniform_count, draws->uniforms);
+                ++vid_stats.uniform_uploads;
+                vid_stats.uniform_bytes += uniform_count * 4 * sizeof(float);
+                memcpy(applied_uniforms, draws->uniforms, uniform_count * 4 * sizeof(float));
+                applied_uniform_count = uniform_count;
+                uniform_valid = 1;
+            }
+            applied_uniform_snapshot = draws->uniforms;
         }
         if (draws->pass == 1)
         {
@@ -919,8 +1326,19 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
         {
             glBindBuffer(GL_ARRAY_BUFFER, geometry->object);
             // ANGLE dynamic vertex storage rebases gl_VertexID twice for indexed draws
-            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)geometry->count * geometry->stride), geometry->vertices, GL_STATIC_DRAW);
+            if (geometry->uploaded != 0 && geometry->dirty_last > geometry->dirty_first && geometry->storage_bytes >= (size_t)geometry->count * geometry->stride)
+            {
+                size_t first = (size_t)geometry->dirty_first * geometry->stride;
+                size_t bytes = (size_t)(geometry->dirty_last - geometry->dirty_first) * geometry->stride;
+                glBufferSubData(GL_ARRAY_BUFFER, first, bytes, (const unsigned char *)geometry->vertices + first);
+#if defined(_DEBUG)
+                vid_stats.vertex_bytes += bytes;
+#endif
+            }
+            else
+                vid_buffer_upload(GL_ARRAY_BUFFER, (size_t)geometry->count * geometry->stride, geometry->vertices, GL_STATIC_DRAW, &geometry->storage_bytes, (size_t)geometry->count * geometry->stride);
             geometry->uploaded = geometry->version;
+            geometry->dirty_first = geometry->dirty_last = 0;
             if (geometry->immutable)
             {
                 free(geometry->vertices);
@@ -939,7 +1357,7 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             }
             if (indices->uploaded != indices->version)
             {
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)indices->count * sizeof(uint32)), indices->values, indices->immutable ? GL_STATIC_DRAW : GL_DYNAMIC_DRAW);
+                vid_buffer_upload(GL_ELEMENT_ARRAY_BUFFER, (size_t)indices->count * sizeof(uint32), indices->values, indices->immutable ? GL_STATIC_DRAW : GL_DYNAMIC_DRAW, &indices->storage_bytes, (size_t)indices->capacity * sizeof(uint32));
                 indices->uploaded = indices->version;
                 if (indices->immutable)
                 {
@@ -948,19 +1366,35 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
                 }
             }
             glDrawElements(GL_TRIANGLES, draws->count, GL_UNSIGNED_INT, (const void *)((size_t)draws->first * sizeof(uint32)));
+            ++vid_stats.draws;
+            vid_stats.triangles += draws->count / 3;
         }
         else
         {
             glDrawArrays(GL_TRIANGLES, draws->first, draws->count);
+            ++vid_stats.draws;
+            vid_stats.triangles += draws->count / 3;
         }
+        if (material->shader)
+            ++material->shader->draw_count;
         draws = draws->next;
     }
     if (active_unit != 0)
         glActiveTexture(GL_TEXTURE0);
     glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_POLYGON_OFFSET_FILL);
     if (frame_target)
     {
-        frame_target->ready = glGetError() == GL_NO_ERROR;
+        frame_target->ready = vid_render_status();
+        if (frame_target->ready && frame_target->texture->format != VID_DEPTH24)
+        {
+            if (frame_target->texture->cube)
+                frame_target->completed_faces |= 1u << frame_target->face;
+            if (frame_target_mip)
+                vid_target_mip_written(frame_target, frame_target_mip);
+            else
+                vid_texture_rendered(frame_target->texture);
+        }
         glBindFramebuffer(GL_READ_FRAMEBUFFER, frame_target->framebuffer);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
         if (frame_target_present)
@@ -981,9 +1415,11 @@ static sint32 vid_render(const VID_DRAW *draws, const float *clear, sint32 frame
             }
         }
         glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+        if (frame_target_mip)
+            frame_target->framebuffer = frame_target->framebuffers[frame_target->face];
     }
 
-    return frame_target && !frame_target_present ? glGetError() == GL_NO_ERROR : vid_swap();
+    return frame_target && !frame_target_present ? vid_render_status() : vid_swap();
 }
 
 static void vid_mesh_delete(VID_GEOMETRY *geometry)
@@ -1006,11 +1442,21 @@ static VID_MATERIAL *materials;
 static VID_DRAW *draw_head, *draw_tail, *draw_pool;
 static VID_RECT frame_viewport;
 static float frame_fog[12];
-static float frame_uniforms[VID_UNIFORM_VECTORS * 4];
+
+typedef struct VID_UNIFORM_CHUNK
+{
+    struct VID_UNIFORM_CHUNK *next;
+    uint32 used;
+    float values[16384];
+} VID_UNIFORM_CHUNK;
+
+static VID_UNIFORM_CHUNK *uniform_chunks, *uniform_cursor;
+static const float *frame_uniforms;
 static uint32 frame_uniform_count;
 static sint32 frame_width, frame_height;
 static float frame_clear[3];
 static sint32 frame_active, initialized, frame_pass;
+static const VID_DRAW *frame_pass_snapshot;
 
 static void sample_release(VID_SAMPLE *sample)
 {
@@ -1158,6 +1604,10 @@ static void shader_release(VID_SHADER *shader)
     {
     }
     *entry = shader->next;
+    GLint current_program;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
+    if ((GLuint)current_program == shader->program)
+        glUseProgram(0);
     glDeleteProgram(shader->program);
     free(shader);
 }
@@ -1175,7 +1625,7 @@ static void material_release(VID_MATERIAL *material)
         texture_release(material->held_texture);
     if (material->held_shader)
         shader_release(material->held_shader);
-    for (uint32 idx = 0; idx < 2; ++idx)
+    for (uint32 idx = 0; idx < VID_AUX_TEXTURES; ++idx)
         if (material->held_aux[idx])
             texture_release(material->held_aux[idx]);
     free(material);
@@ -1252,6 +1702,33 @@ void vid_mesh_commit(VID_GEOMETRY *geometry)
     if (!++geometry->version)
         geometry->version = 1;
     geometry->uploaded = 0;
+    geometry->dirty_first = 0;
+    geometry->dirty_last = geometry->count;
+}
+
+void vid_mesh_commit_range(VID_GEOMETRY *geometry, uint32 first, uint32 count)
+{
+    if (!geometry || geometry->released || geometry->immutable || geometry->refs != 1 || first > geometry->count || count > geometry->count - first)
+        abort();
+    if (!count)
+        return;
+    if (geometry->dirty_last <= geometry->dirty_first)
+    {
+        geometry->dirty_first = first;
+        geometry->dirty_last = first + count;
+    }
+    else
+    {
+        if (first < geometry->dirty_first)
+            geometry->dirty_first = first;
+        if (first + count > geometry->dirty_last)
+            geometry->dirty_last = first + count;
+    }
+    if (!++geometry->version)
+    {
+        geometry->version = 1;
+        geometry->uploaded = 0;
+    }
 }
 
 void vid_mesh_static(VID_GEOMETRY *geometry)
@@ -1279,12 +1756,12 @@ void vid_mesh_free(VID_GEOMETRY *geometry)
 VID_TEXTURE *vid_tex_create_fmt(uint32 width, uint32 height, uint32 format)
 {
     VID_TEXTURE *texture;
-    if (format > VID_RGBA16UI || !width || !height || width > SIZE_MAX / 8 / height)
+    if ((format > VID_RGBA16UI && format != VID_RGBA32F && format != VID_RGBA16F && format != VID_R8) || !width || !height || width > SIZE_MAX / (format == VID_RGBA32F ? 16 : 8) / height)
         return NULL;
     texture = calloc(1, sizeof(*texture));
     if (!texture)
         return NULL;
-    texture->pixels = calloc((size_t)width * height, format == VID_RGBA5551 ? 2 : format == VID_R8UI ? 1 : format == VID_RGBA16UI ? 8 : 4);
+    texture->pixels = calloc((size_t)width * height, vid_format(format)->bytes);
     if (!texture->pixels)
     {
         free(texture);
@@ -1309,7 +1786,7 @@ VID_TEXTURE *vid_tex_create_array_fmt(uint32 width, uint32 height, uint32 layers
 {
     VID_TEXTURE *texture;
     uint8 *pixels;
-    uint32 stride = format == VID_RGBA5551 ? 2 : 4;
+    uint32 stride = format <= VID_RGBA5551 ? vid_format(format)->bytes : 0;
     if (format > VID_RGBA5551 || layers < 1 || layers > 256 || !width || !height || (size_t)width > SIZE_MAX / stride / height / layers)
         return NULL;
     pixels = calloc((size_t)width * height * layers, stride);
@@ -1429,6 +1906,119 @@ VID_TARGET *vid_target_create(void)
     return target;
 }
 
+VID_TARGET *vid_target_create_hdr(void)
+{
+    VID_TARGET *target = vid_target_create();
+    if (target)
+        target->texture->format = VID_RGBA16F;
+    return target;
+}
+
+static VID_TARGET *vid_target_attach_depth(VID_TARGET *target)
+{
+    VID_TEXTURE *depth;
+    if (!target)
+        return NULL;
+    depth = calloc(1, sizeof(*depth));
+    if (!depth)
+    {
+        vid_target_free(target);
+        return NULL;
+    }
+    depth->refs = depth->version = depth->layers = 1;
+    depth->format = VID_DEPTH24_RAW;
+    depth->cube = target->texture->cube;
+    depth->next = textures;
+    textures = depth;
+    target->depth_texture = depth;
+    return target;
+}
+
+VID_TARGET *vid_target_create_hdr_depth(void)
+{
+    return vid_target_attach_depth(vid_target_create_hdr());
+}
+
+VID_TEXTURE *vid_target_depth_texture(VID_TARGET *target)
+{
+    return target && !target->released ? target->depth_texture : NULL;
+}
+
+static VID_TARGET *vid_target_attach_surface(VID_TARGET *target)
+{
+    if (!target)
+        return NULL;
+    VID_TEXTURE *surface = calloc(1, sizeof(*surface));
+    if (!surface)
+    {
+        vid_target_free(target);
+        return NULL;
+    }
+    surface->refs = surface->version = surface->layers = 1;
+    surface->format = VID_R8;
+    surface->next = textures;
+    textures = surface;
+    target->surface_texture = surface;
+    return target;
+}
+
+VID_TARGET *vid_target_create_scene(void)
+{
+    return vid_target_attach_surface(vid_target_create_hdr_depth());
+}
+
+VID_TARGET *vid_target_create_scene_ldr(void)
+{
+    return vid_target_attach_surface(vid_target_create());
+}
+
+VID_TEXTURE *vid_target_surface_texture(VID_TARGET *target)
+{
+    return target && !target->released ? target->surface_texture : NULL;
+}
+
+VID_TARGET *vid_target_create_depth(void)
+{
+    VID_TARGET *target = vid_target_create();
+    if (target)
+        target->texture->format = VID_DEPTH24;
+    return target;
+}
+
+VID_TARGET *vid_target_create_depth_array(uint32 size, uint32 layers)
+{
+    VID_TARGET *target;
+    if (!size || size > 16384 || !layers || layers > 256)
+        return NULL;
+    target = vid_target_create_depth();
+    if (target)
+    {
+        target->texture->array = 1;
+        target->texture->layers = layers;
+        target->texture->width = target->texture->height = size;
+    }
+    return target;
+}
+
+VID_TARGET *vid_target_create_cube(uint32 size)
+{
+    VID_TARGET *target;
+    if (!size || size > 16384)
+        return NULL;
+    target = vid_target_create();
+    if (target)
+    {
+        target->texture->cube = 1;
+        target->texture->width = target->texture->height = size;
+    }
+    return target;
+}
+
+VID_TARGET *vid_target_create_cube_depth(uint32 size)
+{
+    return vid_target_attach_depth(vid_target_create_cube(size));
+}
+
 VID_TEXTURE *vid_target_texture(VID_TARGET *target)
 {
     return target && !target->released ? target->texture : NULL;
@@ -1443,11 +2033,17 @@ static void target_release(VID_TARGET *target)
     while (*link != target)
         link = &(*link)->next;
     *link = target->next;
-    if (target->framebuffer)
-        glDeleteFramebuffers(1, &target->framebuffer);
+    if (target->framebuffers)
+        glDeleteFramebuffers(target->framebuffer_count, target->framebuffers);
+    free(target->framebuffers);
+    for (uint32 level = 0; level < 32; ++level)
+        if (target->mip_framebuffers[level])
+            glDeleteFramebuffers(1, &target->mip_framebuffers[level]);
     if (target->depth)
         glDeleteRenderbuffers(1, &target->depth);
     vid_tex_free(target->texture);
+    vid_tex_free(target->depth_texture);
+    vid_tex_free(target->surface_texture);
     free(target);
 }
 
@@ -1465,7 +2061,7 @@ sint32 vid_target_copy(VID_TARGET *destination, const VID_TARGET *source)
 {
     GLint previous_read, previous_draw;
     sint32 result;
-    if (!initialized || frame_active || !destination || !source || destination == source || destination->released || source->released || !source->ready || destination->texture->draw_refs)
+    if (!initialized || frame_active || !destination || !source || destination == source || destination->released || source->released || !source->ready || destination->texture->draw_refs || destination->texture->format == VID_DEPTH24 || source->texture->format == VID_DEPTH24 || destination->texture->cube || source->texture->cube)
         return 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
@@ -1475,18 +2071,96 @@ sint32 vid_target_copy(VID_TARGET *destination, const VID_TARGET *source)
     {
         glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
-        glBlitFramebuffer(0, 0, source->texture->width, source->texture->height, 0, 0, source->texture->width, source->texture->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        {
+            GLenum color = GL_COLOR_ATTACHMENT0;
+            glReadBuffer(color);
+            glDrawBuffers(1, &color);
+            glBlitFramebuffer(0, 0, source->texture->width, source->texture->height, 0, 0, source->texture->width, source->texture->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (source->surface_texture && destination->surface_texture)
+            {
+                color = GL_COLOR_ATTACHMENT1;
+                glReadBuffer(color);
+                glDrawBuffers(1, &color);
+                glBlitFramebuffer(0, 0, source->texture->width, source->texture->height, 0, 0, source->texture->width, source->texture->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                color = GL_COLOR_ATTACHMENT0;
+                glReadBuffer(color);
+                glDrawBuffers(1, &color);
+            }
+        }
         result = glGetError() == GL_NO_ERROR;
         destination->ready = result;
+        if (result)
+        {
+            vid_texture_rendered(destination->texture);
+            if (source->surface_texture && destination->surface_texture)
+                vid_texture_rendered(destination->surface_texture);
+        }
     }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
     return result;
 }
 
+sint32 vid_target_copy_mip(VID_TARGET *destination, uint32 level, const VID_TARGET *source)
+{
+    if (!initialized || frame_active || !destination || !source || destination == source || destination->released || source->released || !destination->ready || !source->ready)
+        return 0;
+    VID_TEXTURE *texture = destination->texture;
+    if (texture->draw_refs || texture->cube || texture->array || source->texture->cube || source->texture->array || (texture->format != VID_RGBA16F && texture->format != VID_RGBA8) || source->texture->format != texture->format)
+        return 0;
+    uint32 levels = 1, size = texture->width > texture->height ? texture->width : texture->height;
+    for (; size > 1; size >>= 1)
+        ++levels;
+    if (texture->mip_levels && texture->mip_levels < levels)
+        levels = texture->mip_levels;
+    if (!level || level >= levels)
+        return 0;
+    uint32 width = texture->width >> level, height = texture->height >> level;
+    if (!width)
+        width = 1;
+    if (!height)
+        height = 1;
+    if (source->texture->width < width || source->texture->height < height)
+        return 0;
+    GLint previous_read, previous_texture;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+    glBindTexture(GL_TEXTURE_2D, texture->object);
+    for (uint32 index = destination->mip_storage_levels; index < levels; ++index)
+    {
+        uint32 w = texture->width >> index, h = texture->height >> index;
+        glTexImage2D(GL_TEXTURE_2D, index, texture->format == VID_RGBA16F ? GL_RGBA16F : GL_RGBA8, w ? w : 1, h ? h : 1, 0, GL_RGBA, texture->format == VID_RGBA16F ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE, NULL);
+    }
+    sint32 result = glGetError() == GL_NO_ERROR;
+    if (result)
+    {
+        destination->mip_storage_levels = levels;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, source->framebuffer);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, 0, 0, width, height);
+        result = glGetError() == GL_NO_ERROR;
+    }
+    if (destination->mip_base_version != texture->version)
+    {
+        destination->mip_base_version = texture->version;
+        destination->mip_written = 1;
+    }
+    if (result)
+    {
+        destination->mip_written |= 1u << level;
+        uint32 complete = levels == 32 ? UINT32_MAX : (1u << levels) - 1;
+        if ((destination->mip_written & complete) == complete)
+            texture->mip_version = texture->version;
+    }
+    glBindTexture(GL_TEXTURE_2D, previous_texture);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+    return result;
+}
+
 static VID_SHADER *vid_shader_create_impl(const char *vertex_source, const char *fragment, uint32 array)
 {
-    static const char prefix[] = VID_GLSL "in vec2 vUV; in vec4 vColor; in float vDepth; uniform sampler2D uTex; uniform int uTextured; uniform vec4 uParams[2]; out vec4 outColor;\n"
+    static const char prefix[] = VID_GLSL "in vec2 vUV; in vec4 vColor; in float vDepth; uniform sampler2D uTex; uniform int uTextured; uniform vec4 uParams[2]; layout(location=0) out vec4 outColor;\n"
                                           "in vec2 vFog; uniform vec4 uFog[3];\n"
                                           "vec4 vidFog(vec4 color){if(uFog[0].y<=uFog[0].x)return color;"
                                           "float f=vFog.x;"
@@ -1510,7 +2184,7 @@ static VID_SHADER *vid_shader_create_impl(const char *vertex_source, const char 
         const char *sampler = strstr(prefix, "sampler2D uTex");
         size_t before = (size_t)(sampler - prefix);
         memcpy(array_prefix, prefix, before);
-        strcpy(array_prefix + before, "highp sampler2DArray uTex");
+        strcpy(array_prefix + before, array == 2 ? "highp samplerCube uTex" : "highp sampler2DArray uTex");
         strcat(array_prefix, sampler + strlen("sampler2D uTex"));
         fragment_prefix = array_prefix;
     }
@@ -1576,8 +2250,56 @@ static VID_SHADER *vid_shader_create_impl(const char *vertex_source, const char 
     shader->params = glGetUniformLocation(shader->program, "uParams");
     shader->fog = glGetUniformLocation(shader->program, "uFog");
     shader->uniforms = glGetUniformLocation(shader->program, "uDraw");
-    shader->aux[0] = glGetUniformLocation(shader->program, "uAux0");
-    shader->aux[1] = glGetUniformLocation(shader->program, "uAux1");
+    if (shader->uniforms >= 0)
+    {
+        GLint count;
+        glGetProgramiv(shader->program, GL_ACTIVE_UNIFORMS, &count);
+        for (GLint index = 0; index < count; ++index)
+        {
+            char name[128];
+            GLsizei length;
+            GLint size;
+            GLenum type;
+            glGetActiveUniform(shader->program, (GLuint)index, sizeof(name), &length, &size, &type, name);
+            if (!strcmp(name, "uDraw[0]") || !strcmp(name, "uDraw"))
+                shader->uniform_vectors = (uint32)size;
+        }
+    }
+    {
+        static const char *const names[VID_AUX_TEXTURES] = {"uAux0", "uAux1", "uAux2", "uAux3", "uAux4", "uAux5", "uAux6", "uAux7"};
+        for (uint32 index = 0; index < VID_AUX_TEXTURES; ++index)
+            shader->aux[index] = glGetUniformLocation(shader->program, names[index]);
+        GLint active;
+        glGetProgramiv(shader->program, GL_ACTIVE_UNIFORMS, &active);
+        for (GLint item = 0; item < active; ++item)
+        {
+            char name[128];
+            GLsizei length;
+            GLint size;
+            GLenum type;
+            glGetActiveUniform(shader->program, (GLuint)item, sizeof(name), &length, &size, &type, name);
+            if (type == GL_SAMPLER_2D_ARRAY_SHADOW)
+                for (uint32 index = 0; index < VID_AUX_TEXTURES; ++index)
+                    if (!strcmp(name, names[index]))
+                        shader->aux_shadow_mask |= 1u << index;
+            if (type == GL_SAMPLER_2D)
+                for (uint32 index = 0; index < VID_AUX_TEXTURES; ++index)
+                    if (!strcmp(name, names[index]))
+                        shader->aux_2d_mask |= 1u << index;
+        }
+    }
+    {
+        GLint previous_program;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &previous_program);
+        glUseProgram(shader->program);
+        GLint texture = glGetUniformLocation(shader->program, "uTex");
+        if (texture >= 0)
+            glUniform1i(texture, 0);
+        for (uint32 unit = 0; unit < VID_AUX_TEXTURES; ++unit)
+            if (shader->aux[unit] >= 0)
+                glUniform1i(shader->aux[unit], unit + 1);
+        glUseProgram((GLuint)previous_program);
+    }
     shader->refs = 1;
     shader->next = shaders;
     shaders = shader;
@@ -1604,6 +2326,11 @@ void vid_shader_free(VID_SHADER *shader)
     shader_release(shader);
 }
 
+VID_SHADER *vid_shader_create_cube(const char *vertex, const char *fragment)
+{
+    return vid_shader_create_impl(vertex, fragment, 2);
+}
+
 VID_MATERIAL *vid_mat_create(void)
 {
     VID_MATERIAL *material = calloc(1, sizeof(*material));
@@ -1620,15 +2347,28 @@ VID_MATERIAL_DATA *vid_mat_data(VID_MATERIAL *material)
     return material && !material->released && material->refs == 1 ? &material->data : NULL;
 }
 
+const VID_MATERIAL_DATA *vid_mat_read(const VID_MATERIAL *material)
+{
+    return material && !material->released ? &material->data : NULL;
+}
+
+static uint64 material_revision;
+
+uint64 vid_mat_revision(const VID_MATERIAL *material)
+{
+    return material && !material->released ? material->revision : 0;
+}
+
 void vid_mat_commit(VID_MATERIAL *material)
 {
     VID_TEXTURE *texture;
     VID_SHADER *shader;
     if (!material || material->released || material->refs != 1)
         abort();
+    material->revision = ++material_revision;
     texture = material->data.texture;
     shader = material->data.shader;
-    for (uint32 idx = 0; idx < 2; ++idx)
+    for (uint32 idx = 0; idx < VID_AUX_TEXTURES; ++idx)
         if (material->data.aux[idx] != material->held_aux[idx])
         {
             VID_TEXTURE *aux = material->data.aux[idx];
@@ -1728,7 +2468,12 @@ sint32 vid_begin(float r, float g, float b)
     frame_clear[1] = g;
     frame_clear[2] = b;
     frame_uniform_count = 0;
+    frame_uniforms = NULL;
+    uniform_cursor = uniform_chunks;
+    for (VID_UNIFORM_CHUNK *chunk = uniform_chunks; chunk; chunk = chunk->next)
+        chunk->used = 0;
     frame_pass = 0;
+    vid_allocation_failed = 0;
     frame_active = 1;
     return 1;
 }
@@ -1738,6 +2483,7 @@ sint32 vid_target_select(VID_TARGET *target)
     if (!frame_active || draw_head || frame_target || !target || target->released || target->texture->draw_refs)
         return 0;
     frame_target = target;
+    target->fixed_width = target->fixed_height = 0;
     ++target->refs;
     return 1;
 }
@@ -1747,6 +2493,49 @@ sint32 vid_target_select_offscreen(VID_TARGET *target)
     if (!vid_target_select(target))
         return 0;
     frame_target_present = 0;
+    return 1;
+}
+
+sint32 vid_target_select_offscreen_size(VID_TARGET *target, uint32 width, uint32 height)
+{
+    if (!width || !height || width > 16384 || height > 16384 || !vid_target_select_offscreen(target))
+        return 0;
+    target->fixed_width = width;
+    target->fixed_height = height;
+    frame_width = (sint32)width;
+    frame_height = (sint32)height;
+    return 1;
+}
+
+sint32 vid_target_select_mip(VID_TARGET *target, uint32 level)
+{
+    if (!target || !target->ready || target->texture->cube || target->texture->array || (target->texture->format != VID_RGBA8 && target->texture->format != VID_RGBA16F) || !level || !target->texture->mip_levels || level >= vid_texture_mip_count(target->texture) || level >= 32)
+        return 0;
+    if (!vid_target_select_offscreen(target))
+        return 0;
+    frame_target_mip = level;
+    return 1;
+}
+
+sint32 vid_target_select_cube_face(VID_TARGET *target, uint32 face)
+{
+    if (!target || !target->texture->cube || face >= 6)
+        return 0;
+    if (!vid_target_select_offscreen_size(target, target->texture->width, target->texture->height))
+        return 0;
+    target->face = face;
+    if (!face)
+        target->completed_faces = 0;
+    return 1;
+}
+
+sint32 vid_target_select_depth_layer(VID_TARGET *target, uint32 layer)
+{
+    if (!target || !target->texture->array || target->texture->format != VID_DEPTH24 || layer >= target->texture->layers)
+        return 0;
+    if (!vid_target_select_offscreen_size(target, target->texture->width, target->texture->height))
+        return 0;
+    target->face = layer;
     return 1;
 }
 
@@ -1770,8 +2559,24 @@ void vid_uniforms(const float *values, uint32 vectors)
     if (!frame_active || vectors > VID_UNIFORM_VECTORS || (vectors && !values))
         abort();
     frame_uniform_count = vectors;
+    frame_uniforms = NULL;
     if (vectors)
-        memcpy(frame_uniforms, values, vectors * 4 * sizeof(float));
+    {
+        VID_UNIFORM_CHUNK **link = uniform_cursor ? &uniform_cursor : &uniform_chunks;
+        while (*link && (*link)->used + vectors * 4 > 16384)
+            link = &(*link)->next;
+        if (!*link)
+        {
+            *link = calloc(1, sizeof(**link));
+            if (!*link)
+                abort();
+        }
+        uniform_cursor = *link;
+        float *snapshot = uniform_cursor->values + uniform_cursor->used;
+        memcpy(snapshot, values, vectors * 4 * sizeof(float));
+        uniform_cursor->used += vectors * 4;
+        frame_uniforms = snapshot;
+    }
 }
 
 static sint32 vid_record(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 first, uint32 count, VID_MATERIAL *material, uint32 pass)
@@ -1779,14 +2584,18 @@ static sint32 vid_record(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 firs
     VID_DRAW *draw;
     if (!frame_active || (pass == 2 && !frame_pass))
         return 0;
-    if (pass != 1 && pass != 3 && (!geometry || geometry->released || !count || count % 3))
+    if (pass != 1 && pass != 3 && pass != 4 && (!geometry || geometry->released || !count || count % 3))
         return 0;
-    if (pass != 1 && pass != 3 && (indices ? indices->released || first > indices->count || count > indices->count - first : first > geometry->count || count > geometry->count - first))
+    if (pass != 1 && pass != 3 && pass != 4 && (indices ? indices->released || first > indices->count || count > indices->count - first : first > geometry->count || count > geometry->count - first))
         return 0;
-    if (pass != 2 && pass != 3 && (!material || material->released || material->data.texture != material->held_texture || material->data.shader != material->held_shader || material->data.aux[0] != material->held_aux[0] || material->data.aux[1] != material->held_aux[1]))
+    if (pass != 2 && pass != 3 && pass != 4 && (!material || material->released || material->data.texture != material->held_texture || material->data.shader != material->held_shader))
         return 0;
-    if (pass != 2 && pass != 3 && frame_target && (material->data.texture == frame_target->texture || material->data.aux[0] == frame_target->texture || material->data.aux[1] == frame_target->texture))
+    if (pass != 2 && pass != 3 && pass != 4 && frame_target && ((material->data.texture == frame_target->texture || (frame_target->depth_texture && material->data.texture == frame_target->depth_texture) || (frame_target->surface_texture && material->data.texture == frame_target->surface_texture))))
         return 0;
+    if (pass != 2 && pass != 3 && pass != 4)
+        for (uint32 index = 0; index < VID_AUX_TEXTURES; ++index)
+            if (material->data.aux[index] != material->held_aux[index] || (frame_target && (material->data.aux[index] == frame_target->texture || (frame_target->depth_texture && material->data.aux[index] == frame_target->depth_texture) || (frame_target->surface_texture && material->data.aux[index] == frame_target->surface_texture))))
+                return 0;
     draw = draw_pool;
     if (draw)
         draw_pool = draw->next;
@@ -1797,14 +2606,14 @@ static sint32 vid_record(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 firs
     memset(draw, 0, sizeof(*draw));
     draw->geometry = geometry;
     draw->material = material;
-    if (!pass || pass == 3)
+    if (!pass || pass == 3 || pass == 4)
         frame_pass = 0;
     draw->pass = pass;
     draw->indices = indices;
     if (material)
         draw->data = material->data;
     draw->uniform_count = frame_uniform_count;
-    memcpy(draw->uniforms, frame_uniforms, frame_uniform_count * 4 * sizeof(float));
+    draw->uniforms = frame_uniforms;
     draw->viewport = frame_viewport;
     draw->first = first;
     draw->count = count;
@@ -1820,7 +2629,7 @@ static sint32 vid_record(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 firs
         ++draw->data.texture->refs;
         ++draw->data.texture->draw_refs;
     }
-    for (uint32 idx = 0; idx < 2; ++idx)
+    for (uint32 idx = 0; idx < VID_AUX_TEXTURES; ++idx)
         if (draw->data.aux[idx])
         {
             ++draw->data.aux[idx]->refs;
@@ -1841,9 +2650,12 @@ sint32 vid_draw(VID_GEOMETRY *geometry, uint32 first, uint32 count, VID_MATERIAL
 
 void vid_pass(VID_MATERIAL *material)
 {
+    if (frame_active && frame_pass && material && !material->released && frame_pass_snapshot && frame_pass_snapshot->material == material && memcmp(&frame_pass_snapshot->viewport, &frame_viewport, sizeof(frame_viewport)) == 0 && memcmp(frame_pass_snapshot->fog, frame_fog, sizeof(frame_fog)) == 0 && (!frame_uniform_count || (draw_tail->uniform_count == frame_uniform_count && (draw_tail->uniforms == frame_uniforms || memcmp(draw_tail->uniforms, frame_uniforms, frame_uniform_count * 4 * sizeof(float)) == 0))))
+        return;
     if (!vid_record(NULL, NULL, 0, 0, material, 1))
         abort();
     frame_pass = 1;
+    frame_pass_snapshot = draw_tail;
 }
 
 sint32 vid_submit(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 first, uint32 count)
@@ -1854,6 +2666,41 @@ sint32 vid_submit(VID_GEOMETRY *geometry, VID_INDEX *indices, uint32 first, uint
 sint32 vid_clear_depth(void)
 {
     return vid_record(NULL, NULL, 0, 0, NULL, 3);
+}
+
+sint32 vid_target_next_part(uint32 part)
+{
+    if (!frame_active || !frame_target || frame_target_present || (!frame_target->texture->cube && !frame_target->texture->array) || part >= (frame_target->texture->cube ? 6 : frame_target->texture->layers))
+        return 0;
+    return vid_record(NULL, NULL, part, 0, NULL, 4);
+}
+
+sint32 vid_cube_capture(VID_TARGET *target, const float clear[3], VID_CUBE_RENDER render, void *context)
+{
+    static const float rotations[6][3][3] = {{{0, 0, -1}, {0, 1, 0}, {1, 0, 0}}, {{0, 0, 1}, {0, 1, 0}, {-1, 0, 0}}, {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}}, {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}}, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, {{-1, 0, 0}, {0, 1, 0}, {0, 0, -1}}};
+    if (frame_active || !target || target->released || !target->texture->cube || !clear || !render)
+        return 0;
+    if (!vid_begin(clear[0], clear[1], clear[2]))
+        return 0;
+    for (uint32 index = 0; index < 6; ++index)
+    {
+        if (!(index ? vid_target_next_part(index) : vid_target_select_cube_face(target, 0)))
+        {
+            vid_cancel();
+            return 0;
+        }
+        VID_CUBE_FACE face;
+        face.index = index;
+        face.size = target->texture->width;
+        memcpy(face.rotation, rotations[index], sizeof(face.rotation));
+        vid_viewport((VID_RECT){0, 0, (sint32)face.size, (sint32)face.size});
+        if (!render(context, &face))
+        {
+            vid_cancel();
+            return 0;
+        }
+    }
+    return vid_end();
 }
 
 sint32 vid_sample(VID_SAMPLE *sample, float x, float y)
@@ -1913,7 +2760,7 @@ void vid_cancel(void)
             --draw->data.texture->draw_refs;
             texture_release(draw->data.texture);
         }
-        for (uint32 idx = 0; idx < 2; ++idx)
+        for (uint32 idx = 0; idx < VID_AUX_TEXTURES; ++idx)
             if (draw->data.aux[idx])
             {
                 --draw->data.aux[idx]->draw_refs;
@@ -1935,6 +2782,7 @@ void vid_cancel(void)
     frame_active = 0;
     frame_target_present = 1;
     frame_target_offset = 0;
+    frame_target_mip = 0;
     memset(frame_fog, 0, sizeof(frame_fog));
 }
 
@@ -1964,6 +2812,10 @@ sint32 vid_init(void *window)
         return 1;
     vid_anisotropy_limit = 0.0f;
     initialized = vid_context_init(window);
+#if !defined(AP_WEB)
+    if (initialized)
+        glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+#endif
     return initialized;
 }
 
@@ -1990,6 +2842,14 @@ void vid_free(void)
         draw_pool = draw->next;
         free(draw);
     }
+    while (uniform_chunks)
+    {
+        VID_UNIFORM_CHUNK *chunk = uniform_chunks;
+        uniform_chunks = chunk->next;
+        free(chunk);
+    }
+    uniform_cursor = NULL;
+    frame_uniforms = NULL;
     if (initialized)
         vid_context_free();
     initialized = 0;
@@ -2005,6 +2865,7 @@ sint32 vid_blit(const uint32 *pixels, sint32 width, sint32 height, VID_RECT src)
     const uint8 corners[6] = {0, 1, 2, 2, 1, 3};
     if (!initialized || !pixels || width <= 0 || height <= 0 || src.x < 0 || src.y < 0 || src.w <= 0 || src.h <= 0 || src.w > width || src.h > height || src.x > width - src.w || src.y > height - src.h || (size_t)width > SIZE_MAX / 4 / height)
         return 0;
+    vid_allocation_failed = 0;
     vid_update_size(&client_width, &client_height);
     dst = vid_best_fit(client_width, client_height);
     if (!dst.w || !dst.h)
@@ -2057,16 +2918,18 @@ sint32 vid_blit(const uint32 *pixels, sint32 width, sint32 height, VID_RECT src)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, vid_blit_pixels);
-    vid_vertices(vid_blit_buffer, sizeof(VID_VERTEX), vid_array);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
+    if (vid_blit_width != width || vid_blit_height != height)
     {
-        sint32 result = vid_swap();
-#if defined(AP_WEB)
-        if (result)
-            xport_present_complete();
-#endif
-        return result;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, vid_blit_pixels);
+        if (glGetError() != GL_NO_ERROR)
+            return 0;
+        vid_blit_width = width;
+        vid_blit_height = height;
     }
+    else
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, vid_blit_pixels);
+    vid_vertices(vid_blit_buffer, sizeof(VID_VERTEX), vid_array);
+    vid_buffer_upload(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW, &vid_blit_storage, sizeof(vertices));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    return vid_swap();
 }

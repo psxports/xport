@@ -520,7 +520,7 @@ static void mdec_execute(MdecState *s)
     mdec_status(s);
 }
 
-static uint32 mdec_rgb_fifteen(uint32 rgb, uint32 high_bit)
+uint32 mdec_rgb_fifteen(uint32 rgb, uint32 high_bit)
 {
     uint32 channel, value = high_bit << 15;
     for (channel = 0u; channel < 3u; ++channel)

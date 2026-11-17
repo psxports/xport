@@ -1,6 +1,10 @@
 #ifndef AP_H
 #define AP_H
 
+#if defined(NDEBUG) && !defined(XPORT_DISABLE_FUNCTION_MARKERS)
+    #define XPORT_DISABLE_FUNCTION_MARKERS 1
+#endif
+
 #if defined(__EMSCRIPTEN__)
     #define AP_WEB 1
 #elif defined(_WIN32)

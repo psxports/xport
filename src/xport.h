@@ -159,6 +159,10 @@ extern "C"
     void xport_set_cleanup(void (*cleanup)(void));
     typedef void (*XportCleanup)(void);
     XportCleanup xport_get_cleanup(void);
+#if defined(AP_WIN)
+    typedef void (*XportQuitHandoff)(void);
+    XportQuitHandoff xport_set_quit_handoff(XportQuitHandoff handoff);
+#endif
     // Fullscreen playback returns 1 at EOF, 2 when interrupted and -1 on failure
     sint32 xport_fmv_play(const char *path);
     // Include the final source frame; zero selects physical EOF
@@ -180,6 +184,16 @@ extern "C"
         sint32 (*finish)(void *context, uint32 step);
     } XportFmvPresentation;
 
+    typedef struct XportFmvPlayback
+    {
+        const XportFmvPresentation *presentation;
+        uint32 page_stride;
+        uint32 *interrupted_buttons;
+        sint32 skip_after_present;
+        sint32 preserve_volume;
+    } XportFmvPlayback;
+
+    sint32 xport_fmv_play_configured(const char *path, uint32 last_frame, sint32 repeat, const XportFmvPlayback *playback);
     sint32 xport_fmv_play_presented(const char *path, uint32 last_frame, sint32 repeat, const XportFmvPresentation *presentation);
     sint32 xport_fmv_ready(void);
     typedef struct XportFmvAudioRemainder XportFmvAudioRemainder;
@@ -204,6 +218,8 @@ extern "C"
 
     // Copy the backend callbacks while no source session is open; NULL restores the platform source
     sint32 xport_fmv_set_backend(const XportFmvBackend *backend, void *context);
+    // copy one logical-to-prepared native source binding while playback is inactive
+    sint32 xport_fmv_set_native_source(const char *logical_path, const char *prepared_path);
     // Open a source session without an owned game loop
     sint32 xport_fmv_open(const char *path);
     // Return 0 while waiting, 1 for RGB24, 2 at EOF and -1 on error
@@ -212,6 +228,13 @@ extern "C"
     void xport_fmv_close(void);
     void xport_shutdown(void);
     uint64 xport_timer_get(void);
+
+    static __inline float xport_frame_fract_ex(uint64 *idx, uint32 rate)
+    {
+        uint64 elapsed = xport_timer_get() * rate;
+        *idx = elapsed / 1000000;
+        return (elapsed % 1000000) / 1000000.0f;
+    }
 
     static __inline float xport_frame_fract(uint64 *idx)
     {

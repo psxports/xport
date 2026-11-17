@@ -1,6 +1,8 @@
 """Index C implementations and declarations without requiring one function per file"""
 from collections import Counter, defaultdict
+from copy import deepcopy
 from contextlib import closing
+from functools import lru_cache
 from pathlib import Path
 import argparse
 import hashlib
@@ -12,7 +14,7 @@ import sqlite3
 import subprocess
 import time
 
-PARSER_VERSION='c-cpp-source-index-v12'
+PARSER_VERSION='c-cpp-source-index-v13'
 CODE_EXTENSIONS=('.c','.cpp')
 HEADER_EXTENSIONS=('.h','.hpp')
 SOURCE_EXTENSIONS=CODE_EXTENSIONS+HEADER_EXTENSIONS
@@ -110,7 +112,7 @@ def backward_paren(text,close):
 def line_number(text,offset):return text.count('\n',0,offset)+1
 
 
-def functions(text,path):
+def _parse_functions(text,path):
     masked=mask_c(text);result=[];statement=0;i=0;depth=0
     while i<len(masked):
         c=masked[i]
@@ -157,6 +159,69 @@ def functions(text,path):
     return result
 
 
+@lru_cache(maxsize=16)
+def _cached_functions(text,path):
+    return _parse_functions(text,path)
+
+
+def functions(text,path):
+    """return independent rows while reusing identical source text and paths"""
+    return deepcopy(_cached_functions(text,path))
+
+
+def header_functions(text,path):
+    """Index ordinary inline definitions in named C++ scopes, preserving source ranges"""
+    result=[]
+
+    def visit(start,end,scope):
+        fragment=text[start:end];masked=mask_c(fragment);parse=list(fragment)
+        # access labels and member cv qualifiers are not part of the return type
+        for match in re.finditer(r'\b(?:public|protected|private)\s*:',masked):
+            for offset in range(match.start(),match.end()):
+                if parse[offset] not in '\r\n':parse[offset]=' '
+        for match in re.finditer(r'(?<=\))\s*(?:(?:const|volatile|noexcept)\s*)+(?=\{)',masked):
+            for offset in range(match.start(),match.end()):
+                if parse[offset] not in '\r\n':parse[offset]=' '
+        statement=0;i=0;children=[]
+        while i<len(masked):
+            if masked[i]=='{':
+                closing=matching(masked,i)
+                prefix=re.sub(r'\b(?:public|protected|private)\s*:', '', masked[statement:i]).strip()
+                named=re.fullmatch(r'(?:class|struct|union|namespace)\s+([A-Za-z_]\w*)(?:\s*:[^{};]*)?',prefix)
+                if named:
+                    children.append((start+i+1,start+closing,scope+[named.group(1)]))
+                    for offset in range(statement,closing+1):
+                        if parse[offset] not in '\r\n':parse[offset]=' '
+                i=closing+1;statement=i;continue
+            if masked[i]==';':statement=i+1
+            i+=1
+        for item in functions(''.join(parse),path):
+            # constructor initializer lists need a richer declarator parser
+            opening=masked.find('{',item['start'],item['end'])
+            prefix=masked[item['start']:opening]
+            if re.search(r'(?<!:):(?!:)',prefix):continue
+            local_start=item['start'];local_end=item['end']
+            item['start']=start+local_start;item['end']=start+local_end
+            body=text[item['start']:item['end']]
+            item['sha256']=sha(body.encode())
+            item['start_line']=line_number(text,item['start'])
+            item['end_line']=line_number(text,item['end']-1)
+            item['identifiers']=sorted(set(IDENT.findall(mask_c(body))))
+            if scope and '::' not in item['name']:
+                name=item['name']
+                if re.search(r'~\s*'+re.escape(name)+r'\s*\(',prefix):name='~'+name
+                item['name']='::'.join(scope+[name])
+            result.append(item)
+        for child in children:visit(*child)
+
+    visit(0,len(text),[])
+    return sorted(result,key=lambda item:item['start'])
+
+
+def source_functions(text,path):
+    return header_functions(text,path) if Path(path).suffix.lower() in HEADER_EXTENSIONS else functions(text,path)
+
+
 def declaration_names(snippet,kind_hint=None):
     clean=mask_c(snippet).strip();names=[];kind=kind_hint
     if snippet.lstrip().startswith('#define'):
@@ -201,7 +266,7 @@ def declarations(text,path,is_header):
         elif c==';' and depth==0:
             begin=start
             while begin<i and masked[begin].isspace():begin+=1
-            snippet=text[begin:i+1];names,kind=declaration_names(snippet)
+            snippet=text[begin:i+1];names,kind=declaration_names(masked[begin:i+1])
             for name in names:
                 result.append(dict(path=path,name=name,kind=kind,start=begin,end=i+1,
                     start_line=line_number(text,begin),end_line=line_number(text,i),sha256=sha(snippet.encode())))
@@ -286,13 +351,13 @@ def populate(db,root,ledger):
     CREATE INDEX implementation_source ON implementations(source_path,start_line);
     CREATE INDEX declaration_name ON source_declarations(name,path);
     ''')
-    texts={};parsed={};decls=[]
+    texts={};parsed={};decls=[];closure_cache={}
     paths=source_inventory(root)
     for source in paths:
         rel=source_relative(root,source);raw=source.read_bytes();text=raw.decode('utf-8-sig')
         texts[rel]=text;db.execute('INSERT INTO source_files VALUES(?,?,?,?)',(rel,sha(raw),len(raw),PARSER_VERSION))
         from marker_names import canonicalize
-        parsed[rel]=canonicalize(root,functions(text,rel)) if source.suffix.lower() in CODE_EXTENSIONS else []
+        parsed[rel]=canonicalize(root,source_functions(text,rel))
         decls.extend(declarations(text,rel,source.suffix.lower() in HEADER_EXTENSIONS))
     declaration_ids=defaultdict(list)
     for item in decls:
@@ -320,7 +385,8 @@ def populate(db,root,ledger):
         db.execute('INSERT INTO implementations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(image,address,rel,*values,PARSER_VERSION))
         if item:
             db.executemany('INSERT INTO implementation_identifiers VALUES(?,?,?)',[(image,address,name) for name in item['identifiers']])
-            allowed=include_closure(root,rel,texts)
+            if rel not in closure_cache:closure_cache[rel]=include_closure(root,rel,texts)
+            allowed=closure_cache[rel]
             for name in item['identifiers']:
                 rows=[row for row in declaration_ids.get(name,[]) if row[1] in allowed]
                 db.executemany('INSERT OR IGNORE INTO implementation_declarations VALUES(?,?,?,?)',[(image,address,row[0],'lexical_identifier_in_include_closure') for row in rows])
@@ -343,7 +409,8 @@ def populate(db,root,ledger):
         db.execute('INSERT INTO implementations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
             (image,address,rel,item['name'],item['start'],item['end'],item['start_line'],item['end_line'],item['sha256'],'mapped','unique_original_address_symbol',PARSER_VERSION))
         db.executemany('INSERT INTO implementation_identifiers VALUES(?,?,?)',[(image,address,token) for token in item['identifiers']])
-        allowed=include_closure(root,rel,texts)
+        if rel not in closure_cache:closure_cache[rel]=include_closure(root,rel,texts)
+        allowed=closure_cache[rel]
         for token in item['identifiers']:
             links=[row for row in declaration_ids.get(token,[]) if row[1] in allowed]
             db.executemany('INSERT OR IGNORE INTO implementation_declarations VALUES(?,?,?,?)',[(image,address,row[0],'lexical_identifier_in_include_closure') for row in links])
@@ -359,7 +426,7 @@ def incremental_source_refresh(db,root,ledger,changed):
     for relative in changed:
         path=(root/relative).resolve();raw=path.read_bytes();text=raw.decode('utf-8-sig');is_header=path.suffix.lower() in HEADER_EXTENSIONS
         from marker_names import canonicalize
-        parsed=[] if is_header else canonicalize(root,functions(text,relative))
+        parsed=canonicalize(root,source_functions(text,relative))
         if any(identity in retired for item in parsed for identity in item['markers']):
             raise ValueError('Native retirement conflicts with current marker in '+relative)
         if is_header:changed_headers.add(relative)

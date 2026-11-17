@@ -21,7 +21,7 @@ VIDEO_CHUNK_BYTES = 256 * 1024
 
 
 def compressed_packages(startup, remaining):
-    """Keep package zero collected-only and bound final gzip and decoded sizes"""
+    """keep collected packages separate and bound gzip and decoded sizes"""
     compressor = zlib.compressobj(9, zlib.DEFLATED, 31)
     compressed = bytearray()
     group, used, index = [], 0, 0
@@ -39,10 +39,11 @@ def compressed_packages(startup, remaining):
         return data
 
     for phase, items in enumerate((startup, remaining)):
-        if phase == 1 and index == 0:
+        if phase == 1 and (group or index == 0):
             yield group, finish()
             compressor = zlib.compressobj(9, zlib.DEFLATED, 31)
-            compressed, group, used, index = bytearray(), [], 0, 1
+            compressed, group, used = bytearray(), [], 0
+            index += 1
         for source, target, size in items:
             if size == 0:
                 group.append((source, target, 0, 0))
@@ -163,6 +164,12 @@ def prepared_videos(project):
                 (track['width'], track['height']) != (original_info.get('width'), original_info.get('height'))):
             raise ValueError('Prepared movie frames/geometry differ from source: '+source)
         timeline = clip.get('media_timeline')
+        audio_selection = clip.get('audio_selection')
+        configured_audio_selection = video.get('audio_selections', {}).get(source)
+        if audio_selection != configured_audio_selection:
+            raise ValueError('Prepared movie audio selection differs from configuration: '+source)
+        if timeline is not None and audio_selection is not None:
+            raise ValueError('STR audio selection requires original sector timeline: '+source)
         if timeline is not None:
             if (not isinstance(timeline, dict) or any(type(timeline.get(key)) is not int or timeline[key] < 0
                     for key in ('video_offset_us', 'audio_offset_us'))):
@@ -176,7 +183,11 @@ def prepared_videos(project):
             if source_range != configured_range:
                 raise ValueError('Prepared movie source range differs from configuration: '+source)
             observed = inspect_str(original, include_completions=True,
-                                   sector_count=reviewed_sector_count(original, source_range))
+                                   sector_count=reviewed_sector_count(original, source_range),
+                                   audio_selection=audio_selection)
+            if audio_selection is not None and any(observed.get(key) != original_info.get(key)
+                    for key in ('audio_identity', 'omitted_audio_sectors', 'audio')):
+                raise ValueError('Original movie audio selection differs from receipt: '+source)
             if ([(row['frame'], row['sector']) for row in observed['frames']] !=
                     [(row['frame'], row['sector']) for row in frame_list]):
                 raise ValueError('Original movie frame locations differ from receipt: '+source)
@@ -348,7 +359,7 @@ def build_lazy(args, output):
     music_output = output / 'MUSIC'
     music_output.mkdir(exist_ok=True)
     for path in sorted((project / 'bin/MUSIC').glob('*')):
-        if path.suffix.upper() not in ('.WAV', '.XA') or not path.is_file():
+        if path.suffix.upper() not in ('.WAV', '.XA', '.VAG') or not path.is_file():
             continue
         if is_excluded(Path('/MUSIC') / path.name, excluded):
             continue

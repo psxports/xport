@@ -34,7 +34,13 @@ def msbuild_path():
 def process_running(name):
     if os.name!='nt' or not name:return False
     result=subprocess.run(['tasklist','/FI','IMAGENAME eq '+name,'/FO','CSV','/NH'],capture_output=True,text=True,encoding='oem',env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    if result.returncode:raise RuntimeError('Cannot inspect running native processes: tasklist exit '+str(result.returncode))
+    if result.returncode:
+        stem=name[:-4] if name.lower().endswith('.exe') else name
+        literal=stem.replace("'", "''")
+        script="try { $names = @(Get-Process -ErrorAction Stop | Select-Object -ExpandProperty ProcessName); if ($names -contains '"+literal+"') { exit 1 }; exit 0 } catch { exit 2 }"
+        guard=subprocess.run(['powershell','-NoProfile','-NonInteractive','-Command',script],capture_output=True,env=normalized_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if guard.returncode not in (0,1):raise RuntimeError('Cannot inspect running native processes: tasklist exit '+str(result.returncode)+'; PowerShell exit '+str(guard.returncode))
+        return guard.returncode==1
     return any(line.lower().startswith(('"'+name+'"').lower()) for line in result.stdout.splitlines())
 
 

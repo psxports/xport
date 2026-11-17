@@ -6,7 +6,9 @@ from ida_ctree_schema import validate as validate_ctree
 R=project_root()
 def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
 def write(p,d):p.write_text(json.dumps(d,indent=2)+'\n',encoding='utf8')
-def main(no_format=False):
+def main(no_format=False, original_only=False):
+ if original_only:
+  no_format=True
  _,project_config=load_project(R)
  if project_config.get('analysis',{}).get('function_queue') not in (None,'image_qualified','unique_exact_bodies','operand_templates'):
   raise ValueError('Unsupported analysis.function_queue mode')
@@ -180,8 +182,11 @@ def main(no_format=False):
  else:
   from function_similarity import run as compare_mips_functions
   similarity_summary=compare_mips_functions(db)
- from source_index import populate as index_sources
- source_summary=index_sources(db,R,ledger)
+ if original_only:
+  source_summary=dict(parser_version='deferred',deferred=True,reason='Original evidence refresh during static translation; source indexing deferred to integration')
+ else:
+  from source_index import populate as index_sources
+  source_summary=index_sources(db,R,ledger)
  for k,v in {'schema_version':'5','source':'IDA 7.7 + Hex-Rays; instruction bytes independently verified against files','identity':'image + virtual address; names are not debug symbols','status_policy':'Historical strict-proof metadata; ordinary queue uses project.sqlite complete source bindings','source_index_parser':source_summary['parser_version'],'source_index_ledger_sha256':hashlib.sha256(ledger_bytes(R)).hexdigest(),'semantic_map_sha256':hashlib.sha256(semantic_path.read_bytes()).hexdigest() if semantic_path.exists() else 'absent','source_format_style_sha256':source_format['style_sha256'],'source_formatter_version':source_format['formatter'] or 'unavailable','ctree_functions':str(ctree_count),'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}.items():db.execute('INSERT INTO metadata VALUES(?,?)',(k,v))
  db.execute('INSERT INTO metadata VALUES(?,?)',('original_index_exports',json.dumps(dict(inputs=index_inputs,selection=project_config.get('analysis',{}).get('index_exports',[]),additional=project_config.get('analysis',{}).get('additional_index_exports',[])),sort_keys=True)))
  db.commit();assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok';assert not db.execute('PRAGMA foreign_key_check').fetchall()
@@ -205,4 +210,6 @@ if __name__=='__main__':
  import argparse
  parser=argparse.ArgumentParser(description=__doc__)
  parser.add_argument('--no-format',action='store_true',help='Rebuild evidence views without changing C/H source bytes')
- main(no_format=parser.parse_args().no_format)
+ parser.add_argument('--original-only',action='store_true',help='Refresh original evidence without formatting or indexing native sources')
+ args=parser.parse_args()
+ main(no_format=args.no_format,original_only=args.original_only)
